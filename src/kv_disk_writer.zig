@@ -116,6 +116,7 @@ pub const Writer = struct {
     land_mutex: std.Io.Mutex = .init,
     /// Landed bytes per op since `takeLanding` read them; the oldest go past `MAX_LANDINGS`.
     landings: std.ArrayList(Landing) = .empty,
+    room_waiting_for_test: std.atomic.Value(u32) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Writer {
         return .{ .allocator = allocator, .io = io };
@@ -278,6 +279,10 @@ pub const Writer = struct {
     fn waitForRoomLocked(self: *Writer, n: usize) void {
         if (!self.overPermitLocked(n)) return;
         const sw = io_util.Stopwatch.init(self.io);
+        if (comptime @import("builtin").is_test) _ = self.room_waiting_for_test.fetchAdd(1, .acq_rel);
+        defer if (comptime @import("builtin").is_test) {
+            _ = self.room_waiting_for_test.fetchSub(1, .acq_rel);
+        };
         while (self.overPermitLocked(n)) self.done.waitUncancelable(self.io, &self.mutex);
         self.waited_ns += sw.read();
     }
@@ -1010,7 +1015,7 @@ test "kv_disk_writer op: the permit bounds the host bytes staged ops hold" {
     };
     var got = std.atomic.Value(bool).init(false);
     const t = try std.Thread.spawn(.{}, Waiter.run, .{ &w, &got });
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .real) catch {};
+    while (w.room_waiting_for_test.load(.acquire) == 0) std.Thread.yield() catch {};
     try testing.expect(!got.load(.acquire));
     w.setPaused(false);
     t.join();

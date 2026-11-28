@@ -94,12 +94,8 @@ test "boot gate: a request waiting for the boot runs only once it opens" {
     g.begin();
     var w: Waiter = .{ .gate = &g };
     const t = try std.Thread.spawn(.{}, Waiter.run, .{&w});
-    var slept: u32 = 0;
-    while (slept < 50) : (slept += 1) {
-        try testing.expect(!w.done.load(.acquire));
-        const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
-        _ = std.c.nanosleep(&ts, null);
-    }
+    while (g.waiting.load(.acquire) == 0) std.Thread.yield() catch {};
+    try testing.expect(!w.done.load(.acquire));
     g.open(testing.io);
     t.join();
     try testing.expect(w.done.load(.acquire));

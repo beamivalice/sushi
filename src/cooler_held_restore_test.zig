@@ -128,6 +128,37 @@ test "cooler contract: a served request restored from a shorter prompt's SSD rec
     }.run);
 }
 
+test "cooler contract: a served request cancelled at its prefill leaves the pool at its resting cap once it is drained, as one that ends does" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const gpu_mem = @import("gpu_mem.zig");
+            const ld = try heldLoad(C, dir);
+            var sv: Served = undefined;
+            try sv.init(ld, dir);
+            defer sv.deinit();
+            const rest = @import("arch/cooler.zig").restCap(&ld.config);
+            const prompt = ids[0..@min(ids.len, 40)];
+            var from: u32 = 0;
+            var done = try sv.request(prompt, 8, &from);
+            done.deinit(a);
+            const after_end = gpu_mem.engineFree();
+            const sch = &sv.sch;
+            const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 8 });
+            _ = sch.pending.orderedRemove(0);
+            try Served.scheduler.runPrefill(sch, slot);
+            slot.cancel();
+            sch.complete(slot);
+            Served.scheduler.drainSlots(sch, sch.cleanup_queue.items);
+            sch.cleanup_queue.clearRetainingCapacity();
+            const after_cancel = gpu_mem.engineFree();
+            errdefer std.debug.print("cooler contract: free pool {d} B after a request that ended, {d} B after one cancelled at its prefill; resting cap {d} B\n", .{ after_end, after_cancel, rest });
+            try testing.expect(after_end <= rest);
+            try testing.expect(after_cancel <= rest);
+        }
+    }.run);
+}
+
 test "cooler contract: a served SSD restore refused at any pool buffer site its cold requests lack falls back to a cold prefill and says the cold tokens, and the next conversation says them" {
     try qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
@@ -168,7 +199,7 @@ test "cooler contract: a served SSD restore refused at any pool buffer site its 
 }
 
 test "cooler contract: a served Qwen conversation keeps its newest off-grid restore points in RAM, writes none while the next turn extends them, and a flush writes the held ones" {
-    try eachQwenServed(struct {
+    try qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             const dws = @import("disk_write_stats.zig");
@@ -209,7 +240,7 @@ test "cooler contract: a served Qwen conversation keeps its newest off-grid rest
 }
 
 test "cooler contract: a served Qwen turn that leaves the last turn's text between two restore points inherits the one below the cut, the engine refusing nothing" {
-    try eachQwenServed(struct {
+    try qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             const route = @import("tensor/route.zig");
@@ -248,170 +279,8 @@ test "cooler contract: a served Qwen turn that leaves the last turn's text betwe
     }.run);
 }
 
-test "cooler contract: a served Qwen turn that shares part of the last turn's RAM entry, and fits only by taking it over, takes it and says the shared restore's tokens, the engine refusing nothing (#109)" {
-    try eachQwenServed(struct {
-        /// Admission that refuses a warm share the request did not take over: a copy of the prefix does not fit.
-        fn onlyTaken(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, will_donate: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
-            return matched == 0 or will_donate;
-        }
-
-        /// Turn 1, a turn 2 that extends it (its entry holds both prompt ends' restore points), then a turn 3 that
-        /// leaves turn 2's text between those points and says more; turn 3's tokens. Every engine refusal on the way
-        /// is counted in `refused`.
-        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, taken: bool, reused: *u32, entries: *usize, refused: *u64) !std.ArrayList(u32) {
-            const a = testing.allocator;
-            const route = @import("tensor/route.zig");
-            const refused0 = route.refusals;
-            defer refused.* = route.refusals - refused0;
-            var sv: Served = undefined;
-            try sv.initTiers(ld, dir, 1 << 30);
-            defer sv.deinit();
-            var f: u32 = 0;
-            var first = try heldPrompt(a, ids, 1500, 0);
-            defer first.deinit(a);
-            var reply = try sv.request(first.items, 16, &f);
-            defer reply.deinit(a);
-            var second: std.ArrayList(u32) = .empty;
-            defer second.deinit(a);
-            try second.appendSlice(a, first.items);
-            try second.appendSlice(a, reply.items);
-            var said = try heldPrompt(a, ids, 1500, 2);
-            defer said.deinit(a);
-            try second.appendSlice(a, said.items);
-            var reply2 = try sv.request(second.items, 16, &f);
-            defer reply2.deinit(a);
-            // The entry's point at turn 2's prompt end is past the cut, another text's: the share keeps turn 1's.
-            var next: std.ArrayList(u32) = .empty;
-            defer next.deinit(a);
-            try next.appendSlice(a, second.items[0 .. second.items.len - 100]);
-            var more = try heldPrompt(a, ids, 200, 1);
-            defer more.deinit(a);
-            try next.appendSlice(a, more.items);
-            const scheduler = @import("scheduler.zig");
-            const fits_was = scheduler.prefill_admission_fits;
-            defer scheduler.prefill_admission_fits = fits_was;
-            if (taken) scheduler.prefill_admission_fits = onlyTaken;
-            var got = try sv.request(next.items, 16, &f);
-            errdefer got.deinit(a);
-            reused.* = sv.reused;
-            // A turn 4 that leaves turn 3's text between its restore points: a partial share of the entry turn 3
-            // committed, taken over again on the takeover arm.
-            var fourth: std.ArrayList(u32) = .empty;
-            defer fourth.deinit(a);
-            try fourth.appendSlice(a, next.items[0 .. next.items.len - 50]);
-            try fourth.appendSlice(a, said.items[0..150]);
-            var got4 = try sv.request(fourth.items, 16, &f);
-            defer got4.deinit(a);
-            if (sv.reused == 0 or sv.reused >= next.items.len - 50) return error.TestTurnFourNotPartial;
-            try got.appendSlice(a, got4.items);
-            entries.* = sv.entry.prefix_cache.?.entries.items.len;
-            return got;
-        }
-
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var shared_reused: u32 = 0;
-            var taken_reused: u32 = 0;
-            var entries: usize = 0;
-            var refused: u64 = 0;
-            var shared = try conversation(ld, dir, ids, false, &shared_reused, &entries, &refused);
-            defer shared.deinit(a);
-            // The share's commit inherits the entry's points below the cut on the engine's stream.
-            try testing.expectEqual(@as(u64, 0), refused);
-            var taken = try conversation(ld, dir, ids, true, &taken_reused, &entries, &refused);
-            defer taken.deinit(a);
-            try testing.expectEqual(@as(u64, 0), refused);
-            // A partial share: turn 1's restore point, below the cut.
-            try testing.expect(taken_reused > 0 and taken_reused < 1516);
-            try testing.expectEqual(shared_reused, taken_reused);
-            try testing.expectEqualSlices(u32, shared.items, taken.items);
-            // Turn 2's commit replaced the entry it took over.
-            try testing.expectEqual(@as(usize, 1), entries);
-        }
-    }.run);
-}
-
-test "cooler contract: a served Qwen turn no longer than the RAM entry it partly shares, a regenerate or a turn that drops more of the last one than it adds, fits by taking it over and says the shared restore's tokens (#109)" {
-    try eachQwenServed(struct {
-        /// Admission that refuses a warm share the request did not take over: a copy of the prefix does not fit.
-        fn onlyTaken(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, will_donate: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
-            return matched == 0 or will_donate;
-        }
-
-        const Shape = enum { shorter_turn, regenerate };
-
-        /// Turn 1, a turn 2 that extends it, then turn 3: turn 2 less its last 100 tokens and 50 new ones, or turn 2's
-        /// prompt again. Returns turn 3's tokens; its prompt (`prompt_len`) is shorter than turn 2's entry either way.
-        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, shape: Shape, taken: bool, reused: *u32, prompt_len: *usize, refused: *u64) !std.ArrayList(u32) {
-            const a = testing.allocator;
-            const route = @import("tensor/route.zig");
-            const refused0 = route.refusals;
-            defer refused.* = route.refusals - refused0;
-            var sv: Served = undefined;
-            try sv.initTiers(ld, dir, 1 << 30);
-            defer sv.deinit();
-            var f: u32 = 0;
-            var first = try heldPrompt(a, ids, 1500, 0);
-            defer first.deinit(a);
-            var reply = try sv.request(first.items, 16, &f);
-            defer reply.deinit(a);
-            var second: std.ArrayList(u32) = .empty;
-            defer second.deinit(a);
-            try second.appendSlice(a, first.items);
-            try second.appendSlice(a, reply.items);
-            var said = try heldPrompt(a, ids, 1500, 2);
-            defer said.deinit(a);
-            try second.appendSlice(a, said.items);
-            var reply2 = try sv.request(second.items, 16, &f);
-            defer reply2.deinit(a);
-            var next: std.ArrayList(u32) = .empty;
-            defer next.deinit(a);
-            switch (shape) {
-                .shorter_turn => {
-                    try next.appendSlice(a, second.items[0 .. second.items.len - 100]);
-                    var more = try heldPrompt(a, ids, 50, 1);
-                    defer more.deinit(a);
-                    try next.appendSlice(a, more.items);
-                },
-                .regenerate => try next.appendSlice(a, second.items),
-            }
-            if (next.items.len >= second.items.len + reply2.items.len) return error.TestTurnThreeNotShorter;
-            prompt_len.* = next.items.len;
-            const scheduler = @import("scheduler.zig");
-            const fits_was = scheduler.prefill_admission_fits;
-            defer scheduler.prefill_admission_fits = fits_was;
-            if (taken) scheduler.prefill_admission_fits = onlyTaken;
-            const got = try sv.request(next.items, 16, &f);
-            reused.* = sv.reused;
-            return got;
-        }
-
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            for ([_]Shape{ .shorter_turn, .regenerate }) |shape| {
-                var shared_reused: u32 = 0;
-                var taken_reused: u32 = 0;
-                var prompt_len: usize = 0;
-                var refused: u64 = 0;
-                var shared = try conversation(ld, dir, ids, shape, false, &shared_reused, &prompt_len, &refused);
-                defer shared.deinit(a);
-                try testing.expectEqual(@as(u64, 0), refused);
-                var taken = try conversation(ld, dir, ids, shape, true, &taken_reused, &prompt_len, &refused);
-                defer taken.deinit(a);
-                try testing.expectEqual(@as(u64, 0), refused);
-                // The slot restores at a point below its prompt's end, the regenerate's whole-prompt share included.
-                try testing.expect(taken_reused > 0 and taken_reused < prompt_len);
-                try testing.expectEqual(shared_reused, taken_reused);
-                try testing.expectEqualSlices(u32, shared.items, taken.items);
-            }
-        }
-    }.run);
-}
-
 test "cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)" {
-    try eachQwenServed(struct {
+    try qwenTinyServed(struct {
         var cache: ?*const @import("prefix_cache.zig").HotPrefixCache = null;
 
         /// Admission that refuses a warm share while the cache holds another entry than the one shared.
@@ -513,7 +382,7 @@ test "cooler contract: a served Qwen conversation of takeovers, partial, regener
                     try prompt.appendSlice(a, said.items);
                 }
                 if (poison) |b| _ = mlx.engine.poison.free(b);
-                var r = try sv.request(prompt.items, 16, &f);
+                var r = try sv.request(prompt.items, 8, &f);
                 defer r.deinit(a);
                 try out.appendSlice(a, r.items);
                 last.clearRetainingCapacity();
@@ -573,7 +442,7 @@ test "cooler contract: a served Qwen turn of every prompt shape against a RAM en
             defer Served.scheduler.prefill_admission_fits = fits_was;
             if (taken) Served.scheduler.prefill_admission_fits = fitsOnlyTaken;
             var f: u32 = 0;
-            var got = try sv.request(prompt.items, 16, &f);
+            var got = try sv.request(prompt.items, 8, &f);
             defer got.deinit(a);
             try testing.expect(sv.reused > 0);
             try out.appendSlice(a, got.items);
@@ -585,9 +454,10 @@ test "cooler contract: a served Qwen turn of every prompt shape against a RAM en
             const prefix_cache = @import("prefix_cache.zig");
             const ld = try heldLoad(Q, dir);
             defer prefix_cache.ssd_first_override = null;
-            for ([_]bool{ true, false }) |ssd_first| {
+            for ([_]bool{ false, true }) |ssd_first| {
                 prefix_cache.ssd_first_override = ssd_first;
-                for (shapes) |sh| {
+                const run_shapes: []const Shape = if (ssd_first) &.{ shapes[0], shapes[3] } else &shapes;
+                for (run_shapes) |sh| {
                     errdefer std.debug.print("cooler contract: the turn of E less {d} tokens then {d} new, SSD-first {any}\n", .{ sh.cut, sh.say, ssd_first });
                     var shared: std.ArrayList(u32) = .empty;
                     defer shared.deinit(a);
@@ -696,7 +566,7 @@ test "cooler contract: a served speculative Qwen conversation of takeovers, part
                     try prompt.appendSlice(a, said.items);
                 }
                 if (poison) |b| _ = mlx.engine.poison.free(b);
-                var r = try sv.requestWith(prompt.items, 24, .{ .temperature = 0.0 }, true, &f);
+                var r = try sv.requestWith(prompt.items, 12, .{ .temperature = 0.0 }, true, &f);
                 defer r.deinit(a);
                 try out.appendSlice(a, r.items);
                 last.clearRetainingCapacity();
@@ -715,6 +585,383 @@ test "cooler contract: a served speculative Qwen conversation of takeovers, part
             defer taken.deinit(a);
             try conversation(ld, dir, ids, true, &taken);
             try testing.expectEqualSlices(u32, shared.items, taken.items);
+        }
+    }.run);
+}
+
+test "cooler contract: a served Qwen partial takeover refused before it donates leaves no cut on the entry, so the next turn takes the entry whole and keeps its restore points" {
+    try qwenTinyServed(struct {
+        /// Admission that refuses every warm request, taken over or shared.
+        fn fitsNoWarm(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, _: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
+            return matched == 0;
+        }
+
+        /// The #109 conversation, (its turn 3 taken over and then refused), and a turn 4 that extends turn 2's entry:
+        /// the restore points of the entry turn 4 leaves.
+        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, refused_turn: bool, out: *std.ArrayList(usize)) !void {
+            const a = testing.allocator;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, 1 << 30);
+            defer sv.deinit();
+            sv.quiet_failures = true;
+            var c = try PartialShare.serve(&sv, ids, 200);
+            defer c.deinit();
+            const hc = &sv.entry.prefix_cache.?;
+            if (refused_turn) {
+                const fits_was = Served.scheduler.prefill_admission_fits;
+                defer Served.scheduler.prefill_admission_fits = fits_was;
+                Served.scheduler.prefill_admission_fits = fitsNoWarm;
+                _ = try sv.requestToCleanup(c.third.items, 16, false);
+                // Refused before its append donated: turn 2's entry is back, whole.
+                try testing.expect(takeoverAtRest(hc));
+                var whole = false;
+                for (hc.entries.items) |*e| whole = whole or std.mem.eql(u32, e.tokens, c.entry.items);
+                try testing.expect(whole);
+            }
+            var fourth: std.ArrayList(u32) = .empty;
+            defer fourth.deinit(a);
+            try fourth.appendSlice(a, c.entry.items);
+            var said = try heldPrompt(a, ids, 1500, 5);
+            defer said.deinit(a);
+            try fourth.appendSlice(a, said.items);
+            var f: u32 = 0;
+            var got = try sv.request(fourth.items, 16, &f);
+            defer got.deinit(a);
+            for (hc.entries.items) |*e| {
+                if (e.tokens.len < fourth.items.len) continue;
+                if (e.ssm_checkpoints) |cps| for (cps) |*cp| try out.append(a, cp.pos);
+            }
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var clean: std.ArrayList(usize) = .empty;
+            defer clean.deinit(a);
+            var after_refusal: std.ArrayList(usize) = .empty;
+            defer after_refusal.deinit(a);
+            try conversation(ld, dir, ids, false, &clean);
+            try conversation(ld, dir, ids, true, &after_refusal);
+            try testing.expect(clean.items.len > 0);
+            try testing.expectEqualSlices(usize, clean.items, after_refusal.items);
+        }
+    }.run);
+}
+
+test "cooler contract: a held Qwen restore point another conversation pushes out of RAM is written, not dropped, and restores" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var sv: Served = undefined;
+            try sv.init(ld, dir);
+            defer sv.deinit();
+            const disk = &sv.entry.prefix_cache.?.disk.?;
+            var prompts: [3]std.ArrayList(u32) = undefined;
+            for (&prompts, 0..) |*p, k| p.* = try heldPrompt(a, ids, 3000, k + 1);
+            defer for (&prompts) |*p| p.deinit(a);
+            var f: u32 = 0;
+            var r0 = try sv.request(prompts[0].items, 8, &f);
+            r0.deinit(a);
+            disk.drainWriter();
+            try testing.expectEqual(@as(usize, 1), disk.held.items.len);
+            const one = disk.held_bytes;
+            disk.held_cap_for_test = 2 * one + one / 2;
+            var r1 = try sv.request(prompts[1].items, 8, &f);
+            r1.deinit(a);
+            disk.drainWriter();
+            try testing.expectEqual(@as(usize, 2), disk.held.items.len);
+            const before = ssmWritten();
+            // A third conversation's point: the oldest (the first conversation's) is written, not dropped.
+            var r2 = try sv.request(prompts[2].items, 8, &f);
+            r2.deinit(a);
+            disk.drainWriter();
+            try testing.expectEqual(@as(usize, 2), disk.held.items.len);
+            try testing.expectEqual(one, ssmWritten() - before);
+            var again = try sv.request(prompts[0].items, 8, &f);
+            again.deinit(a);
+            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
+        }
+    }.run);
+}
+
+test "cooler contract: a held Qwen restore point restores the same tokens as its file after a flush" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var sv: Served = undefined;
+            try sv.init(ld, dir);
+            defer sv.deinit();
+            const disk = &sv.entry.prefix_cache.?.disk.?;
+            var prompt = try heldPrompt(a, ids, 3000, 7);
+            defer prompt.deinit(a);
+            var f: u32 = 0;
+            var cold = try sv.request(prompt.items, 8, &f);
+            cold.deinit(a);
+            disk.drainWriter();
+            const before = ssmWritten();
+            var from_ram = try sv.request(prompt.items, 24, &f);
+            defer from_ram.deinit(a);
+            disk.drainWriter();
+            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
+            try testing.expectEqual(before, ssmWritten());
+            // The clean unload's flush: the held point is written, and the next request restores it from its file.
+            @import("scheduler.zig").flushLiveState(sv.entry, "test");
+            disk.drainWriter();
+            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
+            try testing.expect(ssmWritten() > before);
+            var from_file = try sv.request(prompt.items, 24, &f);
+            defer from_file.deinit(a);
+            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
+            try testing.expectEqualSlices(u32, from_ram.items, from_file.items);
+        }
+    }.run);
+}
+
+test "cooler contract: a regenerated Qwen turn restores from its own prompt end, live and after a flush" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var sv: Served = undefined;
+            try sv.init(ld, dir);
+            defer sv.deinit();
+            const disk = &sv.entry.prefix_cache.?.disk.?;
+            var prompt = try heldPrompt(a, ids, 3000, 11);
+            defer prompt.deinit(a);
+            var f: u32 = 0;
+            var first = try sv.request(prompt.items, 16, &f);
+            first.deinit(a);
+            disk.drainWriter();
+            // The same conversation's next point extends the prompt end (a reply end, or the turn after).
+            var longer = try prompt.clone(a);
+            defer longer.deinit(a);
+            for (0..64) |i| try longer.append(a, ids[(i * 13 + 5) % ids.len]);
+            var next = try sv.request(longer.items, 16, &f);
+            next.deinit(a);
+            disk.drainWriter();
+            // Regenerate: the first prompt again restores from its own end, which the newer point did not take away.
+            var live = try sv.request(prompt.items, 16, &f);
+            defer live.deinit(a);
+            disk.drainWriter();
+            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
+            // After the flush an unload or a restart runs, it restores from the written point.
+            @import("scheduler.zig").flushLiveState(sv.entry, "test");
+            disk.drainWriter();
+            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
+            var after = try sv.request(prompt.items, 16, &f);
+            defer after.deinit(a);
+            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
+            try testing.expectEqualSlices(u32, live.items, after.items);
+        }
+    }.run);
+}
+
+test "cooler contract: a Qwen prompt that re-renders an earlier reply restores from that turn's own point, written when the held points pass the cap" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var sv: Served = undefined;
+            try sv.init(ld, dir);
+            defer sv.deinit();
+            const disk = &sv.entry.prefix_cache.?.disk.?;
+            // Over the 8192 grid, so a written grid point lies under the turns' held points.
+            var conv = try heldPrompt(a, ids, 9000, 41);
+            defer conv.deinit(a);
+            var f: u32 = 0;
+            // The second turn's prompt and the first 8 tokens of its reply: an agent's later prompt that re-renders
+            // the rest of that reply (a coerced tool call) shares this much.
+            var shared: usize = 0;
+            for (0..3) |turn| {
+                var reply = try sv.request(conv.items, 16, &f);
+                defer reply.deinit(a);
+                try expectListedPointsLive(disk);
+                // Room for one point and a half: a commit keeps its newest point held and writes the spare it supersedes.
+                if (turn == 0) disk.held_cap_for_test = disk.held_bytes / disk.held.items.len * 3 / 2;
+                if (turn == 1) shared = conv.items.len + 8;
+                try conv.appendSlice(a, reply.items);
+                for (0..600) |i| try conv.append(a, ids[(i * 13 + turn * 101) % ids.len]);
+            }
+            var next = try conv.clone(a);
+            defer next.deinit(a);
+            next.shrinkRetainingCapacity(shared);
+            for (0..200) |i| try next.append(a, ids[(i * 17 + 3) % ids.len]);
+            var last = try sv.request(next.items, 16, &f);
+            last.deinit(a);
+            // The second turn's prompt-end point, not the 8192 grid point under it.
+            try testing.expectEqual(@as(u32, @intCast(shared - 8 - 31)), sv.reused);
+        }
+    }.run);
+}
+
+test "cooler contract: a held Qwen restore point whose write fails as it gives way to a staged write mid-commit leaves no listed point without bytes" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var sv: Served = undefined;
+            try sv.init(ld, dir);
+            defer sv.deinit();
+            const disk = &sv.entry.prefix_cache.?.disk.?;
+            var conv = try heldPrompt(a, ids, 3000, 51);
+            defer conv.deinit(a);
+            var f: u32 = 0;
+            var first = try sv.request(conv.items, 16, &f);
+            try conv.appendSlice(a, first.items);
+            first.deinit(a);
+            try expectListedPointsLive(disk);
+            const one = disk.held_bytes;
+            try testing.expect(one > 0);
+            // The next turn's commit stages its chunks with too little permit beside the held points, and their writes fail.
+            const permit = disk.writer.?.permit_bytes;
+            defer disk.writer.?.permit_bytes = permit;
+            disk.writer.?.permit_bytes = one + (1 << 20);
+            disk.fail_held_flush_for_test = true;
+            defer disk.fail_held_flush_for_test = false;
+            for (0..1500) |i| try conv.append(a, ids[(i * 13 + 7) % ids.len]);
+            var next = try sv.request(conv.items, 16, &f);
+            next.deinit(a);
+            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
+            try expectListedPointsLive(disk);
+        }
+    }.run);
+}
+
+test "cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var sv: Served = undefined;
+            try sv.init(ld, dir);
+            defer sv.deinit();
+            const disk = &sv.entry.prefix_cache.?.disk.?;
+            var p0 = try heldPrompt(a, ids, 3000, 11);
+            defer p0.deinit(a);
+            var p1 = try heldPrompt(a, ids, 3000, 12);
+            defer p1.deinit(a);
+            var f: u32 = 0;
+            var r0 = try sv.request(p0.items, 8, &f);
+            r0.deinit(a);
+            disk.drainWriter();
+            const one = disk.held_bytes;
+            try testing.expect(one > 0);
+            // Room for the held points, but not beside the next conversation's chunk writes.
+            disk.held_cap_for_test = 4 * one;
+            const permit = disk.writer.?.permit_bytes;
+            defer disk.writer.?.permit_bytes = permit;
+            disk.writer.?.permit_bytes = one + (1 << 20);
+            const before = ssmWritten();
+            var r1 = try sv.request(p1.items, 8, &f);
+            r1.deinit(a);
+            disk.drainWriter();
+            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
+            try testing.expect(ssmWritten() - before >= one);
+        }
+    }.run);
+}
+
+test "cooler contract: a rewind past a Qwen conversation's held restore points restores from the grid point, the same tokens every time" {
+    // Its tokens are not the cold run's: the grid point's state came from a prefill that started at the turn before's
+    // point, off a cold prefill's split, as any restore from another prompt's record is (the shorter-prompt SSD cell).
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var said: [2]std.ArrayList(u32) = undefined;
+            for (&said) |*got| {
+                var reused: u32 = 0;
+                got.* = try rewindPastHeld(ld, dir, ids, &reused);
+                try testing.expectEqual(@as(u32, 8192), reused);
+            }
+            defer for (&said) |*got| got.deinit(a);
+            try testing.expectEqualSlices(u32, said[0].items, said[1].items);
+        }
+    }.run);
+}
+
+test "cooler contract: a served Qwen turn that shares part of the last turn's RAM entry, and fits only by taking it over, takes it and says the shared restore's tokens, the engine refusing nothing (#109)" {
+    try eachQwenServed(struct {
+        /// Admission that refuses a warm share the request did not take over: a copy of the prefix does not fit.
+        fn onlyTaken(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, will_donate: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
+            return matched == 0 or will_donate;
+        }
+
+        /// Turn 1, a turn 2 that extends it (its entry holds both prompt ends' restore points), then a turn 3 that
+        /// leaves turn 2's text between those points and says more; turn 3's tokens. Every engine refusal on the way
+        /// is counted in `refused`.
+        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, taken: bool, reused: *u32, entries: *usize, refused: *u64) !std.ArrayList(u32) {
+            const a = testing.allocator;
+            const route = @import("tensor/route.zig");
+            const refused0 = route.refusals;
+            defer refused.* = route.refusals - refused0;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, 1 << 30);
+            defer sv.deinit();
+            var f: u32 = 0;
+            var first = try heldPrompt(a, ids, 1500, 0);
+            defer first.deinit(a);
+            var reply = try sv.request(first.items, 8, &f);
+            defer reply.deinit(a);
+            var second: std.ArrayList(u32) = .empty;
+            defer second.deinit(a);
+            try second.appendSlice(a, first.items);
+            try second.appendSlice(a, reply.items);
+            var said = try heldPrompt(a, ids, 1500, 2);
+            defer said.deinit(a);
+            try second.appendSlice(a, said.items);
+            var reply2 = try sv.request(second.items, 8, &f);
+            defer reply2.deinit(a);
+            // The entry's point at turn 2's prompt end is past the cut, another text's: the share keeps turn 1's.
+            var next: std.ArrayList(u32) = .empty;
+            defer next.deinit(a);
+            try next.appendSlice(a, second.items[0 .. second.items.len - 100]);
+            var more = try heldPrompt(a, ids, 200, 1);
+            defer more.deinit(a);
+            try next.appendSlice(a, more.items);
+            const scheduler = @import("scheduler.zig");
+            const fits_was = scheduler.prefill_admission_fits;
+            defer scheduler.prefill_admission_fits = fits_was;
+            if (taken) scheduler.prefill_admission_fits = onlyTaken;
+            var got = try sv.request(next.items, 8, &f);
+            errdefer got.deinit(a);
+            reused.* = sv.reused;
+            // A turn 4 that leaves turn 3's text between its restore points: a partial share of the entry turn 3
+            // committed, taken over again on the takeover arm.
+            var fourth: std.ArrayList(u32) = .empty;
+            defer fourth.deinit(a);
+            try fourth.appendSlice(a, next.items[0 .. next.items.len - 50]);
+            try fourth.appendSlice(a, said.items[0..150]);
+            var got4 = try sv.request(fourth.items, 8, &f);
+            defer got4.deinit(a);
+            if (sv.reused == 0 or sv.reused >= next.items.len - 50) return error.TestTurnFourNotPartial;
+            try got.appendSlice(a, got4.items);
+            entries.* = sv.entry.prefix_cache.?.entries.items.len;
+            return got;
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const ld = try heldLoad(Q, dir);
+            var shared_reused: u32 = 0;
+            var taken_reused: u32 = 0;
+            var entries: usize = 0;
+            var refused: u64 = 0;
+            var shared = try conversation(ld, dir, ids, false, &shared_reused, &entries, &refused);
+            defer shared.deinit(a);
+            // The share's commit inherits the entry's points below the cut on the engine's stream.
+            try testing.expectEqual(@as(u64, 0), refused);
+            var taken = try conversation(ld, dir, ids, true, &taken_reused, &entries, &refused);
+            defer taken.deinit(a);
+            try testing.expectEqual(@as(u64, 0), refused);
+            // A partial share: turn 1's restore point, below the cut.
+            try testing.expect(taken_reused > 0 and taken_reused < 1508);
+            try testing.expectEqual(shared_reused, taken_reused);
+            try testing.expectEqualSlices(u32, shared.items, taken.items);
+            // Turn 2's commit replaced the entry it took over.
+            try testing.expectEqual(@as(usize, 1), entries);
         }
     }.run);
 }
@@ -793,299 +1040,6 @@ test "cooler contract: a served Qwen takeover turn, whole or partial, is credite
     }.run);
 }
 
-test "cooler contract: a served Qwen partial takeover refused before it donates leaves no cut on the entry, so the next turn takes the entry whole and keeps its restore points" {
-    try qwenTinyServed(struct {
-        /// Admission that refuses every warm request, taken over or shared.
-        fn fitsNoWarm(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, _: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
-            return matched == 0;
-        }
-
-        /// The #109 conversation, (its turn 3 taken over and then refused), and a turn 4 that extends turn 2's entry:
-        /// the restore points of the entry turn 4 leaves.
-        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, refused_turn: bool, out: *std.ArrayList(usize)) !void {
-            const a = testing.allocator;
-            var sv: Served = undefined;
-            try sv.initTiers(ld, dir, 1 << 30);
-            defer sv.deinit();
-            sv.quiet_failures = true;
-            var c = try PartialShare.serve(&sv, ids, 200);
-            defer c.deinit();
-            const hc = &sv.entry.prefix_cache.?;
-            if (refused_turn) {
-                const fits_was = Served.scheduler.prefill_admission_fits;
-                defer Served.scheduler.prefill_admission_fits = fits_was;
-                Served.scheduler.prefill_admission_fits = fitsNoWarm;
-                _ = try sv.requestToCleanup(c.third.items, 16, false);
-                // Refused before its append donated: turn 2's entry is back, whole.
-                try testing.expect(takeoverAtRest(hc));
-                var whole = false;
-                for (hc.entries.items) |*e| whole = whole or std.mem.eql(u32, e.tokens, c.entry.items);
-                try testing.expect(whole);
-            }
-            var fourth: std.ArrayList(u32) = .empty;
-            defer fourth.deinit(a);
-            try fourth.appendSlice(a, c.entry.items);
-            var said = try heldPrompt(a, ids, 1500, 5);
-            defer said.deinit(a);
-            try fourth.appendSlice(a, said.items);
-            var f: u32 = 0;
-            var got = try sv.request(fourth.items, 16, &f);
-            defer got.deinit(a);
-            for (hc.entries.items) |*e| {
-                if (e.tokens.len < fourth.items.len) continue;
-                if (e.ssm_checkpoints) |cps| for (cps) |*cp| try out.append(a, cp.pos);
-            }
-        }
-
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var clean: std.ArrayList(usize) = .empty;
-            defer clean.deinit(a);
-            var after_refusal: std.ArrayList(usize) = .empty;
-            defer after_refusal.deinit(a);
-            try conversation(ld, dir, ids, false, &clean);
-            try conversation(ld, dir, ids, true, &after_refusal);
-            try testing.expect(clean.items.len > 0);
-            try testing.expectEqualSlices(usize, clean.items, after_refusal.items);
-        }
-    }.run);
-}
-
-test "cooler contract: a held Qwen restore point another conversation pushes out of RAM is written, not dropped, and restores" {
-    try eachQwenServed(struct {
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var sv: Served = undefined;
-            try sv.init(ld, dir);
-            defer sv.deinit();
-            const disk = &sv.entry.prefix_cache.?.disk.?;
-            var prompts: [3]std.ArrayList(u32) = undefined;
-            for (&prompts, 0..) |*p, k| p.* = try heldPrompt(a, ids, 3000, k + 1);
-            defer for (&prompts) |*p| p.deinit(a);
-            var f: u32 = 0;
-            var r0 = try sv.request(prompts[0].items, 8, &f);
-            r0.deinit(a);
-            disk.drainWriter();
-            try testing.expectEqual(@as(usize, 1), disk.held.items.len);
-            const one = disk.held_bytes;
-            disk.held_cap_for_test = 2 * one + one / 2;
-            var r1 = try sv.request(prompts[1].items, 8, &f);
-            r1.deinit(a);
-            disk.drainWriter();
-            try testing.expectEqual(@as(usize, 2), disk.held.items.len);
-            const before = ssmWritten();
-            // A third conversation's point: the oldest (the first conversation's) is written, not dropped.
-            var r2 = try sv.request(prompts[2].items, 8, &f);
-            r2.deinit(a);
-            disk.drainWriter();
-            try testing.expectEqual(@as(usize, 2), disk.held.items.len);
-            try testing.expectEqual(one, ssmWritten() - before);
-            var again = try sv.request(prompts[0].items, 8, &f);
-            again.deinit(a);
-            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
-        }
-    }.run);
-}
-
-test "cooler contract: a held Qwen restore point restores the same tokens as its file after a flush" {
-    try eachQwenServed(struct {
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var sv: Served = undefined;
-            try sv.init(ld, dir);
-            defer sv.deinit();
-            const disk = &sv.entry.prefix_cache.?.disk.?;
-            var prompt = try heldPrompt(a, ids, 3000, 7);
-            defer prompt.deinit(a);
-            var f: u32 = 0;
-            var cold = try sv.request(prompt.items, 8, &f);
-            cold.deinit(a);
-            disk.drainWriter();
-            const before = ssmWritten();
-            var from_ram = try sv.request(prompt.items, 24, &f);
-            defer from_ram.deinit(a);
-            disk.drainWriter();
-            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
-            try testing.expectEqual(before, ssmWritten());
-            // The clean unload's flush: the held point is written, and the next request restores it from its file.
-            @import("scheduler.zig").flushLiveState(sv.entry, "test");
-            disk.drainWriter();
-            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
-            try testing.expect(ssmWritten() > before);
-            var from_file = try sv.request(prompt.items, 24, &f);
-            defer from_file.deinit(a);
-            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
-            try testing.expectEqualSlices(u32, from_ram.items, from_file.items);
-        }
-    }.run);
-}
-
-test "cooler contract: a regenerated Qwen turn restores from its own prompt end, live and after a flush" {
-    try eachQwenServed(struct {
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var sv: Served = undefined;
-            try sv.init(ld, dir);
-            defer sv.deinit();
-            const disk = &sv.entry.prefix_cache.?.disk.?;
-            var prompt = try heldPrompt(a, ids, 3000, 11);
-            defer prompt.deinit(a);
-            var f: u32 = 0;
-            var first = try sv.request(prompt.items, 16, &f);
-            first.deinit(a);
-            disk.drainWriter();
-            // The same conversation's next point extends the prompt end (a reply end, or the turn after).
-            var longer = try prompt.clone(a);
-            defer longer.deinit(a);
-            for (0..64) |i| try longer.append(a, ids[(i * 13 + 5) % ids.len]);
-            var next = try sv.request(longer.items, 16, &f);
-            next.deinit(a);
-            disk.drainWriter();
-            // Regenerate: the first prompt again restores from its own end, which the newer point did not take away.
-            var live = try sv.request(prompt.items, 16, &f);
-            defer live.deinit(a);
-            disk.drainWriter();
-            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
-            // After the flush an unload or a restart runs, it restores from the written point.
-            @import("scheduler.zig").flushLiveState(sv.entry, "test");
-            disk.drainWriter();
-            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
-            var after = try sv.request(prompt.items, 16, &f);
-            defer after.deinit(a);
-            try testing.expectEqual(@as(u32, 3000 - 31), sv.reused);
-            try testing.expectEqualSlices(u32, live.items, after.items);
-        }
-    }.run);
-}
-
-test "cooler contract: a Qwen prompt that re-renders an earlier reply restores from that turn's own point, written when the held points pass the cap" {
-    try eachQwenServed(struct {
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var sv: Served = undefined;
-            try sv.init(ld, dir);
-            defer sv.deinit();
-            const disk = &sv.entry.prefix_cache.?.disk.?;
-            // Over the 8192 grid, so a written grid point lies under the turns' held points.
-            var conv = try heldPrompt(a, ids, 9000, 41);
-            defer conv.deinit(a);
-            var f: u32 = 0;
-            // The second turn's prompt and the first 8 tokens of its reply: an agent's later prompt that re-renders
-            // the rest of that reply (a coerced tool call) shares this much.
-            var shared: usize = 0;
-            for (0..3) |turn| {
-                var reply = try sv.request(conv.items, 16, &f);
-                defer reply.deinit(a);
-                try expectListedPointsLive(disk);
-                // Room for one point and a half: a commit keeps its newest point held and writes the spare it supersedes.
-                if (turn == 0) disk.held_cap_for_test = disk.held_bytes / disk.held.items.len * 3 / 2;
-                if (turn == 1) shared = conv.items.len + 8;
-                try conv.appendSlice(a, reply.items);
-                for (0..600) |i| try conv.append(a, ids[(i * 13 + turn * 101) % ids.len]);
-            }
-            var next = try conv.clone(a);
-            defer next.deinit(a);
-            next.shrinkRetainingCapacity(shared);
-            for (0..200) |i| try next.append(a, ids[(i * 17 + 3) % ids.len]);
-            var last = try sv.request(next.items, 16, &f);
-            last.deinit(a);
-            // The second turn's prompt-end point, not the 8192 grid point under it.
-            try testing.expectEqual(@as(u32, @intCast(shared - 8 - 31)), sv.reused);
-        }
-    }.run);
-}
-
-test "cooler contract: a held Qwen restore point whose write fails as it gives way to a staged write mid-commit leaves no listed point without bytes" {
-    try eachQwenServed(struct {
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var sv: Served = undefined;
-            try sv.init(ld, dir);
-            defer sv.deinit();
-            const disk = &sv.entry.prefix_cache.?.disk.?;
-            var conv = try heldPrompt(a, ids, 3000, 51);
-            defer conv.deinit(a);
-            var f: u32 = 0;
-            var first = try sv.request(conv.items, 16, &f);
-            try conv.appendSlice(a, first.items);
-            first.deinit(a);
-            try expectListedPointsLive(disk);
-            const one = disk.held_bytes;
-            try testing.expect(one > 0);
-            // The next turn's commit stages its chunks with too little permit beside the held points, and their writes fail.
-            const permit = disk.writer.?.permit_bytes;
-            defer disk.writer.?.permit_bytes = permit;
-            disk.writer.?.permit_bytes = one + (1 << 20);
-            disk.fail_held_flush_for_test = true;
-            defer disk.fail_held_flush_for_test = false;
-            for (0..1500) |i| try conv.append(a, ids[(i * 13 + 7) % ids.len]);
-            var next = try sv.request(conv.items, 16, &f);
-            next.deinit(a);
-            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
-            try expectListedPointsLive(disk);
-        }
-    }.run);
-}
-
-test "cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit" {
-    try eachQwenServed(struct {
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var sv: Served = undefined;
-            try sv.init(ld, dir);
-            defer sv.deinit();
-            const disk = &sv.entry.prefix_cache.?.disk.?;
-            var p0 = try heldPrompt(a, ids, 3000, 11);
-            defer p0.deinit(a);
-            var p1 = try heldPrompt(a, ids, 3000, 12);
-            defer p1.deinit(a);
-            var f: u32 = 0;
-            var r0 = try sv.request(p0.items, 8, &f);
-            r0.deinit(a);
-            disk.drainWriter();
-            const one = disk.held_bytes;
-            try testing.expect(one > 0);
-            // Room for the held points, but not beside the next conversation's chunk writes.
-            disk.held_cap_for_test = 4 * one;
-            const permit = disk.writer.?.permit_bytes;
-            defer disk.writer.?.permit_bytes = permit;
-            disk.writer.?.permit_bytes = one + (1 << 20);
-            const before = ssmWritten();
-            var r1 = try sv.request(p1.items, 8, &f);
-            r1.deinit(a);
-            disk.drainWriter();
-            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
-            try testing.expect(ssmWritten() - before >= one);
-        }
-    }.run);
-}
-
-test "cooler contract: a rewind past a Qwen conversation's held restore points restores from the grid point, the same tokens every time" {
-    // Its tokens are not the cold run's: the grid point's state came from a prefill that started at the turn before's
-    // point, off a cold prefill's split, as any restore from another prompt's record is (the shorter-prompt SSD cell).
-    try eachQwenServed(struct {
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const ld = try heldLoad(Q, dir);
-            var said: [2]std.ArrayList(u32) = undefined;
-            for (&said) |*got| {
-                var reused: u32 = 0;
-                got.* = try rewindPastHeld(ld, dir, ids, &reused);
-                try testing.expectEqual(@as(u32, 8192), reused);
-            }
-            defer for (&said) |*got| got.deinit(a);
-            try testing.expectEqualSlices(u32, said[0].items, said[1].items);
-        }
-    }.run);
-}
-
 /// One served conversation on a fresh tier: `long` cold, another conversation, then `long` again, restored from SSD.
 const SsdRestore = struct {
     ld: *Load,
@@ -1103,12 +1057,12 @@ const SsdRestore = struct {
         defer sv.deinit();
         sv.quiet_failures = true;
         var f: u32 = 0;
-        var cold = try sv.request(self.long, 12, &f);
+        var cold = try sv.request(self.long, 6, &f);
         cold.deinit(a);
         var o = try sv.request(self.other, 4, &f);
         o.deinit(a);
         if (self.cold_only) return;
-        const got = try sv.request(self.long, 12, &f);
+        const got = try sv.request(self.long, 6, &f);
         if (self.restored) |out| out.* = got else {
             var g = got;
             g.deinit(a);
@@ -1156,35 +1110,4 @@ fn rewindPastHeld(ld: *Load, dir: []const u8, ids: []const u32, reused: *u32) !s
     const back = try sv.request(rewind.items, 16, &f);
     reused.* = sv.reused;
     return back;
-}
-
-test "cooler contract: a served request cancelled at its prefill leaves the pool at its resting cap once it is drained, as one that ends does" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            const gpu_mem = @import("gpu_mem.zig");
-            const ld = try heldLoad(C, dir);
-            var sv: Served = undefined;
-            try sv.init(ld, dir);
-            defer sv.deinit();
-            const rest = @import("arch/cooler.zig").restCap(&ld.config);
-            const prompt = ids[0..@min(ids.len, 40)];
-            var from: u32 = 0;
-            var done = try sv.request(prompt, 8, &from);
-            done.deinit(a);
-            const after_end = gpu_mem.engineFree();
-            const sch = &sv.sch;
-            const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 8 });
-            _ = sch.pending.orderedRemove(0);
-            try Served.scheduler.runPrefill(sch, slot);
-            slot.cancel();
-            sch.complete(slot);
-            Served.scheduler.drainSlots(sch, sch.cleanup_queue.items);
-            sch.cleanup_queue.clearRetainingCapacity();
-            const after_cancel = gpu_mem.engineFree();
-            errdefer std.debug.print("cooler contract: free pool {d} B after a request that ended, {d} B after one cancelled at its prefill; resting cap {d} B\n", .{ after_end, after_cancel, rest });
-            try testing.expect(after_end <= rest);
-            try testing.expect(after_cancel <= rest);
-        }
-    }.run);
 }

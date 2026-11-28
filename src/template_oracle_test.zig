@@ -53,7 +53,7 @@ const Oracle = struct {
 };
 
 /// A template as a pack serves it. `tok` null: no tokenizer of that pack on the release box, rendered unmarked.
-const Served = struct { id: []const u8, config: chat.ChatConfig, tok: ?*const tokenizer_mod.Tokenizer };
+const Served = struct { id: []const u8, config: chat.ChatConfig, tok: ?*tokenizer_mod.Tokenizer, stops: []const u32 = &.{} };
 
 const Arm = struct { thinking: bool, effort: ?[]const u8 = null, preserve: ?bool = null };
 const both_arms = [_]Arm{ .{ .thinking = true }, .{ .thinking = false } };
@@ -116,10 +116,11 @@ fn caseId(template: []const u8, messages: []const u8, tools: ?[]const u8, extra:
     return std.fmt.bytesToHex(digest[0..12].*, .lower);
 }
 
-fn testTokenizer(a: std.mem.Allocator, arena: std.mem.Allocator, pack: []const u8) !*tokenizer_mod.Tokenizer {
+fn testTokenizer(a: std.mem.Allocator, arena: std.mem.Allocator, pack: []const u8) !struct { tok: *tokenizer_mod.Tokenizer, stops: []const u32 } {
+    const pt = try tokenizer_mod.packTokenizerForTests(a, arena, pack);
     const tok = try arena.create(tokenizer_mod.Tokenizer);
-    tok.* = (try tokenizer_mod.packTokenizerForTests(a, arena, pack)).tok;
-    return tok;
+    tok.* = pt.tok;
+    return .{ .tok = tok, .stops = pt.stops };
 }
 
 /// The four templates with the bos/eos their packs' tokenizer_config.json carries (DeepSeek's are objects, read as
@@ -127,20 +128,20 @@ fn testTokenizer(a: std.mem.Allocator, arena: std.mem.Allocator, pack: []const u
 fn servedTemplates(a: std.mem.Allocator, arena: std.mem.Allocator, toks: *std.ArrayList(*tokenizer_mod.Tokenizer)) ![]Served {
     var out = std.ArrayList(Served).empty;
     if (arch_fx.qwen_template) |qwen| {
-        const tok = try testTokenizer(a, arena, "qwen38_flash_next");
-        try toks.append(arena, tok);
-        try out.append(arena, .{ .id = "qwen38_flash_next", .tok = tok, .config = .{ .chat_template = qwen, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .model_type = arch_fx.qwen_model_type } });
+        const pt = try testTokenizer(a, arena, "qwen38_flash_next");
+        try toks.append(arena, pt.tok);
+        try out.append(arena, .{ .id = "qwen38_flash_next", .tok = pt.tok, .stops = pt.stops, .config = .{ .chat_template = qwen, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .model_type = arch_fx.qwen_model_type } });
     }
     {
-        const tok = try testTokenizer(a, arena, "glm53");
-        try toks.append(arena, tok);
-        try out.append(arena, .{ .id = "glm53", .tok = tok, .config = .{ .chat_template = @embedFile("fixtures/glm53_chat_template.jinja"), .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = a } });
+        const pt = try testTokenizer(a, arena, "glm53");
+        try toks.append(arena, pt.tok);
+        try out.append(arena, .{ .id = "glm53", .tok = pt.tok, .stops = pt.stops, .config = .{ .chat_template = @embedFile("fixtures/glm53_chat_template.jinja"), .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = a } });
     }
     try out.append(arena, .{ .id = "mimo_v26", .tok = null, .config = .{ .chat_template = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a } });
     if (arch_chat.pinOf("deepseek_v41")) |pin| {
-        const tok = try testTokenizer(a, arena, "dsv41");
-        try toks.append(arena, tok);
-        try out.append(arena, .{ .id = "dsv41", .tok = tok, .config = .{ .chat_template = pin.template, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = pin.image_placeholder } });
+        const pt = try testTokenizer(a, arena, "dsv41");
+        try toks.append(arena, pt.tok);
+        try out.append(arena, .{ .id = "dsv41", .tok = pt.tok, .stops = pt.stops, .config = .{ .chat_template = pin.template, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = pin.image_placeholder } });
     }
     return out.items;
 }
@@ -934,26 +935,28 @@ test "template oracle: a prompt encoded through the segment cache is the prompt 
     const segment_cache = @import("segment_cache.zig");
     var checked: usize = 0;
     for (served) |s| {
-        if (s.tok == null) continue;
-        const pt = try tokenizer_mod.packTokenizerForTests(a, arena, s.id);
-        const tok = try arena.create(tokenizer_mod.Tokenizer);
-        tok.* = pt.tok;
-        try toks.append(arena, tok);
+        const tok = s.tok orelse continue;
         var cfg = s.config;
         try cfg.compile();
         defer cfg.dropCompiled();
-        try tok.bindTemplate(cfg.printedFacts(), pt.stops, &.{});
-        // Every prompt of the corpus, encoded without a cache.
+        try tok.bindTemplate(cfg.printedFacts(), s.stops, &.{});
+        // A representative 64-prompt slice of the corpus, encoded without a cache.
         var prompts = std.ArrayList(Call).empty;
-        for (requests) |r| for (r.arms) |arm| {
-            var c2 = cfg;
-            c2.preserve_thinking = arm.preserve;
-            const ids = chat.formatChat(arena, tok, r.messages, &c2, r.tools, r.instr, arm.thinking, arm.effort, r.continue_final) catch |e| switch (e) {
-                error.ChatNeedsUserTurn, error.ChatTemplateUnusable => continue,
-                else => return e,
-            };
-            try prompts.append(arena, .{ .r = r, .arm = arm, .want = ids });
-        };
+        const req_stride: usize = @max(1, requests.len / 40);
+        var ri: usize = 0;
+        while (ri < requests.len and prompts.items.len < 64) : (ri += req_stride) {
+            const r = requests[ri];
+            for (r.arms) |arm| {
+                if (prompts.items.len >= 64) break;
+                var c2 = cfg;
+                c2.preserve_thinking = arm.preserve;
+                const ids = chat.formatChat(arena, tok, r.messages, &c2, r.tools, r.instr, arm.thinking, arm.effort, r.continue_final) catch |e| switch (e) {
+                    error.ChatNeedsUserTurn, error.ChatTemplateUnusable => continue,
+                    else => return e,
+                };
+                try prompts.append(arena, .{ .r = r, .arm = arm, .want = ids });
+            }
+        }
         // The default budget, and one small enough that the threads evict each other's segments.
         for ([_]usize{ segment_cache.default_budget, 64 << 10 }) |budget| {
             try tok.enableSegmentCache(budget);

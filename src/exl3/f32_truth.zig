@@ -58,7 +58,17 @@ pub fn matvec(w: []const f32, x: []const f32, out: usize, dst: []f64) void {
     @memset(dst, 0);
     for (x, 0..) |xv, i| {
         if (xv == 0) continue;
-        for (w[i * out ..][0..out], dst) |wv, *d| d.* += @as(f64, xv) * wv;
+        const x4: @Vector(4, f64) = @splat(@as(f64, xv));
+        const row = w[i * out ..][0..out];
+        var j: usize = 0;
+        while (j + 4 <= out) : (j += 4) {
+            const wv: @Vector(4, f32) = row[j..][0..4].*;
+            const wf: @Vector(4, f64) = wv;
+            var d: @Vector(4, f64) = dst[j..][0..4].*;
+            d += x4 * wf;
+            dst[j..][0..4].* = d;
+        }
+        while (j < out) : (j += 1) dst[j] += @as(f64, xv) * row[j];
     }
 }
 

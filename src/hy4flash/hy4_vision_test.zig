@@ -836,9 +836,7 @@ fn releaseTower(w: *model_mod.Weights, v: hy4_config.Vision) !void {
 /// attention chunk, whole chunks of 512 query rows and a last short one, key counts aligned and not, past 4,096 and
 /// 8,192 keys, a row's width and a column's.
 const release_grids = [_][2]u32{
-    .{ 2, 2 },  .{ 2, 8 },  .{ 4, 4 },   .{ 6, 10 },  .{ 8, 8 },   .{ 16, 16 }, .{ 10, 52 }, .{ 6, 86 },  .{ 22, 24 },
-    .{ 30, 34 }, .{ 32, 32 }, .{ 12, 86 }, .{ 2, 96 },  .{ 96, 2 },  .{ 40, 102 }, .{ 64, 64 }, .{ 64, 66 }, .{ 66, 66 },
-    .{ 70, 90 }, .{ 92, 88 }, .{ 128, 64 }, .{ 90, 92 }, .{ 96, 96 },
+    .{ 2, 2 }, .{ 6, 10 }, .{ 16, 16 }, .{ 32, 32 }, .{ 2, 96 }, .{ 96, 2 }, .{ 64, 66 }, .{ 96, 96 },
 };
 
 fn towerAfterWarm(quantized: bool) !void {

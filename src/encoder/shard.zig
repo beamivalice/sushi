@@ -1,9 +1,9 @@
 const std = @import("std");
 const api = @import("sushi_exl3");
 const format = api.format;
-const encode = @import("encode.zig");
 const st = @import("safetensors.zig");
-const quantize = @import("quantize.zig");
+const mlx = @import("mlx_host").mlx;
+const metal_search = @import("metal_search.zig");
 
 pub const trunk_prefix = "language_model.model";
 pub const mtp_prefix = "language_model.mtp";
@@ -248,9 +248,7 @@ fn packShard(allocator: std.mem.Allocator, naming: Naming, groups: []const Group
     return file.toOwnedSlice(allocator);
 }
 
-fn fillBank(allocator: std.mem.Allocator, prng: *std.Random.DefaultPrng, experts: usize, in_features: usize, out_features: usize, rate: format.Rate, dec: format.Decode) !Bank {
-    var enc = try encode.Encoder.init(allocator, rate, dec);
-    defer enc.deinit();
+fn fillBank(allocator: std.mem.Allocator, prng: *std.Random.DefaultPrng, experts: usize, in_features: usize, out_features: usize, rate: format.Rate) !Bank {
     const tiles_in = in_features / 16;
     const tiles_out = out_features / 16;
     const n = rate.n;
@@ -259,15 +257,7 @@ fn fillBank(allocator: std.mem.Allocator, prng: *std.Random.DefaultPrng, experts
     const svh = try allocator.alloc(u16, experts * out_features);
     for (suh, 0..) |*v, i| v.* = format.f32ToF16Bits(0.25 + @as(f32, @floatFromInt(i)) * 0.01);
     for (svh, 0..) |*v, i| v.* = format.f32ToF16Bits(-0.5 - @as(f32, @floatFromInt(i)) * 0.01);
-    const r = prng.random();
-    var tile: [encode.tile_len]f32 = undefined;
-    for (0..experts) |e| {
-        for (0..tiles_in) |ti| for (0..tiles_out) |to| {
-            for (&tile) |*v| v.* = r.floatNorm(f32);
-            const at = ((e * tiles_in + ti) * tiles_out + to) * n;
-            _ = try enc.encodeTile(&tile, trellis[at..][0..n], null);
-        };
-    }
+    prng.random().bytes(std.mem.sliceAsBytes(trellis));
     return .{ .experts = experts, .in_features = in_features, .out_features = out_features, .trellis = trellis, .suh = suh, .svh = svh };
 }
 
@@ -287,15 +277,15 @@ test "shard: serialization and offsets round-trip through the loader and the eng
     const rate = format.Rate{ .n = 32 };
     const dec = format.Decode{ .codebook = .mcg, .window = .w12 };
     var prng = std.Random.DefaultPrng.init(19);
-    const gate = try fillBank(t.allocator, &prng, 2, 128, 128, rate, dec);
+    const gate = try fillBank(t.allocator, &prng, 2, 128, 128, rate);
     defer t.allocator.free(gate.trellis);
     defer t.allocator.free(gate.suh);
     defer t.allocator.free(gate.svh);
-    const up = try fillBank(t.allocator, &prng, 2, 128, 128, rate, dec);
+    const up = try fillBank(t.allocator, &prng, 2, 128, 128, rate);
     defer t.allocator.free(up.trellis);
     defer t.allocator.free(up.suh);
     defer t.allocator.free(up.svh);
-    const down = try fillBank(t.allocator, &prng, 2, 128, 128, rate, dec);
+    const down = try fillBank(t.allocator, &prng, 2, 128, 128, rate);
     defer t.allocator.free(down.trellis);
     defer t.allocator.free(down.suh);
     defer t.allocator.free(down.svh);
@@ -448,7 +438,8 @@ test "shard: quantizeNamed written and loaded matches its reconstruction and sta
     };
     const dec = format.Decode{ .codebook = .mcg, .window = .w12 };
     const rate = format.Rate{ .n = 32 };
-    var q = try quantize.quantizeNamed(t.allocator, weight, hessian, in, out, 3, "language_model.model.layers.0.mlp.switch_mlp.gate_proj.e0", rate, dec, .never);
+    try mlx.requireGpu();
+    var q = try metal_search.quantizeNamed(t.allocator, mlx.gpuStream(), weight, hessian, in, out, 3, "language_model.model.layers.0.mlp.switch_mlp.gate_proj.e0", rate, dec, .never, null);
     defer q.deinit(t.allocator);
     const memory = try t.allocator.alloc(u16, in * out);
     defer t.allocator.free(memory);
@@ -519,7 +510,7 @@ test "shard: provenance pairs ride beside the engine's stamp keys" {
     const rate = format.Rate{ .n = 32 };
     const dec = format.Decode{ .codebook = .mcg, .window = .w12 };
     var prng = std.Random.DefaultPrng.init(41);
-    const bank = try fillBank(t.allocator, &prng, 1, 128, 128, rate, dec);
+    const bank = try fillBank(t.allocator, &prng, 1, 128, 128, rate);
     defer t.allocator.free(bank.trellis);
     defer t.allocator.free(bank.suh);
     defer t.allocator.free(bank.svh);
@@ -546,7 +537,7 @@ test "shard: the MTP head's bank takes its own prefix and file name" {
     const rate = format.Rate{ .n = 32 };
     const dec = format.Decode{ .codebook = .mcg, .window = .w12 };
     var prng = std.Random.DefaultPrng.init(43);
-    const bank = try fillBank(t.allocator, &prng, 1, 128, 128, rate, dec);
+    const bank = try fillBank(t.allocator, &prng, 1, 128, 128, rate);
     defer t.allocator.free(bank.trellis);
     defer t.allocator.free(bank.suh);
     defer t.allocator.free(bank.svh);
@@ -574,7 +565,7 @@ test "shard: rate groups write .gN banks, each at its own rate, that the engine'
     var prng = std.Random.DefaultPrng.init(23);
     var groups: [2]Group = undefined;
     for (&groups, sizes, rates) |*g, e, r| {
-        for (&g.banks, r) |*b, rate| b.* = try fillBank(t.allocator, &prng, e, 128, 128, rate, dec);
+        for (&g.banks, r) |*b, rate| b.* = try fillBank(t.allocator, &prng, e, 128, 128, rate);
         g.rates = r;
     }
     defer for (groups) |g| for (g.banks) |b| {

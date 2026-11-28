@@ -10,6 +10,7 @@ const model_mod = @import("../model.zig");
 const hy4_config = @import("hy4_config.zig");
 const hy4_model = @import("hy4_model.zig");
 const hy4_dfly = @import("hy4_dfly.zig");
+const hy4_held = @import("hy4_held.zig");
 const Arr = mlx.mlx_array;
 
 const Fixture = struct {
@@ -17,6 +18,7 @@ const Fixture = struct {
     config: hy4_config.Config,
 
     fn open(s: mlx.mlx_stream) !Fixture {
+        hy4_held.releaseHeld();
         const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY_STQ") orelse return error.SkipZigTest);
         const a = testing.allocator;
         var f: Fixture = .{ .w = model_mod.Weights.init(a), .config = undefined };
@@ -170,9 +172,8 @@ test "hy4 dfly: a draft waits for the GPU once across all slots (HY4_BF16_TINY_S
     }
 }
 
-test "hy4 dfly: a plain round of a DFly2 request makes no more launches, waits or ring copies than a plain decode step (HY4_STQ_TINY)" {
+test "hy4 dfly: a plain round of a DFly2 request makes no more launches, waits or ring copies than a plain decode step and pipelines one step in flight like plain decode (HY4_STQ_TINY)" {
     try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");
@@ -181,42 +182,13 @@ test "hy4 dfly: a plain round of a DFly2 request makes no more launches, waits o
     const Generator = @import("../generate.zig").Generator;
     const Tokenizer = @import("../tokenizer.zig").Tokenizer;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_openLight);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
     const p = ids[0..24];
-    const Count = struct { dispatches: u64, waits: u64, updates_copied: u64, pool_bytes_delta: i64, tok: u32 };
-    const plain: Count = blk: {
-        var ld: contract.Load = undefined;
-        try ld.prepare(hy4_contract, dir, true);
-        ld.config.stream_mtp_head = false;
-        try ld.loadServed(dir);
-        defer _ = ld.close();
-        const turn = arch_handle.turnFor(ld.h, &ld.config);
-        defer turn.end();
-        defer arch_sched.endRequest(&ld.config);
-        var tok = Tokenizer.initEmpty(a);
-        defer tok.deinit();
-        try ld.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{});
-        defer gen.deinit(a);
-        _ = try gen.next(a);
-        _ = try gen.next(a);
-        const s0 = mlx.engine.stats();
-        var t: u32 = 0;
-        for (0..4) |_| t = (try gen.next(a)).?;
-        const s1 = mlx.engine.stats();
-        break :blk .{
-            .dispatches = s1.dispatches - s0.dispatches,
-            .waits = s1.waits - s0.waits,
-            .updates_copied = s1.updates_copied - s0.updates_copied,
-            .pool_bytes_delta = @as(i64, @intCast(s1.pool_bytes)) - @as(i64, @intCast(s0.pool_bytes)),
-            .tok = t,
-        };
-    };
-    const dfly: Count = blk: {
-        var ld: contract.Load = undefined;
-        try ld.open(hy4_contract, dir, true);
-        defer _ = ld.close();
+    const Run = struct { dispatches: u64, waits: u64, submits: u64, updates_copied: u64, pool_bytes_delta: i64, in_flight: usize, toks: [4]u32 };
+    const dfly: Run = blk: {
+        const ld = h.ld;
         const turn = arch_handle.turnFor(ld.h, &ld.config);
         defer turn.end();
         defer arch_sched.endRequest(&ld.config);
@@ -230,35 +202,78 @@ test "hy4 dfly: a plain round of a DFly2 request makes no more launches, waits o
         if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
         if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
         const s0 = mlx.engine.stats();
-        var t: u32 = 0;
-        for (0..4) |_| {
+        var toks: [4]u32 = undefined;
+        var in_flight: usize = 0;
+        for (&toks) |*t| {
             const r = (try gen.nextDrafterRound(a)).?;
-            t = r.tokens[0];
+            t.* = r.tokens[0];
             a.free(r.tokens);
+            if (gen.pending != null and gen.ctx.cache.step == p.len + gen.completion_tokens + 1) in_flight += 1;
         }
         try testing.expectEqual(@as(u64, 6), gen.drafter_stats.plain);
         const s1 = mlx.engine.stats();
         break :blk .{
             .dispatches = s1.dispatches - s0.dispatches,
             .waits = s1.waits - s0.waits,
+            .submits = s1.submits - s0.submits,
             .updates_copied = s1.updates_copied - s0.updates_copied,
             .pool_bytes_delta = @as(i64, @intCast(s1.pool_bytes)) - @as(i64, @intCast(s0.pool_bytes)),
-            .tok = t,
+            .in_flight = in_flight,
+            .toks = toks,
         };
     };
-    errdefer std.debug.print("hy4 dfly plain step: plain(dispatches={d}, waits={d}, updates_copied={d}, pool_delta={d}) vs dfly(dispatches={d}, waits={d}, updates_copied={d}, pool_delta={d})\n", .{
-        plain.dispatches, plain.waits, plain.updates_copied, plain.pool_bytes_delta,
-        dfly.dispatches,  dfly.waits,  dfly.updates_copied,  dfly.pool_bytes_delta,
+    const dir = try a.dupe(u8, h.dir);
+    defer a.free(dir);
+    hy4_held.releaseHeld();
+    const plain: Run = blk: {
+        var ld: contract.Load = undefined;
+        try ld.prepare(hy4_contract, dir, true);
+        ld.config.stream_mtp_head = false;
+        try ld.loadLight(dir);
+        defer _ = ld.close();
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{});
+        defer gen.deinit(a);
+        _ = try gen.next(a);
+        _ = try gen.next(a);
+        const s0 = mlx.engine.stats();
+        var toks: [4]u32 = undefined;
+        var in_flight: usize = 0;
+        for (&toks) |*t| {
+            t.* = (try gen.next(a)).?;
+            if (gen.pending != null and gen.ctx.cache.step == p.len + gen.completion_tokens + 1) in_flight += 1;
+        }
+        const s1 = mlx.engine.stats();
+        break :blk .{
+            .dispatches = s1.dispatches - s0.dispatches,
+            .waits = s1.waits - s0.waits,
+            .submits = s1.submits - s0.submits,
+            .updates_copied = s1.updates_copied - s0.updates_copied,
+            .pool_bytes_delta = @as(i64, @intCast(s1.pool_bytes)) - @as(i64, @intCast(s0.pool_bytes)),
+            .in_flight = in_flight,
+            .toks = toks,
+        };
+    };
+    errdefer std.debug.print("hy4 dfly plain step: plain(dispatches={d}, waits={d}, submits={d}, updates_copied={d}, pool_delta={d}, in_flight={d}) vs dfly(dispatches={d}, waits={d}, submits={d}, updates_copied={d}, pool_delta={d}, in_flight={d})\n", .{
+        plain.dispatches, plain.waits, plain.submits, plain.updates_copied, plain.pool_bytes_delta, plain.in_flight,
+        dfly.dispatches,  dfly.waits,  dfly.submits,  dfly.updates_copied,  dfly.pool_bytes_delta,  dfly.in_flight,
     });
-    try testing.expectEqual(plain.tok, dfly.tok);
-    try testing.expect(dfly.waits <= plain.waits);
+    try testing.expectEqualSlices(u32, &plain.toks, &dfly.toks);
+    try testing.expectEqual(@as(usize, 4), plain.in_flight);
+    try testing.expectEqual(plain.in_flight, dfly.in_flight);
+    try testing.expectEqual(plain.waits, dfly.waits);
     try testing.expect(dfly.updates_copied <= plain.updates_copied);
     try testing.expect(dfly.dispatches <= plain.dispatches);
+    try testing.expect(dfly.submits <= plain.submits);
 }
 
 test "hy4 dfly: a plain stretch hands over fresh hidden and picks to the retrial draft round (HY4_STQ_TINY)" {
     try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");
@@ -267,13 +282,12 @@ test "hy4 dfly: a plain stretch hands over fresh hidden and picks to the retrial
     const Generator = @import("../generate.zig").Generator;
     const Tokenizer = @import("../tokenizer.zig").Tokenizer;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_openLight);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
     const p = ids[0..24];
-    var ld: contract.Load = undefined;
-    try ld.open(hy4_contract, dir, true);
-    defer _ = ld.close();
-    var want = try contract.serial(&ld, p, 12, .{ .temperature = 0.0 });
+    const ld = h.ld;
+    var want = try contract.serial(ld, p, 12, .{ .temperature = 0.0 });
     defer want.deinit(a);
     const turn = arch_handle.turnFor(ld.h, &ld.config);
     defer turn.end();
@@ -299,85 +313,68 @@ test "hy4 dfly: a plain stretch hands over fresh hidden and picks to the retrial
     try testing.expect(gen.drafter_stats.rounds > gen.drafter_stats.plain);
 }
 
-test "hy4 dfly: a plain stretch pipelines one step in flight like plain decode (HY4_STQ_TINY)" {
+test "hy4 bill: on a load that drafts, the closed-form terms at a request's reach hold the blocks reserveFor makes for it, drafting or not, at 8 and 16 bits (HY4_STQ_TINY)" {
     try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const arch = @import("arch.zig");
+    const arch_handle = @import("../arch/handle.zig");
+    const arch_sched = @import("../arch/sched.zig");
+    const h = try hy4_held.acquire(.stq_openLight);
+    const ld = h.ld;
+    const seq: u64 = 500;
+    const max_tokens: u32 = 100;
+    const chunk: u64 = 512;
+    const turn = arch_handle.turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer arch_sched.endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    try testing.expect(arch.drafterOn(&ld.config));
+    try testing.expect(m.keep_hidden);
+    for ([_]u64{ 8, 16 }) |kv| {
+        m.reset();
+        m.req().kv = if (kv == 8) .engine_default else .dense;
+        const end = seq + max_tokens;
+        try m.reserveFor(@intCast(end));
+        const held = @import("hy4_prefix.zig").heldBytes(m, null);
+        const terms = @import("hy4_ledger.zig").ledgerTerms(&ld.config, kv, chunk).?;
+        errdefer std.debug.print("[hy4-bill] kv{d}: reserveFor({d}) holds {d} B, the terms {d} B\n", .{ kv, end, held, terms.at(end) });
+        try testing.expect(held <= terms.at(end));
+    }
+}
+
+test "hy4: a load keeps no Engram row cache, so a repeated request reads its rows through the shard again (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
     const a = testing.allocator;
-    const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");
     const arch_handle = @import("../arch/handle.zig");
     const arch_sched = @import("../arch/sched.zig");
-    const Generator = @import("../generate.zig").Generator;
-    const Tokenizer = @import("../tokenizer.zig").Tokenizer;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_openLight);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    const p = ids[0..24];
-    const Run = struct { waits: u64, submits: u64, in_flight: usize, toks: [4]u32 };
-    const plain: Run = blk: {
-        var ld: contract.Load = undefined;
-        try ld.prepare(hy4_contract, dir, true);
-        ld.config.stream_mtp_head = false;
-        try ld.loadServed(dir);
-        defer _ = ld.close();
-        const turn = arch_handle.turnFor(ld.h, &ld.config);
-        defer turn.end();
-        defer arch_sched.endRequest(&ld.config);
-        var tok = Tokenizer.initEmpty(a);
-        defer tok.deinit();
-        try ld.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{});
-        defer gen.deinit(a);
-        _ = try gen.next(a);
-        _ = try gen.next(a);
-        const s0 = mlx.engine.stats();
-        var toks: [4]u32 = undefined;
-        var in_flight: usize = 0;
-        for (&toks) |*t| {
-            t.* = (try gen.next(a)).?;
-            if (gen.pending != null and gen.ctx.cache.step == p.len + gen.completion_tokens + 1) in_flight += 1;
-        }
-        const s1 = mlx.engine.stats();
-        break :blk .{ .waits = s1.waits - s0.waits, .submits = s1.submits - s0.submits, .in_flight = in_flight, .toks = toks };
+    const ld = h.ld;
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    var reads = std.atomic.Value(u64).init(0);
+    var tables: usize = 0;
+    for (m.engram_store) |*e| if (e.disk) |*d| {
+        try testing.expect(d.cache == null);
+        d.rows_read = &reads;
+        tables += 1;
     };
-    const dfly: Run = blk: {
-        var ld: contract.Load = undefined;
-        try ld.open(hy4_contract, dir, true);
-        defer _ = ld.close();
-        const turn = arch_handle.turnFor(ld.h, &ld.config);
-        defer turn.end();
-        defer arch_sched.endRequest(&ld.config);
-        var tok = Tokenizer.initEmpty(a);
-        defer tok.deinit();
-        try ld.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
-        defer gen.deinit(a);
-        gen.drafter_policy.gate.mode = .plain;
-        gen.drafter_policy.gate.plain_tokens = 4;
-        if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
-        if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
-        const s0 = mlx.engine.stats();
-        var toks: [4]u32 = undefined;
-        var in_flight: usize = 0;
-        for (&toks) |*t| {
-            const r = (try gen.nextDrafterRound(a)).?;
-            t.* = r.tokens[0];
-            a.free(r.tokens);
-            if (gen.pending != null and gen.ctx.cache.step == p.len + gen.completion_tokens + 1) in_flight += 1;
-        }
-        try testing.expectEqual(@as(u64, 6), gen.drafter_stats.plain);
-        const s1 = mlx.engine.stats();
-        break :blk .{ .waits = s1.waits - s0.waits, .submits = s1.submits - s0.submits, .in_flight = in_flight, .toks = toks };
+    defer for (m.engram_store) |*e| if (e.disk) |*d| {
+        d.rows_read = null;
     };
-    errdefer std.debug.print("hy4 dfly pipeline: plain(waits={d}, submits={d}, in_flight={d}) vs dfly(waits={d}, submits={d}, in_flight={d})\n", .{
-        plain.waits, plain.submits, plain.in_flight,
-        dfly.waits,  dfly.submits,  dfly.in_flight,
-    });
-    try testing.expectEqualSlices(u32, &plain.toks, &dfly.toks);
-    try testing.expectEqual(@as(usize, 4), plain.in_flight);
-    try testing.expectEqual(plain.in_flight, dfly.in_flight);
-    try testing.expectEqual(plain.waits, dfly.waits);
-    try testing.expect(dfly.submits <= plain.submits);
+    try testing.expect(tables > 0);
+    const turn = arch_handle.turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer arch_sched.endRequest(&ld.config);
+    var got = try hy4_contract.specTokens(a, ld.xfm, ids[0..24], 8);
+    defer got.deinit(a);
+    const first = reads.load(.monotonic);
+    var again = try hy4_contract.specTokens(a, ld.xfm, ids[0..24], 8);
+    defer again.deinit(a);
+    const second = reads.load(.monotonic) - first;
+    errdefer std.debug.print("hy4: the same request read {d} then {d} Engram rows from the shard\n", .{ first, second });
+    try testing.expect(first > 0);
+    try testing.expectEqual(first, second);
 }
 
 test "hy4 dfly: a resident load keeps DFly2 by default where the pack ships it and drops it under mtp off (HY4_STQ_TINY)" {
@@ -389,6 +386,7 @@ test "hy4 dfly: a resident load keeps DFly2 by default where the pack ships it a
     const hy4_load = @import("hy4_load.zig");
     const model_load = @import("../model_load.zig");
     const trunk_mod = @import("../trunk.zig");
+    hy4_held.releaseHeld();
     var cfg = try model_mod.parseConfig(io, a, dir);
     defer cfg.deinit(a);
     cfg.expert_source_dir = try a.dupe(u8, dir);
@@ -463,75 +461,6 @@ test "hy4 bill: warmNeedBytes and warmRequestBill bill Hy4 DFly2 warm request wi
     try testing.expect(warm_need >= bill_on);
 }
 
-test "hy4 bill: on a load that drafts, the closed-form terms at a request's reach hold the blocks reserveFor makes for it, drafting or not, at 8 and 16 bits (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const arch = @import("arch.zig");
-    const contract = @import("../cooler_contract_test.zig");
-    const hy4_contract = @import("hy4_contract.zig");
-    const arch_handle = @import("../arch/handle.zig");
-    const arch_sched = @import("../arch/sched.zig");
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const seq: u64 = 500;
-    const max_tokens: u32 = 100;
-    const chunk: u64 = 512;
-    for ([_]u64{ 8, 16 }) |kv| {
-        var ld: contract.Load = undefined;
-        try ld.open(hy4_contract, dir, true);
-        defer _ = ld.close();
-        const turn = arch_handle.turnFor(ld.h, &ld.config);
-        defer turn.end();
-        defer arch_sched.endRequest(&ld.config);
-        const m = ld.xfm.arch_state.hy4flash.model.?;
-        try testing.expect(arch.drafterOn(&ld.config));
-        try testing.expect(m.keep_hidden);
-        m.reset();
-        m.req().kv = if (kv == 8) .engine_default else .dense;
-        const end = seq + max_tokens;
-        try m.reserveFor(@intCast(end));
-        const held = @import("hy4_prefix.zig").heldBytes(m, null);
-        const terms = @import("hy4_ledger.zig").ledgerTerms(&ld.config, kv, chunk).?;
-        errdefer std.debug.print("[hy4-bill] kv{d}: reserveFor({d}) holds {d} B, the terms {d} B\n", .{ kv, end, held, terms.at(end) });
-        try testing.expect(held <= terms.at(end));
-    }
-}
-
-
-test "hy4: a load keeps no Engram row cache, so a repeated request reads its rows through the shard again (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    const contract = @import("../cooler_contract_test.zig");
-    const hy4_contract = @import("hy4_contract.zig");
-    const arch_handle = @import("../arch/handle.zig");
-    const arch_sched = @import("../arch/sched.zig");
-    const ids = try hy4_contract.prompt(a, dir);
-    defer a.free(ids);
-    var ld: contract.Load = undefined;
-    try ld.open(hy4_contract, dir, true);
-    defer _ = ld.close();
-    const m = ld.xfm.arch_state.hy4flash.model.?;
-    var reads = std.atomic.Value(u64).init(0);
-    var tables: usize = 0;
-    for (m.engram_store) |*e| if (e.disk) |*d| {
-        try testing.expect(d.cache == null);
-        d.rows_read = &reads;
-        tables += 1;
-    };
-    try testing.expect(tables > 0);
-    const turn = arch_handle.turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer arch_sched.endRequest(&ld.config);
-    var got = try hy4_contract.specTokens(a, ld.xfm, ids[0..24], 8);
-    defer got.deinit(a);
-    const first = reads.load(.monotonic);
-    var again = try hy4_contract.specTokens(a, ld.xfm, ids[0..24], 8);
-    defer again.deinit(a);
-    const second = reads.load(.monotonic) - first;
-    errdefer std.debug.print("hy4: the same request read {d} then {d} Engram rows from the shard\n", .{ first, second });
-    try testing.expect(first > 0);
-    try testing.expectEqual(first, second);
-}
-
 test "hy4 bill: a 3-slot streamed load's ledger lines hold what it holds after each served request, plain and drafting (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
@@ -539,11 +468,12 @@ test "hy4 bill: a 3-slot streamed load's ledger lines hold what it holds after e
     const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");
     const static_bill = @import("../static_bill.zig");
+    hy4_held.releaseHeld();
     var ld: contract.Load = undefined;
     try ld.prepare(hy4_contract, dir, true);
     // Three slots a layer: every layer streams, so the requests run the group path and the cache's misses.
     ld.config.expert_cache_bytes = 3 * @as(u64, ld.config.hy4flash.?.layers) * 26_112;
-    try ld.loadServed(dir);
+    try ld.loadLight(dir);
     defer _ = ld.close();
     defer static_bill.close(&ld.config);
     try testing.expect(ld.xfm.expert_stream.?.residentRoute(1) == null);
@@ -553,14 +483,14 @@ test "hy4 bill: a 3-slot streamed load's ledger lines hold what it holds after e
     var sv: contract.Served = undefined;
     try sv.init(&ld, dir);
     defer sv.deinit();
-    for ([_]bool{ false, true }) |drafting| for ([_]usize{ 24, 40 }) |len| {
+    for ([_]struct { drafting: bool, len: usize }{ .{ .drafting = false, .len = 24 }, .{ .drafting = true, .len = 40 } }) |case| {
         var from: u32 = 0;
-        var got = try sv.requestWith(ids[0..len], 6, .{ .temperature = 0.0 }, drafting, &from);
+        var got = try sv.requestWith(ids[0..case.len], 6, .{ .temperature = 0.0 }, case.drafting, &from);
         got.deinit(a);
         mlx.engine.close();
         const s = l.snapshot();
         const lines = s.committed - s.of(.margin) - s.of(.host) - s.of(.media) - s.of(.pipelines);
-        errdefer std.debug.print("hy4 bill: after a served request (drafting {}, {d} tokens): the lines hold {d} B, the engine {d} B\n", .{ drafting, len, lines, ld.before.heldSince() });
+        errdefer std.debug.print("hy4 bill: after a served request (drafting {}, {d} tokens): the lines hold {d} B, the engine {d} B\n", .{ case.drafting, case.len, lines, ld.before.heldSince() });
         try testing.expectEqual(lines, ld.before.heldSince());
-    };
+    }
 }

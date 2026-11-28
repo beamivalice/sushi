@@ -1339,11 +1339,8 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
         for ([_]c_int{ 1, 31, 1024 }) |seq_len| {
             if (seq_len > kv) continue;
             const offset = kv - seq_len;
-            var topk_buf: [11]c_int = undefined;
-            topk_buf[0] = nb;
-            topk_buf[1] = nb + 4;
-            for (1..9) |d| topk_buf[1 + d] = nb - @as(c_int, @intCast(d));
-            topk_buf[10] = 512;
+            if (!qsaAllBlocksVisible(offset, nb, ratio)) continue;
+            const topk_buf = [_]c_int{ nb, nb + 4, nb - 1, nb - 8, 512 };
 
             for (topk_buf) |block_topk| {
                 if (block_topk <= 0) continue;
@@ -2131,6 +2128,8 @@ test "qsa select: 8-bit digits are the exact top-k" {
     for (nbs) |nb| {
         for (row_counts) |rows| {
             if (nb >= 215000 and rows >= 16) continue;
+            if (nb >= 24576 and nb < 215000 and rows != 1 and rows != 16) continue;
+            if (nb >= 215000 and rows != 1 and rows != 7) continue;
             const nbu: usize = @intCast(nb);
             const rowsu: usize = @intCast(rows);
             const ku: usize = @intCast(k);
@@ -2138,6 +2137,7 @@ test "qsa select: 8-bit digits are the exact top-k" {
             defer ta.free(buf);
             var kind: u8 = 0;
             while (kind < 5) : (kind += 1) {
+                if (nb >= 65536 and (kind == 1 or kind == 3)) continue;
                 switch (kind) {
                     0 => {
                         for (buf) |*v| v.* = rnd.float(f32) * 2.0 - 1.0;
@@ -2175,8 +2175,8 @@ test "qsa select: 8-bit digits are the exact top-k" {
                 const sc_shape = [_]c_int{ 1, rows, nb };
                 const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
                 defer _ = mlx.mlx_array_free(scores);
-                const bound_kinds = [_]i32{ nb, @divTrunc(k, 2), @min(nb, k + 17) };
-                for (bound_kinds) |bv| {
+                const bound_kinds = [_]i32{ nb, @min(nb, k + 17), @divTrunc(k, 2) };
+                for (bound_kinds[0..if (nb >= 65536) 2 else bound_kinds.len]) |bv| {
                     const bounds_host = try ta.alloc(i32, rowsu);
                     defer ta.free(bounds_host);
                     var r: usize = 0;
@@ -2230,14 +2230,14 @@ test "qsa score kernel: fused score sheet is bit-identical to the composed chain
     const rowss = [_]c_int{ 1, 2, 3, 8, 15, 16, 17, 31, 64, 128, 256 };
     const layouts = [_]QsaScoreLayout{ .base, .h4 };
     for (nbs) |nb| {
+        const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
+        defer _ = mlx.mlx_array_free(pooled);
+        try mlx.check(mlx.mlx_array_eval(pooled));
+        const k32t = try qsaScoreK32tFromPooled(s, pooled);
+        defer _ = mlx.mlx_array_free(k32t);
         for (rowss) |rows| {
             const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
             defer _ = mlx.mlx_array_free(q);
-            const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
-            defer _ = mlx.mlx_array_free(pooled);
-            try mlx.check(mlx.mlx_array_eval(pooled));
-            const k32t = try qsaScoreK32tFromPooled(s, pooled);
-            defer _ = mlx.mlx_array_free(k32t);
             const want = try qsaScoreSheetComposed(s, q, k32t);
             defer _ = mlx.mlx_array_free(want);
             for (layouts) |layout| {

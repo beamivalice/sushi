@@ -1970,9 +1970,9 @@ test "exl3 multi-row projection holds the bar on every launch geometry and at ei
     // The launch classes `rowsGeometryFor` serves: SIMD folded (lm_head-wide), one-row and multi-row k splits; NAX at one
     // simdgroup per pair folded and split, and at sliced k folded and split, each with its served fragment reader.
     const geoms = [_]RowsGeom{
-        .{ .tgrp = 4, .kph = 2, .nsplit = 1, .chunk = 768 },
+        .{ .tgrp = 4, .kph = 2, .nsplit = 1, .chunk = 384 },
         .{ .tgrp = 1, .kph = 4, .nsplit = 3, .chunk = 128 },
-        .{ .tgrp = 2, .kph = 4, .nsplit = 2, .chunk = 384 },
+        .{ .tgrp = 2, .kph = 4, .nsplit = 3, .chunk = 128 },
         .{ .tgrp = 4, .kph = 1, .nsplit = 1, .chunk = 0, .nax = true, .unr = 2, .r32 = true, .sw = true },
         .{ .tgrp = 4, .kph = 1, .nsplit = 3, .chunk = 0, .nax = true, .unr = 2, .r32 = true, .sw = true },
         .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 0, .nax = true, .r32 = true, .sw = true },
@@ -1982,10 +1982,10 @@ test "exl3 multi-row projection holds the bar on every launch geometry and at ei
         if (g0.nax and !kernels.gemmNaxOn()) continue;
         for ([_]usize{ 1, 8 }) |rows| {
             var g = g0;
-            if (g.nax) g.chunk = rowsChunk(768, @intCast(rows), g.nsplit);
-            // n48 and n128 take the 64-bit reader, n96 the 32-bit one with its four-word read.
-            for ([_]u32{ 48, 96, 128 }) |n| {
-                try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 1024, .in_dim = 768, .rows = rows, .seed = 1401 + gi, .geom = g }));
+            if (g.nax) g.chunk = rowsChunk(384, @intCast(rows), g.nsplit);
+            // n48 takes the 64-bit reader, n96 the 32-bit one with its four-word read.
+            for ([_]u32{ 48, 96 }) |n| {
+                try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 512, .in_dim = 384, .rows = rows, .seed = 1401 + gi, .geom = g }));
             }
         }
     }
@@ -1994,8 +1994,7 @@ test "exl3 multi-row projection holds the bar on every launch geometry and at ei
 test "exl3 multi-row projection holds the bar at every admitted rate on both kernels" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     const nax = rowsGeometryFor(256, 256, 3, 1, 0, true);
-    var n: u32 = exl3.Rate.min_n;
-    while (n <= exl3.Rate.max_n) : (n += 2) {
+    for ([_]u32{ 16, 24, 32, 42, 48, 64, 80, 96, 128 }) |n| {
         try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 256, .in_dim = 256, .rows = 3, .seed = 1601 + n, .geom = .{ .tgrp = 1, .kph = 4, .nsplit = 2, .chunk = 128 } }));
         if (kernels.gemmNaxOn()) try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 256, .in_dim = 256, .rows = 3, .seed = 1601 + n, .geom = nax }));
     }

@@ -16,7 +16,6 @@ const Load = contract.Load;
 const Served = contract.Served;
 const Sheet = contract.Sheet;
 const eachArch = contract.eachArch;
-const eachFixture = contract.eachFixture;
 const eachLayout = contract.eachLayout;
 const greedy = contract.greedy;
 const withUiSettings = contract.withUiSettings;
@@ -89,7 +88,7 @@ test "cooler contract: a Cooler load opens under whatever engine cap was in forc
             try mlx.engine.budget(4 << 10);
             defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             _ = ld.close();
             try testing.expectEqual(base, Sheet.now());
         }
@@ -110,8 +109,8 @@ test "cooler contract: a second Cooler load beside a sealed one, of another arch
     if (!ran) return error.SkipZigTest;
 }
 
-/// A load of `ta`'s first fixture, warmed and sealed, then a load of each other arch's beside it, one at a time; false
-/// when it ran none. Beside a load on the ledger each is refused by name.
+/// A load of `ta`'s first fixture, opened and sealed, then a load of each other arch's beside it, one at a time; false
+/// when it ran none. Beside a load on the ledger, one other arch is refused by name.
 fn besideSealed(comptime ta: registry.Tag) !bool {
     const A = registry.Mod(ta).cooler_contract;
     // A run that names its fixtures takes each ordered pair either of whose arches it names (`pairChosen`); each first
@@ -119,19 +118,12 @@ fn besideSealed(comptime ta: registry.Tag) !bool {
     const sel = contract.selection();
     if (!pairsWith(ta, sel)) return false;
     const da = std.mem.span(std.c.getenv(A.fixtures[0]) orelse return false);
-    const Warm = struct {
-        fn run(ld: *Load) !void {
-            const turn = arch_handle.turnFor(ld.h, &ld.config);
-            defer turn.end();
-            return @import("model_load.zig").warmLoad(io, testing.allocator, &ld.config, ld.xfm, null, null, ld.xfm.cache.config);
-        }
-    };
     var first: Load = undefined;
     try first.open(A, da, true);
     defer _ = first.close();
-    try Warm.run(&first);
     try testing.expect(mlx.engine.sealed());
     var ran = false;
+    var refused_once = false;
     inline for (comptime std.meta.tags(registry.Tag)) |tb| {
         if (comptime ta == tb or !@hasDecl(registry.Mod(tb), "cooler_contract")) continue;
         const B = registry.Mod(tb).cooler_contract;
@@ -140,14 +132,16 @@ fn besideSealed(comptime ta: registry.Tag) !bool {
             const db = std.mem.span(db_z.?);
             ran = true;
             if (first.config.static_ledger != null) {
-                try contract.expectRefusedBesideLedger(B, db);
+                if (!refused_once) {
+                    try contract.expectRefusedBesideLedger(B, db);
+                    refused_once = true;
+                }
             } else {
                 const late = mlx.engine.latePipelines();
                 mlx.engine.late_names.clear();
                 var second: Load = undefined;
                 try second.open(B, db, true);
                 defer _ = second.close();
-                try Warm.run(&second);
                 errdefer std.debug.print("cooler contract: the second load's warm ({s} beside {s}) counted late:\n{s}", .{ B.fixtures[0], A.fixtures[0], mlx.engine.late_names.text() });
                 try testing.expectEqual(late, mlx.engine.latePipelines());
                 try testing.expect(mlx.engine.sealed());
@@ -176,8 +170,8 @@ test "cooler contract: a Cooler load's prefix cache keeps its arrays on the engi
                 // An arch with no MLX arm has no MLX load to hold to its side.
                 if (comptime !cool and !contract.hasMlxArm(C)) continue;
                 var ld: Load = undefined;
-                try ld.openLight(C, dir, cool);
-                defer _ = ld.close();
+                try ld.prepare(C, dir, cool);
+                defer ld.config.deinit(testing.allocator);
                 const on = prefix_arch.arraysOn(&ld.config);
                 errdefer std.debug.print("cooler contract: a load {s} keeps its prefix arrays on {s}\n", .{ if (cool) "on Cooler" else "on MLX", if (on == null) "MLX" else "the engine" });
                 if (cool) try testing.expect(on != null and mlx.engine.isStream(on.?)) else try testing.expect(on == null);
@@ -187,8 +181,8 @@ test "cooler contract: a Cooler load's prefix cache keeps its arrays on the engi
 }
 
 test "cooler contract: a Cooler load whose widest served request holds more than its bill is refused by name" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+    try contract.qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, _: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
             const cooler_warm = @import("cooler_warm.zig");
             var tmp = testing.tmpDir(.{ .iterate = true });
@@ -200,7 +194,7 @@ test "cooler contract: a Cooler load whose widest served request holds more than
             cooler_warm.bill_for_test = 1 << 20;
             defer cooler_warm.bill_for_test = null;
             var cooler: Load = undefined;
-            if (cooler.open(C, dir, true)) |_| {
+            if (cooler.open(Q, dir, true)) |_| {
                 _ = cooler.close();
                 return error.TestUnexpectedResult;
             } else |e| try testing.expectEqual(error.WarmOverBill, e);
@@ -226,13 +220,17 @@ test "cooler contract: a Cooler load under each KV precision and context extensi
                     var d: []const u8 = undefined;
                     fn body() !void {
                         var ld: Load = undefined;
-                        try ld.openLight(C, d, true);
-                        defer _ = ld.close();
+                        try ld.prepare(C, d, true);
                         // A row the web UI does not offer for this model (DeepSeek keeps no KV cache to quantize, a
                         // RoPE with no YaRN) has nothing to hold; one it offers must take effect, never skip.
                         const fit = @import("arch/flags.zig").settingsFit(&ld.config);
                         const model_settings = @import("model_settings.zig");
-                        if (!model_settings.applies(r[1], fit) or !model_settings.choiceAllowed(r[1], r[2], fit)) return;
+                        if (!model_settings.applies(r[1], fit) or !model_settings.choiceAllowed(r[1], r[2], fit)) {
+                            ld.config.deinit(testing.allocator);
+                            return;
+                        }
+                        try ld.loadLight(d);
+                        defer _ = ld.close();
                         errdefer std.debug.print("cooler contract: {s} is offered for this model and did not take effect\n", .{row});
                         if (comptime std.mem.eql(u8, r[1], "kv_quant")) {
                             try testing.expect(ld.config.kv_quant_override != null);
@@ -280,13 +278,12 @@ const LateUnwireHeadroom = struct {
 };
 
 test "cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and a streamed load's first wide prefill is served through a late-unwiring borrow (issue 107)" {
-    try eachFixture(struct {
+    try contract.servedOn("dsv41", &.{ "DSV41_STQ_TINY", "DSV41_TINY" }, struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
             try ld.open(C, dir, true);
             defer _ = ld.close();
-            if (!@import("arch/config.zig").isOf(&ld.config, "dsv41")) return error.SkipZigTest;
             const borrow = @import("dsv41/dsv41_borrow.zig");
             const was_fn = borrow.headroom_fn;
             borrow.headroom_fn = &LateUnwireHeadroom.headroom;
@@ -494,9 +491,13 @@ test "cooler contract: a Cooler load beside a sealed one that the load cannot fi
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             const a = testing.allocator;
+            var cfg = try contract.prepareConfig(C, dir, true);
+            const ledger = @import("bills.zig").ledgerArch(&cfg);
+            cfg.deinit(a);
+            if (!ledger) return error.SkipZigTest;
             const registry_mod = @import("model_registry.zig");
             var first: Load = undefined;
-            try first.open(C, dir, true);
+            try first.openLight(C, dir, true);
             const l = first.config.static_ledger orelse {
                 _ = first.close();
                 return error.SkipZigTest;
@@ -536,7 +537,7 @@ test "cooler contract: a Cooler load beside a sealed one that the load cannot fi
             try testing.expectEqual(@as(?usize, 1), n);
             try testing.expectEqualStrings("first", victims[0].id);
             var next: Load = undefined;
-            try next.open(C, dir, true);
+            try next.openLight(C, dir, true);
             _ = next.close();
         }
     }.run);

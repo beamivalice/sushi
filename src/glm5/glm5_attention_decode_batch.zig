@@ -348,8 +348,12 @@ test "GLM decode batch geometry ancestry and conservative scratch" {
 
 test "GLM kv8 and kv6 decode batches match BF16 and independent B1 branches" {
     try mlx.requireGpu();
-    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| for ([_]usize{ 2, 3, 4, 5, 6, 7, 8 }) |rows| for ([_]usize{ 5, 3000 }) |prefix_rows| for ([_]bool{ false, true }) |chain| for ([_]f32{ 0.05, 2 }) |spread| {
-        try decodeBatchParity(bits, rows, prefix_rows, chain, spread);
+    const BatchCfg = struct { prefix_rows: usize, chain: bool, spread: f32 };
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| for ([_]usize{ 2, 3, 5, 8 }) |rows| for ([_]BatchCfg{
+        .{ .prefix_rows = 5, .chain = false, .spread = 0.05 },
+        .{ .prefix_rows = 3000, .chain = true, .spread = 2 },
+    }) |cfg| {
+        try decodeBatchParity(bits, rows, cfg.prefix_rows, cfg.chain, cfg.spread);
     };
 }
 

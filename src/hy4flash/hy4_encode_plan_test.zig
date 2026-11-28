@@ -6,45 +6,15 @@ const mlx = @import("../mlx.zig");
 const core = @import("../tensor/core.zig");
 const contract = @import("../cooler_contract_test.zig");
 const hy4_contract = @import("hy4_contract.zig");
+const hy4_held = @import("hy4_held.zig");
 const hy4_encode_plan = @import("hy4_encode_plan.zig");
 const hy4_media = @import("hy4_media.zig");
-const VisionEncoder = @import("../vision.zig").VisionEncoder;
-
-/// A Hy4 load with every expert resident and its vision tower kept, warmed and planned as a served load is.
-const Served = struct {
-    ld: contract.Load,
-    tower: VisionEncoder,
-
-    fn open(self: *Served, dir: []const u8) !void {
-        try self.ld.prepare(hy4_contract, dir, true);
-        self.ld.vision = true;
-        try self.ld.load(dir);
-        self.tower = VisionEncoder.init(testing.allocator, self.ld.config, &self.ld.weights) catch |e| {
-            self.ld.discard();
-            return e;
-        };
-        self.ld.serve() catch |e| {
-            self.tower.deinit();
-            self.ld.discard();
-            return e;
-        };
-    }
-
-    fn close(self: *Served) void {
-        self.tower.deinit();
-        _ = self.ld.close();
-    }
-
-    fn hy4Tower(self: *Served) *hy4_media.Tower {
-        return &self.tower.tower.?.arch.hy4flash;
-    }
-};
 
 /// An image's encode into a media of its own rows, in the load's region when `planned`, else on the pool: its rows'
 /// bytes, the pool's asks and the wide executions it took.
-fn encodeOnce(s: *Served, pixels: []const u8, gh: u32, gw: u32, planned: bool, out: *std.ArrayList(u8)) !struct { asks: u64, wide: u64 } {
+fn encodeOnce(s: *hy4_held.Held, pixels: []const u8, gh: u32, gw: u32, planned: bool, out: *std.ArrayList(u8)) !struct { asks: u64, wide: u64 } {
     const m = s.ld.xfm.arch_state.hy4flash.model.?;
-    const t = &s.hy4Tower().tower;
+    const t = &s.tower.?.tower.?.arch.hy4flash.tower;
     var media = blk: {
         const scope = mlx.engine.enter(mlx.engine.stream());
         defer scope.end();
@@ -64,13 +34,10 @@ fn encodeOnce(s: *Served, pixels: []const u8, gh: u32, gw: u32, planned: bool, o
 test "hy4 plan: an image's encode in the region gives the pool's rows in one wide execution and asks the pool nothing, poison and canaries on, at one attention chunk, several, a short last one and the most patches the load accepts (HY4_BF16_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
-    var s: Served = undefined;
-    try s.open(dir);
-    defer s.close();
+    const s = try hy4_held.acquire(.bf16_vision);
     const turn = hy4_contract.openTurn(s.ld.h, &s.ld.config);
     defer turn.end();
-    const t = &s.hy4Tower().tower;
+    const t = &s.tower.?.tower.?.arch.hy4flash.tower;
     const most = hy4_media.maxImagePatches(hy4_media.preproc(&s.ld.config));
     const m: u32 = t.v.merge;
     // 64 patches (one chunk of 512 query rows), 1,024 (two whole), 640 (a short last one of 128), and the most patches
@@ -90,8 +57,8 @@ test "hy4 plan: an image's encode in the region gives the pool's rows in one wid
         defer pool.deinit(a);
         var arena: std.ArrayList(u8) = .empty;
         defer arena.deinit(a);
-        const on_pool = try encodeOnce(&s, std.mem.sliceAsBytes(vals), g[0], g[1], false, &pool);
-        const on_arena = try encodeOnce(&s, std.mem.sliceAsBytes(vals), g[0], g[1], true, &arena);
+        const on_pool = try encodeOnce(s, std.mem.sliceAsBytes(vals), g[0], g[1], false, &pool);
+        const on_arena = try encodeOnce(s, std.mem.sliceAsBytes(vals), g[0], g[1], true, &arena);
         errdefer std.debug.print("an encode of {d} x {d} patches: {d} wide executions, {d} asks of the pool\n", .{ g[0], g[1], on_arena.wide, on_arena.asks });
         try testing.expectEqual(@as(u64, 0), on_pool.wide);
         try testing.expectEqual(@as(u64, 1), on_arena.wide);
@@ -104,12 +71,9 @@ test "hy4 plan: an image's encode in the region gives the pool's rows in one wid
 test "hy4 plan: a request of two images encodes each into its Media past the seal asking the closed pool nothing, and its prompt answers as the tower's rows joined do (HY4_BF16_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
-    var s: Served = undefined;
-    try s.open(dir);
-    defer s.close();
-    const tower = &s.tower.tower.?;
-    const t = &s.hy4Tower().tower;
+    const s = try hy4_held.acquire(.bf16_vision);
+    const tower = &s.tower.?.tower.?;
+    const t = &tower.arch.hy4flash.tower;
     const grids = [_][2]u32{ .{ 6, 10 }, .{ 32, 20 } };
     var pixels: [2][]f32 = undefined;
     var rng = std.Random.DefaultPrng.init(0x3ed1a);
@@ -174,7 +138,7 @@ test "hy4 plan: a request of two images encodes each into its Media past the sea
     for ([_]mlx.mlx_array{ joined, media }, &answers) |ve, *got| {
         var ctx = s.ld.xfm.defaultCtx();
         ctx.vision_embeddings = ve;
-        got.* = try contract.serialWith(&s.ld, ids, 6, .{ .temperature = 0 }, .{ .ctx = ctx });
+        got.* = try contract.serialWith(s.ld, ids, 6, .{ .temperature = 0 }, .{ .ctx = ctx });
     }
     defer for (&answers) |*got| got.deinit(a);
     try testing.expectEqualSlices(u32, answers[0].items, answers[1].items);
@@ -183,14 +147,11 @@ test "hy4 plan: a request of two images encodes each into its Media past the sea
 test "hy4 plan: an encode that asks past the region its load holds is refused by name, and the engine's latch names the region (HY4_BF16_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
-    var s: Served = undefined;
-    try s.open(dir);
-    defer s.close();
+    const s = try hy4_held.acquire(.bf16_vision);
     const turn = @import("../arch/handle.zig").turnFor(s.ld.h, &s.ld.config);
     defer turn.end();
     const p = s.ld.xfm.arch_state.hy4flash.model.?.plans.?;
-    const t = &s.hy4Tower().tower;
+    const t = &s.tower.?.tower.?.arch.hy4flash.tower;
     try testing.expect(p.encode.scratch > 0);
     const g = [2]u32{ 32, 32 };
     const vals = try a.alloc(f32, @as(usize, g[0]) * g[1] * 3 * @as(usize, t.v.patch) * t.v.patch);

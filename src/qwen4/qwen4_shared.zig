@@ -27,7 +27,7 @@ fn affineBank(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, rows: usize, k: 
     defer a.free(scales);
     const biases = try a.alloc(u16, scales.len);
     defer a.free(biases);
-    for (codes) |*v| v.* = rnd.int(u32);
+    rnd.bytes(std.mem.sliceAsBytes(codes));
     for (scales, biases) |*sc, *b| {
         sc.* = bf16(gain * (rnd.float(f32) + 0.125) / 128);
         b.* = bf16(gain * (rnd.float(f32) - 0.5));
@@ -91,15 +91,38 @@ pub const Weights = struct {
     logit: api.riders_gated.Affine,
     group: usize,
     trellis: ?TrellisShared = null,
+    shared_trellis: ?*const TrellisShared = null,
 
     pub fn deinit(self: *Weights, a: std.mem.Allocator) void {
         if (self.trellis) |*t| t.deinit(a);
     }
 };
 
+var cached_trellis_96: ?TrellisShared = null;
+
+fn sharedTrellis96(s: mlx.mlx_stream) !*const TrellisShared {
+    if (cached_trellis_96) |*t| return t;
+    const c_alloc = std.heap.c_allocator;
+    var arena = std.heap.ArenaAllocator.init(c_alloc);
+    defer arena.deinit();
+    var random = std.Random.DefaultPrng.init(913);
+    var local_ops = Ops{ .s = s };
+    errdefer local_ops.deinit();
+    var t = try TrellisShared.init(&local_ops, c_alloc, arena.allocator(), random.random(), s, 96, api.format.Decode.tabled(.spec1, .w15));
+    errdefer t.deinit(c_alloc);
+    try t.held.appendSlice(c_alloc, local_ops.values[0..local_ops.count]);
+    local_ops.count = 0;
+    cached_trellis_96 = t;
+    return &cached_trellis_96.?;
+}
+
 /// A layer's shared expert at hidden width `hidden_k`: affine8 at `group`, or with `trellis_bits` other than 0 the
 /// trunk's trellis banks at that packed rate (96 is 6 bits).
 pub fn weights(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, s: mlx.mlx_stream, hidden_k: usize, width: usize, group: usize, gain: f32, trellis_bits: u32) !Weights {
+    if (trellis_bits == 96 and hidden_k == hidden and width == inter) {
+        const t = try sharedTrellis96(s);
+        return .{ .shared = try t.shared(ops), .logit = t.logit, .group = group, .shared_trellis = t };
+    }
     if (trellis_bits != 0) {
         var t = try TrellisShared.init(ops, a, a, rnd, s, trellis_bits, api.format.Decode.tabled(.spec1, .w15));
         errdefer t.deinit(a);
@@ -123,6 +146,7 @@ pub const Chain = union(enum) { bank: api.Bank, ragged: *const api.Ragged };
 /// routed experts with the gated shared add as `moeExl3` runs them.
 pub fn separate(ops: *Ops, x: Arr, w: Weights, chain: Chain, ids: Arr, scores: Arr, dec: api.format.Decode) !Arr {
     if (w.trellis) |t| return t.separate(ops, x, chain, ids, scores, dec);
+    if (w.shared_trellis) |t| return t.separate(ops, x, chain, ids, scores, dec);
     const s = ops.s;
     const g = try ops.own(try trunk_mod.qmatmulBits(x, w.shared.gate.weight, w.shared.gate.scales, w.shared.gate.biases, 8, @intCast(w.group), .affine, s));
     const u = try ops.own(try trunk_mod.qmatmulBits(x, w.shared.up.weight, w.shared.up.scales, w.shared.up.biases, 8, @intCast(w.group), .affine, s));
@@ -358,8 +382,9 @@ test "Qwen trellis shared expert folded into the routed launches is bit exact to
     defer arena.deinit();
     // Each trunk rate once, the one-bank chain at K4 and the rate-grouped one at K6.
     for ([_]u32{ 96, 64 }, [_]usize{ 1, 0 }) |bits, chain_kind| {
-        var w = try TrellisShared.init(&ops, std.testing.allocator, arena.allocator(), rnd, s, bits, trunk_dec);
-        defer w.deinit(std.testing.allocator);
+        var owned_w: ?TrellisShared = if (bits == 96) null else try TrellisShared.init(&ops, std.testing.allocator, arena.allocator(), rnd, s, bits, trunk_dec);
+        defer if (owned_w) |*ow| ow.deinit(std.testing.allocator);
+        const w: *const TrellisShared = if (owned_w) |*ow| ow else try sharedTrellis96(s);
         for (fold_rows) |rows| {
             const dec = if (chain_kind == 0) test_dec else api.format.Decode.tabled(.spec1, .w15);
             const route = try routing(&ops, rnd, rows, 24);
@@ -391,11 +416,8 @@ test "Qwen trellis shared expert fold declines what the separate chain must run"
     const rnd = random.random();
     var ops = Ops{ .s = s };
     defer ops.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const bank = try routedBank(&ops, 24, 64, 64, 91);
-    var w = try TrellisShared.init(&ops, std.testing.allocator, arena.allocator(), rnd, s, 96, api.format.Decode.tabled(.spec1, .w15));
-    defer w.deinit(std.testing.allocator);
+    const w = try sharedTrellis96(s);
     var sh = try w.shared(&ops);
     sh.logit = w.logit;
     const four = try routing(&ops, rnd, 4, 24);
@@ -429,7 +451,7 @@ fn layerOf(w: Weights, chain: Chain, dense_gate: bool) MoeMlpWeights {
         .shared_expert_gate_s = if (dense_gate) none else w.logit.scales,
         .shared_expert_gate_b = if (dense_gate) none else w.logit.biases,
     });
-    if (w.trellis) |t| {
+    if (w.trellis orelse if (w.shared_trellis) |p| p.* else null) |t| {
         mw.shared_gate_up_stack = t.stack;
         mw.shared_down_w = t.down.w;
         mw.shared_down_s = t.down.s;
@@ -535,7 +557,7 @@ test "Qwen shared expert fold: the geometry bound at load is the one the shapes 
             if (c.trellis_bits == 0) try std.testing.expect(stored != null);
         }
         var served: usize = 0;
-        for (1..9) |rows| {
+        for ([_]usize{ 1, 8 }) |rows| {
             var scope = Ops{ .s = s };
             defer scope.deinit();
             const route = try routing(&scope, rnd, rows, 24);

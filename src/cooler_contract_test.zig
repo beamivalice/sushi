@@ -81,8 +81,13 @@ pub const Load = struct {
     }
 
     pub fn open(self: *Load, comptime C: type, dir: []const u8, cooler: bool) !void {
+        return self.openWithVerifyCap(C, dir, cooler, null);
+    }
+
+    /// `open` with an explicit verify draft cap for the warm, avoiding a second warm when a cell needs a wider cap.
+    pub fn openWithVerifyCap(self: *Load, comptime C: type, dir: []const u8, cooler: bool, verify_cap: ?usize) !void {
         try self.prepare(C, dir, cooler);
-        try self.loadServed(dir);
+        try self.loadServedWith(dir, verify_cap);
     }
 
     /// `open` with the warm skipped, for a cell that asserts nothing the warm compiles or grows.
@@ -100,9 +105,14 @@ pub const Load = struct {
 
     /// `load` and then `serve`, as a served load runs them; on an error nothing of the load stays.
     pub fn loadServed(self: *Load, dir: []const u8) !void {
+        return self.loadServedWith(dir, null);
+    }
+
+    /// `loadServed` with an optional `verify_cap` override for `serveWith`.
+    pub fn loadServedWith(self: *Load, dir: []const u8, verify_cap: ?usize) !void {
         try self.load(dir);
         errdefer self.discard();
-        try self.serve();
+        try self.serveWith(verify_cap);
     }
 
     /// The teardown of a served load that failed (`model_load.failLoadRequest` after the load's own errdefers): the
@@ -121,6 +131,10 @@ pub const Load = struct {
     /// What a served load runs once its trunk is up: the KV scheme a launch with no flag gets, the MTP head's draft
     /// rerank, and the warm (`model_load.warmLoad`, fatal on Cooler, which ends sealed). No aux head is loaded.
     pub fn serve(self: *Load) !void {
+        return self.serveWith(null);
+    }
+
+    pub fn serveWith(self: *Load, verify_cap_override: ?usize) !void {
         const job = JobTurn.begin(self.h, &self.config);
         defer job.end();
         const kv = @import("bills.zig").kvCacheForLaunch(&self.config, null).config;
@@ -128,7 +142,7 @@ pub const Load = struct {
         const mtp_on = self.mtpOn();
         if (mtp_on) _ = try @import("arch/arch_state.zig").buildDraftRerank(self.xfm);
         const policy = @import("mtp_policy.zig");
-        const verify_cap: ?u32 = if (mtp_on) @min(policy.resolveMtpDepthCapForProfile(0, .generic), policy.mtpVerifyDraftsMax(&self.config)) else null;
+        const verify_cap: ?u32 = if (verify_cap_override) |v| @intCast(v) else if (mtp_on) @min(policy.resolveMtpDepthCapForProfile(0, .generic), policy.mtpVerifyDraftsMax(&self.config)) else null;
         // An arch on the ledger opens it, fixes its chunk and arena, warms and seals, as a served load does.
         errdefer static_bill.close(&self.config);
         try model_load.openLedger(&self.config, self.xfm, self.before, true, null);
@@ -209,6 +223,23 @@ pub fn requirePoolCap(config: *const model_mod.ModelConfig) error{SkipZigTest}!v
 /// The refusals a load beside a load on the ledger may meet: what is left of the ceiling does not hold it.
 const memory_refusals = [_]anyerror{ error.InsufficientMemory, error.ExpertCacheDoesNotFit, error.WarmChunkDoesNotFit, error.ModelBillPastBudget, error.PrefillChunkDoesNotFit, error.ContextDoesNotFit };
 
+/// Parses and prepares `dir` on `C` without touching weights or the GPU; caller owns the returned `ModelConfig`.
+pub fn prepareConfig(comptime C: type, dir: []const u8, cooler: bool) !model_mod.ModelConfig {
+    var ld: Load = undefined;
+    try ld.prepare(C, dir, cooler);
+    return ld.config;
+}
+
+/// Whether `dir` on `C` ships a drafter without loading weights or touching the GPU.
+fn shipsDrafter(comptime C: type, dir: []const u8) !bool {
+    if (comptime !@hasDecl(C, "specTokens")) return false;
+    var cfg = try prepareConfig(C, dir, true);
+    defer cfg.deinit(testing.allocator);
+    if (!model_load.packShipsMtpHead(io, testing.allocator, cfg.model_type, dir)) return false;
+    if (cfg.expert_streaming and !cfg.stream_mtp_head) return false;
+    return true;
+}
+
 /// A served load of `dir` beside a load on the ledger, which holds its whole budget (D90): refused by name, before it
 /// holds anything.
 pub fn expectRefusedBesideLedger(comptime C: type, dir: []const u8) !void {
@@ -241,6 +272,29 @@ fn unloadHeldOnLedger() void {
         held_count -= 1;
         rest.held.holds -= 1;
     }
+}
+
+/// Unloads any held load for `dir`, freeing its memory before a cut test that opens its own configured load.
+pub fn unloadHeldDir(dir: []const u8) void {
+    const rest = @import("test_rest.zig");
+    var i: usize = 0;
+    while (i < held_count) {
+        const h = held_loads[i];
+        if (!std.mem.eql(u8, h.dir, dir)) {
+            i += 1;
+            continue;
+        }
+        _ = h.ld.close();
+        std.heap.smp_allocator.destroy(h.ld);
+        std.heap.smp_allocator.free(h.dir);
+        std.mem.copyForwards(Held, held_loads[i .. held_count - 1], held_loads[i + 1 .. held_count]);
+        held_count -= 1;
+        rest.held.holds -= 1;
+    }
+    if (held_count == 0) rest.held = .{};
+    mlx.engine.close();
+    mlx.engine.trim();
+    if (held_count > 0) held_sheet = Sheet.now();
 }
 
 fn configHash(config: *const model_mod.ModelConfig) u64 {
@@ -432,6 +486,12 @@ pub fn eachArch(comptime body: fn (comptime C: type, dir: []const u8, ids: []con
     return eachOf(.first, body);
 }
 
+/// `body` on the first fixture per arch that ships a drafter (`QWEN4_STQ_TINY`, `DSV41_STQ_TINY`, `HY4_STQ_TINY`),
+/// checked from config/metadata before loading weights or touching the GPU.
+pub fn eachDraftingArch(comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return eachOf(.drafting, body);
+}
+
 /// `body` on one fixture per arch and per expert residency, the first chosen of each: resident, and streamed (the BF16
 /// checkpoint, MXFP4 experts). For a pool, memory or cleanup property, which a streamed plan changes and a pack's
 /// geometry or tile order does not.
@@ -456,7 +516,7 @@ pub fn onTheCut(comptime body: fn (comptime C: type, dir: []const u8, ids: []con
     return eachOf(.cut, body);
 }
 
-const Which = enum { every, first, per_residency, per_layout, tinies, cut };
+const Which = enum { every, first, drafting, per_residency, per_layout, tinies, cut };
 
 /// The fixture env of the Qwen cut (`QWEN4_TEST_MODEL`).
 const cut_env = "QWEN4_TEST_MODEL";
@@ -465,7 +525,7 @@ pub fn takes(comptime which: Which, env: []const u8) bool {
     return switch (which) {
         .tinies => !std.mem.eql(u8, env, cut_env),
         .cut => std.mem.eql(u8, env, cut_env),
-        .every, .first, .per_residency, .per_layout => true,
+        .every, .first, .drafting, .per_residency, .per_layout => true,
     };
 }
 
@@ -497,11 +557,12 @@ fn eachOf(comptime which: Which, comptime body: fn (comptime C: type, dir: []con
             var took: [4]bool = @splat(false);
             for (C.fixtures) |env| {
                 if (!takes(which, env) or !fixtureChosen(sel, env)) continue;
-                if (which == .first and took_one) break;
+                if ((which == .first or which == .drafting) and took_one) break;
                 const dir = std.mem.span(std.c.getenv(env) orelse {
                     tally.absent();
                     continue;
                 });
+                if (which == .drafting and !(shipsDrafter(C, dir) catch |e| return named(env, dir, e))) continue;
                 if (which == .per_residency or which == .per_layout) {
                     const layout = layoutOf(C, dir) catch |e| return named(env, dir, e);
                     const key = if (which == .per_residency) layout & 1 else layout;
@@ -583,6 +644,26 @@ test "cooler contract: test_skip_warm skips the warm on a light load and never r
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const cooler_warm = @import("cooler_warm.zig");
             const prompt = ids[0..@min(ids.len, 16)];
+            var cfg = try prepareConfig(C, dir, true);
+            const is_ledger = @import("bills.zig").ledgerArch(&cfg);
+            cfg.deinit(testing.allocator);
+            if (is_ledger) {
+                const light_before = cooler_warm.runs_for_test;
+                const light_arch_before = cooler_warm.arch_warm_runs_for_test;
+                var light: Load = undefined;
+                try light.openLight(C, dir, true);
+                defer _ = light.close();
+                try testing.expectEqual(light_before, cooler_warm.runs_for_test);
+                try testing.expectEqual(light_arch_before, cooler_warm.arch_warm_runs_for_test);
+                const l = light.config.static_ledger orelse return error.TestUnexpectedResult;
+                try testing.expect(l.context.load(.acquire) > 0);
+                try testing.expect(light.config.static_prefill_chunk > 0);
+                try testing.expectEqual(@as(@FieldType(mlx.engine.BudgetSlot, "gate"), .refuse), light.xfm.cooler_budget.gate);
+                var got = try greedy(&light, prompt, 4);
+                defer got.deinit(testing.allocator);
+                try testing.expectEqual(@as(usize, 4), got.items.len);
+                return;
+            }
             const served_before = cooler_warm.runs_for_test;
             const arch_before = cooler_warm.arch_warm_runs_for_test;
             var want: std.ArrayList(u32) = .empty;
@@ -1150,6 +1231,20 @@ pub const MixedTick = struct {
             made += 1;
             try testing.expect(!solo[made - 1].failed());
         }
+        const Solo = struct {
+            sv: *Served,
+            specs: []const Spec,
+            fn go(q: @This()) anyerror!void {
+                for (q.specs) |sp| {
+                    var one = [_]Spec{sp};
+                    one[0].cancel_at = null;
+                    var o: [1]Out = undefined;
+                    try run(q.sv, &one, &o);
+                    o[0].tokens.deinit(testing.allocator);
+                }
+            }
+        };
+        a.free(try firstAsks(a, seen, C, Solo{ .sv = sv, .specs = specs }, Solo.go));
         const Joined = struct {
             sv: *Served,
             specs: []const Spec,

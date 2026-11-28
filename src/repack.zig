@@ -68,9 +68,12 @@ pub fn writeExact(fd: std.c.fd_t, src: []const u8, offset: u64) !void {
     }
 }
 
+pub var skip_fsync_for_test: bool = false;
+
 /// F_FULLFSYNC reaches the platter; plain fsync, which macOS leaves in the drive's cache, is the fallback for a volume
 /// that refuses it.
 pub fn fullSync(fd: std.c.fd_t) !void {
+    if (skip_fsync_for_test) return;
     if (std.c.fcntl(fd, std.c.F.FULLFSYNC) == 0) return;
     if (std.c.fsync(fd) != 0) return error.RepackIoFailed;
 }

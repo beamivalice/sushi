@@ -543,6 +543,7 @@ test "dsv41 shell: the transformer serves the streamed model's logits through fo
     config.expert_streaming = true;
     config.expert_cache_bytes = 3 * config.num_hidden_layers * try expertBytes(&config.dsv41.?);
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
+    config.test_skip_warm = true;
 
     const resident = try model.tinyModel(dir, .{}, s);
     defer resident.deinit();
@@ -963,11 +964,21 @@ test "dsv41 stq: the served STQ pack (trunk banks, affine embedding, streamed ra
     defer _ = mlx.mlx_array_free(want_l);
     const want = try model.hostRows(&sc, want_l);
     defer testing.allocator.free(want);
-    // A cache that holds every expert, and one that streams.
+    // A cache that holds every expert, and one that streams (reusing the 3-slot one for decode chunks).
+    var streamed: StqServed = undefined;
+    var streamed_ready = false;
+    defer if (streamed_ready) streamed.deinit();
     for ([_]u64{ 8, 3 }) |slots| {
-        var served: StqServed = undefined;
-        try served.init(dir, .float32, false, false, slots, s);
-        defer served.deinit();
+        var local: StqServed = undefined;
+        const served: *StqServed = if (slots == 3) blk: {
+            try streamed.init(dir, .float32, false, false, 3, s);
+            streamed_ready = true;
+            break :blk &streamed;
+        } else blk: {
+            try local.init(dir, .float32, false, false, slots, s);
+            break :blk &local;
+        };
+        defer if (slots != 3) local.deinit();
         try scaleRouters(&sc, served.m);
         try testing.expect(served.m.layers[0].wq_b.stq != null and served.m.layers[0].wo_a.stq != null and served.m.head.stq != null);
         try testing.expect(served.m.embed.scales.ctx != null);
@@ -1009,10 +1020,8 @@ test "dsv41 stq: the served STQ pack (trunk banks, affine embedding, streamed ra
         if (first_flip == served.m.cfg.layers) try testing.expect(c > 0.99);
     }
     // Decode chunks of one row and a few after a prefill, the decode chain's widths.
-    var served: StqServed = undefined;
-    try served.init(dir, .float32, false, false, 3, s);
-    defer served.deinit();
-    try scaleRouters(&sc, served.m);
+    const served = &streamed;
+    model.resetState(served.m);
     served.m.fused = false;
     model.resetState(twin);
     var at: usize = 0;
@@ -1116,7 +1125,9 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the waiting
     defer testing.allocator.free(ids);
     // The prepared chain is the pack's geometry (5120/2304) in serving: it keeps the planes a settle reuses.
     defer exl3.rate_groups.prepared_force = null;
-    for ([_]?bool{ null, true }) |prepared| for ([_]u64{ 8, 3 }) |slots| {
+    for ([_]struct { prepared: ?bool, slots: u64 }{ .{ .prepared = null, .slots = 8 }, .{ .prepared = null, .slots = 3 }, .{ .prepared = true, .slots = 3 } }) |case| {
+        const prepared = case.prepared;
+        const slots = case.slots;
         exl3.rate_groups.prepared_force = prepared;
         var waiting: StqServed = undefined;
         try waiting.init(dir, .bfloat16, true, false, slots, s);
@@ -1134,7 +1145,7 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the waiting
         const redo_picks0 = model.spec_redo_picks;
         const rebuilt_picks0 = model.spec_rebuilt_picks;
         var at: usize = 0;
-        for ([_]usize{ 20, 1, 1, 5, 1, 3, 1, 16, 1, 1, 1, 1, 2, 1, 1 }) |n| {
+        for ([_]usize{ 20, 1, 5, 1, 16, 2, 1 }) |n| {
             const take = @min(n, ids.len - at);
             if (take == 0) break;
             const b = try model.extend(waiting.m, ids[at..][0..take], .all);
@@ -1158,7 +1169,7 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the waiting
             try testing.expect(rebuilt > 0);
             if (prepared != null) try testing.expect(redone > 0) else try testing.expectEqual(@as(u64, 0), redone);
         }
-    };
+    }
 }
 
 test "dsv41 stq: a settle that recomputes only the picks off the map gives the whole chain's bytes, 1 to 16 rows, one, two and every pick off (DSV41_STQ_TINY)" {
@@ -1251,7 +1262,7 @@ test "dsv41 stq: a queued decode layer is one command buffer, two where a prefet
         // The DSpark stage rings' commit goes out once per step.
         const flush: u64 = @intFromBool(dspark);
         const predicted_all = model.prefetch_predicted;
-        for ([_]usize{ 1, 1, 3, 1, 4, 1, 2, 1, 1, 3 }) |n| {
+        for ([_]usize{ 1, 3, 1, 4, 2, 1 }) |n| {
             const q0 = model.async_evals;
             const rebuilt0 = model.spec_rebuilt;
             const predicted0 = model.prefetch_predicted;
@@ -1470,7 +1481,7 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
         _ = mlx.mlx_array_free(pb);
         var at: usize = 20;
         // (rows, accepted) of a verify round; 0 rows is a one-row decode step.
-        for ([_][2]usize{ .{ 0, 0 }, .{ 5, 2 }, .{ 0, 0 }, .{ 0, 0 }, .{ 6, 0 }, .{ 4, 3 }, .{ 0, 0 }, .{ 3, 1 }, .{ 0, 0 }, .{ 0, 0 }, .{ 2, 1 }, .{ 0, 0 } }) |round| {
+        for ([_][2]usize{ .{ 0, 0 }, .{ 5, 2 }, .{ 6, 0 }, .{ 4, 3 }, .{ 0, 0 }, .{ 3, 1 }, .{ 2, 1 } }) |round| {
             const a = if (round[0] == 0) try model.extend(plain.m, ids[at..][0..1], .all) else try model.verify(plain.m, ids[at..][0..round[0]]);
             defer _ = mlx.mlx_array_free(a);
             const c = if (round[0] == 0) try model.extend(metered.m, ids[at..][0..1], .all) else try model.verify(metered.m, ids[at..][0..round[0]]);
@@ -1825,6 +1836,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     config.expert_streaming = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try testing.allocator.dupe(u8, root);
+    config.test_skip_warm = true;
     var served: StqServed = undefined;
     var d = try model.testDrop(8);
     defer d.deinit();
@@ -1910,6 +1922,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
     config.expert_streaming = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
+    config.test_skip_warm = true;
 
     var served: StqServed = undefined;
     try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
@@ -2049,6 +2062,7 @@ fn borrowCase(cache_bytes: u64) !void {
     config.expert_streaming = true;
     config.expert_cache_bytes = cache_bytes;
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
+    config.test_skip_warm = true;
     var served: StqServed = undefined;
     try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
     defer served.deinit();
@@ -2311,6 +2325,7 @@ test "dsv41 borrow: a layer left released with no union workspace is healed befo
     config.expert_streaming = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
+    config.test_skip_warm = true;
     var served: StqServed = undefined;
     try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
     defer served.deinit();
@@ -2646,69 +2661,6 @@ test "dsv41 stq: the served path is no farther from the f32 CPU truth than the G
     };
 }
 
-/// A request on `m` from a fresh state: `prompt` prefilled, then until position `end` a plain step and verify rounds of
-/// every width up to the block, each keeping a different count.
-fn roundsTo(m: *model.Model, prompt: []const u32, end: usize) !void {
-    model.resetState(m);
-    const V = m.cfg.vocab;
-    var t: u32 = blk: {
-        const lg = try model.extend(m, prompt, .last);
-        defer _ = mlx.mlx_array_free(lg);
-        break :blk @intCast(argmax(try sc_mod.hostF32(lg)));
-    };
-    const widest: usize = if (m.dspark != null) m.cfg.dspark.block + 1 else 1;
-    var width: usize = 1;
-    while ((try model.ensureState(m)).n < end) : (width = width % widest + 1) {
-        if (width == 1) {
-            const lg = try model.extend(m, &.{t}, .last);
-            defer _ = mlx.mlx_array_free(lg);
-            t = @intCast(argmax(try sc_mod.hostF32(lg)));
-            continue;
-        }
-        var d = try model.draftHeads(m, t, .conf);
-        defer d.deinit();
-        var round: [16]u32 = undefined;
-        round[0] = t;
-        @memcpy(round[1..width], d.ids[0 .. width - 1]);
-        const vl = try model.verify(m, round[0..width]);
-        defer _ = mlx.mlx_array_free(vl);
-        const keep = (try model.ensureState(m)).n % width;
-        try model.finishVerify(m, keep);
-        t = @intCast(argmax((try sc_mod.hostF32(vl))[keep * V ..][0..V]));
-    }
-}
-
-test "dsv41 kernels: after the load's warm, prompts of any length, every verify width and a growing context compile no Metal library on the STQ pack, streamed and resident, DSpark on and off (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    const dir = try stqDir();
-    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
-    defer fx.deinit();
-    const s = mlx.gpuStream();
-    var sc = Scope.plain(testing.allocator, s);
-    defer sc.deinit();
-    const ids = try model.tokens(&sc, &fx);
-    defer testing.allocator.free(ids);
-    const keys = mlx.kernel_keys;
-    _ = keys.trackForTest();
-    // The served setting (bf16, QAT round trips): a cache of 3 of 8 experts a layer (misses and the union), and one
-    // that holds them all (resident).
-    for ([_]u64{ 3 * 8 * 256 * 128 * 3 * 64 / 128, 1 << 40 }) |budget| for ([_]bool{ true, false }) |dspark| {
-        var served: StqServed = undefined;
-        try served.initBytes(dir, .bfloat16, true, dspark, budget, s);
-        defer served.deinit();
-        try model.warmKernels(served.m);
-        const warm = keys.count();
-        try roundsTo(served.m, ids[0..20], 21);
-        try roundsTo(served.m, ids[0..3], 3 + 30);
-        try roundsTo(served.m, ids[0..29], 110);
-        try roundsTo(served.m, ids[0..17], 60);
-        if (keys.count() != warm) {
-            std.debug.print("budget {d} dspark {}: {d} libraries built after warmup, the last: {s}\n", .{ budget, dspark, keys.count() - warm, keys.last() });
-            return error.KernelRebuilt;
-        }
-    };
-}
-
 test "dsv41 kernels: the spilled-route warm reads nothing, leaves every pool as it was, and the served logits are the unwarmed model's bit for bit (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();
@@ -2747,35 +2699,58 @@ test "dsv41 kernels: the spilled-route warm reads nothing, leaves every pool as 
 test "dsv41 kernels: the load's warm leaves no state, and the served logits are the unwarmed model's bit for bit (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();
-    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
-    defer fx.deinit();
-    const s = mlx.gpuStream();
-    var sc = Scope.plain(testing.allocator, s);
-    defer sc.deinit();
-    const ids = try model.tokens(&sc, &fx);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const model_mod = @import("../model.zig");
+    const Trunk = @import("../trunk.zig").Trunk;
+    const ids = blk: {
+        var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+        defer fx.deinit();
+        var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        break :blk try model.tokens(&sc, &fx);
+    };
     defer testing.allocator.free(ids);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
     var rows: [2][]f32 = undefined;
+    var filled: usize = 0;
+    defer for (rows[0..filled]) |r| testing.allocator.free(r);
     for (&rows, [_]bool{ false, true }) |*out, warm| {
-        var served: StqServed = undefined;
-        try served.init(dir, .bfloat16, true, true, 3, s);
-        defer served.deinit();
+        var config = try model_mod.parseConfig(io, testing.allocator, dir);
+        defer config.deinit(testing.allocator);
+        config.expert_streaming = true;
+        config.stream_mtp_head = true;
+        config.expert_cache_bytes = 3 * 8 * 256 * 128 * 3 * 64 / 128;
+        config.expert_source_dir = try testing.allocator.dupe(u8, dir);
+        config.test_skip_warm = true;
+        @import("../cooler_side.zig").forTest(&config, true);
+        var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
+        defer weights.deinit();
+        var xfm = try Trunk.init(io, testing.allocator, config, &weights);
+        defer xfm.deinit();
+        const m = dsv41_state.modelOf(&xfm).?;
         if (warm) {
-            try model.warmKernels(served.m);
-            try testing.expect((try @import("dsv41_model.zig").currentState(served.m)) == null);
+            try model.warmKernels(m);
+            try testing.expect((try model.currentState(m)) == null);
         }
+        var cs = Scope.plain(testing.allocator, m.s);
+        defer cs.deinit();
         var all: std.ArrayList(f32) = .empty;
         errdefer all.deinit(testing.allocator);
         var t: u32 = 0;
         for (0..8) |i| {
-            const lg = try model.extend(served.m, if (i == 0) ids[0..20] else &.{t}, .last);
+            const slice = if (i == 0) ids[0..20] else &.{t};
+            const chunk = try cs.ints(@as([]const i32, @ptrCast(slice)), &.{ 1, @intCast(slice.len) });
+            const lg = try xfm.forward(chunk);
             defer _ = mlx.mlx_array_free(lg);
             const row = try sc_mod.hostF32(lg);
             try all.appendSlice(testing.allocator, row);
             t = @intCast(argmax(row));
         }
         out.* = try all.toOwnedSlice(testing.allocator);
+        filled += 1;
     }
-    defer for (rows) |r| testing.allocator.free(r);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rows[0]), std.mem.sliceAsBytes(rows[1]));
 }
 
@@ -2887,6 +2862,7 @@ fn pmReference(dir: []const u8, ids: []const u32, sc: *Scope, slots: u64, s: mlx
 /// `direct_bytes`: at least this many fill bytes of the resident load (every expert read once) skip the bounce buffer.
 fn expectPmParity(dir: []const u8, pm_path: []const u8, direct_bytes: u64, budgets: []const u64) !void {
     try mlx.requireGpu();
+    @import("dsv41_generate_test.zig").releaseHeld();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();

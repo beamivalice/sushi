@@ -20,6 +20,7 @@ test "cooler contract: a Cooler prefill's chunks before the tail project no logi
     // An eager engine evaluates what MLX's lazy graph drops: a chunk's logits are rows x vocab x 2 bytes.
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            if (comptime @hasDecl(C, "reads_out_last_row_only")) return error.SkipZigTest;
             var ld: Load = undefined;
             try ld.openLight(C, dir, true);
             defer _ = ld.close();

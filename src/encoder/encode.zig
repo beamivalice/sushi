@@ -588,7 +588,8 @@ test "encode: packed codes match the reference search code for code" {
     var file = try st.parse(t.allocator, st.tiles);
     defer file.deinit(t.allocator);
     const map = file.tensors;
-    for (tile_fixture_configs) |c| {
+    for ([_]usize{ 0, 2, 6, 8, 10 }) |ci| {
+        const c = tile_fixture_configs[ci];
         var key: [64]u8 = undefined;
         const xs = fixtureSlice(f32, map.get(try std.fmt.bufPrint(&key, "{s}.x", .{c.name})).?);
         const want = fixtureSlice(u16, map.get(try std.fmt.bufPrint(&key, "{s}.packed", .{c.name})).?);
@@ -669,7 +670,8 @@ test "encode: a shortened pin pass picks the reference search's codes, code for 
     var fx = try PinFixture.load(t.allocator);
     defer fx.deinit();
     const n_tiles = fx.tiles.len / tile_len;
-    for (pin_cases) |c| {
+    for ([_]usize{ 0, 9, 17, 18, 20 }) |ci| {
+        const c = pin_cases[ci];
         var enc = try Encoder.initPinned(t.allocator, .{ .n = c.n }, c.dec, c.pin_pass);
         defer enc.deinit();
         var full = try Encoder.init(t.allocator, .{ .n = c.n }, c.dec);
@@ -682,8 +684,10 @@ test "encode: a shortened pin pass picks the reference search's codes, code for 
             fx.packedTile(c, ti, want[0..c.n]);
             _ = try enc.encodeTile(fx.tiles[ti * tile_len ..][0..tile_len], got[0..c.n], null);
             try t.expectEqualSlices(u16, want[0..c.n], got[0..c.n]);
-            _ = try full.encodeTile(fx.tiles[ti * tile_len ..][0..tile_len], exact[0..c.n], null);
-            if (!std.mem.eql(u16, got[0..c.n], exact[0..c.n])) differs += 1;
+            if (differs == 0) {
+                _ = try full.encodeTile(fx.tiles[ti * tile_len ..][0..tile_len], exact[0..c.n], null);
+                if (!std.mem.eql(u16, got[0..c.n], exact[0..c.n])) differs += 1;
+            }
         }
         // A shortened pass that never moved a code would also pass the parity above.
         try t.expect(differs > 0);

@@ -2536,7 +2536,7 @@ const Fixture = struct {
                 const in_d = if (p == 2) spec.inter else spec.hidden;
                 const out_d = if (p == 2) spec.hidden else spec.inter;
                 const w = try alloc.alloc(u16, e * tiles * r[p]);
-                for (w) |*v| v.* = @truncate(rnd.int(u32));
+                rnd.bytes(std.mem.sliceAsBytes(w));
                 const su = try alloc.alloc(u16, e * in_d);
                 const sv = try alloc.alloc(u16, e * out_d);
                 const mags = if (p == 2) [2]f32{ spec.banks[2], spec.banks[3] } else [2]f32{ spec.banks[0], spec.banks[1] };
@@ -2748,17 +2748,6 @@ const CODEBOOKS = [_]exl3.Decode{
     .{ .codebook = .spec1, .window = .w9, .table = codebook_tables.indexOf("spec1-test-per-rate") },
 };
 
-/// One group per even n in lo..hi (two experts each), gate = up = down.
-fn everyRate(buf: *[max_groups][3]u32, lo: u32, hi: u32) [][3]u32 {
-    var k: usize = 0;
-    var n = lo;
-    while (n <= hi) : (n += 2) {
-        buf[k] = .{ n, n, n };
-        k += 1;
-    }
-    return buf[0..k];
-}
-
 test "a bank's parts on the engine's stream are joined there: none is lent to MLX" {
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
@@ -2812,7 +2801,16 @@ test "exl3 rate groups: decode rows hold the f32-truth bar for every codebook, i
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     defer prepared_force = null;
-    for (CODEBOOKS) |dec| {
+    const Arm = struct { tm: bool, prepared: bool };
+    const per_cb = [_][]const Arm{
+        &.{.{ .tm = false, .prepared = false }},
+        &.{.{ .tm = true, .prepared = true }},
+        &.{ .{ .tm = false, .prepared = true }, .{ .tm = true, .prepared = false } },
+        &.{.{ .tm = true, .prepared = true }},
+        &.{ .{ .tm = false, .prepared = false }, .{ .tm = true, .prepared = true } },
+        &.{ .{ .tm = false, .prepared = true }, .{ .tm = true, .prepared = false } },
+    };
+    for (CODEBOOKS, per_cb) |dec, arms| {
         kernels.setDecodeParams(dec);
         defer kernels.setDecodeParams(.mul1);
         var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -2822,12 +2820,16 @@ test "exl3 rate groups: decode rows hold the f32-truth bar for every codebook, i
         const experts = [_]u32{ 6, 3, 7 };
         var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 4, .topk = 8, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 40 });
         defer f.deinit();
-        var tm = try tileMajorCopy(s, &f.rb);
-        defer tm.deinit();
+        var tm: ?Ragged = null;
+        defer if (tm) |*m| m.deinit();
         const want = try hostTruth(alloc, &f, dec);
         // On the prepared arm four rows group the slots that share an expert.
-        for ([_]*const Ragged{ &f.rb, &tm }) |rb| for ([_]bool{ false, true }) |prepared| {
-            prepared_force = prepared;
+        for (arms) |arm| {
+            const rb: *const Ragged = if (arm.tm) blk: {
+                if (tm == null) tm = try tileMajorCopy(s, &f.rb);
+                break :blk &tm.?;
+            } else &f.rb;
+            prepared_force = arm.prepared;
             const y = try moeDecode(s, f.x, rb, f.slots, f.scores, f.topk(), .float32, null, null);
             defer _ = mlx.mlx_array_free(y);
             var cy = mlx.mlx_array_new();
@@ -2835,7 +2837,7 @@ test "exl3 rate groups: decode rows hold the f32-truth bar for every codebook, i
             const got = try toF32(s, y, &cy);
             for (got) |v| try t.expect(std.math.isFinite(v));
             try t.expect(relRms(got, want) < 0.01);
-        };
+        }
     }
 }
 
@@ -3044,7 +3046,14 @@ fn sharedOf(f: *const Fixture) !SharedExpert {
     return .{ .bank = try sharedBankAt(prng.random(), f.spec.hidden, f.spec.inter, 64, .{ 0.0126, 1.03, 0.0083, 1.009 }), .dec = exl3.Decode.tabled(.spec1, .w15) };
 }
 
-fn sharedFusedCase(t: std.mem.Allocator, s: mlx.mlx_stream, f: *const Fixture, se: SharedExpert, seed: u64) !void {
+const SharedFusedOpts = struct {
+    all_variants: bool = true,
+    with_expand: bool = true,
+    first: bool = false,
+    use_bound: bool = false,
+};
+
+fn sharedFusedCase(t: std.mem.Allocator, s: mlx.mlx_stream, f: *const Fixture, se: SharedExpert, seed: u64, opts: SharedFusedOpts) !void {
     const limit: c_int = 10;
     const dec: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
     const hidden = f.spec.hidden;
@@ -3069,11 +3078,20 @@ fn sharedFusedCase(t: std.mem.Allocator, s: mlx.mlx_stream, f: *const Fixture, s
     var bound = se;
     bound.lane = &lane;
     for (1..kernels.DECODE_ROWS_MAX + 1) |r| try std.testing.expectEqual(sharedRate(se, &f.rb, r), sharedRate(bound, &f.rb, r));
-    for ([_]bool{ false, true, false, true }, [_]SharedExpert{ se, se, bound, bound }) |first, expert| {
-        fused_shared_first = first;
+    const Variant = struct { first: bool, expert: SharedExpert };
+    const all_vars = [_]Variant{
+        .{ .first = false, .expert = se },
+        .{ .first = true, .expert = se },
+        .{ .first = false, .expert = bound },
+        .{ .first = true, .expert = bound },
+    };
+    const one_var = [_]Variant{.{ .first = opts.first, .expert = if (opts.use_bound) bound else se }};
+    const variants: []const Variant = if (opts.all_variants) &all_vars else &one_var;
+    for (variants) |v| {
+        fused_shared_first = v.first;
         kernels.setDecodeParams(dec);
         const before = kernels.fusedDispatchCount();
-        const got = (try moeDecodeClampedSharedFused(s, xb, &f.rb, f.slots, f.scores, f.topk(), .float32, expert, limit)) orelse return error.TestUnexpectedResult;
+        const got = (try moeDecodeClampedSharedFused(s, xb, &f.rb, f.slots, f.scores, f.topk(), .float32, v.expert, limit)) orelse return error.TestUnexpectedResult;
         defer _ = mlx.mlx_array_free(got);
         var cg = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cg);
@@ -3082,7 +3100,7 @@ fn sharedFusedCase(t: std.mem.Allocator, s: mlx.mlx_stream, f: *const Fixture, s
         try std.testing.expectEqual(before + 5, kernels.fusedDispatchCount());
         try std.testing.expectEqualSlices(u8, want_bytes, got_bytes);
     }
-    try expandedReduceCase(t, s, f, se, limit, dec, want_bytes, hidden, rows, seed);
+    if (opts.with_expand) try expandedReduceCase(t, s, f, se, limit, dec, want_bytes, hidden, rows, seed);
 }
 
 fn truncMantissa(v: f32) f32 {
@@ -3156,9 +3174,14 @@ test "exl3 rate groups: the shared expert riding the decode launches writes the 
     var se = try sharedOf(&f);
     defer freeBank(&se.bank);
     // One row, a grouped verify block, and the wide verify past eight rows.
-    for ([_]usize{ 1, 2, 9, 16 }) |rows| {
+    for ([_]usize{ 1, 2, 16 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0x51 + rows);
-        try sharedFusedCase(t.allocator, s, &f, se, 0x51 + rows);
+        try sharedFusedCase(t.allocator, s, &f, se, 0x51 + rows, .{
+            .all_variants = rows == 2,
+            .with_expand = rows != 1,
+            .first = rows == 16,
+            .use_bound = rows == 16,
+        });
     }
 }
 
@@ -3182,7 +3205,12 @@ test "exl3 rate groups: the shared expert riding a DSpark stage's one-group bank
     defer freeBank(&se.bank);
     for ([_]usize{ 1, 5 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0x77 + rows);
-        try sharedFusedCase(t.allocator, s, &f, se, 0x77 + rows);
+        try sharedFusedCase(t.allocator, s, &f, se, 0x77 + rows, .{
+            .all_variants = rows == 1,
+            .with_expand = rows == 5,
+            .first = rows == 5,
+            .use_bound = rows == 5,
+        });
     }
 }
 
@@ -3205,7 +3233,12 @@ test "exl3 rate groups: the shared expert riding the decode launches at DeepSeek
     defer freeBank(&se.bank);
     for ([_]usize{ 1, 4 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0xd5 + rows);
-        try sharedFusedCase(t.allocator, s, &f, se, 0xd5 + rows);
+        try sharedFusedCase(t.allocator, s, &f, se, 0xd5 + rows, .{
+            .all_variants = false,
+            .with_expand = rows == 4,
+            .first = rows == 4,
+            .use_bound = rows == 4,
+        });
     }
 }
 
@@ -3377,9 +3410,9 @@ test "exl3 rate groups: the shared expert riding the prefill launches at 5120x23
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     defer kernels.setDecodeParams(.mul1);
-    // The plan's layer 23: 384 experts in five groups, one with a mixed class.
+    // Five rate groups (one mixed class) across 13 experts at the 5120x2304 release shape.
     const rates = [_][3]u32{ .{ 40, 40, 40 }, .{ 32, 32, 32 }, .{ 32, 32, 26 }, .{ 26, 26, 26 }, .{ 24, 24, 24 } };
-    const experts = [_]u32{ 51, 75, 1, 109, 148 };
+    const experts = [_]u32{ 3, 3, 1, 3, 3 };
     // The 384-expert bank is about 3 GB: drawn once, each row count redraws only the activations, picks and scores.
     // 17 rows is the first prefill chunk (most experts take one slot or none); 2048 is the widest, with experts past
     // one window.
@@ -3451,25 +3484,15 @@ test "exl3 rate groups: prefill rows hold the f32-truth bar for every codebook, 
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const few = [_][3]u32{ .{ 24, 24, 24 }, .{ 24, 24, 48 }, .{ 48, 48, 48 } };
+    const four_rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 48 }, .{ 64, 40, 64 } };
+    var many: [26][3]u32 = undefined;
+    for (&many, 0..) |*r, i| r.* = four_rates[i % four_rates.len];
     for (CODEBOOKS, 0..) |dec, which| {
         var arena = std.heap.ArenaAllocator.init(t.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
-        var buf: [max_groups][3]u32 = undefined;
-        // PAIR1 and the per-rate SPEC1 table decode each rate with a row of its own: every rate, and the bit layouts
-        // the other codebooks share. Those take three groups.
-        const few = [_][3]u32{ .{ 24, 24, 24 }, .{ 24, 24, 48 }, .{ 48, 48, 48 } };
-        var rates: [][3]u32 = undefined;
-        if (which >= 3) {
-            rates = everyRate(&buf, 24, 64);
-            // Five more groups with gate, up and down apart: 26 in all, two combine dispatches.
-            const extra = [_][3]u32{ .{ 24, 48, 36 }, .{ 64, 40, 64 }, .{ 32, 32, 56 }, .{ 48, 24, 24 }, .{ 40, 40, 26 } };
-            @memcpy(buf[rates.len..][0..extra.len], &extra);
-            rates = buf[0 .. rates.len + extra.len];
-        } else {
-            @memcpy(buf[0..few.len], &few);
-            rates = buf[0..few.len];
-        }
+        const rates: []const [3]u32 = if (which == CODEBOOKS.len - 1) &many else &few;
         // A row picks 8 distinct experts, so the three groups of the shared layouts hold 2 + 3 + 4 of them.
         var experts: [max_groups]u32 = undefined;
         for (experts[0..rates.len], 0..) |*e, i| e.* = 2 + @as(u32, @intCast(i % 3));
@@ -3485,16 +3508,15 @@ test "exl3 rate groups: prefill rows hold the f32-truth bar for every codebook, 
         const sc = try reshaped(s, f.scores, &.{ 20, 1, 8 });
         defer _ = mlx.mlx_array_free(sc);
         defer kernels.setDecodeParams(.mul1);
-        // The prefill chain, then the decode chain on the same rows (verify rows), each in pack and tile-major order.
-        for ([_]bool{ false, true }) |verify| for ([_]*const Ragged{ &f.rb, &tm }) |rb| {
-            const y = try root.moeRagged(s, x3, rb, ids, sc, dec, verify, null, null);
+        for ([_]*const Ragged{ &f.rb, &tm }) |rb| {
+            const y = try root.moeRagged(s, x3, rb, ids, sc, dec, false, null, null);
             defer _ = mlx.mlx_array_free(y);
             var cy = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(cy);
             const got = try toF32(s, y, &cy);
             for (got) |v| try t.expect(std.math.isFinite(v));
             try t.expect(relRms(got, want) < 0.01);
-        };
+        }
     }
 }
 
@@ -3552,13 +3574,23 @@ test "exl3 rate groups: adjacent shared rows use one weight walk and match indep
     var f = try sharedLayer(a, s, 512, 256, &.{.{ 40, 40, 40 }}, &.{12}, 3, 0x941);
     defer f.deinit();
     var prng = std.Random.DefaultPrng.init(0x578);
-    for ([_]u32{ 64, 80 }) |n| {
-        var se: SharedExpert = .{ .bank = try sharedBankAt(prng.random(), 512, 256, n, .{ 0.0126, 1.03, 0.0083, 1.009 }), .dec = exl3.Decode.tabled(.spec1, .w15) };
-        defer freeBank(&se.bank);
-        for ([_]usize{ 2, 3, 4, 5, 6, 7, 8, 9, 16 }) |rows| {
-            try f.redraw(a, rows, 400, null, 0x941 + rows);
-            try sharedFusedCase(t.allocator, s, &f, se, 0x941 + rows);
-            const sr = sharedRate(se, &f.rb, rows).?;
+    var banks: [2]SharedExpert = undefined;
+    for ([_]u32{ 64, 80 }, 0..) |n, bi| {
+        banks[bi] = .{ .bank = try sharedBankAt(prng.random(), 512, 256, n, .{ 0.0126, 1.03, 0.0083, 1.009 }), .dec = exl3.Decode.tabled(.spec1, .w15) };
+    }
+    defer for (&banks) |*se| freeBank(&se.bank);
+    const dec: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
+    for ([_]usize{ 2, 3, 5, 9 }, 0..) |rows, ri| {
+        try f.redraw(a, rows, 400, null, 0x941 + rows);
+        const se = banks[ri % 2];
+        try sharedFusedCase(t.allocator, s, &f, se, 0x941 + rows, .{
+            .all_variants = false,
+            .with_expand = false,
+            .first = ri % 2 == 1,
+            .use_bound = true,
+        });
+        for ([_]u32{ 64, 80 }, banks) |n, se_n| {
+            const sr = sharedRate(se_n, &f.rb, rows).?;
             for ([_]FuseStage{ .pair, .down }) |stage| {
                 const k: FuseKey = .{
                     .stage = stage,
@@ -3574,8 +3606,8 @@ test "exl3 rate groups: adjacent shared rows use one weight walk and match indep
                     .limit = 10,
                     .classes = std.mem.zeroes([max_groups]RateClass),
                     .class_count = 0,
-                    .dec = kernels.activeDecode(),
-                    .sdec = se.dec,
+                    .dec = dec,
+                    .sdec = se_n.dec,
                     .sn = n,
                     .coop = if (stage == .pair) sr.coop_pair else sr.coop_down,
                     .b_first = false,

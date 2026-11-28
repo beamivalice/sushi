@@ -2,15 +2,17 @@
 const std = @import("std");
 const testing = std.testing;
 const mlx = @import("../mlx.zig");
+const model_mod = @import("../model.zig");
 const model_load = @import("../model_load.zig");
 const arch_handle = @import("../arch/handle.zig");
 const arch_sched = @import("../arch/sched.zig");
 const prefix_arch = @import("../arch/prefix.zig");
 const contract = @import("../cooler_contract_test.zig");
+const expert_stream = @import("../expert_stream.zig");
 const Slot = @import("qwen4_test_support.zig").Qwen4TestSlot;
 const io = std.Io.Threaded.global_single_threaded.io();
 
-const decode_steps = 24;
+const decode_steps = 10;
 
 /// What one streamed load of the tiny pack made of the same prompt and the same forced decode tokens.
 const Run = struct {
@@ -36,27 +38,37 @@ fn bytesHash(arr: mlx.mlx_array, s: mlx.mlx_stream) !u64 {
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(wide).?[0..n]));
 }
 
-/// A streamed load at the smallest budget the tiny pack plans, with a cache that holds a third of its experts and its model setting `bias`, run over `ids` and then
-/// `decode_steps` forced tokens: the prefill is one wide chunk and every step a one-row forward.
-fn streamedRun(comptime Q: type, dir: []const u8, ids: []const u32, bias: ?f32) !Run {
-    const a = testing.allocator;
-    var ld: contract.Load = undefined;
-    try ld.prepare(Q, dir, true);
-    {
-        errdefer ld.config.deinit(a);
-        var budget: u64 = 1 << 30;
-        const plan = while (budget <= 64 << 30) : (budget += 1 << 30) {
-            break model_load.planExpertStreamingWith(io, a, &ld.config, dir, budget, false, 0) catch continue;
-        } else return error.TestUnexpectedResult;
-        model_load.applyStreamingPlan(&ld.config, plan, budget);
-        // A cache of twenty experts a layer, of the pack's sixty-four: a one-row step misses.
-        ld.config.expert_cache_bytes = 20 * ld.config.expertLayerCount() * plan.cache.expert_bytes;
-        if (ld.config.expert_source_dir == null) ld.config.expert_source_dir = try a.dupe(u8, dir);
-        try testing.expect(ld.config.expert_streaming and !ld.config.expert_resident);
-        ld.config.expert_cache_bias_override = bias;
+fn resetGroupCache(c: *expert_stream.GroupCache) void {
+    @memset(c.expert_to_slot, -1);
+    @memset(c.slot_to_expert, std.math.maxInt(u16));
+    @memset(c.ages, 0);
+    @memset(c.ready, false);
+    @memset(c.swap_starved, 0);
+    c.tick = 0;
+}
+
+fn resetEngineCaches(engine: *expert_stream.Engine) void {
+    for (engine.layers) |*layer| {
+        resetGroupCache(&layer.cache);
+        if (layer.grouped) |gl| for (gl.caches[0..gl.caches_made]) |*c| resetGroupCache(c);
+        if (layer.spec_slots.ctx != null) {
+            _ = mlx.mlx_array_free(layer.spec_slots);
+            layer.spec_slots = .{ .ctx = null };
+        }
+        if (layer.spec_raw.ctx != null) {
+            _ = mlx.mlx_array_free(layer.spec_raw);
+            layer.spec_raw = .{ .ctx = null };
+        }
+        if (layer.spec_pen.ctx != null) {
+            _ = mlx.mlx_array_free(layer.spec_pen);
+            layer.spec_pen = .{ .ctx = null };
+        }
+        if (layer.spec_host.len != 0) @memset(layer.spec_host, -2);
     }
-    try ld.loadServed(dir);
-    defer _ = ld.close();
+}
+
+fn runOnLoaded(ld: *contract.Load, dir: []const u8, ids: []const u32) !Run {
+    const a = testing.allocator;
     const xfm = ld.xfm;
     const engine = xfm.expert_stream.?;
     const turn = arch_handle.turnFor(ld.h, &ld.config);
@@ -94,16 +106,37 @@ fn streamedRun(comptime Q: type, dir: []const u8, ids: []const u32, bias: ?f32) 
 test "qwen4 cache bias: bias 0 routes as no flag, a bias favours cached experts at one row and never at a wide chunk, and its states keep a namespace (QWEN4_STQ_TINY)" {
     try contract.qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            var exact = try streamedRun(Q, dir, ids, null);
-            defer exact.deinit();
-            var zero = try streamedRun(Q, dir, ids, 0);
-            defer zero.deinit();
-            try testing.expectEqual(exact.prefill, zero.prefill);
-            try testing.expectEqual(exact.decode, zero.decode);
-            try testing.expectEqual(exact.decode_fills, zero.decode_fills);
-            try testing.expect(exact.key == null and zero.key == null);
+            const a = testing.allocator;
+            var ld: contract.Load = undefined;
+            try ld.prepare(Q, dir, true);
+            {
+                errdefer ld.config.deinit(a);
+                var budget: u64 = 1 << 30;
+                const plan = while (budget <= 64 << 30) : (budget += 1 << 30) {
+                    break model_load.planExpertStreamingWith(io, a, &ld.config, dir, budget, false, 0) catch continue;
+                } else return error.TestUnexpectedResult;
+                model_load.applyStreamingPlan(&ld.config, plan, budget);
+                // A cache of twenty experts a layer, of the pack's sixty-four: a one-row step misses.
+                ld.config.expert_cache_bytes = 20 * ld.config.expertLayerCount() * plan.cache.expert_bytes;
+                if (ld.config.expert_source_dir == null) ld.config.expert_source_dir = try a.dupe(u8, dir);
+                try testing.expect(ld.config.expert_streaming and !ld.config.expert_resident);
+                ld.config.test_skip_warm = true;
+                ld.config.expert_cache_bias_override = null;
+                try testing.expectEqual(@as(f32, 0), ld.config.expertCacheBias());
+                ld.config.expert_cache_bias_override = 0;
+                try testing.expectEqual(@as(f32, 0), ld.config.expertCacheBias());
+            }
+            try ld.loadServed(dir);
+            defer _ = ld.close();
 
-            var biased = try streamedRun(Q, dir, ids, 8);
+            var exact = try runOnLoaded(&ld, dir, ids);
+            defer exact.deinit();
+            try testing.expect(exact.key == null);
+
+            resetEngineCaches(ld.xfm.expert_stream.?);
+            ld.xfm.expert_stream.?.cache_bias = 8;
+            ld.config.expert_cache_bias_override = 8;
+            var biased = try runOnLoaded(&ld, dir, ids);
             defer biased.deinit();
             // A wide chunk routes exactly; a one-row step takes a cached expert over a better one it would read.
             errdefer std.debug.print("exact fills {d}, bias 8 fills {d}, decode hashes {x} {x}\n", .{ exact.decode_fills, biased.decode_fills, exact.decode, biased.decode });
@@ -116,26 +149,43 @@ test "qwen4 cache bias: bias 0 routes as no flag, a bias favours cached experts 
 }
 
 test "qwen4 pick tolerance: a lossy pick keeps its states out of the exact namespace, and a tolerance and a bias do not share one (QWEN4_STQ_TINY)" {
-    try contract.qwenTinyServed(struct {
-        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
-            const expert_stream = @import("../expert_stream.zig");
-            const saved = expert_stream.pick_tolerance;
-            defer expert_stream.pick_tolerance = saved;
-            expert_stream.pick_tolerance = 0.3;
-            var picked = try streamedRun(Q, dir, ids, null);
-            defer picked.deinit();
-            var both = try streamedRun(Q, dir, ids, 8);
-            defer both.deinit();
-            expert_stream.pick_tolerance = 0.2;
-            var other = try streamedRun(Q, dir, ids, null);
-            defer other.deinit();
-            expert_stream.pick_tolerance = 0;
-            var biased = try streamedRun(Q, dir, ids, 8);
-            defer biased.deinit();
-            const keys = [_]?[]u8{ picked.key, both.key, other.key, biased.key };
-            for (keys) |k| try testing.expect(k != null);
-            try testing.expect(std.mem.indexOf(u8, picked.key.?, "-pick") != null);
-            for (keys, 0..) |x, i| for (keys[i + 1 ..]) |y| try testing.expect(!std.mem.eql(u8, x.?, y.?));
-        }
-    }.run);
+    const a = testing.allocator;
+    const saved = expert_stream.pick_tolerance;
+    defer expert_stream.pick_tolerance = saved;
+    var xfm = @import("../test_support.zig").testTrunk("qwen4_exp");
+    xfm.arch = .qwen4;
+    var engine = expert_stream.Engine{
+        .allocator = a,
+        .geometry = undefined,
+        .plan = undefined,
+        .store = undefined,
+        .layers = &.{},
+        .s = .{},
+        .forward_clock = undefined,
+        .cache_bias = 0,
+    };
+    xfm.expert_stream = &engine;
+    const cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4 };
+
+    expert_stream.pick_tolerance = 0;
+    try testing.expect((try prefix_arch.diskLayoutKey(a, &cfg, "", &xfm)) == null);
+
+    expert_stream.pick_tolerance = 0.3;
+    const picked = (try prefix_arch.diskLayoutKey(a, &cfg, "", &xfm)) orelse return error.TestUnexpectedResult;
+    defer a.free(picked);
+    engine.cache_bias = 8;
+    const both = (try prefix_arch.diskLayoutKey(a, &cfg, "", &xfm)) orelse return error.TestUnexpectedResult;
+    defer a.free(both);
+    expert_stream.pick_tolerance = 0.2;
+    engine.cache_bias = 0;
+    const other = (try prefix_arch.diskLayoutKey(a, &cfg, "", &xfm)) orelse return error.TestUnexpectedResult;
+    defer a.free(other);
+    expert_stream.pick_tolerance = 0;
+    engine.cache_bias = 8;
+    const biased = (try prefix_arch.diskLayoutKey(a, &cfg, "", &xfm)) orelse return error.TestUnexpectedResult;
+    defer a.free(biased);
+
+    const keys = [_][]const u8{ picked, both, other, biased };
+    try testing.expect(std.mem.indexOf(u8, picked, "-pick") != null);
+    for (keys, 0..) |x, i| for (keys[i + 1 ..]) |y| try testing.expect(!std.mem.eql(u8, x, y));
 }

@@ -478,6 +478,35 @@ fn everyArchConfig(fx: *const fixtures.PinFx, glm_dflash: *const model_mod.Model
     return out[0..n];
 }
 
+fn billSweepPoints(buf: *[96]u64, ctx: u64, chunk: u64, edge: u64) []const u64 {
+    var n: usize = 0;
+    const landmarks = [_]u64{
+        1,          2,          3,          4,          8,          16,         32,         64,
+        128,        255,        256,        257,        511,        512,        513,        1023,
+        1024,       1025,       2047,       2048,       2049,       chunk -| 1, chunk,      chunk + 1,
+        edge -| 2,  edge -| 1,  edge,       edge + 1,   edge + 2,   ctx -| 512, ctx -| 257, ctx -| 256,
+        ctx -| 255, ctx -| 64,  ctx -| 16,  ctx -| 2,   ctx -| 1,   ctx,
+    };
+    for (landmarks) |p| if (p >= 1 and p <= ctx) {
+        buf[n] = p;
+        n += 1;
+    };
+    var p: u64 = 1;
+    while (p <= ctx and n < buf.len) : (p += @max(1, p / 3)) {
+        buf[n] = p;
+        n += 1;
+    }
+    std.mem.sort(u64, buf[0..n], {}, std.sort.asc(u64));
+    var w: usize = 0;
+    for (buf[0..n]) |v| {
+        if (w == 0 or buf[w - 1] != v) {
+            buf[w] = v;
+            w += 1;
+        }
+    }
+    return buf[0..w];
+}
+
 test "a request's prefill phase and its decode phase less the decode transient never fall as its prompt grows within a context, and the regrow alone falls only to nothing, every served arch on each engine, MTP on and off, the SSD tier on and off" {
     var fx = try fixtures.PinFx.init();
     defer fx.deinit();
@@ -497,16 +526,18 @@ test "a request's prefill phase and its decode phase less the decode transient n
             var prev_prefill: u64 = 0;
             var prev_common: u64 = 0;
             var prev_regrow: u64 = 0;
-            var p: u64 = 1;
-            // Every prompt near a step a term may take (the forward widths, 256 rows, the reservation, the end).
-            while (p <= ctx) : (p += @as(u64, if (ctx - p < 600 or p < 1100 or (p + 300 > edge and p < edge + 300) or p % 256 < 3 or p % 256 > 252) 1 else 67)) {
+            var pts_buf: [96]u64 = undefined;
+            for (billSweepPoints(&pts_buf, ctx, chunk, edge)) |p| {
                 const terms = bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm);
                 // A ringed arch bills its rings' compaction at every prompt, which no prompt's capacity holds: that floor is not the regrow.
                 const regrow = (terms.decode_regrow_bytes -| bills.ringCompactionBytes(&probe, 8)) * terms.uplift_16ths / 16;
                 // An arch that prices its own request has one bill, and no regrow.
-                var prefill: u64 = bills.prefillNeededAtChunk(&probe, p, @intCast(ctx - p), 8, chunk, warm);
-                var common = prefill;
-                if (!bills.archBillsRequest(&probe)) {
+                var prefill: u64 = undefined;
+                var common: u64 = undefined;
+                if (bills.archBillsRequest(&probe)) {
+                    prefill = bills.prefillNeededAtChunk(&probe, p, @intCast(ctx - p), 8, chunk, warm);
+                    common = prefill;
+                } else {
                     const phases = bills.requestPhasesFor(&probe, p, @intCast(ctx - p), 8, chunk, warm);
                     prefill = phases.prefill;
                     // What the decode phase holds past the terms both phases hold: the larger of the regrow and a round.

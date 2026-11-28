@@ -3346,17 +3346,17 @@ test "KV growth does not ratchet the MLX buffer pool" {
 
     _ = mlx.mlx_clear_cache();
 
+    var k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k);
+    var v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v);
+    try mlx.check(mlx.mlx_zeros(&k, &shape, 4, .bfloat16, s));
+    try mlx.check(mlx.mlx_zeros(&v, &shape, 4, .bfloat16, s));
     var peak_cache: usize = 0;
     var t: usize = 0;
     while (t < N) : (t += 1) {
         var layer: u32 = 0;
         while (layer < LAYERS) : (layer += 1) {
-            var k = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k);
-            var v = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(v);
-            try mlx.check(mlx.mlx_zeros(&k, &shape, 4, .bfloat16, s));
-            try mlx.check(mlx.mlx_zeros(&v, &shape, 4, .bfloat16, s));
             var view = try cache.update(layer, k, v, s, 0);
             view.deinit();
         }

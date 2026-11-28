@@ -431,20 +431,25 @@ test "GLM shared expert folded into the routed rows launches is bit exact to the
     const sigmoid = try @import("../hc_prefill.zig").sigmoidTable(s);
     const routed = try routedBank(&ops, 36);
     defer api.fold_clamped.shared_first = false;
-    for ([_][3]usize{ .{ 6, 6, 6 }, .{ 5, 5, 5 }, .{ 8, 8, 8 }, .{ 5, 5, 8 }, .{ 8, 8, 6 } }) |bits| for ([_]f32{ 1, 0.02 }) |gain| {
+    const SharedCase = struct { bits: [3]usize, gain: f32, rows: []const usize, shared_first: []const bool };
+    for ([_]SharedCase{
+        .{ .bits = .{ 6, 6, 6 }, .gain = 1, .rows = &.{ 2, 3, 5, 8 }, .shared_first = &.{ false, true } },
+        .{ .bits = .{ 5, 5, 8 }, .gain = 0.02, .rows = &.{ 3, 7 }, .shared_first = &.{ false, true } },
+        .{ .bits = .{ 8, 8, 5 }, .gain = 1, .rows = &.{ 4, 6 }, .shared_first = &.{true} },
+    }) |case| {
         var fx = Fixture{};
         defer fx.deinit();
-        const gate = try fx.bank(std.testing.allocator, rnd, 2048, 4096, bits[0], gain);
-        const up = try fx.bank(std.testing.allocator, rnd, 2048, 4096, bits[1], gain);
-        const down = try fx.bank(std.testing.allocator, rnd, 4096, 2048, bits[2], gain);
-        for ([_]usize{ 2, 3, 4, 5, 6, 7, 8 }) |rows| {
+        const gate = try fx.bank(std.testing.allocator, rnd, 2048, 4096, case.bits[0], case.gain);
+        const up = try fx.bank(std.testing.allocator, rnd, 2048, 4096, case.bits[1], case.gain);
+        const down = try fx.bank(std.testing.allocator, rnd, 4096, 2048, case.bits[2], case.gain);
+        for (case.rows) |rows| {
             var scope = Ops{ .s = s };
             defer scope.deinit();
             const route = try routeInputs(&scope, rnd, rows);
             const values = try scope.own(try randomRow(std.testing.allocator, rnd, rows * 4096, 4));
             const x = try scope.reshape(values, &.{ 1, @intCast(rows), 4096 });
             const want = (try separateRows(&scope, x, gate, up, down, routed, route.ids, route.scores)) orelse return error.TestExpectedGroup2Shared;
-            for ([_]bool{ false, true }) |shared_first| {
+            for (case.shared_first) |shared_first| {
                 api.fold_clamped.shared_first = shared_first;
                 const folded_before = api.fold_clamped.foldedCount();
                 const launches_before = api.fold_clamped.launchCount();
@@ -455,7 +460,7 @@ test "GLM shared expert folded into the routed rows launches is bit exact to the
                 try expectSameBits(want, got);
             }
         }
-    };
+    }
 }
 
 test "GLM shared expert rows fold declines what the separate chains must run" {

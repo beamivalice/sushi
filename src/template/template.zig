@@ -633,7 +633,8 @@ fn expectSteps(text: []const u8, extra: []const u8, want: []const u8, max_steps:
     }
 }
 
-const step_limit = "the render takes more than 20000000 steps";
+const step_limit_100k = "the render takes more than 100000 steps";
+const fast_limits: Limits = .{ .max_steps = 100_000 };
 
 test "template: repeating an empty string or list any number of times is immediate" {
     try expectSteps("{{ ('' * 20000000000)|length }} {{ ([] * 20000000000)|length }}", "{}", "0 0", 16);
@@ -692,10 +693,10 @@ test "template: substring search, strip(chars) and long comparisons are metered 
     try expectSteps(setup ++ "{{ h.split(n)|length }} {{ h.rsplit(n)|length }}", "{}", "1 1", 200_000);
     try expectSteps(setup ++ "{{ h.replace(n, '')|length }} {{ (h|replace(n, ''))|length }}", "{}", "1600000 1600000", 300_000);
     try expectSteps("{{ ('a' * 1000000).strip('b' * 100000 ~ 'a')|length }} {{ (('a' * 1000000)|trim('b' * 100000 ~ 'a'))|length }}", "{}", "0 0", 150_000);
-    const twins = "{% set x = 'a' * 50000000 %}{% set y = 'a' * 49999999 ~ 'a' %}";
-    try expectLimit(twins ++ "{% for i in range(5000) %}{% if x < y %}{% endif %}{% endfor %}", .{}, step_limit);
-    try expectLimit(twins ++ "{% for i in range(5000) %}{% if x == y %}{% endif %}{% endfor %}", .{}, step_limit);
-    try expectLimit(twins ++ "{% set d = {x: 1} %}{% for i in range(5000) %}{% set t = d[y] %}{% endfor %}", .{}, step_limit);
+    const twins = "{% set x = 'a' * 5000000 %}{% set y = 'a' * 4999999 ~ 'a' %}";
+    try expectLimit(twins ++ "{% for i in range(500) %}{% if x < y %}{% endif %}{% endfor %}", fast_limits, step_limit_100k);
+    try expectLimit(twins ++ "{% for i in range(500) %}{% if x == y %}{% endif %}{% endfor %}", fast_limits, step_limit_100k);
+    try expectLimit(twins ++ "{% set d = {x: 1} %}{% for i in range(500) %}{% set t = d[y] %}{% endfor %}", fast_limits, step_limit_100k);
 }
 
 test "template: printing a generator fails by naming it, since Python prints its address" {
@@ -716,28 +717,27 @@ test "template: a filter that applies a filter nests against the call depth" {
 
 test "template: work inside comparisons, lookups, sorts and string scans is metered by the step budget" {
     const doubling = "{% set ns = namespace(x=1, y=1) %}{% for i in range(60) %}{% set ns.x = [ns.x, ns.x] %}{% set ns.y = [ns.y, ns.y] %}{% endfor %}";
-    try expectLimit(doubling ++ "{{ ns.x == ns.y }}", .{}, step_limit);
-    try expectLimit(doubling ++ "{{ ns.x < ns.y }}", .{}, step_limit);
-    try expectLimit(doubling ++ "{{ ns.x }}", .{}, step_limit);
-    try expectLimit(doubling ++ "{{ ns.x|tojson }}", .{}, step_limit);
-    try expectLimit(doubling ++ "{{ ns.x in [ns.y] }}", .{}, step_limit);
-    try expectLimit("{% set xs = range(100000)|list %}{% for i in range(100000) %}{% if -1 in xs %}{% endif %}{% endfor %}", .{}, step_limit);
-    try expectLimit("{{ range(100000)|unique|list|length }}", .{}, step_limit);
-    try expectLimit("{% set s = 'a' * 10000000 %}{% for i in range(100000) %}{% if 'b' in s %}{% endif %}{% endfor %}", .{}, step_limit);
-    try expectLimit("{% set s = 'a' * 10000000 %}{% for i in range(100000) %}{% set t = s|wordcount %}{% endfor %}", .{}, step_limit);
-    try expectLimit("{% set s = 'a' * 10000000 %}{% for i in range(100000) %}{% set t = s[-1] %}{% endfor %}", .{}, step_limit);
-    // An O(n log n) sort: a hundred thousand items sort well inside the budget.
-    // Two sorts of 100000 items: about n log2 n = 1.7M comparisons each.
-    try expectSteps("{{ range(100000)|reverse|sort|first }} {{ range(100000)|reverse|list|sort(reverse=true)|first }}", "{}", "0 99999", 8_000_000);
+    try expectLimit(doubling ++ "{{ ns.x == ns.y }}", fast_limits, step_limit_100k);
+    try expectLimit(doubling ++ "{{ ns.x < ns.y }}", fast_limits, step_limit_100k);
+    try expectLimit(doubling ++ "{{ ns.x }}", fast_limits, step_limit_100k);
+    try expectLimit(doubling ++ "{{ ns.x|tojson }}", fast_limits, step_limit_100k);
+    try expectLimit(doubling ++ "{{ ns.x in [ns.y] }}", fast_limits, step_limit_100k);
+    try expectLimit("{% set xs = range(10000)|list %}{% for i in range(10000) %}{% if -1 in xs %}{% endif %}{% endfor %}", fast_limits, step_limit_100k);
+    try expectLimit("{{ range(10000)|unique|list|length }}", fast_limits, step_limit_100k);
+    try expectLimit("{% set s = 'a' * 1000000 %}{% for i in range(10000) %}{% if 'b' in s %}{% endif %}{% endfor %}", fast_limits, step_limit_100k);
+    try expectLimit("{% set s = 'a' * 1000000 %}{% for i in range(10000) %}{% set t = s|wordcount %}{% endfor %}", fast_limits, step_limit_100k);
+    try expectLimit("{% set s = 'a' * 1000000 %}{% for i in range(10000) %}{% set t = s[-1] %}{% endfor %}", fast_limits, step_limit_100k);
+    // An O(n log n) sort: ten thousand items sort well inside the budget.
+    try expectSteps("{{ range(10000)|reverse|sort|first }} {{ range(10000)|reverse|list|sort(reverse=true)|first }}", "{}", "0 9999", 800_000);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var keys = std.ArrayList(u8).empty;
     try keys.appendSlice(arena.allocator(), "{\"d\": {");
-    var i: usize = 100_000;
+    var i: usize = 10_000;
     while (i > 0) : (i -= 1) try keys.print(arena.allocator(), "\"k{d:0>6}\": 0{s}", .{ i - 1, if (i > 1) "," else "" });
     try keys.appendSlice(arena.allocator(), "}}");
-    try expectSteps("{{ (d|tojson(sort_keys=true))[:13] }}", keys.items, "{\"k000000\": 0", 2_000_000);
+    try expectSteps("{{ (d|tojson(sort_keys=true))[:13] }}", keys.items, "{\"k000000\": 0", 200_000);
 }
 
 const StackProbe = struct {

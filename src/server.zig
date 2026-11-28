@@ -1088,6 +1088,7 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
     var fd_quota_logged = false;
 
     while (!server_state.shutdown_requested.load(.acquire)) {
+        if (comptime @import("builtin").is_test) accept_entered_for_test.store(true, .release);
         // Poll with 1-second timeout so we can check shutdown flag
         const poll_result = std.posix.poll(poll_fds[0..nfds], 1000) catch |err| {
             if (server_state.shutdown_requested.load(.acquire)) break;
@@ -4508,12 +4509,15 @@ test "a kv_quant the arch refuses ends a Responses WebSocket turn in its error f
     try std.testing.expect(std.mem.startsWith(u8, frames.out.items, "{\"type\":\"error\",\"status\":400,"));
 }
 
+var accept_entered_for_test = std.atomic.Value(bool).init(false);
+
 test "acceptLoop wakes on requestShutdown without waiting out the poll timeout" {
     const t = std.testing;
     const prev = server_state.shutdown_requested.swap(false, .acq_rel);
     defer server_state.shutdown_requested.store(prev, .release);
+    accept_entered_for_test.store(false, .release);
     const th = try std.Thread.spawn(.{}, acceptLoop, .{ t.allocator, t.io, @as(?*std.Io.net.Server, null) });
-    std.Io.sleep(t.io, .fromMilliseconds(50), .awake) catch {};
+    while (!accept_entered_for_test.load(.acquire)) std.Thread.yield() catch {};
     const t0 = io_util.nowMsMonotonic(t.io);
     requestShutdown();
     th.join();

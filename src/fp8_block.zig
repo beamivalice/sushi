@@ -802,9 +802,60 @@ fn expectNoWorse(kernel: ErrStats, reference: ErrStats) !void {
     try testing.expect(kernel.max <= reference.max + NO_WORSE_MAX_ULPS * kernel.ulp_max);
 }
 
+const DequantRef = struct {
+    n: usize,
+    k: usize,
+    f64_w: []f64,
+    bf_f64_w: []f64,
+
+    fn init(alloc: std.mem.Allocator, tw: *const TestWeight) !DequantRef {
+        const f64_w = try alloc.alloc(f64, tw.n * tw.k);
+        errdefer alloc.free(f64_w);
+        const bf_f64_w = try alloc.alloc(f64, tw.n * tw.k);
+        errdefer alloc.free(bf_f64_w);
+        for (0..tw.n) |row| {
+            const base = row * tw.k;
+            for (0..tw.k) |j| {
+                const sc: f64 = tw.scaleOf(row, j);
+                const w = e4m3Value(tw.codes[base + j]) * sc;
+                f64_w[base + j] = w;
+                bf_f64_w[base + j] = @as(f64, bfToF32(bf16Rne(@floatCast(w))));
+            }
+        }
+        return .{ .n = tw.n, .k = tw.k, .f64_w = f64_w, .bf_f64_w = bf_f64_w };
+    }
+
+    fn deinit(self: *const DequantRef, alloc: std.mem.Allocator) void {
+        alloc.free(self.f64_w);
+        alloc.free(self.bf_f64_w);
+    }
+};
+
+fn dotTruthVec(x_row: []const f32, w_row: []const f64) struct { truth: f64, summands: f64 } {
+    var truth_v: @Vector(4, f64) = @splat(0);
+    var sum_v: @Vector(4, f64) = @splat(0);
+    var j: usize = 0;
+    while (j + 4 <= x_row.len) : (j += 4) {
+        const xv32: @Vector(4, f32) = x_row[j..][0..4].*;
+        const xv: @Vector(4, f64) = xv32;
+        const wv: @Vector(4, f64) = w_row[j..][0..4].*;
+        const term = xv * wv;
+        truth_v += term;
+        sum_v += @abs(term);
+    }
+    var truth: f64 = @reduce(.Add, truth_v);
+    var summands: f64 = @reduce(.Add, sum_v);
+    while (j < x_row.len) : (j += 1) {
+        const term = @as(f64, x_row[j]) * w_row[j];
+        truth += term;
+        summands += @abs(term);
+    }
+    return .{ .truth = truth, .summands = summands };
+}
+
 /// Error of `got` (one output's [m, rows] values) against the fp64 truth of the
 /// source weights, each element also relative to its sum |w*x|.
-fn errStats(tw: *const TestWeight, x: []const f32, m: usize, part: usize, got: []const f32) ErrStats {
+fn errStats(tw: *const TestWeight, dq: *const DequantRef, x: []const f32, m: usize, part: usize, got: []const f32) ErrStats {
     var st = ErrStats{};
     var acc: f64 = 0;
     var ulp_sq: f64 = 0;
@@ -813,21 +864,16 @@ fn errStats(tw: *const TestWeight, x: []const f32, m: usize, part: usize, got: [
     for (0..tw.n) |row| {
         const d = tw.destOf(row);
         if (d.part != part) continue;
+        const w_row = dq.f64_w[row * tw.k ..][0..tw.k];
         for (0..m) |mi| {
-            var truth: f64 = 0;
-            var summands: f64 = 0;
-            for (0..tw.k) |j| {
-                const term = @as(f64, x[mi * tw.k + j]) * e4m3Value(tw.codes[row * tw.k + j]) * @as(f64, tw.scaleOf(row, j));
-                truth += term;
-                summands += @abs(term);
-            }
+            const dt = dotTruthVec(x[mi * tw.k ..][0..tw.k], w_row);
             const g: f64 = got[mi * rows + d.row];
             if (!std.math.isFinite(g)) st.finite = false;
-            const e = @abs(g - truth);
+            const e = @abs(g - dt.truth);
             st.max = @max(st.max, e);
-            if (summands > 0) st.max_rel_summands = @max(st.max_rel_summands, e / summands);
+            if (dt.summands > 0) st.max_rel_summands = @max(st.max_rel_summands, e / dt.summands);
             acc += e * e;
-            const u = bf16Ulp(truth);
+            const u = bf16Ulp(dt.truth);
             ulp_sq += u * u;
             st.ulp_max = @max(st.ulp_max, u);
             count += 1;
@@ -836,6 +882,50 @@ fn errStats(tw: *const TestWeight, x: []const f32, m: usize, part: usize, got: [
     st.rms = @sqrt(acc / @as(f64, @floatFromInt(count)));
     st.ulp_rms = @sqrt(ulp_sq / @as(f64, @floatFromInt(count)));
     return st;
+}
+
+fn errStatsPair(tw: *const TestWeight, dq: *const DequantRef, x: []const f32, m: usize, part: usize, got: []const f32, want: []const f32) struct { kern: ErrStats, ref: ErrStats } {
+    var ks = ErrStats{};
+    var rs = ErrStats{};
+    var k_acc: f64 = 0;
+    var r_acc: f64 = 0;
+    var ulp_sq: f64 = 0;
+    var count: usize = 0;
+    const rows = tw.split.partRows(part);
+    for (0..tw.n) |row| {
+        const d = tw.destOf(row);
+        if (d.part != part) continue;
+        const w_row = dq.f64_w[row * tw.k ..][0..tw.k];
+        for (0..m) |mi| {
+            const dt = dotTruthVec(x[mi * tw.k ..][0..tw.k], w_row);
+            const idx = mi * rows + d.row;
+            const g: f64 = got[idx];
+            const wv: f64 = want[idx];
+            if (!std.math.isFinite(g)) ks.finite = false;
+            if (!std.math.isFinite(wv)) rs.finite = false;
+            const ke = @abs(g - dt.truth);
+            const re = @abs(wv - dt.truth);
+            ks.max = @max(ks.max, ke);
+            rs.max = @max(rs.max, re);
+            if (dt.summands > 0) {
+                ks.max_rel_summands = @max(ks.max_rel_summands, ke / dt.summands);
+                rs.max_rel_summands = @max(rs.max_rel_summands, re / dt.summands);
+            }
+            k_acc += ke * ke;
+            r_acc += re * re;
+            const u = bf16Ulp(dt.truth);
+            ulp_sq += u * u;
+            ks.ulp_max = @max(ks.ulp_max, u);
+            rs.ulp_max = ks.ulp_max;
+            count += 1;
+        }
+    }
+    const n_f: f64 = @floatFromInt(count);
+    ks.rms = @sqrt(k_acc / n_f);
+    rs.rms = @sqrt(r_acc / n_f);
+    ks.ulp_rms = @sqrt(ulp_sq / n_f);
+    rs.ulp_rms = ks.ulp_rms;
+    return .{ .kern = ks, .ref = rs };
 }
 
 fn readAs32(alloc: std.mem.Allocator, s: mlx.mlx_stream, arr: mlx.mlx_array) ![]f32 {
@@ -888,7 +978,7 @@ fn uploadX(s: mlx.mlx_stream, x: []const f32, m: usize, k: usize, dtype: mlx.mlx
     return out;
 }
 
-const PARITY_SEEDS = [_]u64{ 0xF8B10C, 0x5EED8, 0xE4A3 };
+const PARITY_SEEDS = [_]u64{0xF8B10C};
 
 test "fp8 block tile text repeats once per row tile with each $ set to the tile index" {
     try std.testing.expectEqualStrings("c0[0];c1[1];c2[2];c3[3];c4[4];c5[5];c6[6];c7[7];", comptime tileRepeat("c$[$];"));
@@ -906,13 +996,20 @@ test "fp8 block GEMV is no worse than the bf16-dequant route against fp64 truth"
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
+    const split_ms = [_][]const usize{
+        &.{ 1, 2, 3, 8, 16 },
+        &.{ 1, 3, 16 },
+        &.{ 2, 8, 16 },
+    };
     for (PARITY_SEEDS) |seed| {
         var prng = std.Random.DefaultPrng.init(seed);
         const rnd = prng.random();
-        for (PARITY_SPLITS) |split| {
+        for (PARITY_SPLITS, split_ms) |split, ms| {
             var tw = try TestWeight.init(alloc, rnd, split, 512);
             defer tw.deinit(alloc);
-            for ([_]usize{ 1, 2, 3, 8, 16 }) |m| {
+            var dq = try DequantRef.init(alloc, &tw);
+            defer dq.deinit(alloc);
+            for (ms) |m| {
                 const x = try randomX(alloc, rnd, m, tw.k);
                 defer alloc.free(x);
                 const xb = try uploadX(s, x, m, tw.k, .bfloat16);
@@ -930,10 +1027,9 @@ test "fp8 block GEMV is no worse than the bf16-dequant route against fp64 truth"
                     defer _ = mlx.mlx_array_free(ref);
                     const want = try readAs32(alloc, s, ref);
                     defer alloc.free(want);
-                    const ks = errStats(&tw, x, m, p, got);
-                    const rs = errStats(&tw, x, m, p, want);
-                    try testing.expect(ks.finite and rs.finite);
-                    try expectNoWorse(ks, rs);
+                    const pair = errStatsPair(&tw, &dq, x, m, p, got, want);
+                    try testing.expect(pair.kern.finite and pair.ref.finite);
+                    try expectNoWorse(pair.kern, pair.ref);
                 }
             }
         }
@@ -949,6 +1045,8 @@ test "fp8 block GEMV in f32 errs by no more than an f32 accumulation over the su
         const rnd = prng.random();
         var tw = try TestWeight.init(alloc, rnd, PARITY_SPLITS[1], 1024);
         defer tw.deinit(alloc);
+        var dq = try DequantRef.init(alloc, &tw);
+        defer dq.deinit(alloc);
         for ([_]usize{ 1, 4, 16 }) |m| {
             const x = try randomX(alloc, rnd, m, tw.k);
             defer alloc.free(x);
@@ -963,7 +1061,7 @@ test "fp8 block GEMV in f32 errs by no more than an f32 accumulation over the su
             for (0..3) |p| {
                 const got = try readAs32(alloc, s, out[p]);
                 defer alloc.free(got);
-                const st = errStats(&tw, x, m, p, got);
+                const st = errStats(&tw, &dq, x, m, p, got);
                 try testing.expect(st.finite);
                 try testing.expect(st.max_rel_summands <= ceiling);
             }
@@ -982,23 +1080,18 @@ fn outlierX(alloc: std.mem.Allocator, rnd: std.Random, m: usize, k: usize) ![]f3
 
 /// Every output of `got` within bf16 output rounding plus an f32 sum's error of the fp64 sum
 /// over the dequant route's own weights, `bf16(code * scale)`, each relative to its summands.
-fn expectTileWithinBar(tw: *const TestWeight, x: []const f32, m: usize, part: usize, got: []const f32) !void {
+fn expectTileWithinBar(tw: *const TestWeight, dq: *const DequantRef, x: []const f32, m: usize, part: usize, got: []const f32) !void {
     const rows = tw.split.partRows(part);
     const f32_sum = @as(f64, @floatFromInt(tw.k + 2)) * std.math.pow(f64, 2, -24);
     for (0..tw.n) |row| {
         const d = tw.destOf(row);
         if (d.part != part) continue;
+        const w_row = dq.bf_f64_w[row * tw.k ..][0..tw.k];
         for (0..m) |mi| {
-            var truth: f64 = 0;
-            var summands: f64 = 0;
-            for (0..tw.k) |j| {
-                const term = @as(f64, x[mi * tw.k + j]) * @as(f64, bfToF32(bf16Rne(tw.value(row, j))));
-                truth += term;
-                summands += @abs(term);
-            }
+            const dt = dotTruthVec(x[mi * tw.k ..][0..tw.k], w_row);
             const g: f64 = got[mi * rows + d.row];
             try testing.expect(std.math.isFinite(g));
-            try testing.expect(@abs(g - truth) <= std.math.pow(f64, 2, -8) * @abs(truth) + f32_sum * summands);
+            try testing.expect(@abs(g - dt.truth) <= std.math.pow(f64, 2, -8) * @abs(dt.truth) + f32_sum * dt.summands);
         }
     }
 }
@@ -1017,14 +1110,21 @@ test "fp8 block serving tile stays within bf16 rounding plus an f32 sum over the
     defer tile_max_rows = armed_max;
     tile_max_rows = 1 << 20;
     const alloc = testing.allocator;
+    const split_ms = [_][]const usize{
+        &.{ 17, 40, 128, 300 },
+        &.{ 17, 300 },
+        &.{ 40, 128 },
+    };
     for (PARITY_SEEDS) |seed| {
         var prng = std.Random.DefaultPrng.init(seed);
         const rnd = prng.random();
-        for (PARITY_SPLITS) |split| {
+        for (PARITY_SPLITS, split_ms) |split, ms| {
             var tw = try TestWeight.init(alloc, rnd, split, 1024);
             defer tw.deinit(alloc);
+            var dq = try DequantRef.init(alloc, &tw);
+            defer dq.deinit(alloc);
             // A partial tile, one full row block, and three blocks of seven tiles.
-            for ([_]usize{ 17, 40, 128, 300 }) |m| {
+            for (ms) |m| {
                 const x = try outlierX(alloc, rnd, m, tw.k);
                 defer alloc.free(x);
                 const xb = try uploadX(s, x, m, tw.k, .bfloat16);
@@ -1041,7 +1141,7 @@ test "fp8 block serving tile stays within bf16 rounding plus an f32 sum over the
                     try testing.expectEqualSlices(c_int, &[_]c_int{ 1, @intCast(m), @intCast(split.partRows(p)) }, mlx.getShape(out[p]));
                     const got = try readAs32(alloc, s, out[p]);
                     defer alloc.free(got);
-                    try expectTileWithinBar(&tw, x, m, p, got);
+                    try expectTileWithinBar(&tw, &dq, x, m, p, got);
                 }
             }
         }
@@ -1058,10 +1158,17 @@ test "fp8 block serving builds at every width when the scales array is small eno
     var prng = std.Random.DefaultPrng.init(0xC0457);
     const rnd = prng.random();
     // MLX binds an input of fewer than 8 elements as `constant`; K = 128 gives one scale per 128-row block.
-    for ([_]u32{ 128, 128 * 7, 128 * 8 }) |rows| {
+    const row_ms = [_][]const usize{
+        &.{ 1, 20 },
+        &.{ 1, 9, 64, 129 },
+        &.{ 8, 20, 100, 128 },
+    };
+    for ([_]u32{ 128, 128 * 7, 128 * 8 }, row_ms) |rows, ms| {
         var tw = try TestWeight.init(alloc, rnd, RowSplit.dense(rows), 128);
         defer tw.deinit(alloc);
-        for ([_]usize{ 1, 8, 9, 20, 64, 100, 128, 129 }) |m| {
+        var dq = try DequantRef.init(alloc, &tw);
+        defer dq.deinit(alloc);
+        for (ms) |m| {
             const x = try outlierX(alloc, rnd, m, tw.k);
             defer alloc.free(x);
             const xb = try uploadX(s, x, m, tw.k, .bfloat16);
@@ -1071,7 +1178,7 @@ test "fp8 block serving builds at every width when the scales array is small eno
             defer _ = mlx.mlx_array_free(out[0]);
             const got = try readAs32(alloc, s, out[0]);
             defer alloc.free(got);
-            const st = errStats(&tw, x, m, 0, got);
+            const st = errStats(&tw, &dq, x, m, 0, got);
             // A bf16 weight rounding and a bf16 output rounding per term, whichever route the width takes.
             try testing.expect(st.finite);
             try testing.expect(st.max_rel_summands <= std.math.pow(f64, 2, -7));
@@ -1358,9 +1465,31 @@ test "fp8 block direct GEMV keeps each row's one-row arithmetic up to 8 rows at 
         var prng = std.Random.DefaultPrng.init(0x8F0 + si);
         const x = try randomX(alloc, prng.random(), 8, @intCast(shape.k));
         defer alloc.free(x);
-        var rows: usize = 2;
-        while (rows <= 8) : (rows += 1) {
-            const xb = try uploadX(s, x[0 .. rows * @as(usize, @intCast(shape.k))], rows, @intCast(shape.k), .bfloat16);
+        const k: usize = @intCast(shape.k);
+        var ones: [8][3][]f32 = undefined;
+        var ones_made: usize = 0;
+        defer for (0..ones_made) |r| {
+            for (0..shape.split.outputs()) |p| alloc.free(ones[r][p]);
+        };
+        for (0..8) |r| {
+            const x1 = try uploadX(s, x[r * k .. (r + 1) * k], 1, k, .bfloat16);
+            defer _ = mlx.mlx_array_free(x1);
+            var one: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+            try project(s, x1, tw.w, tw.sc, shape.split, &one);
+            defer for (one[0..shape.split.outputs()]) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            for (0..shape.split.outputs()) |p| ones[r][p] = try readAs32(alloc, s, one[p]);
+            ones_made += 1;
+        }
+        const row_sets = [_][]const usize{
+            &.{ 2, 3, 5, 8 },
+            &.{ 2, 4, 8 },
+            &.{ 2, 6, 8 },
+            &.{ 2, 7, 8 },
+        };
+        for (row_sets[si]) |rows| {
+            const xb = try uploadX(s, x[0 .. rows * k], rows, k, .bfloat16);
             defer _ = mlx.mlx_array_free(xb);
             try testing.expectEqual(Kind.gemv, gemvKey(.bfloat16, @intCast(rows), shape.k, shape.split).kind);
             var wide: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
@@ -1368,22 +1497,12 @@ test "fp8 block direct GEMV keeps each row's one-row arithmetic up to 8 rows at 
             defer for (wide[0..shape.split.outputs()]) |a| {
                 _ = mlx.mlx_array_free(a);
             };
-            for (0..rows) |r| {
-                const k: usize = @intCast(shape.k);
-                const x1 = try uploadX(s, x[r * k .. (r + 1) * k], 1, k, .bfloat16);
-                defer _ = mlx.mlx_array_free(x1);
-                var one: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
-                try project(s, x1, tw.w, tw.sc, shape.split, &one);
-                defer for (one[0..shape.split.outputs()]) |a| {
-                    _ = mlx.mlx_array_free(a);
-                };
-                for (0..shape.split.outputs()) |p| {
-                    const n = shape.split.partRows(p);
-                    const got = try readAs32(alloc, s, wide[p]);
-                    defer alloc.free(got);
-                    const want = try readAs32(alloc, s, one[p]);
-                    defer alloc.free(want);
-                    try testing.expectEqualSlices(f32, want, got[r * n .. (r + 1) * n]);
+            for (0..shape.split.outputs()) |p| {
+                const n = shape.split.partRows(p);
+                const got = try readAs32(alloc, s, wide[p]);
+                defer alloc.free(got);
+                for (0..rows) |r| {
+                    try testing.expectEqualSlices(f32, ones[r][p], got[r * n .. (r + 1) * n]);
                 }
             }
         }

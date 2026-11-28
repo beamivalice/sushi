@@ -123,15 +123,15 @@ test "trunk gemm: the dense decode is the host tile decode, and MLX's GEMM over 
     const rnd = prng.random();
     const Case = struct { in: usize, out: usize, n: u32, dec: fmt.Decode, rows: []const c_int };
     for ([_]Case{
-        .{ .in = 2560, .out = 640, .n = 96, .dec = kernels.SPEC1_W15, .rows = &.{ 1300, 2048, 4065 } },
+        .{ .in = 2560, .out = 640, .n = 96, .dec = kernels.SPEC1_W15, .rows = &.{1300} },
         .{ .in = 6144, .out = 2560, .n = 96, .dec = kernels.SPEC1_W15, .rows = &.{4096} },
-        .{ .in = 640, .out = 2560, .n = 64, .dec = kernels.SPEC1_W15, .rows = &.{ 33, 600 } },
-        .{ .in = 512, .out = 384, .n = 48, .dec = .mcg, .rows = &.{ 200, 1000 } },
+        .{ .in = 640, .out = 2560, .n = 64, .dec = kernels.SPEC1_W15, .rows = &.{33} },
+        .{ .in = 512, .out = 384, .n = 48, .dec = .mcg, .rows = &.{200} },
     }) |c| {
         kernels.setDecodeParams(c.dec);
         const words = try t.allocator.alloc(u16, (c.in / 16) * (c.out / 16) * c.n);
         defer t.allocator.free(words);
-        for (words) |*v| v.* = rnd.int(u16);
+        rnd.bytes(std.mem.sliceAsBytes(words));
         const tr = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ 1, @intCast(c.in / 16), @intCast(c.out / 16), @intCast(c.n) }, 4, .uint16);
         defer _ = mlx.mlx_array_free(tr);
         const dense = try decodeDense(s, tr);

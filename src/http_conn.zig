@@ -3227,6 +3227,32 @@ test "read: a field name with whitespace before its colon, a folded line or a ba
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
+test "read: Content-Length without space after colon is accepted and malformed Content-Length headers are 400, never dropped" {
+    const body = "{\"model\":\"tiny2\"}";
+    const ok = try readAgainst(.{
+        .sent = "POST /v1/unload-model HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length:17\r\n\r\n" ++ body,
+        .limit_ms = 500,
+    });
+    defer freeRead(ok);
+    try std.testing.expect(ok.outcome == .request and std.mem.eql(u8, ok.body, body));
+    var bad: usize = 0;
+    for ([_][]const u8{
+        "Content-Length : 17\r\n",
+        "Content-Length\t:17\r\n",
+        "Content-Length: 1\r\n 7\r\n",
+        "X-A: b\nContent-Length: 17\r\n",
+    }) |field| {
+        const sent = try std.mem.concat(std.testing.allocator, u8, &.{ "POST /v1/unload-model HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n", field, "\r\n", body });
+        defer std.testing.allocator.free(sent);
+        const r = try readAgainst(.{ .sent = sent, .limit_ms = 500 });
+        defer freeRead(r);
+        const whole = r.outcome == .request and std.mem.eql(u8, r.body, body);
+        const refused = std.mem.startsWith(u8, r.reply, "HTTP/1.1 400 ");
+        if (!whole and !refused) bad += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
 test "read: a chunk size is hex digits alone: a sign, an underscore or a negative zero is a 400" {
     // RFC 9112 §7.1: chunk-size = 1*HEXDIG. The sibling rule http_head took for Content-Length ("1_6" and "+16" are a
     // 400, its own test): Zig's parseInt also reads '+', '_' and "-0".

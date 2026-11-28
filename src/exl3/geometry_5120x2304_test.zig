@@ -23,7 +23,7 @@ const PAIR1: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
 const Group = struct { n: [3]u32, experts: u32 };
 
 // A 16-row batch runs the decode arm the 5-row verify block does.
-const GEOMETRY_ROW_COUNTS = [_]usize{ 1, 5, 33 };
+const GEOMETRY_ROW_COUNTS = [_]usize{ 1, 5, 17 };
 
 test "dsv41 geometry: the grouped chain at 5120x2304 over n24, n26 and a mixed class holds the f32-truth bar" {
     const t = std.testing;

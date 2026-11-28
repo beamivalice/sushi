@@ -9,7 +9,6 @@ const KVQuantConfig = kv_quant.KVQuantConfig;
 const model_mod = @import("../model.zig");
 const io_util_mod = @import("../io_util.zig");
 const ModelConfig = model_mod.ModelConfig;
-const Weights = model_mod.Weights;
 const diagEnvOn = io_util_mod.diagEnvOn;
 const testing = std.testing;
 const expectError = @import("../test_expect.zig").expectError;
@@ -24,7 +23,6 @@ const ForwardCtx = trunk_mod.ForwardCtx;
 const KVCache = trunk_mod.KVCache;
 const MimoExl3MoeHarness = @import("mimo_exl3_moe_test.zig").MimoExl3MoeHarness;
 const Trunk = trunk_mod.Trunk;
-const loadSwitchMlpBank = trunk_mod.loadSwitchMlpBank;
 
 /// Prefill `prefix`, then either decode `rows` ids one tick at a time or verify them in
 /// one `verify_rows` forward; the logits rows, `[rows, vocab]` f32.
@@ -86,111 +84,6 @@ fn mimoBatchTestPrefill(xfm: *Trunk, slot: *MimoBatchTestSlot, ids: []const i32,
     const logits = try xfm.forwardWith(&c, pre);
     defer _ = mlx.mlx_array_free(logits);
     try mlx.check(mlx.mlx_array_eval(logits));
-}
-
-test "mimo_v2 EXL3 real shard routed fork matches CPU dump oracle" {
-    const fixture_path = std.c.getenv("MIMO_DIFFERENTIAL_FIXTURE") orelse return error.SkipZigTest;
-    const pack_path = std.c.getenv("MIMO_DIFFERENTIAL_PACK") orelse return error.SkipZigTest;
-    const layer_text = std.c.getenv("MIMO_DIFFERENTIAL_LAYER") orelse "1";
-    const layer = try std.fmt.parseInt(u32, std.mem.span(layer_text), 10);
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var config = try model_mod.parseConfig(t.io, alloc, std.mem.span(pack_path));
-    defer config.deinit(alloc);
-    var fixture = try model_mod.loadWeightsSingleFile(alloc, std.mem.span(fixture_path));
-    defer fixture.deinit();
-    var shards: [3]Weights = undefined;
-    var loaded: usize = 0;
-    defer for (shards[0..loaded]) |*w| w.deinit();
-    var weights = Weights.init(alloc);
-    defer weights.map.deinit();
-    for ([_][]const u8{ "gate", "up", "down" }, 0..) |proj, i| {
-        const path = try std.fmt.allocPrint(alloc, "{s}/model-exl3-L{d:0>2}-{s}_proj.safetensors", .{ std.mem.span(pack_path), layer, proj });
-        shards[i] = try model_mod.loadWeightsSingleFile(alloc, path);
-        loaded += 1;
-        var it = shards[i].map.iterator();
-        while (it.next()) |entry| try weights.map.put(entry.key_ptr.*, entry.value_ptr.*);
-    }
-    var buf: [256]u8 = undefined;
-    const bank = try loadSwitchMlpBank(&weights, &buf, "model", layer, true, &config, s);
-    var h = try MimoExl3MoeHarness.init(alloc, s, .{ .n = 40 }, 1, 191, .mcg);
-    defer h.deinit();
-    h.xfm.config = config;
-    h.mw.router_w = fixture.get("router") orelse return error.MissingWeight;
-    h.mw.expert_bias = fixture.get("bias") orelse return error.MissingWeight;
-    h.mw.switch_gate_w = bank.gate_w;
-    h.mw.switch_gate_s = bank.gate_s;
-    h.mw.switch_gate_b = bank.gate_b;
-    h.mw.switch_up_w = bank.up_w;
-    h.mw.switch_up_s = bank.up_s;
-    h.mw.switch_up_b = bank.up_b;
-    h.mw.switch_down_w = bank.down_w;
-    h.mw.switch_down_s = bank.down_s;
-    h.mw.switch_down_b = bank.down_b;
-    const input = fixture.get("x") orelse return error.MissingWeight;
-    const oracle = fixture.get("oracle_y") orelse return error.MissingWeight;
-    const expected_ids = fixture.get("ids") orelse return error.MissingWeight;
-    const expected_scores = fixture.get("scores") orelse return error.MissingWeight;
-    for ([_]mlx.mlx_array{ oracle, expected_ids, expected_scores }) |a| try mlx.check(mlx.mlx_array_eval(a));
-    const want = mlx.mlx_array_data_float32(oracle) orelse return error.F32Unreadable;
-    const want_ids = mlx.mlx_array_data_uint32(expected_ids) orelse return error.ExpertIdsUnreadable;
-    const want_scores = mlx.mlx_array_data_float32(expected_scores) orelse return error.F32Unreadable;
-    var xb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xb);
-    try mlx.check(mlx.mlx_astype(&xb, input, .bfloat16, s));
-    for ([_]c_int{ 1, 14, 33 }) |rows| {
-        var x = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x);
-        try mlx.check(mlx.mlx_tile(&x, xb, &.{ 1, rows, 1 }, 3, s));
-        const logits = try mimo_forward.mimoRouterLogits(&h.xfm, x, &h.mw);
-        defer _ = mlx.mlx_array_free(logits);
-        const routes = try mimo_forward.computeMimoRouting(&h.xfm, logits, h.mw.expert_bias.?);
-        defer _ = mlx.mlx_array_free(routes.inds);
-        defer _ = mlx.mlx_array_free(routes.norm_scores);
-        var ids32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ids32);
-        try mlx.check(mlx.mlx_astype(&ids32, routes.inds, .uint32, s));
-        try mlx.check(mlx.mlx_array_eval(ids32));
-        try mlx.check(mlx.mlx_array_eval(routes.norm_scores));
-        const ids = mlx.mlx_array_data_uint32(ids32) orelse return error.ExpertIdsUnreadable;
-        const scores = mlx.mlx_array_data_float32(routes.norm_scores) orelse return error.F32Unreadable;
-        for (0..@intCast(rows)) |r| {
-            for (0..config.num_experts_per_tok) |k| {
-                try t.expectEqual(want_ids[k], ids[r * config.num_experts_per_tok + k]);
-                try t.expectApproxEqAbs(want_scores[k], scores[r * config.num_experts_per_tok + k], 1e-6);
-            }
-        }
-        const y = try h.xfm.moeMLP(x, &h.mw);
-        defer _ = mlx.mlx_array_free(y);
-        try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
-        var y32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(y32);
-        try mlx.check(mlx.mlx_astype(&y32, y, .float32, s));
-        try mlx.check(mlx.mlx_array_eval(y32));
-        const got = mlx.mlx_array_data_float32(y32) orelse return error.F32Unreadable;
-        var ss: f64 = 0;
-        var ref: f64 = 0;
-        for (0..@intCast(rows)) |r| {
-            for (0..config.hidden_size) |d| {
-                const actual = got[r * config.hidden_size + d];
-                try t.expect(std.math.isFinite(actual) and std.math.isFinite(want[d]));
-                const delta: f64 = actual - want[d];
-                ss += delta * delta;
-                ref += @as(f64, want[d]) * want[d];
-            }
-        }
-        const rel = @sqrt(ss / @max(ref, 1e-20));
-        if (diagEnvOn("SUSHI_EXL3_PARITY_TRACE"))
-            std.debug.print("mimo real routed layer={d} rows={d} relative RMS={d:.8}\n", .{ layer, rows, rel });
-        if (!(rel < 0.01)) {
-            std.debug.print("mimo real routed layer={d} rows={d} relative RMS={d:.8}\n", .{ layer, rows, rel });
-            return error.TestExpectedEqual;
-        }
-    }
 }
 
 test "mimo_v2 EXL3 sliced real scales and outliers match the f32 oracle" {

@@ -3515,12 +3515,17 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const StopHarness = struct {
     stop: *std.atomic.Value(bool),
+    curl_started: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
 
     fn report(_: *anyopaque, _: []const u8) void {}
 
-    fn event(impl: *anyopaque, _: PullEvent) bool {
+    fn event(impl: *anyopaque, ev: PullEvent) bool {
         const self: *StopHarness = @ptrCast(@alignCast(impl));
+        switch (ev) {
+            .child => |pid| if (pid != null) self.curl_started.store(true, .release),
+            else => {},
+        }
         return !self.stop.load(.monotonic);
     }
 };
@@ -3564,8 +3569,11 @@ test "cli: a stop ends a pull held in its listing, not only one downloading file
         }
     }.run;
     const t = try std.Thread.spawn(.{}, T, .{ &h, arena.allocator(), io, dest });
-    var ts = std.c.timespec{ .sec = 0, .nsec = 400_000_000 };
-    _ = std.c.nanosleep(&ts, null); // the pull is inside curl's listing by now
+    var start_waited_ms: usize = 0;
+    var ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+    while (!h.curl_started.load(.acquire) and !h.done.load(.acquire) and start_waited_ms < 2000) : (start_waited_ms += 1) {
+        _ = std.c.nanosleep(&ts, null);
+    }
     stop.store(true, .monotonic);
     var waited_ms: usize = 0;
     ts = .{ .sec = 0, .nsec = 25_000_000 };

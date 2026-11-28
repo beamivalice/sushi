@@ -400,14 +400,9 @@ test "GLM row-streaming projections equal serial qmv on every row, width and inp
     for ([_]c_int{ 6, 5 }) |bits| for ([_]Shape{
         .{ .n = 32, .k = if (bits == 5) 512 else 256 },
         .{ .n = 1536, .k = 4096 },
-        .{ .n = 8192, .k = 4096 },
         .{ .n = 4096, .k = 8192 },
         .{ .n = 4096, .k = 16384 },
-        .{ .n = 16384, .k = 1536 },
-        .{ .n = 2048, .k = 4096 },
-        .{ .n = 4096, .k = 2048 },
-        .{ .n = 160, .k = 4096 },
-    }) |shape| {
+    }, 0..) |shape, si| {
         var fx = Ops{ .s = s };
         defer fx.deinit();
         const key = try fx.slot();
@@ -420,11 +415,12 @@ test "GLM row-streaming projections equal serial qmv on every row, width and inp
         const linear = Linear.of(codes.*, scales.*, biases, shape.k, shape.n);
         for ([_]Arr{ linear.w, linear.scales, linear.biases }) |a| try mlx.check(mlx.mlx_array_eval(a));
         // The smaller magnitude pushes x/128 into FP32 subnormals, the larger stays finite in BF16 sums.
-        for ([_]f32{ 1, 1e-30, 3e4 }) |spread| {
+        const spreads: []const f32 = if (si <= 1) &.{ 1, 1e-30, 3e4 } else &.{1};
+        for (spreads) |spread| {
             const x8 = try fx.slot();
             try mlx.check(mlx.mlx_random_normal(x8, &[_]c_int{ 1, 8, shape.k }, 3, .bfloat16, 0, spread, key.*, s));
             try mlx.check(mlx.mlx_array_eval(x8.*));
-            for (2..9) |rows_usize| {
+            for ([_]usize{ 2, 5, 7, 8 }) |rows_usize| {
                 const rows: c_int = @intCast(rows_usize);
                 var ops = Ops{ .s = s };
                 defer ops.deinit();

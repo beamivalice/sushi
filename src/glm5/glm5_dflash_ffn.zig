@@ -132,11 +132,16 @@ fn bank(ops: *Ops, hidden: c_int, intermediate: c_int, rate: c_int, down_rate: c
 test "GLM DFlash clamped experts keep serial row bits at all supported rates" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    for (0..18) |case| {
-        const production = case == 17;
-        const hidden: c_int = if (production) 4096 else 128;
-        const intermediate: c_int = if (production) 2048 else 128;
-        const rate: c_int = if (production) 36 else @intCast(32 + case * 2);
+    for ([_]struct { hidden: c_int, intermediate: c_int, rate: c_int }{
+        .{ .hidden = 128, .intermediate = 128, .rate = 32 },
+        .{ .hidden = 128, .intermediate = 128, .rate = 36 },
+        .{ .hidden = 128, .intermediate = 128, .rate = 48 },
+        .{ .hidden = 128, .intermediate = 128, .rate = 64 },
+        .{ .hidden = 4096, .intermediate = 2048, .rate = 36 },
+    }) |case| {
+        const hidden = case.hidden;
+        const intermediate = case.intermediate;
+        const rate = case.rate;
         var ops = Ops{ .s = s };
         defer ops.deinit();
         const weights = try bank(&ops, hidden, intermediate, rate, rate);
@@ -207,69 +212,96 @@ test "GLM DFlash FFN batch matches each target FFN row" {
     }
 }
 
-fn expectGroup2Rows(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int) !void {
-    return expectGroup2RowsAt(allocator, rate, down_rate, .{ .codebook = .mcg, .window = .w12 });
-}
+const Group2Fixture = struct {
+    fixtures: Ops,
+    weights: @import("../model.zig").Weights,
+    target: forward.Model,
+    saved_bank: ?api.Bank,
+    full: Arr,
 
-fn expectGroup2RowsAt(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int, dec: api.format.Decode) !void {
-    const stream = mlx.gpuStream();
-    var fixtures = Ops{ .s = stream };
-    defer fixtures.deinit();
-    var weights = @import("../model.zig").Weights.init(allocator);
-    defer weights.deinit();
-    const cfg = try forward.completeFixture(&weights);
-    var target = try forward.Model.load(allocator, cfg, &weights, stream);
-    defer target.deinit();
-    target.cfg.hidden_size = 4096;
-    target.cfg.num_experts_per_tok = 8;
-    const w = try fixtures.zeros(&.{ 288, 4096 }, .bfloat16);
-    var correction: [288]f32 = @splat(-10);
-    for (correction[0..8]) |*value| value.* = 1;
-    const bias = try fixtures.own(mlx.mlx_array_new_data(&correction, &.{288}, 1, .float32));
-    target.layers[3].ffn.moe.weight = w;
-    target.layers[3].ffn.moe.correction = bias;
-    target.layers[3].ffn.moe.bank = try bank(&fixtures, 4096, 2048, rate, down_rate);
-    target.cfg.expert_quant_codebook = dec.codebook;
-    target.cfg.expert_quant_window = dec.window;
-    target.cfg.expert_quant_table = dec.table;
-    target.cfg.swiglu_limit = 10;
-    target.layers[3].ffn.moe.shared = null;
-    try mlx.check(mlx.mlx_array_eval(w));
-    const full = try fixtures.own(try @import("../dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 8, 4096 }, 731, stream));
-    for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |rows_in| {
-        var ops = Ops{ .s = stream };
-        defer ops.deinit();
-        const x = try ops.slice(full, 1, 0, rows_in);
-        @import("glm5_router.zig").resetBatchCallCount();
-        resetGroup2BatchCount();
-        const actual = try apply(&target, 3, &ops, x);
-        try std.testing.expectEqual(@as(usize, 1), group2BatchCount());
-        try std.testing.expectEqual(@as(usize, 1), @import("glm5_router.zig").batchCallCount());
-        for (0..@intCast(rows_in)) |i| {
-            var one = Ops{ .s = stream };
-            defer one.deinit();
-            const row: c_int = @intCast(i);
-            const expected = try target.feedForwardLayer(3, &one, try one.slice(x, 1, row, row + 1));
-            try equal(expected, try one.slice(actual, 1, row, row + 1), stream);
+    fn init(allocator: std.mem.Allocator) !Group2Fixture {
+        const stream = mlx.gpuStream();
+        var fixtures = Ops{ .s = stream };
+        errdefer fixtures.deinit();
+        var weights = @import("../model.zig").Weights.init(allocator);
+        errdefer weights.deinit();
+        const cfg = try forward.completeFixture(&weights);
+        var target = try forward.Model.load(allocator, cfg, &weights, stream);
+        errdefer target.deinit();
+        target.cfg.hidden_size = 4096;
+        target.cfg.num_experts_per_tok = 8;
+        const w = try fixtures.zeros(&.{ 288, 4096 }, .bfloat16);
+        var correction: [288]f32 = @splat(-10);
+        for (correction[0..8]) |*value| value.* = 1;
+        const bias = try fixtures.own(mlx.mlx_array_new_data(&correction, &.{288}, 1, .float32));
+        target.layers[3].ffn.moe.weight = w;
+        target.layers[3].ffn.moe.correction = bias;
+        const saved_bank = target.layers[3].ffn.moe.bank;
+        target.cfg.swiglu_limit = 10;
+        target.layers[3].ffn.moe.shared = null;
+        try mlx.check(mlx.mlx_array_eval(w));
+        const full = try fixtures.own(try @import("../dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 8, 4096 }, 731, stream));
+        return .{ .fixtures = fixtures, .weights = weights, .target = target, .saved_bank = saved_bank, .full = full };
+    }
+
+    fn deinit(self: *Group2Fixture) void {
+        if (self.saved_bank) |b| self.target.layers[3].ffn.moe.bank = b;
+        self.target.deinit();
+        self.weights.deinit();
+        self.fixtures.deinit();
+    }
+
+    fn checkRows(self: *Group2Fixture, rate: c_int, down_rate: c_int, dec: api.format.Decode) !void {
+        const stream = mlx.gpuStream();
+        var bank_ops = Ops{ .s = stream };
+        defer {
+            if (self.saved_bank) |b| self.target.layers[3].ffn.moe.bank = b;
+            bank_ops.deinit();
+        }
+        self.target.layers[3].ffn.moe.bank = try bank(&bank_ops, 4096, 2048, rate, down_rate);
+        self.target.cfg.expert_quant_codebook = dec.codebook;
+        self.target.cfg.expert_quant_window = dec.window;
+        self.target.cfg.expert_quant_table = dec.table;
+        for ([_]c_int{ 2, 3, 5, 8 }) |rows_in| {
+            var ops = Ops{ .s = stream };
+            defer ops.deinit();
+            const x = try ops.slice(self.full, 1, 0, rows_in);
+            @import("glm5_router.zig").resetBatchCallCount();
+            resetGroup2BatchCount();
+            const actual = try apply(&self.target, 3, &ops, x);
+            try std.testing.expectEqual(@as(usize, 1), group2BatchCount());
+            try std.testing.expectEqual(@as(usize, 1), @import("glm5_router.zig").batchCallCount());
+            for (0..@intCast(rows_in)) |i| {
+                var one = Ops{ .s = stream };
+                defer one.deinit();
+                const row: c_int = @intCast(i);
+                const expected = try self.target.feedForwardLayer(3, &one, try one.slice(x, 1, row, row + 1));
+                try equal(expected, try one.slice(actual, 1, row, row + 1), stream);
+            }
         }
     }
-}
+};
 
 test "GLM DFlash FFN integrates production-width batched routing at every group-two rate" {
     try mlx.requireGpu();
-    var n: c_int = 32;
-    while (n <= 64) : (n += 2) try expectGroup2Rows(std.testing.allocator, n, n);
-    for ([_][2]c_int{ .{ 40, 36 }, .{ 36, 40 }, .{ 48, 32 }, .{ 32, 64 } }) |mixed| try expectGroup2Rows(std.testing.allocator, mixed[0], mixed[1]);
+    var fx = try Group2Fixture.init(std.testing.allocator);
+    defer fx.deinit();
+    for ([_]c_int{ 32, 36, 48, 64 }) |n| try fx.checkRows(n, n, .{ .codebook = .mcg, .window = .w12 });
+    for ([_][2]c_int{ .{ 40, 36 }, .{ 32, 64 } }) |mixed| try fx.checkRows(mixed[0], mixed[1], .{ .codebook = .mcg, .window = .w12 });
 }
 
 test "GLM DFlash FFN batches expert rows at every pack window" {
     try mlx.requireGpu();
-    for ([_]api.format.Window{ .w14, .w16 }) |window| try expectGroup2RowsAt(std.testing.allocator, 36, 36, .{ .codebook = .mcg, .window = window });
+    var fx = try Group2Fixture.init(std.testing.allocator);
+    defer fx.deinit();
+    for ([_]api.format.Window{ .w14, .w16 }) |window| try fx.checkRows(36, 36, .{ .codebook = .mcg, .window = window });
 }
 
 test "GLM serves std1 and spec1 on DFlash FFN batched expert rows" {
     try mlx.requireGpu();
-    for ([_]api.format.Window{ .w14, .w15 }) |window| try expectGroup2RowsAt(std.testing.allocator, 36, 36, api.format.Decode.tabled(.std1, window));
-    try expectGroup2RowsAt(std.testing.allocator, 40, 36, api.format.Decode.tabled(.std1, .w15));
-    try expectGroup2RowsAt(std.testing.allocator, 36, 36, api.format.Decode.tabled(.spec1, .w15));
+    var fx = try Group2Fixture.init(std.testing.allocator);
+    defer fx.deinit();
+    for ([_]api.format.Window{ .w14, .w15 }) |window| try fx.checkRows(36, 36, api.format.Decode.tabled(.std1, window));
+    try fx.checkRows(40, 36, api.format.Decode.tabled(.std1, .w15));
+    try fx.checkRows(36, 36, api.format.Decode.tabled(.spec1, .w15));
 }

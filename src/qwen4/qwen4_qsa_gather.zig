@@ -12,8 +12,6 @@ const qsaPackedGatherServes = qwen4_qsa.qsaPackedGatherServes;
 const qwen4Standin = qwen4_forward.qwen4Standin;
 const KVQuantConfig = kv_quant.KVQuantConfig;
 const log = @import("../log.zig");
-const io_util_mod = @import("../io_util.zig");
-const diagEnvOn = io_util_mod.diagEnvOn;
 const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
 const OneShotBits = qwen4_qsa_attn.OneShotBits;
 const attn256Cosine = qwen4_qsa_attn.attn256Cosine;
@@ -25,7 +23,6 @@ const qsaDecodeGatherAttn = qwen4_qsa_attn.qsaDecodeGatherAttn;
 const qsaEngagedBit = qwen4_qsa_attn.qsaEngagedBit;
 const qsaGatherF32Reference = qwen4_qsa_attn.qsaGatherF32Reference;
 const qsaMaskFromBlocks = qwen4_qsa_attn.qsaMaskFromBlocks;
-const qsaSparseAttn = qwen4_qsa_attn.qsaSparseAttn;
 const qsaVerifyBlocksHost = qwen4_qsa_attn.qsaVerifyBlocksHost;
 const qsaVerifyGatherEnabled = qwen4_qsa_attn.qsaVerifyGatherEnabled;
 const qsaVerifyGatherMinKvFor = qwen4_qsa_attn.qsaVerifyGatherMinKvFor;
@@ -55,7 +52,6 @@ const qsaProbeCorruptFirst = trunk_mod.qsaProbeCorruptFirst;
 const qsaProbeLcgBf16 = trunk_mod.qsaProbeLcgBf16;
 const qsaProbeMaxAbsDiff = trunk_mod.qsaProbeMaxAbsDiff;
 const sliceAttentionSeq = trunk_mod.sliceAttentionSeq;
-const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
 const verifyQmmNaxAvailable = trunk_mod.verifyQmmNaxAvailable;
 
 var qsa_fused_logged = false;
@@ -1008,138 +1004,6 @@ fn attn256ReferenceRows(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, sc
     return out;
 }
 
-const QsaUbenchArm = enum { empty, old, sparse16, packed_nax, packed_stock, gather_rebuild, mask_rebuild };
-
-/// 12 dependent layers of kv8 QSA attention at Flash-Next shapes: each layer feeds its output to
-/// the next layer's query and rebuilds its own dequant graph, as a forward does. Prints ms per
-/// forward minus the empty chain. `old` = the pre-packed route: split-K below 16 rows, else the
-/// whole-cache rebuild into the gather (kv past its floor) or the mask arm.
-fn qsaWideUbench(kvs: []const c_int, widths: []const c_int, arms_run: []const QsaUbenchArm, comptime reps: usize) !void {
-    const s = mlx.gpuStream();
-    const ta = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var prng = std.Random.DefaultPrng.init(0x51DE_0001);
-    const rnd = prng.random();
-    const ratio: c_int = 4;
-    const kb: c_int = 512;
-    const layers: usize = 12;
-    const scale: f32 = 1.0 / 16.0;
-    qwen4_qsa_attn.qsa_attn_packed_max_s_override = 1 << 20;
-    defer qwen4_qsa_attn.qsa_attn_packed_max_s_override = null;
-    defer qsa_nax_override = null;
-
-    const Arm = QsaUbenchArm;
-    const Chain = struct {
-        view: *const DenseKVView,
-        blocks: mlx.mlx_array,
-
-        fn rebuilt(c: @This(), st: mlx.mlx_stream, q: mlx.mlx_array, gather: bool) !mlx.mlx_array {
-            const v = c.view;
-            const k = try kv_quant.dequantizeAffine(st, v.k_triple_q, v.k_triple_scales, v.k_triple_biases, v.group_size, v.bits);
-            defer _ = mlx.mlx_array_free(k);
-            const vv = try kv_quant.dequantizeAffine(st, v.v_triple_q, v.v_triple_scales, v.v_triple_biases, v.group_size, v.bits);
-            defer _ = mlx.mlx_array_free(vv);
-            const kv = mlx.getShape(k)[2];
-            if (gather) return (try gatherQsa256(st, q, k, vv, scale, c.blocks, 4)) orelse error.GatherDeclined;
-            const mask = try qsaMaskFromBlocks(st, c.blocks, kv, 4);
-            defer _ = mlx.mlx_array_free(mask);
-            if (try fusedSdpa256Masked(st, q, k, vv, scale, mask)) |o| return o;
-            if (try splitMaskedSdpa256(st, q, k, vv, scale, mask)) |o| return o;
-            var out = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(out);
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k, vv, scale, "array", mask, .{ .ctx = null }, false, st));
-            return out;
-        }
-
-        fn layer(c: @This(), st: mlx.mlx_stream, q: mlx.mlx_array, arm: Arm) !mlx.mlx_array {
-            qsa_nax_override = null;
-            switch (arm) {
-                .empty => {
-                    var out = mlx.mlx_array_new();
-                    errdefer _ = mlx.mlx_array_free(out);
-                    try mlx.check(mlx.mlx_add(&out, q, q, st));
-                    return out;
-                },
-                .old => {
-                    if (mlx.getShape(q)[2] < FUSED256_MIN_Q_LEN)
-                        return (try qsaSparseAttn(st, q, c.view, c.blocks, 4, scale)) orelse error.SparseAttnDeclined;
-                    return c.rebuilt(st, q, mlx.getShape(c.view.k_triple_q)[2] > qsaGatherMinKv());
-                },
-                .gather_rebuild => return c.rebuilt(st, q, true),
-                .mask_rebuild => return c.rebuilt(st, q, false),
-                .sparse16 => return (try qsaSparseAttn(st, q, c.view, c.blocks, 4, scale)) orelse error.SparseAttnDeclined,
-                .packed_nax, .packed_stock => {
-                    qsa_nax_override = arm == .packed_nax;
-                    return (try gatherQsa256Packed(st, q, c.view, scale, c.blocks, 4)) orelse error.PackedGatherDeclined;
-                },
-            }
-        }
-
-        fn run(c: @This(), st: mlx.mlx_stream, q0: mlx.mlx_array, n: usize, arm: Arm) !mlx.mlx_array {
-            var q = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(q);
-            try mlx.check(mlx.mlx_array_set(&q, q0));
-            for (0..n) |_| {
-                const next = try c.layer(st, q, arm);
-                _ = mlx.mlx_array_free(q);
-                q = next;
-            }
-            return q;
-        }
-    };
-
-    std.debug.print("\n[qsa-wide] kv8 gs64, 24/2 hd256, ratio 4, kb 512, {d} dependent layers; median of {d}, ms per forward minus the empty chain\n[qsa-wide]      kv     S", .{ layers, reps });
-    for (arms_run) |arm| std.debug.print(" {s:>14}", .{@tagName(arm)});
-    std.debug.print("\n", .{});
-    for (kvs) |kv| {
-        const kd = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
-        defer _ = mlx.mlx_array_free(kd);
-        const vd = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
-        defer _ = mlx.mlx_array_free(vd);
-        var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
-        defer cache.deinit();
-        var view = try qsaAttnCacheFixture(ta, s, kd, vd, kv, @divTrunc(kv, 2), kv_quant.KVQuantConfig.affine(8), &cache);
-        defer view.deinit();
-        {
-            const ev = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(ev);
-            for ([_]mlx.mlx_array{ view.k_triple_q, view.v_triple_q, view.k_triple_scales, view.v_triple_scales, view.k_triple_biases, view.v_triple_biases }) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
-            try mlx.check(mlx.mlx_eval(ev));
-        }
-        for (widths) |sq| {
-            if (sq > kv) continue;
-            const bh = try qsaVerifyBlocksHost(ta, rnd, sq, kv, kb, ratio);
-            defer ta.free(bh);
-            const blocks = try mlx.newData(bh.ptr, &[_]c_int{ 1, sq, kb }, .int32);
-            defer _ = mlx.mlx_array_free(blocks);
-            const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, sq, 256 }, s);
-            defer _ = mlx.mlx_array_free(q);
-            const chain = Chain{ .view = &view, .blocks = blocks };
-            var samples: [8][reps]f64 = undefined;
-            for (0..reps + 2) |r| {
-                for (0..arms_run.len + 1) |ai| {
-                    const arm: Arm = if (ai == 0) .empty else arms_run[ai - 1];
-                    const t0 = std.Io.Timestamp.now(io, .boot);
-                    const out = try chain.run(s, q, layers, arm);
-                    defer _ = mlx.mlx_array_free(out);
-                    try mlx.check(mlx.mlx_array_eval(out));
-                    const ns: f64 = @floatFromInt(t0.untilNow(io, .boot).nanoseconds);
-                    if (r >= 2) samples[ai][r - 2] = ns / 1e6;
-                }
-            }
-            var med: [8]f64 = undefined;
-            for (0..arms_run.len + 1) |ai| {
-                std.mem.sort(f64, &samples[ai], {}, std.sort.asc(f64));
-                med[ai] = samples[ai][reps / 2];
-            }
-            std.debug.print("[qsa-wide] {d:>7} {d:>5}", .{ kv, sq });
-            for (1..arms_run.len + 1) |ai| std.debug.print(" {d:>14.2}", .{med[ai] - med[0]});
-            std.debug.print("\n", .{});
-        }
-        _ = mlx.mlx_clear_cache();
-    }
-}
-
 test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ragged tiles, kv chunking)" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -2066,16 +1930,6 @@ test "qsa packed gather: serves while each packed row is staged at most 4 times 
     try std.testing.expect(!qsaPackedGatherServes(128, 32768, 512, 4));
     try std.testing.expect(!qsaPackedGatherServes(64, 8192, 512, 4));
     try std.testing.expect(!qsaPackedGatherServes(8192, 65536, 512, 4));
-}
-
-test "qsa wide µbench: verify and short-prefill widths (SUSHI_QSA_WIDE_UBENCH=1)" {
-    if (!diagEnvOn("SUSHI_QSA_WIDE_UBENCH")) return error.SkipZigTest;
-    try qsaWideUbench(&.{ 8192, 65536, 262144 }, &.{ 8, 12, 15, 16, 24, 32, 40, 48, 56, 64, 96, 128, 256, 512 }, &.{ .old, .sparse16, .packed_nax, .packed_stock }, 7);
-}
-
-test "qsa wide µbench: prefill chunk widths (SUSHI_QSA_PREFILL_UBENCH=1)" {
-    if (!diagEnvOn("SUSHI_QSA_PREFILL_UBENCH")) return error.SkipZigTest;
-    try qsaWideUbench(&.{ 4096, 6144, 8192, 12288, 16384, 32768, 65536, 131072 }, &.{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 }, &.{ .mask_rebuild, .gather_rebuild, .packed_nax }, 5);
 }
 
 /// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone

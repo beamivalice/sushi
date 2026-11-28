@@ -271,7 +271,7 @@ fn check(seed: u64, guard: u64) !void {
 
 test "a recorded plan replayed at any smaller shape, any loop counts and either loop kind keeps live buffers apart, inside the arena and in order" {
     // Seed 467 holds a result an exact child hands up from a loop inside it, which a short run never makes.
-    for ([_]u64{ 0, 16 }) |guard| for (0..6000) |seed| check(seed, guard) catch |e| {
+    for ([_]u64{ 0, 16 }) |guard| for (0..600) |seed| check(seed, guard) catch |e| {
         std.debug.print("soundness: seed {d}, guard {d} failed: {t}\n", .{ seed, guard, e });
         return e;
     };

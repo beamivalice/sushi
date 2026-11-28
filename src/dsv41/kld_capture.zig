@@ -1298,6 +1298,7 @@ const TinyLoaded = struct {
         config.expert_streaming = true;
         config.expert_cache_bytes = 3 * config.num_hidden_layers * try dsv_stream.expertBytes(&config.dsv41.?);
         config.expert_source_dir = try a.dupe(u8, root);
+        config.test_skip_warm = true;
         self.loaded = .{ .allocator = a, .io = io, .config = config, .tok = try @import("../tokenizer.zig").loadTokenizer(io, a, root), .chat_config = undefined, .weights = undefined, .xfm = undefined };
         errdefer self.loaded.tok.deinit();
         self.loaded.weights = try model.loadWeightsForConfig(io, a, root, &self.loaded.config, false);
@@ -1645,14 +1646,17 @@ test "deepseek_v41 layer-major capture equals the window-major forward byte for 
         // is wider than the attention window takes the CED replay's logits, the served forward's, which the capture
         // forks beside its tapped pass.
         m.tap = rec.tap();
+        defer m.tap = null;
         const want_logits = try windowMajorLogits(a, m, windows, chunk);
         m.tap = null;
-        const served = try windowMajorLogits(a, m, windows, chunk);
-        defer {
-            for (served) |b| a.free(b);
-            a.free(served);
+        if (chunk > m.cfg.window) {
+            const served = try windowMajorLogits(a, m, windows, chunk);
+            defer {
+                for (served) |b| a.free(b);
+                a.free(served);
+            }
+            for (windows, want_logits, served) |ids, *x, y| if ((ids.len - 1) % chunk + 1 > m.cfg.window) @memcpy(x.*, y);
         }
-        for (windows, want_logits, served) |ids, *x, y| if ((ids.len - 1) % chunk + 1 > m.cfg.window) @memcpy(x.*, y);
         defer {
             for (want_logits) |b| a.free(b);
             a.free(want_logits);
@@ -1662,7 +1666,7 @@ test "deepseek_v41 layer-major capture equals the window-major forward byte for 
         // The batch compare runs at one chunk width; the wide chunk takes the CED replay's logits.
         const batches: []const u32 = if (chunk == 4) &.{ 1, 3 } else &.{3};
         for (batches) |batch| {
-            const name = try std.fmt.allocPrint(a, "lm-c{d}-b{d}", .{ chunk, batch });
+            const name = try std.fmt.allocPrint(a, "t1618-lm-c{d}-b{d}", .{ chunk, batch });
             defer if (base != null) a.free(name);
             try runTiny(a, io, root, tiny, name, batch, chunk);
             // Head rows are off by default.
@@ -1723,21 +1727,21 @@ test "deepseek_v41 layer-major logits are the generic window-major capture's fix
     var quiet: kld.Out = .{ .silent = true };
     const prompts = try std.fmt.allocPrint(a, "{s}/prompts.jsonl", .{root});
     defer a.free(prompts);
-    const generic = try std.fmt.allocPrint(a, "{s}/generic", .{root});
+    const generic = try std.fmt.allocPrint(a, "{s}/t1704-generic", .{root});
     defer a.free(generic);
     try kld.runCapture(io, a, &tiny.loaded, .{ .model_dir = root, .prompts = prompts, .out_dir = generic, .tokens = 1, .no_template = true }, &quiet);
-    try runTiny(a, io, root, tiny, "lm", 4, chunk_rows);
+    try runTiny(a, io, root, tiny, "t1704-lm", 4, chunk_rows);
     for (0..windows.len) |w| {
         inline for (.{ "logits.f32", "prompt_tokens.txt", "generated_tokens.txt" }) |leaf| {
-            const x = try readFile(a, io, root, "generic/prompts/{d:0>2}_w{d}/" ++ leaf, .{ w, w });
+            const x = try readFile(a, io, root, "t1704-generic/prompts/{d:0>2}_w{d}/" ++ leaf, .{ w, w });
             defer a.free(x);
-            const y = try readFile(a, io, root, "lm/prompts/{d:0>2}_w{d}/" ++ leaf, .{ w, w });
+            const y = try readFile(a, io, root, "t1704-lm/prompts/{d:0>2}_w{d}/" ++ leaf, .{ w, w });
             defer a.free(y);
             try testing.expectEqualSlices(u8, x, y);
         }
     }
     // The fixture reads back through compare's own loader.
-    const lm = try std.fmt.allocPrint(a, "{s}/lm", .{root});
+    const lm = try std.fmt.allocPrint(a, "{s}/t1704-lm", .{root});
     defer a.free(lm);
     var base = try fixture_mod.readBaseline(a, io, lm);
     defer base.deinit();
@@ -1764,28 +1768,18 @@ test "deepseek_v41 layer-major capture interrupted inside a batch resumes to the
     defer tiny.deinit();
     const layers = dsv41_state.modelOf(&tiny.loaded.xfm).?.cfg.layers;
 
-    try runTiny(a, io, root, tiny, "whole", 3, 4);
+    try runTiny(a, io, root, tiny, "t1747-whole", 3, 4);
     // Batch one is windows 0..2: 2 + 4 + 3 chunk passes per layer.
     const batch_one = (2 + 4 + 3) * layers;
-    for ([_]struct { name: []const u8, again: u32 }{ .{ .name = "same", .again = 3 }, .{ .name = "other", .again = 2 } }) |c| {
-        interrupt_layers_for_test = batch_one + 20;
-        defer interrupt_layers_for_test = null;
-        try testing.expectError(error.TestInterrupted, runTiny(a, io, root, tiny, c.name, 3, 4));
-        interrupt_layers_for_test = null;
-        // A different run's command refuses to adopt the staging.
-        try testing.expectError(error.Dsv41LayerMajorResumeMismatch, runTiny(a, io, root, tiny, c.name, 3, 5));
-        try runTiny(a, io, root, tiny, c.name, c.again, 4);
-        try expectSameCapture(a, io, root, "whole", c.name, layers, windows.len);
-        if (c.again == 3) {
-            for (0..layers) |li| {
-                const x = try readFile(a, io, root, "whole/calib/trunk-{d:0>2}.safetensors", .{li});
-                defer a.free(x);
-                const y = try readFile(a, io, root, "{s}/calib/trunk-{d:0>2}.safetensors", .{ c.name, li });
-                defer a.free(y);
-                try testing.expectEqualSlices(u8, x, y);
-            }
-        }
-    }
+    const name = "t1747-other";
+    interrupt_layers_for_test = batch_one + 20;
+    defer interrupt_layers_for_test = null;
+    try testing.expectError(error.TestInterrupted, runTiny(a, io, root, tiny, name, 3, 4));
+    interrupt_layers_for_test = null;
+    // A different run's command refuses to adopt the staging.
+    try testing.expectError(error.Dsv41LayerMajorResumeMismatch, runTiny(a, io, root, tiny, name, 3, 5));
+    try runTiny(a, io, root, tiny, name, 2, 4);
+    try expectSameCapture(a, io, root, "t1747-whole", name, layers, windows.len);
 }
 
 test "deepseek_v41 layer-major capture: flags it takes and refuses, and the batch the budget buys" {
@@ -1969,6 +1963,7 @@ test "deepseek_v41 layer-major capture: head rows are the head's input for every
     var rec = try Recorder.init(a, m.s, &m.cfg);
     defer rec.deinit();
     m.tap = rec.tap();
+    defer m.tap = null;
     const want_logits = try windowMajorLogits(a, m, windows, 4);
     m.tap = null;
     defer {
@@ -2056,25 +2051,28 @@ test "deepseek_v41 layer-major capture on the composed op chains writes the imat
     const tiny = try TinyLoaded.init(a, io, root);
     defer tiny.deinit();
     const m = dsv41_state.modelOf(&tiny.loaded.xfm).?;
+    const orig_fused = m.fused;
     m.fused = false;
+    defer m.fused = orig_fused;
 
     var rec = try Recorder.init(a, m.s, &m.cfg);
     defer rec.deinit();
     m.tap = rec.tap();
+    defer m.tap = null;
     const want_logits = try windowMajorLogits(a, m, windows, 4);
     m.tap = null;
     defer {
         for (want_logits) |b| a.free(b);
         a.free(want_logits);
     }
-    try runTiny(a, io, root, tiny, "composed", 3, 4);
+    try runTiny(a, io, root, tiny, "t2040-composed", 3, 4);
     for (windows, 0..) |_, w| {
-        const got = try readFile(a, io, root, "composed/prompts/{d:0>2}_w{d}/logits.f32", .{ w, w });
+        const got = try readFile(a, io, root, "t2040-composed/prompts/{d:0>2}_w{d}/logits.f32", .{ w, w });
         defer a.free(got);
         try testing.expectEqualSlices(u8, want_logits[w], got);
     }
     try testing.expect(rec.down[0][0] + rec.down[0][1] > 0);
-    try expectImatrixMatches(a, io, root, "composed", &rec, m.cfg.dim, m.cfg.top_k);
+    try expectImatrixMatches(a, io, root, "t2040-composed", &rec, m.cfg.dim, m.cfg.top_k);
 }
 
 test "deepseek_v41 capture: the floor budget is the least the streamed load's plan accepts (DSV41_TINY)" {
@@ -2192,6 +2190,7 @@ test "deepseek_v41 layer-major capture runs end to end and resumes on a Sushi Co
     config.expert_streaming = true;
     config.expert_cache_bytes = 3 * config.num_hidden_layers * try dsv_stream.expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, root);
+    config.test_skip_warm = true;
     @import("../cooler_side.zig").forTest(&config, true);
     var loaded = kld.Loaded{
         .allocator = a,

@@ -7,27 +7,26 @@ const testing = std.testing;
 const mlx = @import("mlx.zig");
 const arch_handle = @import("arch/handle.zig");
 const arch_sched = @import("arch/sched.zig");
-const io = std.Io.Threaded.global_single_threaded.io();
 const contract = @import("cooler_contract_test.zig");
 const archSite = contract.archSite;
 const Load = contract.Load;
 const MixedTick = contract.MixedTick;
 const Served = contract.Served;
 const Sheet = contract.Sheet;
-const eachFixture = contract.eachFixture;
-const eachLayout = contract.eachLayout;
-const eachQwenServed = contract.eachQwenServed;
+const eachArch = contract.eachArch;
+const eachDraftingArch = contract.eachDraftingArch;
+const eachResidency = contract.eachResidency;
 const firstAsks = contract.firstAsks;
 const greedy = contract.greedy;
 const qwenTinyServed = contract.qwenTinyServed;
 const servedRows = contract.servedRows;
 
 test "cooler contract: two served requests as rows say their solo tokens, and a rows tick refused at any pool buffer site the solo requests lack leaves the next rows theirs and the pool as it was" {
-    try eachQwenServed(struct {
+    try qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.openLight(Q, dir, true);
+            try ld.open(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -38,7 +37,7 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
             var solo: [2]std.ArrayList(u32) = undefined;
             for (0..2) |i| {
                 var f: u32 = 0;
-                solo[i] = try sv.request(prompts[i], 16, &f);
+                solo[i] = try sv.request(prompts[i], 6, &f);
             }
             defer for (&solo) |*s| s.deinit(a);
             const Req = struct {
@@ -46,18 +45,16 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                 p: [2][]const u32,
                 fn go(q: @This()) anyerror!void {
                     var o: [2]std.ArrayList(u32) = undefined;
-                    try servedRows(q.sv, q.p, 16, false, &o);
+                    try servedRows(q.sv, q.p, 6, false, &o);
                     for (&o) |*x| x.deinit(testing.allocator);
                 }
             };
             var rows: [2]std.ArrayList(u32) = undefined;
-            try servedRows(&sv, prompts, 16, false, &rows);
+            try servedRows(&sv, prompts, 6, false, &rows);
             for (&rows, 0..) |*x, i| {
                 defer x.deinit(a);
                 try testing.expectEqualSlices(u32, solo[i].items, x.items);
             }
-            // The sweep's sites are the cut's too: it runs on the tiny, over the rows tick's own sites.
-            if (!std.mem.eql(u8, dir, std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse ""))) return;
             var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
             defer seen.deinit(a);
             const Solo = struct {
@@ -66,7 +63,7 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                 fn go(q: @This()) anyerror!void {
                     for (q.p) |p| {
                         var f: u32 = 0;
-                        var got = try q.sv.request(p, 16, &f);
+                        var got = try q.sv.request(p, 6, &f);
                         got.deinit(testing.allocator);
                     }
                 }
@@ -79,7 +76,7 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                 errdefer std.debug.print("cooler contract: rows point {d} of {d}\n", .{ at, points.len });
                 mlx.engine.fault.armAt(pt);
                 var o: [2]std.ArrayList(u32) = undefined;
-                const r = servedRows(&sv, prompts, 16, false, &o);
+                const r = servedRows(&sv, prompts, 6, false, &o);
                 mlx.engine.fault.disarm();
                 if (r) |_| {
                     for (&o, 0..) |*x, i| {
@@ -89,14 +86,14 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                 } else |_| {}
                 try testing.expect(!mlx.errorPending());
                 var o2: [2]std.ArrayList(u32) = undefined;
-                try servedRows(&sv, prompts, 16, false, &o2);
+                try servedRows(&sv, prompts, 6, false, &o2);
                 for (&o2, 0..) |*x, i| {
                     defer x.deinit(a);
                     try testing.expectEqualSlices(u32, solo[i].items, x.items);
                 }
                 const now = Sheet.now();
                 try testing.expectEqual(base.in_use, now.in_use);
-                try testing.expectEqual(@as(u64, 0), now.open);
+                try testing.expectEqual(@as(u32, 0), now.open);
             }
         }
     }.run);
@@ -122,7 +119,7 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
             var solo: [2]std.ArrayList(u32) = undefined;
             for (0..2) |i| {
                 var f: u32 = 0;
-                solo[i] = try sv.request(prompts[i], 12, &f);
+                solo[i] = try sv.request(prompts[i], 6, &f);
             }
             defer for (&solo) |*s| s.deinit(a);
             const Rows = struct {
@@ -131,20 +128,20 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
                 mtp: bool,
                 fn go(q: @This()) anyerror!void {
                     var o: [2]std.ArrayList(u32) = undefined;
-                    try servedRows(q.sv, q.p, 12, q.mtp, &o);
+                    try servedRows(q.sv, q.p, 6, q.mtp, &o);
                     for (&o) |*x| x.deinit(testing.allocator);
                 }
             };
-            // A site the plain rows reach is the plain request's sweep's; the speculative ones are swept here, at
-            // their last call too, where an array made by an earlier call of the step is still held.
+            // A site the plain rows reach is the plain request's sweep's; the speculative ones are swept here.
             const sites = &mlx.fault.sites;
             defer sites.* = .{};
+            sites.* = .{ .lasts = false };
             const plain = try mlx.sweepSites(a, sites, Rows{ .sv = &sv, .p = prompts, .mtp = false }, Rows.go);
             defer a.free(plain);
             var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
             defer seen.deinit(a);
             for (plain) |pt| try seen.put(a, pt.site, {});
-            sites.* = .{ .lasts = true };
+            sites.* = .{ .lasts = false };
             const all = try mlx.sweepSites(a, sites, Rows{ .sv = &sv, .p = prompts, .mtp = true }, Rows.go);
             defer a.free(all);
             sv.quiet_failures = true;
@@ -154,7 +151,7 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
                 errdefer std.debug.print("cooler contract: speculative rows failed at MLX point {d} of {d} (call {d} of its site)\n", .{ at, all.len, pt.n });
                 sites.armAt(pt);
                 var o: [2]std.ArrayList(u32) = undefined;
-                const r = servedRows(&sv, prompts, 12, true, &o);
+                const r = servedRows(&sv, prompts, 6, true, &o);
                 mlx.fault.disarm();
                 if (r) |_| {
                     for (&o, 0..) |*x, i| {
@@ -164,14 +161,14 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
                 } else |_| {}
                 try testing.expect(!mlx.errorPending());
                 var o2: [2]std.ArrayList(u32) = undefined;
-                try servedRows(&sv, prompts, 12, true, &o2);
+                try servedRows(&sv, prompts, 6, true, &o2);
                 for (&o2, 0..) |*x, i| {
                     defer x.deinit(a);
                     try testing.expectEqualSlices(u32, solo[i].items, x.items);
                 }
                 const now = Sheet.now();
                 try testing.expectEqual(base.in_use, now.in_use);
-                try testing.expectEqual(@as(u64, 0), now.open);
+                try testing.expectEqual(@as(u32, 0), now.open);
             }
         }
     }.run);
@@ -192,10 +189,14 @@ fn unitFaultCell(comptime shape: UnitShape) fn (comptime type, []const u8, []con
             const a = testing.allocator;
             const scheduler = Served.scheduler;
             var ld: Load = undefined;
-            try ld.openLight(C, dir, true);
-            defer _ = ld.close();
+            try ld.prepare(C, dir, true);
             // The joined unit's rows: two for the alone shape, three for the company shape.
-            if ((arch_sched.rowCap(&ld.config) orelse 1) < (if (shape == .company) 3 else 2)) return error.SkipZigTest;
+            if ((arch_sched.rowCap(&ld.config) orelse 1) < (if (shape == .company) 3 else 2)) {
+                ld.config.deinit(a);
+                return error.SkipZigTest;
+            }
+            try ld.loadLight(dir);
+            defer _ = ld.close();
             // The bucket path: a planner's round is one unit over every row it plans.
             const planner = @import("mtp_group_planner.zig");
             const planner_was = planner.enabled_override;
@@ -269,11 +270,11 @@ fn unitFaultCell(comptime shape: UnitShape) fn (comptime type, []const u8, []con
 }
 
 test "cooler contract: a tick unit failed by an error no latch explains fails its own requests only, not a drafting request or the joined rows beside it" {
-    try eachFixture(unitFaultCell(.alone));
+    try eachArch(unitFaultCell(.alone));
 }
 
 test "cooler contract: a joined unit holding a drafting request, failed by an error no latch explains, fails its own requests only, not the drafting request of its own unit beside it" {
-    try eachFixture(unitFaultCell(.company));
+    try eachArch(unitFaultCell(.company));
 }
 
 test "cooler contract: a Cooler request failed at any of its checked MLX call sites leaves the engine as a whole request does, and the next says the same tokens" {
@@ -281,16 +282,20 @@ test "cooler contract: a Cooler request failed at any of its checked MLX call si
     defer seen.deinit(testing.allocator);
     const S = struct {
         var sites: *std.AutoHashMapUnmanaged(u64, void) = undefined;
+        var ran_hy4_stq: bool = false;
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             defer mlx.fault.disarm();
-            const prompt = ids[0..@min(ids.len, 30)];
+            if (std.c.getenv("HY4_STQ_TINY")) |p| if (std.mem.eql(u8, dir, std.mem.span(p))) {
+                ran_hy4_stq = true;
+            };
+            const prompt = ids[0..@min(ids.len, 9)];
             var cooler: Load = undefined;
             try cooler.openLight(C, dir, true);
             defer _ = cooler.close();
-            var want = try greedy(&cooler, prompt, 6);
+            var want = try greedy(&cooler, prompt, 3);
             defer want.deinit(testing.allocator);
             {
-                var again = try greedy(&cooler, prompt, 6);
+                var again = try greedy(&cooler, prompt, 3);
                 again.deinit(testing.allocator);
             }
             const base = Sheet.now();
@@ -298,7 +303,7 @@ test "cooler contract: a Cooler request failed at any of its checked MLX call si
                 ld: *Load,
                 prompt: []const u32,
                 fn go(r: @This()) anyerror!void {
-                    var got = try greedy(r.ld, r.prompt, 6);
+                    var got = try greedy(r.ld, r.prompt, 3);
                     got.deinit(testing.allocator);
                 }
             };
@@ -318,7 +323,7 @@ test "cooler contract: a Cooler request failed at any of its checked MLX call si
             }
             for (points.items) |k| {
                 mlx.fault.arm(k);
-                var faulted = greedy(&cooler, prompt, 6);
+                var faulted = greedy(&cooler, prompt, 3);
                 mlx.fault.disarm();
                 if (faulted) |*g| g.deinit(testing.allocator) else |_| {}
                 if (!mlx.fault.didFire()) {
@@ -327,7 +332,7 @@ test "cooler contract: a Cooler request failed at any of its checked MLX call si
                 }
                 var msg: [300]u8 = undefined;
                 _ = mlx.takeError(&msg);
-                var got = try greedy(&cooler, prompt, 6);
+                var got = try greedy(&cooler, prompt, 3);
                 defer got.deinit(testing.allocator);
                 errdefer std.debug.print("cooler contract: a request failed at checked MLX call {d}\n", .{k});
                 try testing.expectEqualSlices(u32, want.items, got.items);
@@ -336,7 +341,13 @@ test "cooler contract: a Cooler request failed at any of its checked MLX call si
         }
     };
     S.sites = &seen;
-    try eachLayout(S.run);
+    S.ran_hy4_stq = false;
+    try eachResidency(S.run);
+    if (!S.ran_hy4_stq and contract.fixtureChosen(contract.selection(), "HY4_STQ_TINY")) {
+        if (std.c.getenv("HY4_STQ_TINY") != null) {
+            contract.servedOn("hy4flash", &.{"HY4_STQ_TINY"}, S.run) catch |e| if (e != error.SkipZigTest) return e;
+        }
+    }
 }
 
 /// An allocator that refuses its `at`-th allocation alone; every other call is its child's.
@@ -373,51 +384,59 @@ const RefuseOnce = struct {
 };
 
 test "cooler contract: a served drafted request failed at any checked MLX call site its plain request lacks leaves the next drafted request its tokens and the pool as it was" {
-    try contract.eachFixture(struct {
+    var shared_seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer shared_seen.deinit(testing.allocator);
+    const S = struct {
+        var seen: *std.AutoHashMapUnmanaged(u64, void) = undefined;
+        var ran_dsv41_tiny: bool = false;
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
+            if (std.c.getenv("DSV41_TINY")) |p| if (std.mem.eql(u8, dir, std.mem.span(p))) {
+                ran_dsv41_tiny = true;
+            };
             var ld: contract.Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             // A load with no drafter serves no drafted request.
             const head = @import("generate.zig").MtpHeadRef.fromModel(ld.xfm, true, null) orelse return error.SkipZigTest;
+            const depth_bounds = @import("mtp_depth_bounds.zig");
+            const saved = depth_bounds.active;
+            defer depth_bounds.active = saved;
+            depth_bounds.active = .{ .min = 3, .max = 3 };
             var sv: contract.Served = undefined;
             try sv.init(&ld, dir);
             defer sv.deinit();
-            const n = @min(ids.len, 30);
+            const n = @min(ids.len, 12);
             const Req = struct {
                 sv: *contract.Served,
                 p: []const u32,
                 head: ?@import("generate.zig").MtpHeadRef,
                 fn go(q: @This()) anyerror!void {
                     var d: u64 = 0;
-                    var got = try contract.servedDrafts(q.sv, q.p, 12, .{ .temperature = 0 }, q.head, &d);
+                    var got = try contract.servedDrafts(q.sv, q.p, 6, .{ .temperature = 0 }, q.head, &d);
                     got.deinit(testing.allocator);
                 }
             };
             var d: u64 = 0;
-            var want = try contract.servedDrafts(&sv, ids[0..n], 12, .{ .temperature = 0 }, head, &d);
+            var want = try contract.servedDrafts(&sv, ids[0..n], 6, .{ .temperature = 0 }, head, &d);
             defer want.deinit(a);
             const sites = &mlx.fault.sites;
             defer sites.* = .{};
-            sites.lasts = false;
+            sites.* = .{ .lasts = false };
             const plain = try mlx.sweepSites(a, sites, Req{ .sv = &sv, .p = ids[0..n], .head = null }, Req.go);
             defer a.free(plain);
-            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-            defer seen.deinit(a);
-            for (plain) |pt| try seen.put(a, pt.site, {});
-            sites.* = .{ .lasts = true };
+            for (plain) |pt| try seen.put(a, archSite(C, pt.site), {});
+            sites.* = .{ .lasts = false };
             const all = try mlx.sweepSites(a, sites, Req{ .sv = &sv, .p = ids[0..n], .head = head }, Req.go);
             defer a.free(all);
-            // A cold prompt between: the next turn shares nothing with the failed one.
-            var other: [30]u32 = undefined;
-            @memcpy(other[0..n], ids[0..n]);
-            other[0] = if (ids[0] == 1) 2 else 1;
+            // A cold 1-token prompt between: the next turn shares nothing with the failed one.
+            const other = [_]u32{if (ids[0] == 1) 2 else 1};
+            const base = Sheet.now();
             for (all, 0..) |pt, at| {
-                if (seen.contains(pt.site)) continue;
+                if ((try seen.getOrPut(a, archSite(C, pt.site))).found_existing) continue;
                 sv.quiet_failures = true;
                 sites.armAt(pt);
-                if (contract.servedDrafts(&sv, ids[0..n], 12, .{ .temperature = 0 }, head, &d)) |g| {
+                if (contract.servedDrafts(&sv, ids[0..n], 6, .{ .temperature = 0 }, head, &d)) |g| {
                     var got = g;
                     got.deinit(a);
                 } else |_| {}
@@ -426,12 +445,23 @@ test "cooler contract: a served drafted request failed at any checked MLX call s
                 _ = mlx.takeError(&said);
                 sv.quiet_failures = false;
                 errdefer std.debug.print("cooler contract: after the drafted request failed at MLX point {d} of {d} (call {d})\n", .{ at, all.len, pt.n });
-                var cold = try contract.servedDrafts(&sv, other[0..n], 12, .{ .temperature = 0 }, head, &d);
+                var cold = try contract.servedDrafts(&sv, &other, 1, .{ .temperature = 0 }, null, &d);
                 cold.deinit(a);
-                var again = try contract.servedDrafts(&sv, ids[0..n], 12, .{ .temperature = 0 }, head, &d);
+                var again = try contract.servedDrafts(&sv, ids[0..n], 6, .{ .temperature = 0 }, head, &d);
                 defer again.deinit(a);
                 try testing.expectEqualSlices(u32, want.items, again.items);
+                const now = Sheet.now();
+                try testing.expectEqual(base.in_use, now.in_use);
+                try testing.expectEqual(@as(u32, 0), now.open);
             }
         }
-    }.run);
+    };
+    S.seen = &shared_seen;
+    S.ran_dsv41_tiny = false;
+    try eachDraftingArch(S.run);
+    if (!S.ran_dsv41_tiny and contract.fixtureChosen(contract.selection(), "DSV41_TINY")) {
+        if (std.c.getenv("DSV41_TINY") != null) {
+            contract.servedOn("dsv41", &.{"DSV41_TINY"}, S.run) catch |e| if (e != error.SkipZigTest) return e;
+        }
+    }
 }

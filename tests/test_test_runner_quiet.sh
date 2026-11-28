@@ -37,7 +37,15 @@ fi
 # Zig 0.17 manifests are binary files with NUL-terminated paths and no extension.
 LC_ALL=C grep -l -a -E 'o/[0-9a-f]+/(exl3-)?test' .zig-cache/h/* 2>/dev/null | xargs rm -f 2>/dev/null
 
-if [ -n "$FILTER" ]; then
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+USE_COMBINED_LOG=0
+if [ -z "$FILTER" ] && { [ "$STEP" = test ] || [ "$STEP" = test-host ]; }; then
+  USE_COMBINED_LOG=1
+  WHAT="zig build $STEP -Dtest-log"
+  OUT=$("$ZIG" build "$STEP" -Doptimize=ReleaseFast -Dtest-log="$TMP/host.tsv" 2>&1)
+elif [ -n "$FILTER" ]; then
   WHAT="zig build $STEP -Dtest-filter=$FILTER"
   OUT=$("$ZIG" build "$STEP" -Doptimize=ReleaseFast -Dtest-filter="$FILTER" 2>&1)
 else
@@ -60,17 +68,20 @@ fi
 # -Dtest-log=<abs path>: each test binary's runner appends `<UTC>\t<step>\t<PASS|SKIP|FAIL>\t<ms>\t<name>` per test
 # and one `DONE` line with its totals, and still prints nothing. Every binary shares the runner, so the host step's
 # format corpus stands for all of them.
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
 LINE=$'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z\t[^\t]+\t(PASS|SKIP|FAIL|DONE)\t[0-9]+\t.+$'
 # counts <log> <step>: the step's PASS, SKIP and FAIL lines as its DONE line words them.
 counts() {
   awk -F'\t' -v s="$2" '$2 == s && $3 == "PASS" {p++} $2 == s && $3 == "SKIP" {k++} $2 == s && $3 == "FAIL" {f++}
     END {printf "%d pass, %d skip, %d fail", p, k, f}' "$1"
 }
-LC_ALL=C grep -l -a -E 'o/[0-9a-f]+/(exl3-)?test' .zig-cache/h/* 2>/dev/null | xargs rm -f 2>/dev/null
-LOG_OUT=$("$ZIG" build test-host -Doptimize=ReleaseFast -Dtest-filter="format corpus" -Dtest-log="$TMP/host.tsv" 2>&1)
-LOG_RC=$?
+if [ $USE_COMBINED_LOG -eq 1 ]; then
+  LOG_OUT=""
+  LOG_RC=$RC
+else
+  LC_ALL=C grep -l -a -E 'o/[0-9a-f]+/(exl3-)?test' .zig-cache/h/* 2>/dev/null | xargs rm -f 2>/dev/null
+  LOG_OUT=$("$ZIG" build test-host -Doptimize=ReleaseFast -Dtest-filter="format corpus" -Dtest-log="$TMP/host.tsv" 2>&1)
+  LOG_RC=$?
+fi
 if [ $LOG_RC -ne 0 ] || [ -n "$LOG_OUT" ]; then
   echo "  FAIL: the -Dtest-log run exited $LOG_RC with $(printf '%s' "$LOG_OUT" | wc -l | tr -d ' ') lines of output"
   printf '%s\n' "$LOG_OUT" | head -20 | sed 's/^/    | /'
@@ -82,9 +93,9 @@ elif [ ! -s "$TMP/host.tsv" ] || LC_ALL=C grep -v -E "$LINE" "$TMP/host.tsv" >/d
 elif ! LC_ALL=C grep -E $'\ttest-host\tPASS\t[0-9]+\t.*format corpus' "$TMP/host.tsv" >/dev/null; then
   echo "  FAIL: no PASS line of the test-host step names a format corpus test"
   FAIL=1
-elif [ "$(awk -F'\t' '$3 == "DONE"' "$TMP/host.tsv" | cut -f2,5)" != "test-host"$'\t'"$(counts "$TMP/host.tsv" test-host)" ]; then
+elif [ "$(awk -F'\t' '$2 == "test-host" && $3 == "DONE"' "$TMP/host.tsv" | cut -f2,5)" != "test-host"$'\t'"$(counts "$TMP/host.tsv" test-host)" ]; then
   echo "  FAIL: the step's one DONE line does not carry its own totals ($(counts "$TMP/host.tsv" test-host))"
-  awk -F'\t' '$3 == "DONE"' "$TMP/host.tsv" | sed 's/^/    | /'
+  awk -F'\t' '$2 == "test-host" && $3 == "DONE"' "$TMP/host.tsv" | sed 's/^/    | /'
   FAIL=1
 fi
 
@@ -172,9 +183,9 @@ const std = @import("std");
 test "a pipe end its parent closed is not held by the test process" {
     const seen = std.c.getenv("EOF_SEEN") orelse return error.NoMarker;
     var tries: u32 = 0;
-    while (tries < 100) : (tries += 1) {
+    while (tries < 200) : (tries += 1) {
         if (std.c.access(seen, 0) == 0) return;
-        std.testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     return error.PipeEndHeld;
 }

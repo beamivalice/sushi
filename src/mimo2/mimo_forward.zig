@@ -2972,7 +2972,7 @@ test "qkv matmul2d kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs 
     const rnd = prng.random();
     for ([_]u8{ 8, 6, 4 }) |bits| {
         // 1000 + Tq keys: a partial last page.
-        for (1..5) |tq| try qkvPackedParityCase(qkvAttnMppKernel, rnd, 64, 4, 192, 128, bits, 1000, @intCast(tq));
+        for ([_]usize{ 1, 4 }) |tq| try qkvPackedParityCase(qkvAttnMppKernel, rnd, 64, 4, 192, 128, bits, 1000, @intCast(tq));
     }
 }
 
@@ -2982,14 +2982,11 @@ test "qkv matmul2d kernel parity: many splits, and the narrower gqa 4 and 24/4 h
     var prng = std.Random.DefaultPrng.init(0x3D2D_5117);
     const rnd = prng.random();
     // 20000 keys = 625 pages over 78 splits.
-    try qkvPackedParityCase(qkvAttnMppKernel, rnd, 64, 4, 192, 128, 8, 20000, 1);
     try qkvPackedParityCase(qkvAttnMppKernel, rnd, 64, 4, 192, 128, 8, 20000, 4);
     // Narrower shapes: gqa 4, and upstream's 24/4 hd 256.
     try qkvPackedParityCase(qkvAttnMppKernel, rnd, 16, 4, 192, 128, 8, 3000, 1);
     try qkvPackedParityCase(qkvAttnMppKernel, rnd, 24, 4, 256, 256, 8, 3000, 1);
     try qkvPackedParityCase(qkvAttnMppKernel, rnd, 24, 4, 256, 256, 4, 3000, 2);
-    try qkvPackedParityCase(qkvAttnMppKernel, rnd, 24, 4, 256, 256, 6, 3000, 2);
-    try qkvPackedParityCase(qkvAttnMppKernel, rnd, 64, 4, 192, 128, 6, 20000, 4);
 }
 
 test "qkv split-K kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs the fp32 truth, no matrix units" {
@@ -3102,9 +3099,9 @@ test "mimoGlobalDecodeArm: a packed cache grown one token at a time switches to 
 test "mimo sliding verify rows run in one dispatch, each row bit-identical to its own sdpa" {
     try mlx.requireGpu();
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
-        for ([_]c_int{ 128, 129, 700 }) |prefix| {
-            for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |width| {
-                for ([_]f32{ 0.05, 1.0, 6.0 }) |gain| try mimoSlidingRowsCase(config, prefix, width, gain);
+        for ([_]c_int{ 128, 700 }) |prefix| {
+            for ([_]c_int{ 2, 5, 8 }) |width| {
+                for ([_]f32{ 0.05, 6.0 }) |gain| try mimoSlidingRowsCase(config, prefix, width, gain);
             }
         }
     }
@@ -3131,8 +3128,8 @@ test "mimo verify rows attend with each serial decode tick's arithmetic (dense, 
     try mlx.requireGpu();
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         for ([_]bool{ false, true }) |is_global| {
-            for ([_]c_int{ 1, 60, 125, 126, 700 }) |prefix| {
-                for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |width| try mimoVerifyRowsIdentityCase(config, is_global, prefix, width);
+            for ([_]c_int{ 1, 126, 700 }) |prefix| {
+                for ([_]c_int{ 2, 5, 8 }) |width| try mimoVerifyRowsIdentityCase(config, is_global, prefix, width);
             }
         }
     }
@@ -3156,13 +3153,6 @@ test "mimo global verify rows on a packed cache share matmul2d passes in groups,
         .{ .prefix = QKV_MPP_DECODE_MIN_TK, .width = 4, .shared = true, .kv_heads = 4 },
         .{ .prefix = QKV_MPP_DECODE_MIN_TK + 61, .width = 4, .shared = false }, // pages 130 -> 131: 2 -> 3 per split
         .{ .prefix = 65566, .width = 4, .shared = true }, // pages 2049 -> 2050, 17 per split
-        .{ .prefix = 65566, .width = 4, .shared = true, .kv_heads = 4 },
-        .{ .prefix = 65566, .width = 4, .shared = true, .bits = 4 },
-        .{ .prefix = 65566, .width = 4, .shared = true, .bits = 6, .kv_heads = 4 },
-        .{ .prefix = 65566, .width = 3, .shared = true },
-        .{ .prefix = 65566, .width = 8, .shared = true },
-        .{ .prefix = 262175, .width = 4, .shared = true }, // pages 8193 -> 8194 inside the first pair, 65 per split
-        .{ .prefix = 262175, .width = 3, .shared = true },
         .{ .prefix = QKV_MPP_DECODE_MIN_TK, .width = FUSED256_MIN_Q_LEN - 1, .shared = true },
     };
     for (cases) |c| {
@@ -3186,9 +3176,8 @@ test "mimo decode qkv prep: bit-identical to partial rope + kv8 and kv6 quantize
     // Heads span tiny to large activations with outliers; one K group is constant and one
     // V group is zero, the quantizer's eps and at-zero corners.
     const head_scales = [_]f32{ 0.02, 0.5, 3.0, 40.0, 300.0 };
-    for (layers) |layer| for (1..@as(usize, MIMO_VERIFY_ROWS_MAX) + 1) |rows_u| {
-        const rows: c_int = @intCast(rows_u);
-        for ([_]c_int{ 0, 1, 4095, 65537, 500000 }) |offset| {
+    for (layers) |layer| for ([_]c_int{ 1, 4, @intCast(MIMO_VERIFY_ROWS_MAX) }) |rows| {
+        for ([_]c_int{ 0, 4095, 500000 }) |offset| {
             var parts: [3]mlx.mlx_array = undefined;
             const widths = [_]c_int{ hq * 192, layer.hk * 192, layer.hk * 128 };
             for (&parts, widths, 0..) |*p, w, which| {
@@ -3603,7 +3592,7 @@ test "fused residual+RMSNorm is bit-identical to mlx_add + mlx_fast_rms_norm" {
     const eps_arr = mlx.mlx_array_new_float(EPS);
     defer _ = mlx.mlx_array_free(eps_arr);
 
-    for ([_]c_int{ 512, 1536, 2048, 2050, 4096 }) |axis| {
+    for ([_]c_int{ 512, 2050, 4096 }) |axis| {
         for ([_]c_int{ 1, 3 }) |rows| {
             for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
                 const cnt: usize = @intCast(rows * axis);

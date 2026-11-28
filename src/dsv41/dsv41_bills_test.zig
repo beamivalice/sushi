@@ -532,8 +532,20 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
     return null;
 }
 
+fn borrowAvailBoundary(config: *const model_mod.ModelConfig, free: u64, target_avail: u64, lo_init: u64, hi_init: u64) u64 {
+    var lo = lo_init;
+    var hi = hi_init;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (bills.admissionAvailableFor(config, mid, 0, free) >= target_avail) hi = mid else lo = mid + 1;
+    }
+    return lo;
+}
+
 test "DeepSeek: an admitted prompt is never refused by a forward's borrow, at the default width or a 512-row chunk, whatever the decoder pools hold and the engine keeps free" {
     const MiB: u64 = 1 << 20;
+    const min_avail: u64 = 256 * MiB;
+    const max_avail: u64 = 8192 * MiB;
     for ([_]bool{ true, false }) |cooler| {
         var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
         config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
@@ -541,6 +553,8 @@ test "DeepSeek: an admitted prompt is never refused by a forward's borrow, at th
         config.max_position_embeddings = 1_048_576;
         config.pinned_context = 1_000_000;
         config.cooler_for_test = cooler;
+        const bits = bills.defaultKvBits(&config);
+        const free = if (cooler) config.expertPoolBytes() else 0;
         // dsv41-memory, the 32 GB Mac at --ssd-budget-gb 18 holds about 2.1 GB of decoder pools; smaller budgets less.
         for ([_]u64{ 300_000_000, 1_000_000_000, 2_100_000_000 }) |borrowable| {
             config.expert_borrow_bytes = borrowable;
@@ -548,8 +562,22 @@ test "DeepSeek: an admitted prompt is never refused by a forward's borrow, at th
                 if (!cooler and free_pct > 0) continue;
                 for ([_]u32{ 16, 8192 }) |max_tokens| {
                     for ([_]u64{ 4096, 4097, 4300, 4600, 5100, 6300, 8400, 20_000 }) |seq| {
-                        var avail: u64 = 256 * MiB;
-                        while (avail <= 8192 * MiB) : (avail += 16 * MiB) {
+                        var points: [16 + bills.PREFILL_CHUNK_LADDER.len * 3]u64 = undefined;
+                        var n_pts: usize = 0;
+                        var grid = min_avail;
+                        while (grid <= max_avail) : (grid += 512 * MiB) {
+                            points[n_pts] = grid;
+                            n_pts += 1;
+                        }
+                        for (bills.PREFILL_CHUNK_LADDER) |rung| {
+                            const need = bills.prefillNeededAtChunk(&config, seq, max_tokens, bits, rung, .{});
+                            const bound = borrowAvailBoundary(&config, free, need, min_avail, max_avail);
+                            for ([_]u64{ @max(min_avail, bound -| MiB), bound, @min(max_avail, bound + MiB) }) |cand| {
+                                points[n_pts] = cand;
+                                n_pts += 1;
+                            }
+                        }
+                        for (points[0..n_pts]) |avail| {
                             for ([_]u32{ 0, 512 }) |explicit| {
                                 const r = borrowRefusal(&config, seq, avail, explicit, max_tokens, free_pct) orelse continue;
                                 std.debug.print("{s}, {d} MB of decoder pools, the engine keeping {d}% free: a {d}-token prompt (max_tokens {d}) admitted with {d} MB free at a {d}-row chunk has its {d}-row forward ending at {d} refused {d} MB short\n", .{
@@ -780,19 +808,61 @@ fn residentPack(lend: bool) !model_mod.ModelConfig {
 
 const resident_weights: u64 = 9_000_000_000;
 
+fn ceilingWarmBoundary(config: *const model_mod.ModelConfig, target_head: u64, lo_init: u64, hi_init: u64) u64 {
+    var lo = lo_init;
+    var hi = hi_init;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (warmHeadroomAfterLoad(config, mid, resident_weights) >= target_head) hi = mid else lo = mid + 1;
+    }
+    return lo;
+}
+
 test "DeepSeek: a fully resident load whose ceiling fits it and its floor warm serves every width as a rung, a borrow or a named refusal, never a forward past the headroom" {
     const t = std.testing;
     const MiB: u64 = 1 << 20;
+    const max_span: u64 = 24 * (1 << 30);
     for ([_]bool{ true, false }) |lend| {
         const config = try residentPack(lend);
         const owned = resident_weights + config.expert_cache_bytes;
+        const max_ceiling = owned + max_span - 1;
         const bits = bills.defaultKvBits(&config);
         const top = bills.widestServedRung(&config);
         var narrowed: u32 = 0;
         var borrowed: u32 = 0;
-        // From the least ceiling the load's fit admits to one that holds the widest forward beside it.
-        var ceiling: u64 = owned;
-        while (ceiling < owned + 24 * (1 << 30)) : (ceiling += 32 * MiB) {
+        // Coarse 512 MiB grid plus exact fit floor, rung warm boundaries (±1 MiB), and borrow thresholds.
+        var points: [64 + bills.PREFILL_CHUNK_LADDER.len * 3 + 12]u64 = undefined;
+        var n_pts: usize = 0;
+        var grid: u64 = owned;
+        while (grid <= max_ceiling) : (grid += 512 * MiB) {
+            points[n_pts] = grid;
+            n_pts += 1;
+        }
+        var fit_lo = owned;
+        var fit_hi = max_ceiling;
+        while (fit_lo < fit_hi) {
+            const mid = fit_lo + (fit_hi - fit_lo) / 2;
+            if (bills.expertStreamingConfigFits(&config, mid, 0, resident_weights)) fit_hi = mid else fit_lo = mid + 1;
+        }
+        for ([_]u64{ @max(owned, fit_lo -| MiB), fit_lo, @min(max_ceiling, fit_lo + MiB) }) |cand| {
+            points[n_pts] = cand;
+            n_pts += 1;
+        }
+        for (bills.PREFILL_CHUNK_LADDER) |rung| {
+            const peak = bills.warmChunkPeakBytes(&config, bits, rung);
+            const bound = ceilingWarmBoundary(&config, peak, owned, max_ceiling);
+            for ([_]u64{ @max(owned, bound -| MiB), bound, @min(max_ceiling, bound + MiB) }) |cand| {
+                points[n_pts] = cand;
+                n_pts += 1;
+            }
+        }
+        for ([_]u64{ 4096, 131_072 }) |seq| {
+            const need_top = bills.prefillNeededAtChunk(&config, seq, 256, bits, top, .{});
+            const c = @min(max_ceiling, owned + need_top);
+            points[n_pts] = c;
+            n_pts += 1;
+        }
+        for (points[0..n_pts]) |ceiling| {
             if (!bills.expertStreamingConfigFits(&config, ceiling, 0, resident_weights)) continue;
             // The served warm takes the widest rung its headroom holds, and the fit leaves it one.
             const head = warmHeadroomAfterLoad(&config, ceiling, resident_weights);
@@ -857,13 +927,27 @@ test "DeepSeek: a request's bill never falls as its prompt grows within a contex
         config.pinned_context = @intCast(ctx);
         var prev: u64 = 0;
         var p: u64 = 1;
-        while (p <= ctx) : (p += @as(u64, if (ctx - p < 300 or p < 1100 or p % 2048 < 3 or p % 2048 > 2045) 1 else 97)) {
+        while (p <= ctx) {
             const b = bills.prefillNeededAtChunk(&config, p, @intCast(ctx - p), 16, chunk, .{});
             if (b < prev) {
                 falls += 1;
                 if (falls < 10) std.debug.print("engine {} ram {} chunk {d} ctx {d}: prompt {d} bills {d} B under the prompt before it\n", .{ engine, ram, chunk, ctx, p, prev - b });
             }
             prev = b;
+            if (p == ctx) break;
+            if (p < 64 or ctx - p <= 8) {
+                p += 1;
+                continue;
+            }
+            // Sparse log sampling with exact checkpoint/page boundaries (±1 around 2048/4096/8192 and tail).
+            var next = @min(ctx, p + @max(@as(u64, 1), p / 12));
+            for ([_]u64{ 511, 512, 513, 2047, 2048, 2049, 4095, 4096, 4097, 8191, 8192, 8193 }) |mark| {
+                if (p < mark and mark < next) {
+                    next = mark;
+                    break;
+                }
+            }
+            p = next;
         }
     };
     try t.expectEqual(@as(u32, 0), falls);

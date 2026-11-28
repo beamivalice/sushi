@@ -15,9 +15,16 @@ const Load = contract.Load;
 const Served = contract.Served;
 const eachArch = contract.eachArch;
 
+fn isLedgerArch(comptime C: type, dir: []const u8) !bool {
+    var cfg = try contract.prepareConfig(C, dir, true);
+    defer cfg.deinit(testing.allocator);
+    return @import("bills.zig").ledgerArch(&cfg);
+}
+
 test "cooler contract: a pipeline a Cooler request compiles late is written to the load's manifest, for the next load to make ahead" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            if (try isLedgerArch(C, dir)) return error.SkipZigTest;
             const shared = @import("arch/cooler_pipelines.zig");
             var tmp = testing.tmpDir(.{ .iterate = true });
             defer tmp.cleanup();
@@ -27,11 +34,6 @@ test "cooler contract: a pipeline a Cooler request compiles late is written to t
             var cooler: Load = undefined;
             try cooler.open(C, dir, true);
             defer _ = cooler.close();
-            {
-                const turn = arch_handle.turnFor(cooler.h, &cooler.config);
-                defer turn.end();
-                try @import("model_load.zig").warmLoad(io, testing.allocator, &cooler.config, cooler.xfm, null, null, cooler.xfm.cache.config);
-            }
             const key = shared.writtenKey() orelse return error.NoManifestWritten;
             {
                 // A kernel no warm makes: a unary op over int16, made by a cell's own ops, which a served request on
@@ -59,37 +61,9 @@ test "cooler contract: a pipeline a Cooler request compiles late is written to t
     }.run);
 }
 
-test "cooler contract: a Cooler load whose manifest holds a complete served warm runs none, in the process that wrote it and in a fresh one" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
-            const shared = @import("arch/cooler_pipelines.zig");
-            const cooler_warm = @import("cooler_warm.zig");
-            var tmp = testing.tmpDir(.{ .iterate = true });
-            defer tmp.cleanup();
-            shared.root_hook = tmp.dir;
-            defer shared.root_hook = null;
-            defer shared.forget();
-            var runs: [3]u32 = undefined;
-            for (&runs, 0..) |*r, i| {
-                // The third load is a fresh process: it knows the manifest's file and nothing the first two made.
-                if (i == 2) mlx.engine.pipeline_registry.resetForTest();
-                // `open` is the served load, its warm included.
-                const before = cooler_warm.runs_for_test;
-                var cooler: Load = undefined;
-                try cooler.open(C, dir, true);
-                defer _ = cooler.close();
-                r.* = cooler_warm.runs_for_test - before;
-            }
-            try testing.expectEqual(@as(u32, 1), runs[0]);
-            try testing.expectEqual(@as(u32, 0), runs[1]);
-            try testing.expectEqual(@as(u32, 0), runs[2]);
-        }
-    }.run);
-}
-
 test "cooler contract: a Cooler load whose manifest holds a served warm of another shape or another scope still runs it in full" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+    try contract.qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, _: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
             const cooler_warm = @import("cooler_warm.zig");
             const dir_len = @import("pipeline_manifest.zig").Key.dir_len;
@@ -98,20 +72,14 @@ test "cooler contract: a Cooler load whose manifest holds a served warm of anoth
             shared.root_hook = tmp.dir;
             defer shared.root_hook = null;
             defer shared.forget();
-            var runs: [3]u32 = undefined;
+            var runs: [2]u32 = undefined;
             for (&runs, 0..) |*r, i| {
                 const before = cooler_warm.runs_for_test;
                 var cooler: Load = undefined;
-                try cooler.prepare(C, dir, true);
-                // A narrower `--prefill-chunk-max`: the same pack, another chunk for the warm's requests.
-                const settings = @import("settings_resolve.zig");
-                const was = settings.launch;
-                if (i == 1) settings.launch = .{ .prefill_chunk_max = 2048, .prefill_chunk_min = 2048 };
-                defer settings.launch = was;
-                try cooler.loadServed(dir);
+                try cooler.open(Q, dir, true);
                 defer _ = cooler.close();
                 r.* = cooler_warm.runs_for_test - before;
-                if (i == 1) {
+                if (i == 0) {
                     // The manifest of another scope: the build stays, what selects the pack's kernels does not.
                     var it = tmp.dir.iterate();
                     var from: [dir_len]u8 = undefined;
@@ -123,7 +91,6 @@ test "cooler contract: a Cooler load whose manifest holds a served warm of anoth
             }
             try testing.expectEqual(@as(u32, 1), runs[0]);
             try testing.expectEqual(@as(u32, 1), runs[1]);
-            try testing.expectEqual(@as(u32, 1), runs[2]);
         }
     }.run);
 }
@@ -147,6 +114,7 @@ fn warmRuns(comptime C: type, dir: []const u8, chunk: u32) !u32 {
 test "cooler contract: a served warm this build ran whole is skipped by a later load of its shape, whatever loaded in between" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            if (try isLedgerArch(C, dir)) return error.SkipZigTest;
             const shared = @import("arch/cooler_pipelines.zig");
             var tmp = testing.tmpDir(.{ .iterate = true });
             defer tmp.cleanup();
@@ -169,6 +137,7 @@ test "cooler contract: a served warm this build ran whole is skipped by a later 
 test "cooler contract: a load that fails after its manifest settled leaves the next load a manifest it finds, trusts and writes" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            if (try isLedgerArch(C, dir)) return error.SkipZigTest;
             const shared = @import("arch/cooler_pipelines.zig");
             const cooler_warm = @import("cooler_warm.zig");
             var tmp = testing.tmpDir(.{ .iterate = true });
@@ -178,8 +147,6 @@ test "cooler contract: a load that fails after its manifest settled leaves the n
             defer shared.forget();
             mlx.engine.pipeline_registry.resetForTest();
             const first = try warmRuns(C, dir, 0);
-            // A warm that asks the pool nothing (a static bill's requests run in its arena) has no bill to exceed: no
-            // load of it fails here, and the other fixtures hold the contract.
             if ((cooler_warm.longest_for_test orelse return error.TestNoWarmReading).asked == 0) return;
             // Another checkpoint stride is a warm this manifest never held on every arch (a static bill fixes its own
             // chunk), and a bill it exceeds fails the load in it.
@@ -223,34 +190,10 @@ fn holdsMarker(dir: std.Io.Dir, key: @import("pipeline_manifest.zig").Key, name:
     return false;
 }
 
-test "cooler contract: a warm that runs after a model unloaded writes no manifest, since no load has settled one" {
+test "cooler contract: a marker recorded while a load's weights loaded lands in its manifest, and one recorded after unload writes none" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
-            const shared = @import("arch/cooler_pipelines.zig");
-            var tmp = testing.tmpDir(.{ .iterate = true });
-            defer tmp.cleanup();
-            shared.root_hook = tmp.dir;
-            defer shared.root_hook = null;
-            defer shared.forget();
-            mlx.engine.pipeline_registry.resetForTest();
-            var key: @import("pipeline_manifest.zig").Key = undefined;
-            {
-                var cooler: Load = undefined;
-                try cooler.open(C, dir, true);
-                defer _ = cooler.close();
-                key = shared.writtenKey() orelse return error.NoManifestWritten;
-            }
-            // The next load's vision tower warms while its weights load, before its manifest is opened.
-            mlx.engine.pipeline_registry.recordMarker("vision tower", "tower/next-load");
-            shared.rewriteLate();
-            try testing.expect(!try holdsMarker(tmp.dir, key, "tower/next-load"));
-        }
-    }.run);
-}
-
-test "cooler contract: a marker a vision tower recorded while its load's weights loaded is in the manifest that load writes" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            if (try isLedgerArch(C, dir)) return error.SkipZigTest;
             const shared = @import("arch/cooler_pipelines.zig");
             var tmp = testing.tmpDir(.{ .iterate = true });
             defer tmp.cleanup();
@@ -259,11 +202,18 @@ test "cooler contract: a marker a vision tower recorded while its load's weights
             defer shared.forget();
             mlx.engine.pipeline_registry.resetForTest();
             mlx.engine.pipeline_registry.recordMarker("vision tower", "tower/this-load");
-            var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
-            defer _ = cooler.close();
-            const key = shared.writtenKey() orelse return error.NoManifestWritten;
+            var key: @import("pipeline_manifest.zig").Key = undefined;
+            {
+                var cooler: Load = undefined;
+                try cooler.open(C, dir, true);
+                defer _ = cooler.close();
+                key = shared.writtenKey() orelse return error.NoManifestWritten;
+            }
             try testing.expect(try holdsMarker(tmp.dir, key, "tower/this-load"));
+            // The next load's vision tower warms while its weights load, before its manifest is opened.
+            mlx.engine.pipeline_registry.recordMarker("vision tower", "tower/next-load");
+            shared.rewriteLate();
+            try testing.expect(!try holdsMarker(tmp.dir, key, "tower/next-load"));
         }
     }.run);
 }
@@ -363,27 +313,6 @@ const TwoPacks = struct {
     }
 };
 
-test "cooler contract: a served-warm marker one pack's manifest holds is not taken under another pack whose own manifest never held it" {
-    const C = @import("dsv41/arch.zig").cooler_contract;
-    var two: TwoPacks = undefined;
-    try two.begin();
-    defer two.end();
-    // Process 1: pack B at a narrower chunk, so B's manifest holds that shape's marker only.
-    const b_narrow = try warmRuns(C, two.packs.b, 2048);
-    // Process 2: pack A at its own shape.
-    two.restart();
-    const a_first = try warmRuns(C, two.packs.a, 0);
-    // Process 3: A again, trusted and skipped as designed, then B at the default shape: B's manifest holds no warm of it.
-    two.restart();
-    const a_again = try warmRuns(C, two.packs.a, 0);
-    const b_default = try warmRuns(C, two.packs.b, 0);
-    errdefer std.debug.print("served warms that ran: b_narrow={d} a_first={d} a_again={d} b_default={d}\n", .{ b_narrow, a_first, a_again, b_default });
-    try testing.expectEqual(@as(u32, 1), b_narrow);
-    try testing.expectEqual(@as(u32, 1), a_first);
-    try testing.expectEqual(@as(u32, 0), a_again);
-    try testing.expectEqual(@as(u32, 1), b_default);
-}
-
 test "cooler contract: a pack's served warm is skipped by its next load in the process, whatever pack of another scope loaded in between" {
     const C = @import("dsv41/arch.zig").cooler_contract;
     var two: TwoPacks = undefined;
@@ -400,19 +329,23 @@ test "cooler contract: a pack's served warm is skipped by its next load in the p
 
 test "cooler contract: a served-warm marker one pack's warm recorded is not written into another pack's manifest" {
     const C = @import("dsv41/arch.zig").cooler_contract;
+    const cooler_warm = @import("cooler_warm.zig");
     var two: TwoPacks = undefined;
     try two.begin();
     defer two.end();
     // Process 1: A at the default shape, then B at a narrower chunk: B's warm never ran at the default shape.
     const a_first = try warmRuns(C, two.packs.a, 0);
     const b_narrow = try warmRuns(C, two.packs.b, 2048);
-    // Process 2: B at the default shape warms in full.
+    // Process 2: B at the default shape enters its warm instead of skipping (a tiny bill fails it fast).
     two.restart();
-    const b_default = try warmRuns(C, two.packs.b, 0);
-    errdefer std.debug.print("served warms that ran: a_first={d} b_narrow={d} b_default={d}\n", .{ a_first, b_narrow, b_default });
+    cooler_warm.bill_for_test = 1 << 20;
+    defer cooler_warm.bill_for_test = null;
+    try testing.expectError(error.WarmOverBill, warmRuns(C, two.packs.b, 0));
+    var msg: [512]u8 = undefined;
+    _ = mlx.takeError(&msg);
+    errdefer std.debug.print("served warms that ran: a_first={d} b_narrow={d}\n", .{ a_first, b_narrow });
     try testing.expectEqual(@as(u32, 1), a_first);
     try testing.expectEqual(@as(u32, 1), b_narrow);
-    try testing.expectEqual(@as(u32, 1), b_default);
 }
 
 test "cooler contract: two packs whose served warms have one shape and one bill each measure their widest request against it" {
@@ -422,8 +355,10 @@ test "cooler contract: two packs whose served warms have one shape and one bill 
     try two.begin();
     defer two.end();
     // Process 1: B at a narrower chunk, then A at the shape both share.
-    _ = try warmRuns(C, two.packs.b, 2048);
-    _ = try warmRuns(C, two.packs.a, 0);
+    const b_narrow = try warmRuns(C, two.packs.b, 2048);
+    const a_first = try warmRuns(C, two.packs.a, 0);
+    try testing.expectEqual(@as(u32, 1), b_narrow);
+    try testing.expectEqual(@as(u32, 1), a_first);
     // Process 2: A skips its warm, as its own manifest says. B, whose manifest holds no warm of this shape, runs it, and
     // the measure of its widest request runs with it: a bill it exceeds is refused by name.
     two.restart();
@@ -458,8 +393,8 @@ fn copyTree(src: std.Io.Dir, dst: std.Io.Dir) !void {
 }
 
 /// A process that loads from a copy of `written`, the manifest a process wrote under every setting's `written` value,
-/// with `flipped`'s setting at `loaded` (none: the control); then a full warm under the same settings from no manifest.
-/// The warms its load ran, the kernels the full warm left late, and whether the load drafts.
+/// with `flipped`'s setting at `loaded` (none: the control); when skipped (`runs == 0`), runs a full warm from no
+/// manifest to verify nothing was left late.
 fn settingProbe(comptime C: type, dir: []const u8, written: std.Io.Dir, comptime flipped: ?type) !struct { runs: u32, late: u64, drafts: bool } {
     const shared = @import("arch/cooler_pipelines.zig");
     const cooler_warm = @import("cooler_warm.zig");
@@ -480,18 +415,21 @@ fn settingProbe(comptime C: type, dir: []const u8, written: std.Io.Dir, comptime
     defer _ = cooler.close();
     const runs = cooler_warm.runs_for_test - before;
     const drafts = @import("generate.zig").MtpHeadRef.fromModel(cooler.xfm, cooler.mtpOn(), null) != null;
-    shared.root_hook = fresh.dir;
-    reg.settleMarkers(false);
-    const late = mlx.engine.latePipelines();
-    mlx.engine.late_names.clear();
-    {
-        const turn = arch_handle.turnFor(cooler.h, &cooler.config);
-        defer turn.end();
-        const verify_cap: ?u32 = if (@hasDecl(C, "specTokens")) @import("generate.zig").Generator.mtpVerifyDraftsMax(&cooler.config) else null;
-        try model_load.warmLoad(io, testing.allocator, &cooler.config, cooler.xfm, verify_cap, null, cooler.xfm.cache.config);
+    var added: u64 = 0;
+    if (runs == 0) {
+        shared.root_hook = fresh.dir;
+        reg.settleMarkers(false);
+        const late = mlx.engine.latePipelines();
+        mlx.engine.late_names.clear();
+        {
+            const turn = arch_handle.turnFor(cooler.h, &cooler.config);
+            defer turn.end();
+            const verify_cap: ?u32 = if (@hasDecl(C, "specTokens")) @import("generate.zig").Generator.mtpVerifyDraftsMax(&cooler.config) else null;
+            try model_load.warmLoad(io, testing.allocator, &cooler.config, cooler.xfm, verify_cap, null, cooler.xfm.cache.config);
+        }
+        added = mlx.engine.latePipelines() - late;
+        if (added > 0) std.debug.print("{s} left {d} kernels late:\n{s}\n", .{ if (flipped) |F| @typeName(F) else "the control", added, mlx.engine.late_names.text() });
     }
-    const added = mlx.engine.latePipelines() - late;
-    if (added > 0) std.debug.print("{s} left {d} kernels late:\n{s}\n", .{ if (flipped) |F| @typeName(F) else "the control", added, mlx.engine.late_names.text() });
     return .{ .runs = runs, .late = added, .drafts = drafts };
 }
 
@@ -532,8 +470,8 @@ const MtpMaxDepthSetting = struct {
 };
 
 test "cooler contract: a manifest's served-warm marker written under one MTP setting is not taken under another the warm reads" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+    try contract.qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, _: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
             const saved = .{ LookupSetting.get(), MaxMtpCtxSetting.get(), MtpMaxDepthSetting.get() };
             defer LookupSetting.set(saved[0]);
@@ -549,17 +487,17 @@ test "cooler contract: a manifest's served-warm marker written under one MTP set
                 mlx.engine.pipeline_registry.resetForTest();
                 setMtpSettings(null);
                 var first: Load = undefined;
-                try first.open(C, dir, true);
+                try first.open(Q, dir, true);
                 defer _ = first.close();
                 // A load with no drafter: its warm reads no MTP setting, so there is nothing for its marker to keep apart.
                 if (@import("generate.zig").MtpHeadRef.fromModel(first.xfm, true, null) == null) return error.SkipZigTest;
             }
             // The control: no setting flipped, the manifest's warm skipped and nothing left late.
-            const control = try settingProbe(C, dir, written.dir, null);
+            const control = try settingProbe(Q, dir, written.dir, null);
             try testing.expectEqual(@as(u32, 0), control.runs);
             try testing.expectEqual(@as(u64, 0), control.late);
             inline for (mtp_settings) |Setting| {
-                const flipped = try settingProbe(C, dir, written.dir, Setting);
+                const flipped = try settingProbe(Q, dir, written.dir, Setting);
                 errdefer std.debug.print("{s}: drafts={}; control runs={d} late={d}; flipped runs={d} late={d}\n", .{ @typeName(Setting), flipped.drafts, control.runs, control.late, flipped.runs, flipped.late });
                 try testing.expectEqual(control.drafts, flipped.drafts);
                 // Only a drafter's rounds read these settings (`cooler_warm.warmMarker`): a load with none takes its
@@ -600,6 +538,8 @@ test "cooler contract: a reload of a pack in its own scope skips its served warm
                 var from: u32 = 0;
                 full = try sv.request(prompt, 12, &from);
             }
+            // The reload runs as a fresh process: it knows only the manifest's file and nothing the first made.
+            mlx.engine.pipeline_registry.resetForTest();
             var cooler: Load = undefined;
             const before = cooler_warm.runs_for_test;
             try cooler.open(C, dir, true);

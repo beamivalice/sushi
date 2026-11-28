@@ -11,12 +11,14 @@ var report: [512]u8 = undefined;
 /// left of them (`rest`, written to `w`; true when it left anything) and their unload as the process ends (`close`).
 pub const Held = struct {
     holds: u32 = 0,
+    quiesce: ?*const fn () void = null,
     rest: ?*const fn (w: *std.Io.Writer) bool = null,
     close: ?*const fn (w: *std.Io.Writer) bool = null,
 };
 pub var held: Held = .{};
 
 fn afterEach() callconv(.c) ?[*:0]const u8 {
+    if (held.quiesce) |q| q();
     var w = std.Io.Writer.fixed(report[0 .. report.len - 1]);
     var left = mlx.engine.leftByTest(&w, held.holds) catch true;
     while (mlx.engine.holdCount() > held.holds) handle.engineHoldEnd();

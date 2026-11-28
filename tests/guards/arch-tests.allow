@@ -103,7 +103,7 @@ cooler contract: a DeepSeek request's first forward finds its whole state made: 
 cooler contract: a DeepSeek request's row stores are made at its last row before its first chunk, and no chunk grows one
 cooler contract: a DeepSeek wide forward's pool growth, the buffers its pass pins included, stays within its cap
 cooler contract: a Qwen prompt that re-renders an earlier reply restores from that turn's own point, written when the held points pass the cap
-cooler contract: a Qwen request reaching generate as one token holds no more cache rows than its bill, on Cooler and on MLX
+cooler contract: a Qwen request reaching generate as one token holds no more cache rows than its bill, on Cooler
 cooler contract: a held Qwen restore point another conversation pushes out of RAM is written, not dropped, and restores
 cooler contract: a held Qwen restore point restores the same tokens as its file after a flush
 cooler contract: a held Qwen restore point whose write fails as it gives way to a staged write mid-commit leaves no listed point without bytes
@@ -116,13 +116,15 @@ cooler contract: a served Qwen partial takeover refused before it donates leaves
 cooler contract: a served Qwen takeover turn cancelled as its prefill ends leaves the hot cache at rest, and the next turn restores and says what the share arm's does
 cooler contract: a served Qwen takeover turn refused at each pool site it reaches, under a roomy and a tight RAM budget, leaves the hot cache at rest and the pool as it was, and the next turn is served
 cooler contract: a served Qwen takeover turn, whole or partial, is credited the capacity it writes in place, and holds no more in use than the exact part of its bill
-cooler contract: a served Qwen turn no longer than the RAM entry it partly shares, a regenerate or a turn that drops more of the last one than it adds, fits by taking it over and says the shared restore's tokens (#109)
 cooler contract: a served Qwen turn of every prompt shape against a RAM entry, shorter, as long and longer, on the share and diverging, is taken over when its share does not fit, SSD-first or not, and says its share arm's tokens
 cooler contract: a served Qwen turn that leaves the last turn's text between two restore points inherits the one below the cut, the engine refusing nothing
 cooler contract: a served Qwen turn that shares part of the last turn's RAM entry, and fits only by taking it over, takes it and says the shared restore's tokens, the engine refusing nothing (#109)
 cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)
 cooler contract: a served speculative Qwen conversation of takeovers, partial and whole, says its share arm's tokens with the pool poisoned
 cooler contract: a streamed Qwen Cooler load decodes one row per forward, so a restore while two requests decode patches no live group and the engine refuses nothing
+cooler contract: after a Cooler load's served warm, lengths, restore and bench compile no kernel, on DeepSeek
+cooler contract: after a Cooler load's served warm, lengths, widest chunk, restore and bench compile no kernel, on the Qwen cut
+cooler contract: after a Cooler load's served warm, lengths, widest chunk, restore and bench compile no kernel, on the Qwen tinies
 cooler contract: every exit of a DeepSeek pool's release, read-back and heal, one refused step or two included, and of an unload mid-lease, on Sushi Cooler and on MLX, publishes as lent what the pools left free in admission's reading and, at a stranded layer, the workspace its heal makes, and admission never reads more than at rest nor than a heal leaves
 cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit
 cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and a streamed load's first wide prefill is served through a late-unwiring borrow (issue 107)

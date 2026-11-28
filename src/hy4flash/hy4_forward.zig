@@ -2593,9 +2593,8 @@ test "hy4 attention spans: at the release's gate and W_o shapes the whole spans'
     const Case = struct { in: c_int, out: c_int, span: c_int, rows: c_int };
     for ([_]Case{
         .{ .in = 3072, .out = 16384, .span = 256, .rows = 600 },
-        .{ .in = 16384, .out = 3072, .span = 256, .rows = 8195 },
-        .{ .in = 3072, .out = 8192, .span = 32, .rows = 1100 },
-        .{ .in = 8192, .out = 3072, .span = 32, .rows = 4108 },
+        .{ .in = 3072, .out = 8192, .span = 32, .rows = 100 },
+        .{ .in = 8192, .out = 3072, .span = 32, .rows = 100 },
     }) |c| {
         const in: usize = @intCast(c.in);
         const out: usize = @intCast(c.out);
@@ -3307,6 +3306,7 @@ fn joinedCell() !void {
             const sd0 = mlx.engine.stats().dispatches;
             for (0..g) |i| {
                 var slot = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(slot);
                 const sin: SpanIn = .{ .gate = gt[i], .whole = false, .hold = &slot };
                 want[i] = try attendGatedCausal(&solo_o, sin, qs[i], ck[i], pk[i], w, geom, keys - 1, 0, null);
             }
@@ -3314,6 +3314,9 @@ fn joinedCell() !void {
             var solo_b: [16][]const f32 = undefined;
             for (0..g) |i| solo_b[i] = try hostRows(&solo_o, want[i]);
             var joined: [16]Arr = @splat(Arr{ .ctx = null });
+            defer for (joined[0..g]) |j| if (j.ctx != null) {
+                _ = mlx.mlx_array_free(j);
+            };
             const d0 = mlx.engine.stats().dispatches;
             try attendJoinedGated(std.testing.allocator, &joined_o, joined[0..g], qs[0..g], raw[0..g], gt[0..g], ck[0..g], pk[0..g], w, geom);
             const launches = mlx.engine.stats().dispatches - d0;

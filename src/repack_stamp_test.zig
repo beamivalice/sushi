@@ -1,6 +1,7 @@
 //! `sushi repack --pack-revision` against small generated packs.
 const std = @import("std");
 const testing = std.testing;
+const repack = @import("repack.zig");
 const stamp = @import("repack_stamp.zig");
 
 extern "c" fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
@@ -184,6 +185,8 @@ test "repack stamp: the whole pack is stamped, config gains the member last, and
 }
 
 test "repack stamp: a selection stamps only its shards, the rest follows, and a rerun changes nothing" {
+    repack.skip_fsync_for_test = true;
+    defer repack.skip_fsync_for_test = false;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -225,6 +228,8 @@ test "repack stamp: a pattern that matches nothing is refused by name before a b
 }
 
 test "repack stamp: a symlinked shard is refused by name unless listed, and listed it is neither read through nor written" {
+    repack.skip_fsync_for_test = true;
+    defer repack.skip_fsync_for_test = false;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -256,6 +261,8 @@ test "repack stamp: a symlinked shard is refused by name unless listed, and list
 }
 
 test "repack stamp: a different existing id is refused, in a shard or in the config, and a bad id is refused" {
+    repack.skip_fsync_for_test = true;
+    defer repack.skip_fsync_for_test = false;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -274,6 +281,8 @@ test "repack stamp: a different existing id is refused, in a shard or in the con
 }
 
 test "repack stamp: the verify step catches a corrupted rewrite and the original stays untouched" {
+    repack.skip_fsync_for_test = true;
+    defer repack.skip_fsync_for_test = false;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -291,6 +300,8 @@ test "repack stamp: the verify step catches a corrupted rewrite and the original
 }
 
 test "repack stamp: an interrupted run resumes: stamped shards are skipped and the config lands last" {
+    repack.skip_fsync_for_test = true;
+    defer repack.skip_fsync_for_test = false;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -307,6 +318,8 @@ test "repack stamp: an interrupted run resumes: stamped shards are skipped and t
 }
 
 test "repack stamp: a full disk is refused before a write, and check names the shard that lacks the id" {
+    repack.skip_fsync_for_test = true;
+    defer repack.skip_fsync_for_test = false;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

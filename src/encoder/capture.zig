@@ -2298,15 +2298,29 @@ test "capture: a calibration window's forward runs on the cut Qwen pack, bound a
     try mlx.requireGpu();
     var loaded = try kld.loadModel(t.io, t.allocator, .{ .model_dir = dir });
     defer loaded.deinit();
-    var ids: [calib.window_len]u32 = undefined;
+    var ids: [8]u32 = undefined;
     for (&ids, 0..) |*v, i| v.* = @intCast((i * 7 + 3) % @as(usize, loaded.config.vocab_size));
-    var windows = try calib.fromTokens(t.allocator, &ids, ids.len);
+    var windows = try calib.fromLengths(t.allocator, &ids, &.{@intCast(ids.len)});
     defer windows.deinit();
     var cap = Capture.init(t.allocator, t.io, mlx.gpuStream(), &windows, undefined, 0);
     defer cap.deinit();
-    var info: driver.Info = undefined;
-    info.ple_layer = std.math.maxInt(u32);
-    cap.info = info;
+    cap.info = .{
+        .pack_dir = std.Io.Dir.cwd(),
+        .pack_abs = "",
+        .source_dir_abs = "",
+        .source_config = "",
+        .geom = .{ .experts = 0, .hidden = 0, .inter = 0 },
+        .layers = 0,
+        .layer_full = &.{},
+        .ple_layer = std.math.maxInt(u32),
+        .rate = .{ .n = 32 },
+        .dec = .mcg,
+        .trunk_bits = 0,
+        .trunk_group = 0,
+        .overrides = &.{},
+        .ngram = null,
+        .eq = .{ .k_text = "", .codebook = "", .window = 12 },
+    };
     // One window a forward, the plan a trunk that is not re-rounded takes.
     cap.batches = try trunk_mod.batchPlan(t.allocator, windows.starts, 0);
     var hidden: ?Hidden = null;

@@ -18,8 +18,6 @@ const qsaScoreSheet = qwen4_qsa.qsaScoreSheet;
 const KVQuantConfig = kv_quant.KVQuantConfig;
 const model_mod = @import("../model.zig");
 const log = @import("../log.zig");
-const io_util_mod = @import("../io_util.zig");
-const diagEnvOn = io_util_mod.diagEnvOn;
 const testing = std.testing;
 const test_support = @import("../test_support.zig");
 const testTrunk = test_support.testTrunk;
@@ -35,7 +33,6 @@ const FUSED256_MIN_Q_LEN = trunk_mod.FUSED256_MIN_Q_LEN;
 const ForwardCtx = trunk_mod.ForwardCtx;
 const KVCache = trunk_mod.KVCache;
 const KvPrefixView = trunk_mod.KvPrefixView;
-const ProfClock = trunk_mod.ProfClock;
 const QSA_ATTN_BK = trunk_mod.QSA_ATTN_BK;
 const QsaAttnCfgKey = trunk_mod.QsaAttnCfgKey;
 const QsaBlockFixture = qwen4_qsa_gather.QsaBlockFixture;
@@ -2550,64 +2547,6 @@ test "qsa sparse attn: loader simdgroups leave every output bit unchanged" {
     // The decode grid (2 kv heads x 16 splits) is too small to hide the tile loads alone.
     qsa_attn_simdgroups_override = null;
     try std.testing.expect(qsaAttnSimdgroups(1, 2, 2, QSA_ATTN_NSPLIT_DEFAULT) > 2);
-}
-
-test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN_UBENCH=1)" {
-    if (!diagEnvOn("SUSHI_QSA_ATTN_UBENCH")) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const ta = std.testing.allocator;
-    const ratio: c_int = 4;
-    const layers: usize = 12;
-    const chain: usize = 8;
-    const reps: usize = 7;
-    var prng = std.Random.DefaultPrng.init(0x0B5E_7A11);
-    const rnd = prng.random();
-    defer qsa_attn_simdgroups_override = null;
-    const arms = [_]c_int{ 2, 16 };
-    for ([_]c_int{ 4096, 32768 }) |kv| {
-        var caches: [layers]KVCache = undefined;
-        var views: [layers]DenseKVView = undefined;
-        var built: usize = 0;
-        defer for (0..built) |i| {
-            views[i].deinit();
-            caches[i].deinit();
-        };
-        for (0..layers) |i| {
-            const k = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
-            defer _ = mlx.mlx_array_free(k);
-            const v = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
-            defer _ = mlx.mlx_array_free(v);
-            caches[i] = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
-            views[i] = try qsaAttnCacheFixture(ta, s, k, v, kv, kv - 1, kv_quant.KVQuantConfig.affine(8), &caches[i]);
-            built += 1;
-        }
-        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, 1, kv, 512, ratio);
-        defer ta.free(blocks_host);
-        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, 1, 512 }, 3, .int32);
-        defer _ = mlx.mlx_array_free(blocks);
-        const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
-        defer _ = mlx.mlx_array_free(q0);
-        var us: [arms.len][reps]f64 = undefined;
-        for (0..reps + 1) |rep| for (arms, 0..) |arm, ai| {
-            qsa_attn_simdgroups_override = arm;
-            var q = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&q, q0));
-            for (0..chain) |_| for (&views) |*view| {
-                const out = (try qsaSparseAttn(s, q, view, blocks, ratio, 1.0 / 16.0)) orelse return error.SparseAttnDeclined;
-                _ = mlx.mlx_array_free(q);
-                q = out;
-            };
-            var clk = ProfClock.init();
-            try mlx.check(mlx.mlx_array_eval(q));
-            const ns = clk.lap();
-            _ = mlx.mlx_array_free(q);
-            if (rep > 0) us[ai][rep - 1] = @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(layers * chain));
-        };
-        for (arms, 0..) |arm, ai| {
-            std.mem.sort(f64, &us[ai], {}, std.sort.asc(f64));
-            std.debug.print("[qsa-attn-ubench] kv={d} simdgroups={d}: {d:.1} us/call (median of {d})\n", .{ kv, arm, us[ai][reps / 2], reps });
-        }
-    }
 }
 
 test "qsa sparse attn: one fused dispatch replaces the arm's op chain (>= 100 ops over 12 layers)" {

@@ -10,6 +10,7 @@ const hy4_model = @import("hy4_model.zig");
 const hy4_prefix = @import("hy4_prefix.zig");
 const hy4_state = @import("hy4_state.zig");
 const hy4_contract = @import("hy4_contract.zig");
+const hy4_held = @import("hy4_held.zig");
 const Load = contract.Load;
 const Served = contract.Served;
 const scheduler = Served.scheduler;
@@ -81,215 +82,194 @@ fn soloRun(sv: *Served, prompt: []const u32, n: u32, mtp: bool) !SoloResult {
 }
 
 test "hy4 request: two requests interleaved tick by tick match solo tokens and end state (HY4_STQ_TINY)" {
-    try contract.servedOn("hy4flash", &.{"HY4_STQ_TINY"}, struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            defer static_bill.close(&ld.config);
-            var sv: Served = undefined;
-            try sv.init(&ld, dir);
-            defer sv.deinit();
-            sv.sch.queue_cap = 4;
-            const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
-            const m = xfm.arch_state.hy4flash.model.?;
-            try testing.expectError(error.Hy4StateNotLent, hy4_prefix.checkLent(m));
-            try testing.expect(!slot_admission.modelExclusiveDecode(sv.entry));
-            const prompt_a = ids[0..@min(ids.len, 24)];
-            const prompt_b = ids[5..@min(ids.len, 35)];
-            for ([_]bool{ false, true }) |mtp| {
-                if (mtp and xfm.arch_state.hy4flash.drafter == null) continue;
-                var solo_a = try soloRun(&sv, prompt_a, 8, mtp);
-                defer solo_a.tokens.deinit(a);
-                defer solo_a.state.deinit(a);
-                var solo_b = try soloRun(&sv, prompt_b, 8, mtp);
-                defer solo_b.tokens.deinit(a);
-                defer solo_b.state.deinit(a);
-                const slot_a = try submitPending(&sv, prompt_a, 8, mtp);
-                defer endSlot(&sv, slot_a);
-                const slot_b = try submitPending(&sv, prompt_b, 8, mtp);
-                defer endSlot(&sv, slot_b);
-                try scheduler.runPrefill(&sv.sch, slot_a);
-                try sv.sch.decoding.append(a, slot_a);
-                try scheduler.runPrefill(&sv.sch, slot_b);
-                try sv.sch.decoding.append(a, slot_b);
-                var state_a: ?std.ArrayList(u8) = null;
-                defer if (state_a) |*s| s.deinit(a);
-                var state_b: ?std.ArrayList(u8) = null;
-                defer if (state_b) |*s| s.deinit(a);
-                while (slot_a.joinsTick() or slot_b.joinsTick()) {
-                    var active: [2]*scheduler.Slot = undefined;
-                    var k: usize = 0;
-                    if (slot_a.joinsTick()) {
-                        active[k] = slot_a;
-                        k += 1;
-                    }
-                    if (slot_b.joinsTick()) {
-                        active[k] = slot_b;
-                        k += 1;
-                    }
-                    try scheduler.runDecodeTick(&sv.sch, active[0..k]);
-                    if (state_a == null and !slot_a.joinsTick()) {
-                        state_a = try captureRequestBytes(a, m, slot_a.request.?.as(.hy4flash).?);
-                    }
-                    if (state_b == null and !slot_b.joinsTick()) {
-                        state_b = try captureRequestBytes(a, m, slot_b.request.?.as(.hy4flash).?);
-                    }
-                    scheduler.cullDecoding(&sv.sch);
-                }
-                try testing.expect(slot_a.error_code == null and slot_b.error_code == null);
-                try testing.expectEqualSlices(u32, solo_a.tokens.items, slot_a.legacy_gen.?.generated_ids.items);
-                try testing.expectEqualSlices(u32, solo_b.tokens.items, slot_b.legacy_gen.?.generated_ids.items);
-                try testing.expectEqualSlices(u8, solo_a.state.items, state_a.?.items);
-                try testing.expectEqualSlices(u8, solo_b.state.items, state_b.?.items);
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const h = try hy4_held.acquire(.stq_openLight);
+    const ids = try hy4_contract.prompt(a, h.dir);
+    defer a.free(ids);
+    var sv: Served = undefined;
+    try sv.init(h.ld, h.dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 4;
+    const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
+    const m = xfm.arch_state.hy4flash.model.?;
+    try testing.expectError(error.Hy4StateNotLent, hy4_prefix.checkLent(m));
+    try testing.expect(!slot_admission.modelExclusiveDecode(sv.entry));
+    const prompt_a = ids[0..@min(ids.len, 24)];
+    const prompt_b = ids[5..@min(ids.len, 35)];
+    for ([_]bool{ false, true }) |mtp| {
+        if (mtp and xfm.arch_state.hy4flash.drafter == null) continue;
+        var solo_a = try soloRun(&sv, prompt_a, 8, mtp);
+        defer solo_a.tokens.deinit(a);
+        defer solo_a.state.deinit(a);
+        var solo_b = try soloRun(&sv, prompt_b, 8, mtp);
+        defer solo_b.tokens.deinit(a);
+        defer solo_b.state.deinit(a);
+        const slot_a = try submitPending(&sv, prompt_a, 8, mtp);
+        defer endSlot(&sv, slot_a);
+        const slot_b = try submitPending(&sv, prompt_b, 8, mtp);
+        defer endSlot(&sv, slot_b);
+        try scheduler.runPrefill(&sv.sch, slot_a);
+        try sv.sch.decoding.append(a, slot_a);
+        try scheduler.runPrefill(&sv.sch, slot_b);
+        try sv.sch.decoding.append(a, slot_b);
+        var state_a: ?std.ArrayList(u8) = null;
+        defer if (state_a) |*s| s.deinit(a);
+        var state_b: ?std.ArrayList(u8) = null;
+        defer if (state_b) |*s| s.deinit(a);
+        while (slot_a.joinsTick() or slot_b.joinsTick()) {
+            var active: [2]*scheduler.Slot = undefined;
+            var k: usize = 0;
+            if (slot_a.joinsTick()) {
+                active[k] = slot_a;
+                k += 1;
             }
+            if (slot_b.joinsTick()) {
+                active[k] = slot_b;
+                k += 1;
+            }
+            try scheduler.runDecodeTick(&sv.sch, active[0..k]);
+            if (state_a == null and !slot_a.joinsTick()) {
+                state_a = try captureRequestBytes(a, m, slot_a.request.?.as(.hy4flash).?);
+            }
+            if (state_b == null and !slot_b.joinsTick()) {
+                state_b = try captureRequestBytes(a, m, slot_b.request.?.as(.hy4flash).?);
+            }
+            scheduler.cullDecoding(&sv.sch);
         }
-    }.run);
+        try testing.expect(slot_a.error_code == null and slot_b.error_code == null);
+        try testing.expectEqualSlices(u32, solo_a.tokens.items, slot_a.legacy_gen.?.generated_ids.items);
+        try testing.expectEqualSlices(u32, solo_b.tokens.items, slot_b.legacy_gen.?.generated_ids.items);
+        try testing.expectEqualSlices(u8, solo_a.state.items, state_a.?.items);
+        try testing.expectEqualSlices(u8, solo_b.state.items, state_b.?.items);
+    }
 }
 
 test "hy4 request: join mid-decode and cancel mid-decode leave survivor unchanged and release every cancelled byte (HY4_STQ_TINY)" {
-    try contract.servedOn("hy4flash", &.{"HY4_STQ_TINY"}, struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            defer static_bill.close(&ld.config);
-            const l = ld.config.static_ledger.?;
-            var sv: Served = undefined;
-            try sv.init(&ld, dir);
-            defer sv.deinit();
-            sv.sch.queue_cap = 4;
-            const prompt_a = ids[0..@min(ids.len, 24)];
-            const prompt_b = ids[6..@min(ids.len, 34)];
-            var solo_a = try soloRun(&sv, prompt_a, 10, false);
-            defer solo_a.tokens.deinit(a);
-            defer solo_a.state.deinit(a);
-            const slot_a = try submitPending(&sv, prompt_a, 10, false);
-            var a_ended = false;
-            defer if (!a_ended) endSlot(&sv, slot_a);
-            try scheduler.runPrefill(&sv.sch, slot_a);
-            try sv.sch.decoding.append(a, slot_a);
-            var one_a = [_]*scheduler.Slot{slot_a};
-            for (0..3) |_| if (slot_a.joinsTick()) try scheduler.runDecodeTick(&sv.sch, &one_a);
-            const bill_a = slot_a.ledger.?.state();
-            try testing.expectEqual(bill_a, l.of(.state));
-            try testing.expect(sched.requestBytes(slot_a) > 0);
-            try testing.expectEqual(@as(u64, 0), sched.modelStateBytes(slot_a));
-            try testing.expectEqual(@as(u64, 0), sched.parkedStateBytes(sv.entry));
-            const slot_b = try submitPending(&sv, prompt_b, 10, false);
-            var b_ended = false;
-            defer if (!b_ended) endSlot(&sv, slot_b);
-            try scheduler.runPrefill(&sv.sch, slot_b);
-            try sv.sch.decoding.append(a, slot_b);
-            const bill_b = slot_b.ledger.?.state();
-            try testing.expectEqual(bill_a + bill_b, l.of(.state));
-            try testing.expect(sched.requestBytes(slot_b) > 0);
-            try testing.expectEqual(@as(u64, 0), sched.modelStateBytes(slot_b));
-            var pair = [_]*scheduler.Slot{ slot_a, slot_b };
-            for (0..2) |_| if (slot_a.joinsTick() and slot_b.joinsTick()) try scheduler.runDecodeTick(&sv.sch, &pair);
-            slot_b.cancelled.store(true, .release);
-            scheduler.cullDecoding(&sv.sch);
-            try testing.expectEqual(@as(u64, 0), sched.requestBytes(slot_b));
-            try testing.expectEqual(bill_a, l.of(.state));
-            try testing.expectEqual(@as(u64, 0), l.of(.parked));
-            b_ended = true;
-            endSlot(&sv, slot_b);
-            try testing.expectEqual(bill_a, l.of(.state));
-            while (slot_a.joinsTick()) try scheduler.runDecodeTick(&sv.sch, &one_a);
-            scheduler.cullDecoding(&sv.sch);
-            try testing.expect(slot_a.error_code == null);
-            try testing.expectEqualSlices(u32, solo_a.tokens.items, slot_a.legacy_gen.?.generated_ids.items);
-            try testing.expectEqual(@as(u64, 0), sched.requestBytes(slot_a));
-            try testing.expectEqual(@as(u64, 0), l.of(.state));
-            try testing.expectEqual(@as(u64, 0), l.of(.parked));
-            a_ended = true;
-            endSlot(&sv, slot_a);
-            try testing.expectEqual(@as(u64, 0), l.of(.state));
-            try testing.expectEqual(@as(u64, 0), l.of(.parked));
-        }
-    }.run);
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const h = try hy4_held.acquire(.stq_openLight);
+    const ids = try hy4_contract.prompt(a, h.dir);
+    defer a.free(ids);
+    const ld = h.ld;
+    const l = ld.config.static_ledger.?;
+    var sv: Served = undefined;
+    try sv.init(ld, h.dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 4;
+    const prompt_a = ids[0..@min(ids.len, 24)];
+    const prompt_b = ids[6..@min(ids.len, 34)];
+    var solo_a = try soloRun(&sv, prompt_a, 10, false);
+    defer solo_a.tokens.deinit(a);
+    defer solo_a.state.deinit(a);
+    const slot_a = try submitPending(&sv, prompt_a, 10, false);
+    var a_ended = false;
+    defer if (!a_ended) endSlot(&sv, slot_a);
+    try scheduler.runPrefill(&sv.sch, slot_a);
+    try sv.sch.decoding.append(a, slot_a);
+    var one_a = [_]*scheduler.Slot{slot_a};
+    for (0..3) |_| if (slot_a.joinsTick()) try scheduler.runDecodeTick(&sv.sch, &one_a);
+    const bill_a = slot_a.ledger.?.state();
+    try testing.expectEqual(bill_a, l.of(.state));
+    try testing.expect(sched.requestBytes(slot_a) > 0);
+    try testing.expectEqual(@as(u64, 0), sched.modelStateBytes(slot_a));
+    try testing.expectEqual(@as(u64, 0), sched.parkedStateBytes(sv.entry));
+    const slot_b = try submitPending(&sv, prompt_b, 10, false);
+    var b_ended = false;
+    defer if (!b_ended) endSlot(&sv, slot_b);
+    try scheduler.runPrefill(&sv.sch, slot_b);
+    try sv.sch.decoding.append(a, slot_b);
+    const bill_b = slot_b.ledger.?.state();
+    try testing.expectEqual(bill_a + bill_b, l.of(.state));
+    try testing.expect(sched.requestBytes(slot_b) > 0);
+    try testing.expectEqual(@as(u64, 0), sched.modelStateBytes(slot_b));
+    var pair = [_]*scheduler.Slot{ slot_a, slot_b };
+    for (0..2) |_| if (slot_a.joinsTick() and slot_b.joinsTick()) try scheduler.runDecodeTick(&sv.sch, &pair);
+    slot_b.cancelled.store(true, .release);
+    scheduler.cullDecoding(&sv.sch);
+    try testing.expectEqual(@as(u64, 0), sched.requestBytes(slot_b));
+    try testing.expectEqual(bill_a, l.of(.state));
+    try testing.expectEqual(@as(u64, 0), l.of(.parked));
+    b_ended = true;
+    endSlot(&sv, slot_b);
+    try testing.expectEqual(bill_a, l.of(.state));
+    while (slot_a.joinsTick()) try scheduler.runDecodeTick(&sv.sch, &one_a);
+    scheduler.cullDecoding(&sv.sch);
+    try testing.expect(slot_a.error_code == null);
+    try testing.expectEqualSlices(u32, solo_a.tokens.items, slot_a.legacy_gen.?.generated_ids.items);
+    try testing.expectEqual(@as(u64, 0), sched.requestBytes(slot_a));
+    try testing.expectEqual(@as(u64, 0), l.of(.state));
+    try testing.expectEqual(@as(u64, 0), l.of(.parked));
+    a_ended = true;
+    endSlot(&sv, slot_a);
+    try testing.expectEqual(@as(u64, 0), l.of(.state));
+    try testing.expectEqual(@as(u64, 0), l.of(.parked));
 }
 
 test "hy4 request: N running requests bill N states exactly (HY4_STQ_TINY)" {
-    try contract.servedOn("hy4flash", &.{"HY4_STQ_TINY"}, struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            defer static_bill.close(&ld.config);
-            const l = ld.config.static_ledger.?;
-            var sv: Served = undefined;
-            try sv.init(&ld, dir);
-            defer sv.deinit();
-            sv.sch.queue_cap = 4;
-            const prompts = [_][]const u32{
-                ids[0..@min(ids.len, 16)],
-                ids[4..@min(ids.len, 28)],
-                ids[8..@min(ids.len, 38)],
-            };
-            const max_toks = [_]u32{ 6, 10, 14 };
-            var slots: [3]*scheduler.Slot = undefined;
-            var bills_each: [3]u64 = undefined;
-            var made: usize = 0;
-            var done: [3]bool = @splat(false);
-            defer for (0..made) |i| if (!done[i]) endSlot(&sv, slots[i]);
-            var expected_state: u64 = 0;
-            for (0..3) |i| {
-                slots[i] = try submitPending(&sv, prompts[i], max_toks[i], false);
-                made = i + 1;
-                try scheduler.runPrefill(&sv.sch, slots[i]);
-                try sv.sch.decoding.append(a, slots[i]);
-                bills_each[i] = slots[i].ledger.?.state();
-                expected_state += bills_each[i];
-                try testing.expectEqual(expected_state, l.of(.state));
-                try testing.expectEqual(@as(u64, 0), l.of(.parked));
-                try testing.expectEqual(@as(u64, 0), sched.parkedStateBytes(sv.entry));
-                try testing.expectEqual(@as(u64, 0), sched.modelStateBytes(slots[i]));
-                try testing.expect(sched.requestBytes(slots[i]) > 0);
-                try testing.expectEqual(
-                    slots[i].cache.residentBytes() + sched.requestBytes(slots[i]) + slots[i].ring_cps.bytes(),
-                    scheduler.slotStateBytes(slots[i]),
-                );
-            }
-            for (0..3) |i| {
-                slots[i].cancelled.store(true, .release);
-                scheduler.cullDecoding(&sv.sch);
-                expected_state -= bills_each[i];
-                try testing.expectEqual(expected_state, l.of(.state));
-                try testing.expectEqual(@as(u64, 0), sched.requestBytes(slots[i]));
-                done[i] = true;
-                endSlot(&sv, slots[i]);
-            }
-            try testing.expectEqual(@as(u64, 0), l.of(.state));
-            try testing.expectEqual(@as(u64, 0), l.of(.parked));
-        }
-    }.run);
-}
-
-const ResidentHy4 = struct {
-    pub fn prepare(a: std.mem.Allocator, config: *@import("../model.zig").ModelConfig, dir: []const u8) !void {
-        try hy4_contract.prepare(a, config, dir);
-        config.expert_resident = true;
-        config.expert_cache_bytes = std.math.maxInt(u64) / 2;
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const h = try hy4_held.acquire(.stq_openLight);
+    const ids = try hy4_contract.prompt(a, h.dir);
+    defer a.free(ids);
+    const ld = h.ld;
+    const l = ld.config.static_ledger.?;
+    var sv: Served = undefined;
+    try sv.init(ld, h.dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 4;
+    const prompts = [_][]const u32{
+        ids[0..@min(ids.len, 16)],
+        ids[4..@min(ids.len, 28)],
+        ids[8..@min(ids.len, 38)],
+    };
+    const max_toks = [_]u32{ 6, 10, 14 };
+    var slots: [3]*scheduler.Slot = undefined;
+    var bills_each: [3]u64 = undefined;
+    var made: usize = 0;
+    var done: [3]bool = @splat(false);
+    defer for (0..made) |i| if (!done[i]) endSlot(&sv, slots[i]);
+    var expected_state: u64 = 0;
+    for (0..3) |i| {
+        slots[i] = try submitPending(&sv, prompts[i], max_toks[i], false);
+        made = i + 1;
+        try scheduler.runPrefill(&sv.sch, slots[i]);
+        try sv.sch.decoding.append(a, slots[i]);
+        bills_each[i] = slots[i].ledger.?.state();
+        expected_state += bills_each[i];
+        try testing.expectEqual(expected_state, l.of(.state));
+        try testing.expectEqual(@as(u64, 0), l.of(.parked));
+        try testing.expectEqual(@as(u64, 0), sched.parkedStateBytes(sv.entry));
+        try testing.expectEqual(@as(u64, 0), sched.modelStateBytes(slots[i]));
+        try testing.expect(sched.requestBytes(slots[i]) > 0);
+        try testing.expectEqual(
+            slots[i].cache.residentBytes() + sched.requestBytes(slots[i]) + slots[i].ring_cps.bytes(),
+            scheduler.slotStateBytes(slots[i]),
+        );
     }
-};
+    for (0..3) |i| {
+        slots[i].cancelled.store(true, .release);
+        scheduler.cullDecoding(&sv.sch);
+        expected_state -= bills_each[i];
+        try testing.expectEqual(expected_state, l.of(.state));
+        try testing.expectEqual(@as(u64, 0), sched.requestBytes(slots[i]));
+        done[i] = true;
+        endSlot(&sv, slots[i]);
+    }
+    try testing.expectEqual(@as(u64, 0), l.of(.state));
+    try testing.expectEqual(@as(u64, 0), l.of(.parked));
+}
 
 test "hy4 request: two and three resident requests join into batchedForward, match solo tokens and end state, and mid-decode cancel preserves survivors (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
+    const ld = h.ld;
     const l = ld.config.static_ledger.?;
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 8;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -407,15 +387,11 @@ test "hy4 request: two and three resident requests join into batchedForward, mat
 test "hy4 request: a drafting slot rides rows only on a batching load, unconstrained and unpenalised (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(h.ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 4;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -446,87 +422,14 @@ test "hy4 request: a drafting slot rides rows only on a batching load, unconstra
     try testing.expectEqual(sched.TickClass.none, sched.tickClass(slot));
 }
 
-test "hy4 request: two drafting requests join as plain rows, then the survivor resumes DFly2 with its solo tokens (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
-    defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
-    var sv: Served = undefined;
-    try sv.init(&ld, dir);
-    defer sv.deinit();
-    sv.sch.queue_cap = 4;
-    const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
-    if (xfm.arch_state.hy4flash.drafter == null) return error.SkipZigTest;
-    const prompts = [_][]const u32{ ids[0..@min(ids.len, 16)], ids[4..@min(ids.len, 24)] };
-    // The first ends early: the other is alone again and resumes DFly2.
-    const max_toks = [2]u32{ 5, 14 };
-    var solos: [2]SoloResult = undefined;
-    var solos_made: usize = 0;
-    defer for (0..solos_made) |i| {
-        solos[i].tokens.deinit(a);
-        solos[i].state.deinit(a);
-    };
-    for (0..2) |i| {
-        solos[i] = try soloRun(&sv, prompts[i], max_toks[i], true);
-        solos_made = i + 1;
-    }
-    hy4_state.joined_ticks_for_test = 0;
-    hy4_sched_knobs.group_ticks_for_test = 0;
-    var slots: [2]*scheduler.Slot = undefined;
-    var made: usize = 0;
-    defer for (0..made) |i| endSlot(&sv, slots[i]);
-    for (0..2) |i| {
-        slots[i] = try submitPending(&sv, prompts[i], max_toks[i], true);
-        made = i + 1;
-        try scheduler.runPrefill(&sv.sch, slots[i]);
-        try sv.sch.decoding.append(a, slots[i]);
-    }
-    var both = [_]*scheduler.Slot{ slots[0], slots[1] };
-    try scheduler.runDecodeTick(&sv.sch, &both);
-    errdefer std.debug.print("joined ticks {d} after the first tick of two drafting requests\n", .{hy4_state.joined_ticks_for_test});
-    try testing.expect(hy4_state.joined_ticks_for_test > 0);
-    try testing.expectEqual(@as(u64, 0), hy4_sched_knobs.group_ticks_for_test);
-    scheduler.cullDecoding(&sv.sch);
-    var ticks: usize = 0;
-    while (ticks < 96) : (ticks += 1) {
-        var act: [2]*scheduler.Slot = undefined;
-        var k: usize = 0;
-        for (0..2) |i| if (slots[i].joinsTick()) {
-            act[k] = slots[i];
-            k += 1;
-        };
-        if (k == 0) break;
-        try scheduler.runDecodeTick(&sv.sch, act[0..k]);
-        scheduler.cullDecoding(&sv.sch);
-    }
-    try testing.expect(ticks < 96);
-    try testing.expectEqual(@as(u64, 0), hy4_sched_knobs.group_ticks_for_test);
-    for (0..2) |i| {
-        try testing.expect(slots[i].error_code == null);
-        try testing.expectEqualSlices(u32, solos[i].tokens.items, slots[i].legacy_gen.?.generated_ids.items);
-    }
-    var drafted: u32 = 0;
-    for (slots[1].legacy_gen.?.drafter_stats.rows_hist[2..]) |c| drafted += c;
-    try testing.expect(drafted > 0);
-}
-
 test "hy4 request: three drafting requests join as plain rows, then the last resumes DFly2 with its solo tokens (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(h.ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 8;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -600,18 +503,12 @@ test "hy4 request: three drafting requests join as plain rows, then the last res
 test "hy4 request: three drafting requests in company verify their drafts as groups and say their solo DFly2 tokens (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
+    const ld = h.ld;
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 8;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -717,18 +614,12 @@ fn expectBlockShapes(m: *const hy4_model.Model, slots: []const *scheduler.Slot) 
 test "hy4 request: a request's logits blocks keep one shape across a group tick, a joined tick and a solo forward, none asking the pool (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
+    const ld = h.ld;
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 8;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -832,18 +723,12 @@ test "hy4 request: a request's logits blocks keep one shape across a group tick,
 fn groupRoundsCut(max_toks: u32, end_at: ?usize) !void {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
+    const ld = h.ld;
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 8;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -952,27 +837,16 @@ fn soloRunWith(sv: *Served, prompt: []const u32, n: u32, sampling: @import("../s
     return .{ .tokens = tokens, .state = state };
 }
 
-const JoinedResident = struct {
-    pub fn prepare(a: std.mem.Allocator, config: *@import("../model.zig").ModelConfig, dir: []const u8) !void {
-        try hy4_contract.prepare(a, config, dir);
-        config.expert_resident = true;
-        config.expert_cache_bytes = std.math.maxInt(u64) / 2;
-    }
-};
-
 test "hy4 request: a joined tick draws each row through its own planned sample root, greedy and top-p alike (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(JoinedResident, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
+    const ld = h.ld;
     try testing.expect(sched.batches(&ld.config));
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 4;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -1030,15 +904,11 @@ test "hy4 request: a joined tick draws each row through its own planned sample r
 test "hy4 request: a joined tick whose shorter row ends in the drain leaves the survivor its solo tokens (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(JoinedResident, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(h.ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 4;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -1085,15 +955,11 @@ test "hy4 request: a joined tick whose shorter row ends in the drain leaves the 
 test "hy4 request: two drafting requests whose shorter one ends at the joined tick's entry leave the survivor its solo DFly2 tokens (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(h.ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 4;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -1133,15 +999,11 @@ test "hy4 request: two drafting requests whose shorter one ends at the joined ti
 test "hy4 request: a drafting row its partner's entry stop leaves alone counts its pending pad once (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(h.ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 4;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -1168,96 +1030,11 @@ test "hy4 request: a drafting row its partner's entry stop leaves alone counts i
     try testing.expect(slots[1].error_code == null);
 }
 
-test "hy4 request: after the load, a joined tick at every width the load joins makes no pipeline, drafting rows in company too (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
-    defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
-    var sv: Served = undefined;
-    try sv.init(&ld, dir);
-    defer sv.deinit();
-    const rows = @import("hy4_plan.zig").joinedRows(&ld.config);
-    if (rows < 2) return error.SkipZigTest;
-    const max_rows = @import("sushi_exl3").project_rows.NAX_ROWS_MAX;
-    sv.sch.queue_cap = @intCast(rows);
-    const mtp = @import("../arch/handle.zig").trunk(sv.entry.handle.?).arch_state.hy4flash.drafter != null;
-    // Rows deeper than the window: the ticks take the grouped sliding attention, which the count below proves.
-    const hy4_forward = @import("hy4_forward.zig");
-    const late = mlx.engine.latePipelines();
-    mlx.engine.late_names.clear();
-    const grouped = hy4_forward.grouped_chains_for_test;
-    var slots: [max_rows]*scheduler.Slot = undefined;
-    var made: usize = 0;
-    defer for (0..made) |i| endSlot(&sv, slots[i]);
-    // Each ends one tick after the one before it, so the tick narrows through every width from `rows` to 2.
-    for (0..rows) |i| {
-        slots[i] = try submitPending(&sv, ids[i % 4 .. @min(ids.len, 12 + i % 4)], @intCast(2 + i), mtp);
-        made = i + 1;
-        try scheduler.runPrefill(&sv.sch, slots[i]);
-        try sv.sch.decoding.append(a, slots[i]);
-    }
-    var ticks: usize = 0;
-    while (ticks < 4 * max_rows) : (ticks += 1) {
-        var act: [max_rows]*scheduler.Slot = undefined;
-        var k: usize = 0;
-        for (slots[0..made]) |s| if (s.joinsTick()) {
-            act[k] = s;
-            k += 1;
-        };
-        if (k == 0) break;
-        try scheduler.runDecodeTick(&sv.sch, act[0..k]);
-        scheduler.cullDecoding(&sv.sch);
-    }
-    for (slots[0..made]) |s| try testing.expect(s.error_code == null);
-    try testing.expect(hy4_forward.grouped_chains_for_test > grouped);
-    errdefer std.debug.print("joined ticks after the load made pipelines:\n{s}\n", .{mlx.engine.late_names.text()});
-    try testing.expectEqual(late, mlx.engine.latePipelines());
-}
-
-test "hy4 request: after the load, a prompt whose chunk runs one or two rows past a whole span compiles no pipeline (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
-    defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
-    var sv: Served = undefined;
-    try sv.init(&ld, dir);
-    defer sv.deinit();
-    const m = @import("../arch/handle.zig").trunk(sv.entry.handle.?).arch_state.hy4flash.model.?;
-    var prompt: [300]u32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
-    const late = mlx.engine.latePipelines();
-    mlx.engine.late_names.clear();
-    var restored: u32 = 0;
-    // A chunk past a whole span runs its last row or two as a span of their own (`fwd.linearSpans`): at both widths a
-    // layer splits a chunk by, before the selection threshold's 512.
-    for ([_]usize{ @intCast(@import("hy4_model.zig").gathered_span), @intCast(m.span_rows) }) |span| for ([_]usize{ 1, 2 }) |past| {
-        const len = span + past + 1;
-        var got = try sv.request(prompt[0..len], 1, &restored);
-        got.deinit(a);
-        errdefer std.debug.print("a {d}-token prompt ({d} rows past a {d}-row span) made pipelines:\n{s}\n", .{ len, past, span, mlx.engine.late_names.text() });
-        try testing.expectEqual(late, mlx.engine.latePipelines());
-    };
-}
-
 /// A served SSD-only load of the tiny, a prompt of `len` tokens from `ids` at `stride`, asked twice with `n` greedy tokens.
-fn repeatOnSsd(dir: []const u8, ids: []const u32, len: usize, stride: usize, n: u32) !struct { first: u32, second: u32, same: bool, points: [8]u32, count: usize } {
+fn repeatOnSsd(ld: *Load, dir: []const u8, ids: []const u32, len: usize, stride: usize, n: u32) !struct { first: u32, second: u32, same: bool, points: [8]u32, count: usize } {
     const a = testing.allocator;
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(ld, dir);
     defer sv.deinit();
     const prompt = try a.alloc(u32, len);
     defer a.free(prompt);
@@ -1268,7 +1045,7 @@ fn repeatOnSsd(dir: []const u8, ids: []const u32, len: usize, stride: usize, n: 
     var r2: u32 = 0;
     var second = try sv.request(prompt, n, &r2);
     defer second.deinit(a);
-    var out: @TypeOf(repeatOnSsd(dir, ids, len, stride, n) catch unreachable) = .{ .first = r1, .second = r2, .same = std.mem.eql(u32, first.items, second.items), .points = @splat(0), .count = 0 };
+    var out: @TypeOf(repeatOnSsd(ld, dir, ids, len, stride, n) catch unreachable) = .{ .first = r1, .second = r2, .same = std.mem.eql(u32, first.items, second.items), .points = @splat(0), .count = 0 };
     for (sv.entry.prefix_cache.?.disk.?.entries.items) |e| for (e.ssm_positions) |p| if (out.count < out.points.len) {
         out.points[out.count] = p;
         out.count += 1;
@@ -1279,19 +1056,19 @@ fn repeatOnSsd(dir: []const u8, ids: []const u32, len: usize, stride: usize, n: 
 test "hy4 request: a served SSD-first load persists a prompt's end point only at or past the persist floor, and a repeat restores from one it holds (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
     const floor = @import("../kv_disk_cache.zig").MIN_PERSIST_TOKENS;
     // A 512-token prompt's end point stands under the floor (the prefill's backoff): it is not persisted, so its repeat
     // re-prefills; only the reply's end, past the repeat's own reach, is written.
-    const short = try repeatOnSsd(dir, ids, floor, 3, 2);
+    const short = try repeatOnSsd(h.ld, h.dir, ids, floor, 3, 2);
     errdefer std.debug.print("512: restored {d} then {d}, points {any}\n", .{ short.first, short.second, short.points[0..short.count] });
     for (short.points[0..short.count]) |p| try testing.expect(p >= floor);
     try testing.expectEqual(@as(u32, 0), short.second);
     try testing.expect(short.same);
     // A 600-token prompt's end point is past the floor: it is persisted and its repeat restores from it.
-    const long = try repeatOnSsd(dir, ids, 600, 5, 2);
+    const long = try repeatOnSsd(h.ld, h.dir, ids, 600, 5, 2);
     errdefer std.debug.print("600: restored {d} then {d}, points {any}\n", .{ long.first, long.second, long.points[0..long.count] });
     try testing.expect(long.second >= floor and long.second < 600);
     try testing.expect(long.same);
@@ -1300,15 +1077,11 @@ test "hy4 request: a served SSD-first load persists a prompt's end point only at
 test "hy4 request: a served reply's end point serves the next turn that adds to the reply; a re-issue of prompt and reply exactly restores at the prompt's end point (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(h.ld, h.dir);
     defer sv.deinit();
     const prompt = try a.alloc(u32, 600);
     defer a.free(prompt);
@@ -1343,18 +1116,12 @@ fn kv_floor() u32 {
 test "hy4 request: batched DFly2 draftBatch + grouped verify at N=2, 4, 8 across ragged depths runs on the arena with zero pool asks and zero late pipelines (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
+    const ld = h.ld;
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 16;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -1453,18 +1220,12 @@ test "hy4 request: batched DFly2 draftBatch + grouped verify at N=2, 4, 8 across
 test "hy4 request: a slot without handover past the sparse threshold joins grouped DFly2 with zero PlanMiss and matches solo (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.stq_resident);
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(ResidentHy4, dir, true);
-    defer _ = ld.close();
-    defer static_bill.close(&ld.config);
+    const ld = h.ld;
     var sv: Served = undefined;
-    try sv.init(&ld, dir);
+    try sv.init(ld, h.dir);
     defer sv.deinit();
     sv.sch.queue_cap = 8;
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
@@ -1563,10 +1324,11 @@ const StreamedHy4 = struct {
 test "hy4 request: a streamed Cooler load with >= 2 * top_k slots/layer joins concurrent requests with exact solo parity, zero PlanMiss, zero late pipelines, and exact ledger balance (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    hy4_held.releaseHeld();
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;

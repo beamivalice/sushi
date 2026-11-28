@@ -3315,10 +3315,10 @@ test "waitForUnwire honors unwire_wait_max_ms" {
     const was = unwire_wait_max_ms;
     unwire_wait_max_ms = 0;
     defer unwire_wait_max_ms = was;
+    unwire_polls_for_test.store(0, .release);
     const tio = std.Io.Threaded.global_single_threaded.io();
-    const t0 = io_util.nowMsMonotonic(tio);
     waitForUnwire(tio, 1 << 30, 100 << 30);
-    try testing.expect(io_util.nowMsMonotonic(tio) - t0 < 500);
+    try testing.expectEqual(@as(u32, 0), unwire_polls_for_test.load(.acquire));
 }
 
 test "waitForUnwire returns at once when shutdown_requested is set" {

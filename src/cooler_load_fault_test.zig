@@ -6,13 +6,12 @@ const std = @import("std");
 const testing = std.testing;
 const mlx = @import("mlx.zig");
 const arch_handle = @import("arch/handle.zig");
-const io = std.Io.Threaded.global_single_threaded.io();
 const contract = @import("cooler_contract_test.zig");
 const Load = contract.Load;
 const Sheet = contract.Sheet;
 const eachArch = contract.eachArch;
-const eachFixture = contract.eachFixture;
 const eachLayout = contract.eachLayout;
+const eachResidency = contract.eachResidency;
 const firstAsks = contract.firstAsks;
 const greedy = contract.greedy;
 
@@ -33,9 +32,11 @@ test "cooler contract: a Cooler load refused at a pool buffer where its cleanup 
             // The asks of the trunk's bring-up (`Load.load`, whose errdefers free the weights and the trunk) and of the
             // served warm (`serve`, whose failure closes the whole load), counted on a clean load after the first.
             var asks: [2]u64 = undefined;
+            var check_serve = false;
             {
                 var counted: Load = undefined;
                 try counted.prepare(C, dir, true);
+                check_serve = !(@import("arch/config.zig").isOf(&counted.config, "dsv41") and counted.config.expert_tile_order == .pair_major);
                 const c0 = mlx.engine.fault.count();
                 try counted.load(dir);
                 defer _ = counted.close();
@@ -45,11 +46,25 @@ test "cooler contract: a Cooler load refused at a pool buffer where its cleanup 
             }
             try testing.expectEqual(base, Sheet.now());
             try testing.expect(asks[0] > 0 and asks[1] > 0);
-            // The bring-up's first and last ask (nothing of it made yet; all of it but one buffer), and the warm's first:
-            // a warm failed anywhere closes the whole load, and its forwards' own unwinding is the request sweeps'.
-            const points = [_]u64{ 1, asks[0], asks[0] + 1 };
+            // The bring-up's first and last ask (nothing of it made yet; all of it but one buffer), on every layout.
+            var points_buf: [4]u64 = undefined;
+            var n_points: usize = 2;
+            points_buf[0] = 1;
+            points_buf[1] = asks[0];
+            // And on each residency, the warm's first ask and a mid-warm point: a warm failed anywhere closes the whole load.
+            if (check_serve) {
+                points_buf[n_points] = asks[0] + 1;
+                n_points += 1;
+                if (asks[1] >= 2 and asks[1] / 2 > 1) {
+                    points_buf[n_points] = asks[0] + asks[1] / 2;
+                    n_points += 1;
+                }
+            }
             var msg: [300]u8 = undefined;
-            for (points) |k| {
+            for (points_buf[0..n_points], 0..) |k, idx| {
+                const is_serve = idx >= 2;
+                mlx.engine.close();
+                const before_pool = mlx.engine.stats().pool_bytes;
                 var fx: Load = undefined;
                 try fx.prepare(C, dir, true);
                 mlx.engine.fault.arm(k);
@@ -62,6 +77,11 @@ test "cooler contract: a Cooler load refused at a pool buffer where its cleanup 
                     try testing.expect(!mlx.errorPending());
                 } else |_| _ = mlx.takeError(&msg);
                 try testing.expect(fired);
+                if (is_serve) {
+                    try testing.expect(std.meta.isError(r));
+                    mlx.engine.close();
+                    try testing.expect(mlx.engine.stats().pool_bytes <= before_pool);
+                }
                 try testing.expect(!mlx.engine.holding());
                 try testing.expectEqual(base, Sheet.now());
             }
@@ -87,9 +107,13 @@ test "cooler contract: a Cooler warm's image splice refused at any of its pool b
             const a = testing.allocator;
             defer mlx.engine.fault.disarm();
             var ld: Load = undefined;
-            try ld.openLight(C, dir, true);
+            try ld.prepare(C, dir, true);
+            if (ld.config.image_token_id == 0) {
+                ld.config.deinit(a);
+                return error.SkipZigTest;
+            }
+            try ld.loadLight(dir);
             defer _ = ld.close();
-            if (ld.config.image_token_id == 0) return error.SkipZigTest;
             // The splice is a step of the warm, which asks the pool by design (D64); the sealed load's gate opens as a warm's does.
             @import("arch/cooler.zig").warmBegins(ld.xfm);
             var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -116,136 +140,59 @@ test "cooler contract: a Cooler warm's image splice refused at any of its pool b
     }.run);
 }
 
-test "cooler contract: a Cooler load's warm that ends seals the engine, and one refused at a pool buffer fails the load" {
-    try eachArch(struct {
-        fn warm(ld: *Load) !void {
-            const turn = arch_handle.turnFor(ld.h, &ld.config);
-            defer turn.end();
-            return @import("model_load.zig").warmLoad(io, testing.allocator, &ld.config, ld.xfm, null, null, ld.xfm.cache.config);
-        }
-
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
-            defer mlx.engine.fault.disarm();
-            var total: u64 = 0;
-            {
-                var ld: Load = undefined;
-                try ld.open(C, dir, true);
-                defer _ = ld.close();
-                const c0 = mlx.engine.fault.count();
-                try warm(&ld);
-                total = mlx.engine.fault.count() - c0;
-                try testing.expect(mlx.engine.sealed());
-            }
-            // An arch that warms inside its init (DeepSeek) fails its load there; its served warm makes nothing more.
-            if (total < 2) return;
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            mlx.engine.fault.arm(total / 2);
-            const r = warm(&ld);
-            mlx.engine.fault.disarm();
-            var msg: [300]u8 = undefined;
-            _ = mlx.takeError(&msg);
-            errdefer std.debug.print("cooler contract: the warm refused at pool buffer {d} of {d} served on\n", .{ total / 2, total });
-            // The load doesn't serve; the refusal is named by whichever op or host maker met it.
-            if (r) |_| return error.TestUnexpectedResult else |_| {}
-        }
-    }.run);
-}
-
 test "cooler contract: a Cooler load failed at the first checked MLX call of any step, or the last of a bring-up step, leaves nothing of it behind" {
     var paths = std.AutoHashMap(u64, void).init(testing.allocator);
     defer paths.deinit();
     const S = struct {
         var seen: *std.AutoHashMap(u64, void) = undefined;
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
-            defer mlx.fault.disarm();
-            defer mlx.fault.sites = .{};
-            {
-                var warm: Load = undefined;
-                try warm.open(C, dir, true);
-                _ = warm.close();
-            }
-            var left: usize = 0;
-            for ([_]Phase{ .load, .serve }) |phase| {
-                // One clean load records the phase's steps; each is failed at its first call (nothing of it made), and a
-                // bring-up step at its last too (all of it made but that call); the warm's tail varies by a call from load
-                // to load. A fixture whose phase makes the very calls another's did is that path again, and is not swept
-                // twice.
-                const R = struct {
-                    dir: []const u8,
-                    phase: Phase,
-                    fn go(r: @This()) anyerror!void {
-                        if ((try faultedLoad(C, r.dir, r.phase, 0)).left) return error.CleanLoadLeft;
+        fn sweep(phase: Phase) fn (comptime type, []const u8, []const u32) anyerror!void {
+            return struct {
+                fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+                    defer mlx.fault.disarm();
+                    defer mlx.fault.sites = .{};
+                    {
+                        var warm: Load = undefined;
+                        try warm.open(C, dir, true);
+                        _ = warm.close();
                     }
-                };
-                mlx.fault.sites = .{ .from = .root, .frames = load_sweep_frames.get(phase), .lasts = phase == .load };
-                const points = try mlx.sweepPoints(testing.allocator, &mlx.fault.sites, R{ .dir = dir, .phase = phase }, R.go);
-                defer testing.allocator.free(points);
-                const path = std.hash.Wyhash.hash(@backingInt(phase), std.mem.sliceAsBytes(points));
-                if ((try seen.getOrPut(path)).found_existing) continue;
-                for (points) |k| {
-                    const r = try faultedLoad(C, dir, phase, k);
-                    if (!r.fired) {
-                        std.debug.print("cooler contract: the load's {s} never reached its checked call {d}: it makes other calls than the one recorded\n", .{ @tagName(phase), k });
-                        return error.TestUnexpectedResult;
+                    var left: usize = 0;
+                    // One clean load records the phase's steps; each is failed at its first call (nothing of it made), and a
+                    // bring-up step at its last too (all of it made but that call); the warm's tail varies by a call from load
+                    // to load. A fixture whose phase makes the very calls another's did is that path again, and is not swept
+                    // twice.
+                    const R = struct {
+                        dir: []const u8,
+                        phase: Phase,
+                        fn go(r: @This()) anyerror!void {
+                            if ((try faultedLoad(C, r.dir, r.phase, 0)).left) return error.CleanLoadLeft;
+                        }
+                    };
+                    mlx.fault.sites = .{ .from = .root, .frames = load_sweep_frames.get(phase), .lasts = phase == .load };
+                    const points = try mlx.sweepPoints(testing.allocator, &mlx.fault.sites, R{ .dir = dir, .phase = phase }, R.go);
+                    defer testing.allocator.free(points);
+                    const path = std.hash.Wyhash.hash(@backingInt(phase), std.mem.sliceAsBytes(points));
+                    if ((try seen.getOrPut(path)).found_existing) return;
+                    for (points) |k| {
+                        const r = try faultedLoad(C, dir, phase, k);
+                        if (!r.fired) {
+                            std.debug.print("cooler contract: the load's {s} never reached its checked call {d}: it makes other calls than the one recorded\n", .{ @tagName(phase), k });
+                            return error.TestUnexpectedResult;
+                        }
+                        if (r.left) {
+                            left += 1;
+                            mlx.fault.trace = true;
+                            defer mlx.fault.trace = false;
+                            _ = try faultedLoad(C, dir, phase, k);
+                        }
                     }
-                    if (r.left) {
-                        left += 1;
-                        mlx.fault.trace = true;
-                        defer mlx.fault.trace = false;
-                        _ = try faultedLoad(C, dir, phase, k);
-                    }
+                    try testing.expectEqual(@as(usize, 0), left);
                 }
-            }
-            try testing.expectEqual(@as(usize, 0), left);
+            }.run;
         }
     };
     S.seen = &paths;
-    try eachLayout(S.run);
-}
-
-test "cooler contract: a Cooler load whose warm fails, torn down as a served load's failure is, leaves the pool holding no more than before the load" {
-    try eachFixture(struct {
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
-            defer mlx.engine.fault.disarm();
-            // The pool buffers a warm asks for, counted on a load that serves.
-            var total: u64 = 0;
-            {
-                var fx: Load = undefined;
-                try fx.prepare(C, dir, true);
-                try fx.load(dir);
-                const c0 = mlx.engine.fault.count();
-                fx.serve() catch |e| {
-                    fx.discard();
-                    return e;
-                };
-                total = mlx.engine.fault.count() - c0;
-                _ = fx.close();
-            }
-            mlx.engine.close();
-            const before = mlx.engine.stats().pool_bytes;
-            for ([_]u64{ total / 4, total / 2, total * 3 / 4, total - 2 }) |k| {
-                var fx: Load = undefined;
-                try fx.prepare(C, dir, true);
-                try fx.load(dir);
-                mlx.engine.fault.arm(k);
-                const r = fx.serve();
-                mlx.engine.fault.disarm();
-                if (r) |_| {
-                    _ = fx.close();
-                    continue;
-                } else |_| {}
-                var msg: [300]u8 = undefined;
-                _ = mlx.takeError(&msg);
-                fx.discard();
-                mlx.engine.close();
-                const held = mlx.engine.stats().pool_bytes;
-                errdefer std.debug.print("{s}: a warm failed at pool buffer {d} of {d} leaves the pool at {d} MB, {d} MB before the load\n", .{ std.fs.path.basename(dir), k, total, held >> 20, before >> 20 });
-                try testing.expect(held <= before);
-            }
-        }
-    }.run);
+    try eachLayout(S.sweep(.load));
+    try eachResidency(S.sweep(.serve));
 }
 
 test "cooler contract: a second Cooler load beside a sealed one whose warm fails leaves the engine sealed, as the second load's success would" {
@@ -253,7 +200,7 @@ test "cooler contract: a second Cooler load beside a sealed one whose warm fails
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             defer mlx.engine.fault.disarm();
             var first: Load = undefined;
-            try first.open(C, dir, true);
+            try first.openLight(C, dir, true);
             defer _ = first.close();
             try testing.expect(mlx.engine.sealed());
             // Beside a load on the ledger the second is refused by name (D90), and the first stays sealed.
@@ -261,27 +208,11 @@ test "cooler contract: a second Cooler load beside a sealed one whose warm fails
                 try contract.expectRefusedBesideLedger(C, dir);
                 return testing.expect(mlx.engine.sealed());
             }
-            // The warm's pool asks, counted on a second load that serves: it ends sealed.
-            var total: u64 = 0;
-            {
-                var fx: Load = undefined;
-                try fx.prepare(C, dir, true);
-                try fx.load(dir);
-                try testing.expect(!mlx.engine.sealed());
-                const c0 = mlx.engine.fault.count();
-                fx.serve() catch |e| {
-                    fx.discard();
-                    return e;
-                };
-                total = mlx.engine.fault.count() - c0;
-                _ = fx.close();
-            }
-            try testing.expect(mlx.engine.sealed());
-            if (total < 2) return error.SkipZigTest;
             var fx: Load = undefined;
             try fx.prepare(C, dir, true);
             try fx.load(dir);
-            mlx.engine.fault.arm(total / 2);
+            try testing.expect(!mlx.engine.sealed());
+            mlx.engine.fault.arm(1);
             const r = fx.serve();
             mlx.engine.fault.disarm();
             if (r) |_| {
@@ -291,7 +222,7 @@ test "cooler contract: a second Cooler load beside a sealed one whose warm fails
             var msg: [300]u8 = undefined;
             _ = mlx.takeError(&msg);
             fx.discard();
-            errdefer std.debug.print("{s}: the first load serves on with the engine unsealed after a second load's warm failed at pool buffer {d} of {d}\n", .{ std.fs.path.basename(dir), total / 2, total });
+            errdefer std.debug.print("{s}: the first load serves on with the engine unsealed after a second load's warm failed at pool buffer 1\n", .{std.fs.path.basename(dir)});
             try testing.expect(mlx.engine.sealed());
         }
     }.run);
@@ -308,12 +239,15 @@ fn faultedLoad(comptime C: type, dir: []const u8, phase: Phase, k: u64) !struct 
     if (phase == .load) mlx.fault.arm(k);
     const loaded = fx.load(dir);
     if (phase == .load) mlx.fault.disarm();
-    const r = if (loaded) |_| blk: {
-        if (phase == .serve) mlx.fault.arm(k);
-        const served = fx.serve();
-        if (phase == .serve) mlx.fault.disarm();
-        if (served) |_| {} else |_| fx.discard();
-        break :blk served;
+    const r: anyerror!void = if (loaded) |_| blk: {
+        if (phase == .serve) {
+            mlx.fault.arm(k);
+            const served = fx.serve();
+            mlx.fault.disarm();
+            if (served) |_| {} else |_| fx.discard();
+            break :blk served;
+        }
+        break :blk {};
     } else |e| e;
     const fired = mlx.fault.didFire();
     if (r) {

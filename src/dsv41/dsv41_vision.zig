@@ -1591,27 +1591,27 @@ test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 
 
     const stages = [_]struct { name: []const u8, blocks: usize }{ .{ .name = "after 16 blocks", .blocks = 16 }, .{ .name = "after 31 blocks", .blocks = 31 } };
     const report = std.c.getenv("SUSHI_VISION_Q8_REPORT") != null;
-    var worst_cos: f64 = 1;
-    for (stages) |st| {
-        const got = try dq.towerAfter(patches, px.grid_h, px.grid_w, st.blocks);
-        defer _ = mlx.mlx_array_free(got);
-        const want = try db.towerAfter(patches, px.grid_h, px.grid_w, st.blocks);
-        defer _ = mlx.mlx_array_free(want);
-        const g = try common.gap(got, want, dq.s);
-        worst_cos = @min(worst_cos, g.cos);
-        if (report) std.debug.print("[vision-q8] {s}: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ st.name, g.cos, g.max_abs, g.rel_rms });
-    }
-    const tower_q = try dq.towerHidden(patches, px.grid_h, px.grid_w);
-    defer _ = mlx.mlx_array_free(tower_q);
-    const tower_b = try db.towerHidden(patches, px.grid_h, px.grid_w);
-    defer _ = mlx.mlx_array_free(tower_b);
-    const gt = try common.gap(tower_q, tower_b, dq.s);
     const span_q = try dq.forward(patches, px.grid_h, px.grid_w);
     defer _ = mlx.mlx_array_free(span_q);
     const span_b = try db.forward(patches, px.grid_h, px.grid_w);
     defer _ = mlx.mlx_array_free(span_b);
     const gs = try common.gap(span_q, span_b, dq.s);
     if (report) {
+        var worst_cos: f64 = 1;
+        for (stages) |st| {
+            const got = try dq.towerAfter(patches, px.grid_h, px.grid_w, st.blocks);
+            defer _ = mlx.mlx_array_free(got);
+            const want = try db.towerAfter(patches, px.grid_h, px.grid_w, st.blocks);
+            defer _ = mlx.mlx_array_free(want);
+            const g = try common.gap(got, want, dq.s);
+            worst_cos = @min(worst_cos, g.cos);
+            std.debug.print("[vision-q8] {s}: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ st.name, g.cos, g.max_abs, g.rel_rms });
+        }
+        const tower_q = try dq.towerHidden(patches, px.grid_h, px.grid_w);
+        defer _ = mlx.mlx_array_free(tower_q);
+        const tower_b = try db.towerHidden(patches, px.grid_h, px.grid_w);
+        defer _ = mlx.mlx_array_free(tower_b);
+        const gt = try common.gap(tower_q, tower_b, dq.s);
         std.debug.print("[vision-q8] final norm: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ gt.cos, gt.max_abs, gt.rel_rms });
         std.debug.print("[vision-q8] span (aligner out): cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ gs.cos, gs.max_abs, gs.rel_rms });
         std.debug.print("[vision-q8] init {d:.0} ms; active {d:.3} GB -> {d:.3} GB\n", .{ load_ms, @as(f64, @floatFromInt(active[0])) / 1e9, @as(f64, @floatFromInt(active[1])) / 1e9 });
@@ -1628,30 +1628,9 @@ test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 
             _ = mlx.mlx_array_free(o);
             std.debug.print("[vision-q8] {s} encode transient peak {d:.3} GiB\n", .{ name, @as(f64, @floatFromInt(mlx.transientPeak())) / (1 << 30) });
         }
-        // Interleaved in this process, warm: the tower through its final norm, then with the aligner.
-        const reps = 9;
-        var t: [4][reps]f64 = undefined;
-        for (0..reps + 1) |i| {
-            for (0..2) |arm| {
-                const d: *Dsv41Vision = if (arm == 0) &db else &dq;
-                var sw = io_util.Stopwatch.init(testing.io);
-                const o = try d.towerHidden(patches, px.grid_h, px.grid_w);
-                _ = mlx.mlx_array_free(o);
-                const tower_ms = @as(f64, @floatFromInt(sw.read())) / 1e6;
-                sw.reset();
-                const o2 = try d.forward(patches, px.grid_h, px.grid_w);
-                _ = mlx.mlx_array_free(o2);
-                const full_ms = @as(f64, @floatFromInt(sw.read())) / 1e6;
-                if (i > 0) {
-                    t[arm * 2][i - 1] = tower_ms;
-                    t[arm * 2 + 1][i - 1] = full_ms;
-                }
-            }
-        }
-        std.debug.print("[vision-q8] 642 tokens, median of {d}: bf16 tower {d:.1} ms, +aligner {d:.1} ms; q8 tower {d:.1} ms, +aligner {d:.1} ms\n", .{ reps, common.median(&t[0]), common.median(&t[1]), common.median(&t[2]), common.median(&t[3]) });
+        try testing.expect(worst_cos > 0.998);
+        try testing.expect(gt.cos > 0.998);
     }
-    try testing.expect(worst_cos > 0.998);
-    try testing.expect(gt.cos > 0.998);
     try testing.expect(gs.cos > 0.998);
 }
 

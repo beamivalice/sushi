@@ -39,6 +39,7 @@ const MtpCacheRef = MtpHeadRef.Cache;
 const qwen4_state = @import("qwen4_state.zig");
 const MtpPreDraft = mtp_round.MtpPreDraft;
 const MtpRoundOpen = mtp_round.MtpRoundOpen;
+const sharedQwen4TestModel = @import("qwen4_fixture_test.zig").sharedQwen4TestModel;
 
 test "a 40k Qwen prefill checkpoints every 8192 tokens at any chunk width the ladder takes" {
     for ([_]usize{ 8192, 4096, 2048, 512 }) |width| {
@@ -346,20 +347,12 @@ const MtpChainTestSlot = struct {
 test "qwen4: the spec warm-up runs a prefill-shaped forward through the grouped expert GEMM (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
-    defer if (config.ngram_table_path) |path| a.free(path);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
+    const xfm = try sharedQwen4TestModel(std.mem.span(model_dir));
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     // A rate-group pack prefills through its grouped chains, a uniform one through the grouped GEMM.
     const api = @import("sushi_exl3");
     const before = api.rate_groups.prefill_chains + api.kernels.prefill_calls;
-    try @import("qwen4_load.zig").warmVerify(&xfm.config, &xfm, 1, @import("../kv_quant.zig").KVQuantConfig.engine_default);
+    try @import("qwen4_load.zig").warmVerify(&xfm.config, xfm, 1, @import("../kv_quant.zig").KVQuantConfig.engine_default);
     try testing.expect(api.rate_groups.prefill_chains + api.kernels.prefill_calls > before);
 }
 
@@ -382,16 +375,8 @@ test "Generator rounds preserve acceptance and next-round stashes at N=4" {
     const coarse_before = trunk.mtp_coarse_pair_dispatches;
     const hc_prepared_before = qwen4_forward.mtp_verify_hc_prepared_calls;
     const verify_kernel_before = trunk.mtp_verify_kernel_calls;
-    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
-    defer if (config.ngram_table_path) |path| a.free(path);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileGdnGate(&xfm);
-    xfm.compileMoeRouting();
+    const xfm = try sharedQwen4TestModel(std.mem.span(model_dir));
+    const config = xfm.config;
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -408,8 +393,8 @@ test "Generator rounds preserve acceptance and next-round stashes at N=4" {
             };
             for (0..n) |i| {
                 const ids = prompt[0..if (i % 2 == 0) @as(usize, 96) else 61];
-                solo[i] = try MtpChainTestSlot.init(a, io, &xfm, &tok, ids, depth);
-                batch[i] = try MtpChainTestSlot.init(a, io, &xfm, &tok, ids, depth);
+                solo[i] = try MtpChainTestSlot.init(a, io, xfm, &tok, ids, depth);
+                batch[i] = try MtpChainTestSlot.init(a, io, xfm, &tok, ids, depth);
             }
             for (0..2) |round| {
                 var ss: [4]?mtp_round.MtpRoundState = @splat(null);
@@ -529,16 +514,7 @@ test "sampled qwen4 chains hand the verify the density each depth drew from (QWE
     depth_bounds.active = .{ .min = depth, .max = depth };
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
-    defer if (config.ngram_table_path) |path| a.free(path);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileGdnGate(&xfm);
-    xfm.compileMoeRouting();
+    const xfm = try sharedQwen4TestModel(std.mem.span(model_dir));
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -569,7 +545,7 @@ test "sampled qwen4 chains hand the verify the density each depth drew from (QWE
         if (slot) |x| x.deinit(a);
     };
     for (&slots, 0..) |*slot, i| {
-        slot.* = try MtpChainTestSlot.init(a, io, &xfm, &tok, prompt[0..if (i == 1) @as(usize, 61) else 96], depth);
+        slot.* = try MtpChainTestSlot.init(a, io, xfm, &tok, prompt[0..if (i == 1) @as(usize, 61) else 96], depth);
         const g = &slot.*.?.gen.?;
         g.sampling = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .seed = 11 + i, .suppress_mask = g.sampling.suppress_mask };
     }
@@ -620,16 +596,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
-    defer if (config.ngram_table_path) |path| a.free(path);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileGdnGate(&xfm);
-    xfm.compileMoeRouting();
+    const xfm = try sharedQwen4TestModel(std.mem.span(model_dir));
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -683,7 +650,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
         if (keys.ctx != null) _ = mlx.mlx_array_free(keys);
     };
     for (0..2) |i| {
-        slots[i] = try MtpChainTestSlot.init(a, io, &xfm, &tok, prompt[0..if (i == 0) @as(usize, 96) else 61], 1);
+        slots[i] = try MtpChainTestSlot.init(a, io, xfm, &tok, prompt[0..if (i == 0) @as(usize, 96) else 61], 1);
         const slot = slots[i].?;
         gens[i] = &slot.gen.?;
         states[i] = try gens[i].mtpRoundContinue(a, try MtpChainTestSlot.begin(gens[i], a, 1, false));
@@ -794,16 +761,7 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
-    defer if (config.ngram_table_path) |name| a.free(name);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileGdnGate(&xfm);
-    xfm.compileMoeRouting();
+    const xfm = try sharedQwen4TestModel(std.mem.span(path));
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const previous = group_planner.enabled_override;
@@ -820,8 +778,8 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
     };
     for (0..2) |row| {
         const ids = prompt[0..if (row == 0) @as(usize, 96) else 61];
-        reference[row] = try MtpChainTestSlot.init(a, io, &xfm, &tok, ids, 2);
-        planned[row] = MtpChainTestSlot.init(a, io, &xfm, &tok, ids, 2) catch |err| {
+        reference[row] = try MtpChainTestSlot.init(a, io, xfm, &tok, ids, 2);
+        planned[row] = MtpChainTestSlot.init(a, io, xfm, &tok, ids, 2) catch |err| {
             reference[row].deinit(a);
             return err;
         };
@@ -838,12 +796,12 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
         }
     }
     for (0..48) |_| {
-        try L11PlainReplay.tick(&xfm, &reference, true);
-        try L11PlainReplay.tick(&xfm, &planned, false);
+        try L11PlainReplay.tick(xfm, &reference, true);
+        try L11PlainReplay.tick(xfm, &planned, false);
     }
     for (planned) |slot| try expectError(error.MtpHiddenStale, slot.gen.?.mtpRoundBegin(a));
-    try L11PlainReplay.tick(&xfm, &reference, true);
-    try L11PlainReplay.tick(&xfm, &planned, true);
+    try L11PlainReplay.tick(xfm, &reference, true);
+    try L11PlainReplay.tick(xfm, &planned, true);
     for (reference, planned) |ref, candidate| {
         const rg = &ref.gen.?;
         const cg = &candidate.gen.?;
@@ -884,16 +842,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
-    defer if (config.ngram_table_path) |name| a.free(name);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileGdnGate(&xfm);
-    xfm.compileMoeRouting();
+    const xfm = try sharedQwen4TestModel(std.mem.span(path));
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prior = group_planner.enabled_override;
@@ -910,8 +859,8 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     };
     for (0..2) |row| {
         const ids = prompt[0..if (row == 0) @as(usize, 96) else 61];
-        solo[row] = try MtpChainTestSlot.init(a, io, &xfm, &tok, ids, 1);
-        grouped[row] = MtpChainTestSlot.init(a, io, &xfm, &tok, ids, 1) catch |err| {
+        solo[row] = try MtpChainTestSlot.init(a, io, xfm, &tok, ids, 1);
+        grouped[row] = MtpChainTestSlot.init(a, io, xfm, &tok, ids, 1) catch |err| {
             solo[row].deinit(a);
             return err;
         };
@@ -920,7 +869,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
             const gen = &slot.gen.?;
             try testing.expect(gen.mtp_hist_stash == null and gen.mtp_pre_draft == null);
             gen.mtp_cache.?.activate();
-            try qwen4_forward.qwen4MtpReset(&xfm);
+            try qwen4_forward.qwen4MtpReset(xfm);
             gen.mtp_planner_owned = true;
             gen.mtp_planner_width = 1;
             gen.mtp_batch_head = true;
@@ -1080,23 +1029,14 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
-    defer if (config.ngram_table_path) |name| a.free(name);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileGdnGate(&xfm);
-    xfm.compileMoeRouting();
+    const xfm = try sharedQwen4TestModel(std.mem.span(path));
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
     const want: usize = 48;
 
-    const whole = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    const whole = try MtpChainTestSlot.init(a, io, xfm, &tok, &prompt, 4);
     defer whole.deinit(a);
     while (whole.gen.?.generated_ids.items.len < want) {
         const round = (try whole.gen.?.nextMtp(a)) orelse return error.MtpRoundDeclined;
@@ -1107,7 +1047,7 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     const closer = reference[20];
     const at = std.mem.indexOfScalar(u32, reference, closer).?;
 
-    const cut = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    const cut = try MtpChainTestSlot.init(a, io, xfm, &tok, &prompt, 4);
     defer cut.deinit(a);
     const gen = &cut.gen.?;
     gen.thought_point = .{ .closer = closer, .grid = 1, .min_tokens = 0, .base = prompt.len };
@@ -1187,23 +1127,14 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
-    defer if (config.ngram_table_path) |name| a.free(name);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileGdnGate(&xfm);
-    xfm.compileMoeRouting();
+    const xfm = try sharedQwen4TestModel(std.mem.span(path));
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
     const want: usize = 64;
 
-    const whole = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    const whole = try MtpChainTestSlot.init(a, io, xfm, &tok, &prompt, 4);
     defer whole.deinit(a);
     while (whole.gen.?.generated_ids.items.len < want) {
         const round = (try whole.gen.?.nextMtp(a)) orelse return error.MtpRoundDeclined;
@@ -1216,7 +1147,7 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     const end = prompt.len + at;
 
     // MTP to the end: the round carrying the end-of-turn token stops before it, and the state stands there.
-    const spec = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    const spec = try MtpChainTestSlot.init(a, io, xfm, &tok, &prompt, 4);
     defer spec.deinit(a);
     const gen = &spec.gen.?;
     gen.eos_token_ids = &eos;
@@ -1241,20 +1172,20 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     var cold_prompt: [96 + want]u32 = undefined;
     @memcpy(cold_prompt[0..prompt.len], &prompt);
     @memcpy(cold_prompt[prompt.len..end], reference[0..at]);
-    const cold = try MtpChainTestSlot.init(a, io, &xfm, &tok, cold_prompt[0..end], 4);
+    const cold = try MtpChainTestSlot.init(a, io, xfm, &tok, cold_prompt[0..end], 4);
     defer cold.deinit(a);
     errdefer std.debug.print("[decode-end] end {d} cold.off {d} spec.off {d} committed {d} base {d}\n", .{ end, cold.off, spec.off, gen.mtpCommittedHistoryLen(), gen.mtp_position_base });
     try testing.expectEqual(end, cold.off);
     try testing.expectEqual(end, spec.off);
     const next = [_]u32{ eos[0], reference[at + 1], reference[at + 2] };
-    const warm_logits = try decodeEndForward(&xfm, &gen.ctx, &next);
+    const warm_logits = try decodeEndForward(xfm, &gen.ctx, &next);
     defer _ = mlx.mlx_array_free(warm_logits);
-    const cold_logits = try decodeEndForward(&xfm, &cold.gen.?.ctx, &next);
+    const cold_logits = try decodeEndForward(xfm, &cold.gen.?.ctx, &next);
     defer _ = mlx.mlx_array_free(cold_logits);
     try decodeEndRowsAgree(cold_logits, warm_logits, xfm.s, 0.05);
 
     // A switch to serial with the end-of-turn token pending still ends on the round's state.
-    const switched = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    const switched = try MtpChainTestSlot.init(a, io, xfm, &tok, &prompt, 4);
     defer switched.deinit(a);
     const sw = &switched.gen.?;
     sw.eos_token_ids = &eos;
@@ -1270,7 +1201,7 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     try testing.expectEqual(mtp_plan.EndPoint.taken, sw.handOverEndPoint(end, eos[0]));
 
     // Serial decode to the end: its trunk ran past the reply, so no point is taken and the state stays with the slot.
-    const serial = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    const serial = try MtpChainTestSlot.init(a, io, xfm, &tok, &prompt, 4);
     defer serial.deinit(a);
     const sg = &serial.gen.?;
     sg.eos_token_ids = &eos;

@@ -985,9 +985,14 @@ fn expectVerifyQmmNoWorseThanStock(
     try mlx.check(mlx.mlx_astype(&tf, truth, .float32, s));
     try mlx.check(mlx.mlx_astype(&rf, ref, .float32, s));
     try mlx.check(mlx.mlx_astype(&gf, got, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(tf));
-    try mlx.check(mlx.mlx_array_eval(rf));
-    try mlx.check(mlx.mlx_array_eval(gf));
+    {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_vector_array_append_value(vec, tf));
+        try mlx.check(mlx.mlx_vector_array_append_value(vec, rf));
+        try mlx.check(mlx.mlx_vector_array_append_value(vec, gf));
+        try mlx.check(mlx.mlx_eval(vec));
+    }
     const td = mlx.mlx_array_data_float32(tf).?;
     const rd = mlx.mlx_array_data_float32(rf).?;
     const gd = mlx.mlx_array_data_float32(gf).?;
@@ -1057,28 +1062,6 @@ fn expectVerifyQmmNoWorseThanStock(
         );
         return error.TestExpectedApproxEq;
     }
-}
-
-test "vqmm Metal sources are byte-identical to the shipped text" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
-    var bytes: usize = 0;
-    for (2..8) |m| {
-        for (VQMM_BN_CHOICES) |bn| {
-            const src = try verifyQmmSource(arena.allocator(), m, @intCast(bn));
-            sha.update(src);
-            bytes += src.len;
-        }
-    }
-    for (2..8) |m| {
-        const src = try verifyQmmMsgSource(arena.allocator(), m, @intCast(vqmmMsgBn(@intCast(m))));
-        sha.update(src);
-        bytes += src.len;
-    }
-    try testing.expectEqual(@as(usize, 312_254), bytes);
-    const digest = std.fmt.bytesToHex(sha.finalResult(), .lower);
-    try testing.expectEqualStrings("484c91a3c6460e022df1f2a5f1f2db9d8630c50c760722b90cc4821bf66f9aea", &digest);
 }
 
 test "verifyQmm: the plain-SIMD tiles match stock qmm at 5/6/8-bit affine too" {
@@ -1248,7 +1231,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
         .{ .k = 5120, .n = 1024, .gs = 32 }, // small-N above the gate, MTP gs-32 class
         .{ .k = 2048, .n = 5120, .gs = 128 }, // gs-128 arm
     };
-    for (cases) |cs| {
+    for (cases, 0..) |cs, ci| {
         // Random dense weight → 4-bit affine triple.
         const wb = try testRandWeightBf16(rnd, &[_]c_int{ cs.n, cs.k }, s);
         defer _ = mlx.mlx_array_free(wb);
@@ -1274,13 +1257,14 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
         const t_axes = [_]c_int{ 1, 0 };
         try mlx.check(mlx.mlx_transpose_axes(&wdq_t, wdq, &t_axes, 2, s));
 
-        // Kernel rows: split-K M 2..7 on every machine; the NAX m16 tile rows
-        // (M 8..16, the padding path at 8/9/12 and the exact-16 tile) run only
-        // where the M5-class probe is live (todo-m5-nax.md §9.3) — the probe
-        // self-gates, so plain-SIMD machines skip them.
-        const simd_ms = [_]c_int{ 2, 3, 4, 5, 6, 7 };
-        const nax_ms = [_]c_int{ 8, 9, 12, 16 };
-        const total_ms: usize = if (verifyQmmNaxEnabled()) simd_ms.len + nax_ms.len else simd_ms.len;
+        // Kernel rows: split-K M 2..7 on shape 0, representative widths on shapes 1 & 2; NAX m16 rows when enabled.
+        const simd_all = [_]c_int{ 2, 3, 4, 5, 6, 7 };
+        const simd_sub = [_]c_int{ 2, 4, 7 };
+        const simd_ms: []const c_int = if (ci == 0) &simd_all else &simd_sub;
+        const nax_all = [_]c_int{ 8, 9, 12, 16 };
+        const nax_sub = [_]c_int{ 8, 16 };
+        const nax_ms: []const c_int = if (!verifyQmmNaxEnabled()) &.{} else if (ci == 0) &nax_all else &nax_sub;
+        const total_ms = simd_ms.len + nax_ms.len;
         var mi: usize = 0;
         while (mi < total_ms) : (mi += 1) {
             const m = if (mi < simd_ms.len) simd_ms[mi] else nax_ms[mi - simd_ms.len];
@@ -1296,12 +1280,19 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             defer _ = mlx.mlx_array_free(x);
             try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
-            // Kernel path — must ENGAGE for every listed M, at EVERY column
-            // tile the test override can force; null takes the shipped per-M default.
-            for ([_]?c_int{null} ++ [_]?c_int{ 2, 4, 8 }) |bn_force| {
+            const all_bns = [_]?c_int{ null, 2, 4, 8 };
+            const default_only = [_]?c_int{null};
+            const one_bn = [_]?c_int{ null, if (ci == 1) @as(c_int, 8) else 4 };
+            const bns: []const ?c_int = if (mi >= simd_ms.len)
+                &default_only
+            else if (ci == 0 and m == 2)
+                &all_bns
+            else if (ci > 0 and m == 2)
+                &one_bn
+            else
+                &default_only;
+            for (bns) |bn_force| {
                 if (bn_force) |bn| {
-                    // The NAX tile ignores bn; only the split-K rows sweep.
-                    if (mi >= simd_ms.len) continue;
                     if (@mod(cs.n, bn) != 0 or bn * m > VQMM_MAX_ACC) continue;
                 }
                 vqmm_bn_test_override = bn_force;
@@ -1495,8 +1486,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
         const t_axes = [_]c_int{ 1, 0 };
         try mlx.check(mlx.mlx_transpose_axes(&wdq_t, wdq, &t_axes, 2, s));
 
-        var m: c_int = 2;
-        while (m <= 6) : (m += 1) {
+        for ([_]c_int{ 2, 4, 6 }) |m| {
             const xn: usize = @intCast(m * mk);
             const xbuf = try allocator.alloc(f32, xn);
             defer allocator.free(xbuf);

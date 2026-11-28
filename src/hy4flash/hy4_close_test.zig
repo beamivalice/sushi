@@ -7,22 +7,13 @@ const mlx = @import("../mlx.zig");
 const core = @import("../tensor/core.zig");
 const contract = @import("../cooler_contract_test.zig");
 const hy4_contract = @import("hy4_contract.zig");
+const hy4_held = @import("hy4_held.zig");
 const sampler = @import("../sampler.zig");
 const Generator = @import("../generate.zig").Generator;
 const Tokenizer = @import("../tokenizer.zig").Tokenizer;
-const VisionEncoder = @import("../vision.zig").VisionEncoder;
 const arch_handle = @import("../arch/handle.zig");
 
 const io = std.Io.Threaded.global_single_threaded.io();
-
-/// Experts resident, DFly2 loaded where the fixture ships it, as a drafting request runs.
-const Drafting = struct {
-    pub fn prepare(a: std.mem.Allocator, config: *@import("../model.zig").ModelConfig, dir: []const u8) !void {
-        config.expert_streaming = false;
-        config.expert_source_dir = try a.dupe(u8, dir);
-        config.stream_mtp_head = @import("hy4_load.zig").shipsHead(io, a, dir);
-    }
-};
 
 /// What a served request said, and the asks of the closed pool it made outside a wide phase.
 const Said = struct {
@@ -80,52 +71,14 @@ fn conversation(a: std.mem.Allocator, ids: []const u32, n: usize, seed: usize) !
     return p;
 }
 
-test "hy4 close: past the seal, served text requests greedy, sampled, under penalties and in DFly2 rounds ask the closed pool nothing outside a wide phase and give the plans-off tokens (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
-    defer a.free(ids);
-    var ld: contract.Load = undefined;
-    try ld.open(Drafting, dir, true);
-    defer _ = ld.close();
-    const Case = struct { what: []const u8, sampling: sampler.SamplingParams, opts: Generator.InitOptions = .{} };
-    const cases = [_]Case{
-        .{ .what = "greedy", .sampling = .{ .temperature = 0 } },
-        .{ .what = "sampled", .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.9, .seed = 11 } },
-        .{ .what = "penalties", .sampling = .{ .temperature = 0.8, .seed = 11, .repeat_penalty = 1.2, .presence_penalty = 0.4 } },
-        .{ .what = "DFly2 greedy", .sampling = .{ .temperature = 0 }, .opts = .{ .drafter_enabled = true } },
-        .{ .what = "DFly2 sampled", .sampling = .{ .temperature = 0.8, .seed = 7 }, .opts = .{ .drafter_enabled = true } },
-    };
-    for (cases) |c| {
-        var want = try generated(&ld, ids[0..24], 16, c.sampling, c.opts, false);
-        defer want.deinit();
-        var got = try generated(&ld, ids[0..24], 16, c.sampling, c.opts, true);
-        defer got.deinit();
-        try expectSame(c.what, &want, &got);
-    }
-}
-
 test "hy4 close: past the seal, a served image request and a restore from the SSD point behind the last reply ask the closed pool nothing outside a wide phase and give the plans-off tokens (HY4_BF16_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
-    const ids = try hy4_contract.prompt(a, dir);
+    const h = try hy4_held.acquire(.bf16_vision);
+    const ld = h.ld;
+    const tower = &h.tower.?;
+    const ids = try hy4_contract.prompt(a, h.dir);
     defer a.free(ids);
-    var ld: contract.Load = undefined;
-    try ld.prepare(hy4_contract, dir, true);
-    ld.vision = true;
-    try ld.load(dir);
-    var tower = VisionEncoder.init(a, ld.config, &ld.weights) catch |e| {
-        ld.discard();
-        return e;
-    };
-    defer tower.deinit();
-    ld.serve() catch |e| {
-        ld.discard();
-        return e;
-    };
-    defer _ = ld.close();
     const m = ld.xfm.arch_state.hy4flash.model.?;
     // An image request: its encode into the request's Media, then its prompt, as `vision_queue` and the slot run them.
     {
@@ -160,7 +113,7 @@ test "hy4 close: past the seal, a served image request and a restore from the SS
             var ctx = ld.xfm.defaultCtx();
             ctx.vision_embeddings = media;
             const closed = core.stats().closed_asks - before;
-            out.* = .{ .tokens = try contract.serialWith(&ld, prompt, 8, .{ .temperature = 0 }, .{ .ctx = ctx }) };
+            out.* = .{ .tokens = try contract.serialWith(ld, prompt, 8, .{ .temperature = 0 }, .{ .ctx = ctx }) };
             out.closed = core.stats().closed_asks - before;
             _ = closed;
         }
@@ -177,7 +130,7 @@ test "hy4 close: past the seal, a served image request and a restore from the SS
         if (!planned) m.plans = null;
         defer m.plans = saved;
         var sv: contract.Served = undefined;
-        try sv.initTiers(&ld, dir, 0);
+        try sv.initTiers(ld, h.dir, 0);
         defer sv.deinit();
         const wide: ?core.Wide = if (planned) null else core.widePhase();
         defer if (wide) |w| w.end();
@@ -197,4 +150,27 @@ test "hy4 close: past the seal, a served image request and a restore from the SS
         try testing.expectEqual(sv.reused, f);
     }
     try expectSame("restore from the SSD point", &said[0], &said[1]);
+}
+
+test "hy4 close: past the seal, served text requests greedy, sampled, under penalties and in DFly2 rounds ask the closed pool nothing outside a wide phase and give the plans-off tokens (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const h = try hy4_held.acquire(.stq_openLight);
+    const ids = try hy4_contract.prompt(a, h.dir);
+    defer a.free(ids);
+    const Case = struct { what: []const u8, sampling: sampler.SamplingParams, opts: Generator.InitOptions = .{} };
+    const cases = [_]Case{
+        .{ .what = "greedy", .sampling = .{ .temperature = 0 } },
+        .{ .what = "sampled", .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.9, .seed = 11 } },
+        .{ .what = "penalties", .sampling = .{ .temperature = 0.8, .seed = 11, .repeat_penalty = 1.2, .presence_penalty = 0.4 } },
+        .{ .what = "DFly2 greedy", .sampling = .{ .temperature = 0 }, .opts = .{ .drafter_enabled = true } },
+        .{ .what = "DFly2 sampled", .sampling = .{ .temperature = 0.8, .seed = 7 }, .opts = .{ .drafter_enabled = true } },
+    };
+    for (cases) |c| {
+        var want = try generated(h.ld, ids[0..24], 16, c.sampling, c.opts, false);
+        defer want.deinit();
+        var got = try generated(h.ld, ids[0..24], 16, c.sampling, c.opts, true);
+        defer got.deinit();
+        try expectSame(c.what, &want, &got);
+    }
 }

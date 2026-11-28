@@ -452,8 +452,8 @@ pub const HostDraw = struct {
     kept: usize,
 };
 
-/// The rule on the host: `row` is the logits as f32, `order` is scratch of the row's length.
-pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, top_k: u32, min_p: f32, key: [2]u32) HostDraw {
+/// Sort `order` in-place for `row` at `temperature` for reuse across `top_k × top_p` filters.
+fn hostSortOrder(row: []const f32, order: []u32, temperature: f32) void {
     const inv_t: f32 = 1.0 / temperature;
     const Ctx = struct {
         row: []const f32,
@@ -471,12 +471,22 @@ pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, to
     const ctx = Ctx{ .row = row, .inv_t = inv_t };
     for (order, 0..) |*o, i| o.* = @intCast(i);
     std.mem.sort(u32, order, ctx, Ctx.before);
+}
+
+fn hostDrawSorted(row: []const f32, order: []const u32, temperature: f32, top_p: f32, top_k: u32, min_p: f32, key: [2]u32) HostDraw {
+    const inv_t: f32 = 1.0 / temperature;
+    const val = struct {
+        fn get(r: []const f32, it: f32, i: u32) f32 {
+            const v = r[i] * it;
+            return if (v == v) @min(v, std.math.floatMax(f32)) else -std.math.inf(f32);
+        }
+    }.get;
     var kept: usize = if (top_k > 0 and top_k < row.len) top_k else row.len;
     var margin: f64 = std.math.inf(f64);
-    const m = ctx.val(order[0]);
+    const m = val(row, inv_t, order[0]);
     if (top_p < 1.0 and m > -std.math.inf(f32)) {
         var z: f64 = 0;
-        for (order[0..kept]) |i| z += @exp(@as(f64, ctx.val(i)) - m);
+        for (order[0..kept]) |i| z += @exp(@as(f64, val(row, inv_t, i)) - m);
         const pz = @as(f64, @max(top_p, std.math.floatMin(f32))) * z;
         var above: f64 = 0;
         var n: usize = 0;
@@ -484,14 +494,14 @@ pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, to
             // The top one is kept whatever the threshold: it has no call to be close on.
             if (n > 0 or above > 0) margin = @min(margin, @abs(above - pz) / z);
             if (above < pz) n += 1;
-            above += @exp(@as(f64, ctx.val(i)) - m);
+            above += @exp(@as(f64, val(row, inv_t, i)) - m);
         }
         kept = n;
     }
     if (min_p > 0 and m > -std.math.inf(f32)) {
         const lmp: f32 = @log(min_p);
         var n: usize = 0;
-        while (n < kept and ctx.val(order[n]) - m >= lmp) n += 1;
+        while (n < kept and val(row, inv_t, order[n]) - m >= lmp) n += 1;
         kept = n;
     }
     var best: f32 = -std.math.inf(f32);
@@ -499,7 +509,7 @@ pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, to
     var id: ?u32 = null;
     var runner: ?u32 = null;
     for (order[0..kept]) |i| {
-        const v = ctx.val(i);
+        const v = val(row, inv_t, i);
         if (!(v > -std.math.inf(f32))) continue;
         const sc = v + gumbel(i, key);
         if (id == null or sc > best or (sc == best and i < id.?)) {
@@ -513,6 +523,12 @@ pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, to
         }
     }
     return .{ .id = id orelse 0, .second = runner, .gap = best - second, .nucleus_margin = margin, .kept = kept };
+}
+
+/// The rule on the host: `row` is the logits as f32, `order` is scratch of the row's length.
+pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, top_k: u32, min_p: f32, key: [2]u32) HostDraw {
+    hostSortOrder(row, order, temperature);
+    return hostDrawSorted(row, order, temperature, top_p, top_k, min_p, key);
 }
 
 const testing = std.testing;
@@ -565,8 +581,8 @@ test "sampler draw: the kernel draws what the rule draws, at every filter, with 
     const n_rows = 5;
     const flat = try a.alloc(f32, n_rows * vocab);
     defer a.free(flat);
-    const order = try a.alloc(u32, vocab);
-    defer a.free(order);
+    const orders = try a.alloc(u32, n_rows * vocab);
+    defer a.free(orders);
     var checked: usize = 0;
     var close: usize = 0;
     test_routes = @splat(@splat(0));
@@ -576,28 +592,31 @@ test "sampler draw: the kernel draws what the rule draws, at every filter, with 
     for ([_]bool{ true, false }) |own| for ([_]bool{ false, true }) |ties| {
         const s = if (own) mlx.engine.stream() else mlx.gpuStream();
         for (0..n_rows) |r| testRow(flat[r * vocab ..][0..vocab], 0x5a17 + r + @as(u64, @intFromBool(ties)) * 100, ties);
-        for ([_]f32{ 0.7, 1.0, 1.4 }) |temperature| for ([_]u32{ 0, 1, 5, 40, 4098, 4099, 9000 }) |top_k| for ([_]f32{ 1.0, 0.95, 0.5, 0.0 }) |top_p| {
-            var keys: [n_rows][2]u32 = undefined;
-            for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x9000 + r * 7 + top_k), @intCast(0x1234 + r) };
-            const got = try drawHost(a, s, flat, n_rows, vocab, if (ties) .bfloat16 else .float32, temperature, top_p, top_k, 0, &keys);
-            defer a.free(got);
-            for (got, 0..) |g, r| {
-                const want = hostDraw(flat[r * vocab ..][0..vocab], order, temperature, top_p, top_k, 0, keys[r]);
-                // A call the two float orders can make differently is not a verdict: the nucleus within 1e-5 of the
-                // kept mass of its threshold, or two scores within 1e-4.
-                if (want.nucleus_margin < 1e-5) {
-                    close += 1;
-                    continue;
+        for ([_]f32{ 0.7, 1.0, 1.4 }) |temperature| {
+            for (0..n_rows) |r| hostSortOrder(flat[r * vocab ..][0..vocab], orders[r * vocab ..][0..vocab], temperature);
+            for ([_]u32{ 0, 1, 5, 40, 4098, 4099, 9000 }) |top_k| for ([_]f32{ 1.0, 0.95, 0.5, 0.0 }) |top_p| {
+                var keys: [n_rows][2]u32 = undefined;
+                for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x9000 + r * 7 + top_k), @intCast(0x1234 + r) };
+                const got = try drawHost(a, s, flat, n_rows, vocab, if (ties) .bfloat16 else .float32, temperature, top_p, top_k, 0, &keys);
+                defer a.free(got);
+                for (got, 0..) |g, r| {
+                    const want = hostDrawSorted(flat[r * vocab ..][0..vocab], orders[r * vocab ..][0..vocab], temperature, top_p, top_k, 0, keys[r]);
+                    // A call the two float orders can make differently is not a verdict: the nucleus within 1e-5 of the
+                    // kept mass of its threshold, or two scores within 1e-4.
+                    if (want.nucleus_margin < 1e-5) {
+                        close += 1;
+                        continue;
+                    }
+                    if (want.gap < 1e-4) {
+                        close += 1;
+                        try testing.expect(g == want.id or g == want.second.?);
+                        continue;
+                    }
+                    try testing.expectEqual(want.id, g);
+                    checked += 1;
                 }
-                if (want.gap < 1e-4) {
-                    close += 1;
-                    try testing.expect(g == want.id or g == want.second.?);
-                    continue;
-                }
-                try testing.expectEqual(want.id, g);
-                checked += 1;
-            }
-        };
+            };
+        }
     };
     try testing.expect(checked > 20 * close);
     // Every route answered for some of them: an unfiltered row its own, each filter the shortlist and the descents.
@@ -742,9 +761,9 @@ test "sampler draw: at the edges of width, row count, special values and filters
     var checked: usize = 0;
     var close: usize = 0;
     for ([_]usize{ 1, 33, 1025, 5000 }) |vocab| {
-        const order = try a.alloc(u32, vocab);
-        defer a.free(order);
         for ([_]usize{ 1, 16 }) |n_rows| {
+            const orders = try a.alloc(u32, n_rows * vocab);
+            defer a.free(orders);
             const flat = try a.alloc(f32, n_rows * vocab);
             defer a.free(flat);
             // A floor, ties, flat, one finite id, two, NaN holes, one +inf, values near the float range's end.
@@ -769,30 +788,33 @@ test "sampler draw: at the edges of width, row count, special values and filters
                         else => {},
                     }
                 }
-                for ([_]f32{ 0.7, 100.0 }) |temperature| for ([_]u32{ 0, 1, @intCast(vocab) }) |top_k| for ([_]f32{ 1.0, 0.9, 0.0, 1e-45 }) |top_p| {
-                    var keys: [16][2]u32 = undefined;
-                    for (keys[0..n_rows], 0..) |*k, r| k.* = .{ @intCast(0x77 + r * 3 + top_k), @intCast(0x99 + r + vocab) };
-                    const got = try drawHost(a, s, flat, n_rows, vocab, .float32, temperature, top_p, top_k, 0, keys[0..n_rows]);
-                    defer a.free(got);
-                    for (got, 0..) |g, r| {
-                        const want = hostDraw(flat[r * vocab ..][0..vocab], order, temperature, top_p, top_k, 0, keys[r]);
-                        if (pat == 6) {
-                            try testing.expectEqual(@as(u32, @intCast((r * 11) % vocab)), g);
-                            try testing.expectEqual(g, want.id);
-                            continue;
+                for ([_]f32{ 0.7, 100.0 }) |temperature| {
+                    for (0..n_rows) |r| hostSortOrder(flat[r * vocab ..][0..vocab], orders[r * vocab ..][0..vocab], temperature);
+                    for ([_]u32{ 0, 1, @intCast(vocab) }) |top_k| for ([_]f32{ 1.0, 0.9, 0.0, 1e-45 }) |top_p| {
+                        var keys: [16][2]u32 = undefined;
+                        for (keys[0..n_rows], 0..) |*k, r| k.* = .{ @intCast(0x77 + r * 3 + top_k), @intCast(0x99 + r + vocab) };
+                        const got = try drawHost(a, s, flat, n_rows, vocab, .float32, temperature, top_p, top_k, 0, keys[0..n_rows]);
+                        defer a.free(got);
+                        for (got, 0..) |g, r| {
+                            const want = hostDrawSorted(flat[r * vocab ..][0..vocab], orders[r * vocab ..][0..vocab], temperature, top_p, top_k, 0, keys[r]);
+                            if (pat == 6) {
+                                try testing.expectEqual(@as(u32, @intCast((r * 11) % vocab)), g);
+                                try testing.expectEqual(g, want.id);
+                                continue;
+                            }
+                            // As in the sweep above: a call the two float orders can make differently is not a verdict,
+                            // but a single finite id is drawn whatever the margins.
+                            if (want.nucleus_margin < 1e-5 or want.gap < 1e-4) {
+                                close += 1;
+                                if (pat == 3) try testing.expectEqual(@as(u32, @intCast((r * 7) % vocab)), g);
+                                if (want.nucleus_margin >= 1e-5) try testing.expect(g == want.id or g == want.second.?);
+                                continue;
+                            }
+                            try testing.expectEqual(want.id, g);
+                            checked += 1;
                         }
-                        // As in the sweep above: a call the two float orders can make differently is not a verdict,
-                        // but a single finite id is drawn whatever the margins.
-                        if (want.nucleus_margin < 1e-5 or want.gap < 1e-4) {
-                            close += 1;
-                            if (pat == 3) try testing.expectEqual(@as(u32, @intCast((r * 7) % vocab)), g);
-                            if (want.nucleus_margin >= 1e-5) try testing.expect(g == want.id or g == want.second.?);
-                            continue;
-                        }
-                        try testing.expectEqual(want.id, g);
-                        checked += 1;
-                    }
-                };
+                    };
+                }
             }
         }
     }
@@ -812,13 +834,13 @@ test "sampler draw: at served vocabularies, over a plateau and a slope, the kern
     var close: usize = 0;
     test_routes = @splat(@splat(0));
     for ([_]usize{ 65537, 129280 }) |vocab| {
-        const order = try a.alloc(u32, vocab);
-        defer a.free(order);
         const n_rows = 4;
+        const orders = try a.alloc(u32, n_rows * vocab);
+        defer a.free(orders);
         const flat = try a.alloc(f32, n_rows * vocab);
         defer a.free(flat);
-        const view = try a.alloc(f32, vocab);
-        defer a.free(view);
+        const views = try a.alloc(f32, n_rows * vocab);
+        defer a.free(views);
         for (0..5) |pat| {
             for (0..n_rows) |r| {
                 const row = flat[r * vocab ..][0..vocab];
@@ -835,26 +857,32 @@ test "sampler draw: at served vocabularies, over a plateau and a slope, the kern
                     else => {},
                 }
             }
-            for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| for ([_]u32{ 0, 1, 1025, 60000 }) |top_k| for ([_]f32{ 1.0, 0.99, 0.3 }) |top_p| {
-                var keys: [n_rows][2]u32 = undefined;
-                for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x11 + r * 5 + top_k), @intCast(0x23 + r + vocab) };
-                const got = try drawHost(a, s, flat, n_rows, vocab, dtype, 1.0, top_p, top_k, 0, &keys);
-                defer a.free(got);
-                for (got, 0..) |g, r| {
+            for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
+                for (0..n_rows) |r| {
+                    const view = views[r * vocab ..][0..vocab];
                     // The rule reads what the kernel reads: the row rounded to the dtype, to nearest even.
                     for (view, flat[r * vocab ..][0..vocab]) |*o, x| {
                         const u: u32 = @bitCast(x);
                         o.* = if (dtype == .bfloat16) @bitCast((u +% 0x7FFF +% ((u >> 16) & 1)) & 0xFFFF_0000) else x;
                     }
-                    const want = hostDraw(view, order, 1.0, top_p, top_k, 0, keys[r]);
-                    if (want.nucleus_margin < 1e-4 or want.gap < 1e-3) {
-                        close += 1;
-                        continue;
-                    }
-                    try testing.expectEqual(want.id, g);
-                    checked += 1;
+                    hostSortOrder(view, orders[r * vocab ..][0..vocab], 1.0);
                 }
-            };
+                for ([_]u32{ 0, 1, 1025, 60000 }) |top_k| for ([_]f32{ 1.0, 0.99, 0.3 }) |top_p| {
+                    var keys: [n_rows][2]u32 = undefined;
+                    for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x11 + r * 5 + top_k), @intCast(0x23 + r + vocab) };
+                    const got = try drawHost(a, s, flat, n_rows, vocab, dtype, 1.0, top_p, top_k, 0, &keys);
+                    defer a.free(got);
+                    for (got, 0..) |g, r| {
+                        const want = hostDrawSorted(views[r * vocab ..][0..vocab], orders[r * vocab ..][0..vocab], 1.0, top_p, top_k, 0, keys[r]);
+                        if (want.nucleus_margin < 1e-4 or want.gap < 1e-3) {
+                            close += 1;
+                            continue;
+                        }
+                        try testing.expectEqual(want.id, g);
+                        checked += 1;
+                    }
+                };
+            }
         }
     }
     // A slope and a plateau make many close calls: about one row in four.

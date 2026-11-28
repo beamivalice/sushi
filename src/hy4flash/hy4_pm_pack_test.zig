@@ -3,6 +3,7 @@
 //! of the Hy4 cells that want a pack laid another way than the tiny's. A pack already pair-major keeps its bytes.
 const std = @import("std");
 const exl3 = @import("sushi_exl3");
+const hy4_held = @import("hy4_held.zig");
 
 const tile_layout = exl3.group_layout;
 
@@ -365,12 +366,14 @@ fn poolsHoldFile(dir: []const u8, slots: u64) !void {
 }
 
 test "hy4 pair-major: a streamed load's pools hold the pack's tiles unchanged, every expert resident or through a cache of 4 slots a layer, and its fills reshuffle none (HY4_STQ_TINY)" {
+    hy4_held.releaseHeld();
     const dir = tinyDir("HY4_STQ_TINY") orelse return error.SkipZigTest;
     try poolsHoldFile(dir, 8);
     try poolsHoldFile(dir, 4);
 }
 
 test "hy4 pair-major: a page-aligned pack, its zero pads listed in the index and skipped by the load, bills what the unpadded pack does and fills the pools with its tiles unchanged (HY4_STQ_TINY)" {
+    hy4_held.releaseHeld();
     const dir = tinyDir("HY4_STQ_TINY") orelse return error.SkipZigTest;
     if (@import("../expert_io.zig").pageSize() != 16384) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();

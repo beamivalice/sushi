@@ -403,8 +403,15 @@ pub fn swaSinkTruth(
             var m: f64 = sinks[h];
             for (lo..p + 1, 0..) |j, i| {
                 const krow = k[(kh * g.t + j) * g.qk ..][0..g.qk];
-                var dot: f64 = 0;
-                for (qrow, krow) |a, b| dot += @as(f64, a) * b;
+                var dot_v: @Vector(4, f64) = @splat(0);
+                var c: usize = 0;
+                while (c + 4 <= g.qk) : (c += 4) {
+                    const qv: @Vector(4, f32) = qrow[c..][0..4].*;
+                    const kv: @Vector(4, f32) = krow[c..][0..4].*;
+                    dot_v += @as(@Vector(4, f64), qv) * @as(@Vector(4, f64), kv);
+                }
+                var dot: f64 = @reduce(.Add, dot_v);
+                while (c < g.qk) : (c += 1) dot += @as(f64, qrow[c]) * krow[c];
                 logits[i] = dot * scale;
                 m = @max(m, logits[i]);
             }
@@ -413,8 +420,16 @@ pub fn swaSinkTruth(
             const orow = out[(h * ql + r) * g.vd ..][0..g.vd];
             for (lo..p + 1, 0..) |j, i| {
                 const w = @exp(logits[i] - m) / denom;
+                const w_v: @Vector(4, f64) = @splat(w);
                 const vrow = v[(kh * g.t + j) * g.vd ..][0..g.vd];
-                for (orow, vrow) |*o, x| o.* += w * x;
+                var c: usize = 0;
+                while (c + 4 <= g.vd) : (c += 4) {
+                    const vv: @Vector(4, f32) = vrow[c..][0..4].*;
+                    var ov: @Vector(4, f64) = orow[c..][0..4].*;
+                    ov += w_v * @as(@Vector(4, f64), vv);
+                    orow[c..][0..4].* = ov;
+                }
+                while (c < g.vd) : (c += 1) orow[c] += w * vrow[c];
             }
         }
     }
@@ -504,8 +519,15 @@ pub fn attnPdCausalTruth(alloc: std.mem.Allocator, g: SwaGeom, q: []const f32, k
             var m: f64 = -std.math.inf(f64);
             for (0..p + 1) |j| {
                 const krow = k[(kh * g.t + j) * g.qk ..][0..g.qk];
-                var dot: f64 = 0;
-                for (qrow, krow) |a, b| dot += @as(f64, a) * b;
+                var dot_v: @Vector(4, f64) = @splat(0);
+                var c: usize = 0;
+                while (c + 4 <= g.qk) : (c += 4) {
+                    const qv: @Vector(4, f32) = qrow[c..][0..4].*;
+                    const kv: @Vector(4, f32) = krow[c..][0..4].*;
+                    dot_v += @as(@Vector(4, f64), qv) * @as(@Vector(4, f64), kv);
+                }
+                var dot: f64 = @reduce(.Add, dot_v);
+                while (c < g.qk) : (c += 1) dot += @as(f64, qrow[c]) * krow[c];
                 logits[j] = dot * scale;
                 m = @max(m, logits[j]);
             }
@@ -514,8 +536,16 @@ pub fn attnPdCausalTruth(alloc: std.mem.Allocator, g: SwaGeom, q: []const f32, k
             const orow = out[(h * ql + r) * g.vd ..][0..g.vd];
             for (0..p + 1) |j| {
                 const w = @exp(logits[j] - m) / denom;
+                const w_v: @Vector(4, f64) = @splat(w);
                 const vrow = v[(kh * g.t + j) * g.vd ..][0..g.vd];
-                for (orow, vrow) |*o, x| o.* += w * x;
+                var c: usize = 0;
+                while (c + 4 <= g.vd) : (c += 4) {
+                    const vv: @Vector(4, f32) = vrow[c..][0..4].*;
+                    var ov: @Vector(4, f64) = orow[c..][0..4].*;
+                    ov += w_v * @as(@Vector(4, f64), vv);
+                    orow[c..][0..4].* = ov;
+                }
+                while (c < g.vd) : (c += 1) orow[c] += w * vrow[c];
             }
         }
     }

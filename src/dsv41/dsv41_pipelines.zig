@@ -89,6 +89,7 @@ const Served = struct {
         self.config.stream_mtp_head = true;
         self.config.expert_cache_bytes = 64 << 20;
         self.config.expert_source_dir = try a.dupe(u8, dir);
+        self.config.test_skip_warm = true;
         @import("../cooler_side.zig").forTest(&self.config, true);
         self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, false);
         errdefer self.weights.deinit();
@@ -159,12 +160,16 @@ fn engineDispatches() u64 {
     return mlx.engine.stats().dispatches;
 }
 
-test "dsv41 pipelines: a load with no manifest writes one with the wide chunks' recipes, and a load from it skips the engine's forwards, the wide ones included, serves the same tokens and compiles none inside a prompt (DSV41_STQ_TINY)" {
+test "dsv41 pipelines: a load with no manifest writes one with the wide chunks' recipes, and a load from it skips the engine's forwards, serves the same tokens and compiles none inside a prompt or tiled index scan (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     var served: Served = undefined;
     try served.init(testing.allocator);
     defer served.deinit();
     const m = served.model();
+    // The fixture's window of 8 rows is a span the indexer scans a row at a time: a wider one is scored in tiles.
+    m.cfg.window = 32;
+    const served_tile = m.index_stream_tile;
+    defer m.index_stream_tile = served_tile;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const key = testKey("b1b1b1b1b1b1b1b1");
@@ -191,12 +196,25 @@ test "dsv41 pipelines: a load with no manifest writes one with the wide chunks' 
     const warmed = try served.tokens();
     defer testing.allocator.free(warmed);
 
+    var prompt: [97]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = served.ids[(i * 5 + 3) % served.ids.len];
+    const late_full = mlx.engine.latePipelines();
+    const streams_full = dsv41_model.indexStreams();
+    // The fixture's context is under one served tile of keys: the smallest tile makes its second chunk span two.
+    m.index_stream_tile = dsv41_model.indexStreamTileMin(m);
+    try served.xfm.resetCache();
+    try served.prefillChunk(prompt[0..64]);
+    try served.prefillChunk(prompt[64..97]);
+    try testing.expect(dsv41_model.indexStreams() > streams_full);
+    try testing.expectEqual(late_full, mlx.engine.latePipelines());
+
     var written = try manifest.lookup(testing.allocator, std.Io.Threaded.global_single_threaded.io(), tmp.dir, key);
     defer written.deinit();
     try testing.expect(written == .same);
     try testing.expect(written.same.recipes.len > 0);
 
     mlx.engine.seal(false);
+    m.index_stream_tile = served_tile;
     var second = plainBegin(tmp.dir, key);
     defer second.deinit();
     try testing.expectEqual(Case.same, second.case);
@@ -211,10 +229,15 @@ test "dsv41 pipelines: a load with no manifest writes one with the wide chunks' 
     defer testing.allocator.free(from_manifest);
     try testing.expectEqualSlices(u32, warmed, from_manifest);
     try served.xfm.resetCache();
-    var prompt: [97]u32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = served.ids[(i * 5 + 3) % served.ids.len];
     try served.prefillChunk(prompt[0..64]);
     try served.prefillChunk(prompt[64..97]);
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+    try served.xfm.resetCache();
+    const streams_manifest = dsv41_model.indexStreams();
+    m.index_stream_tile = dsv41_model.indexStreamTileMin(m);
+    try served.prefillChunk(prompt[0..64]);
+    try served.prefillChunk(prompt[64..97]);
+    try testing.expect(dsv41_model.indexStreams() > streams_manifest);
     try testing.expectEqual(late, mlx.engine.latePipelines());
 }
 
@@ -237,40 +260,6 @@ test "dsv41 pipelines: a load whose warm did not finish leaves no manifest, and 
     var stored = try manifest.lookup(testing.allocator, io, tmp.dir, key);
     defer stored.deinit();
     try testing.expect(stored == .same);
-}
-
-test "dsv41 pipelines: a chunk whose index top-k streams over key tiles compiles nothing inside a prompt, after a full warm and after a load from the manifest (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    var served: Served = undefined;
-    try served.init(testing.allocator);
-    defer served.deinit();
-    const m = served.model();
-    // The fixture's window of 8 rows is a span the indexer scans a row at a time: a wider one is scored in tiles.
-    m.cfg.window = 32;
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const key = testKey("e2e2e2e2e2e2e2e2");
-    var prompt: [97]u32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = served.ids[(i * 5 + 3) % served.ids.len];
-    const served_tile = m.index_stream_tile;
-    defer m.index_stream_tile = served_tile;
-    for ([_]dsv41_model.WarmScope{ .all, .mlx }) |scope| {
-        mlx.engine.seal(false);
-        m.index_stream_tile = served_tile;
-        var plan = plainBegin(tmp.dir, key);
-        defer plan.deinit();
-        try testing.expectEqual(scope, try served.load(&plan));
-        mlx.engine.seal(true);
-        defer mlx.engine.seal(false);
-        const late = mlx.engine.latePipelines();
-        const streams = dsv41_model.indexStreams();
-        // The fixture's context is under one served tile of keys: the smallest tile makes its second chunk span two.
-        m.index_stream_tile = dsv41_model.indexStreamTileMin(m);
-        try served.prefillChunk(prompt[0..64]);
-        try served.prefillChunk(prompt[64..97]);
-        try testing.expect(dsv41_model.indexStreams() > streams);
-        try testing.expectEqual(late, mlx.engine.latePipelines());
-    }
 }
 
 test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs in full, and the older builds' directories go but the newest other's" {

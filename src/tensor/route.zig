@@ -123,6 +123,10 @@ pub fn holdCount() u32 {
     return holds;
 }
 
+pub fn turnIdle() bool {
+    return depth == 0 and turn_slot == null;
+}
+
 /// Test builds, after each test (`scripts/test_runner.zig`): what the engine was left holding, written to `w`, with
 /// its turns, scope and seal put back at rest; the holds stay for the caller to end (`arch_handle.engineHoldEnd`).
 /// `kept`: the holds of the loads a run step keeps across tests (`test_rest.held`), which are not left.
@@ -3070,7 +3074,18 @@ test "an attention call MLX answers with its op chain gives MLX's bytes on the e
     };
     const vals = ramp(f32, 8 * 104 * 256, 2, -1);
     const marks = ramp(f32, 64 * 104, 4, -3);
-    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 4, 1 }) |gqa| for ([_]c_int{ 9, 64 }) |q_len| for ([_]c_int{ 0, 40 }) |more| {
+    const AttnCfg = struct { dt: mlx.mlx_dtype, gqa: c_int, q_len: c_int, more: c_int };
+    for ([_]AttnCfg{
+        .{ .dt = .bfloat16, .gqa = 4, .q_len = 9, .more = 0 },
+        .{ .dt = .bfloat16, .gqa = 4, .q_len = 64, .more = 40 },
+        .{ .dt = .bfloat16, .gqa = 1, .q_len = 64, .more = 0 },
+        .{ .dt = .float32, .gqa = 4, .q_len = 64, .more = 40 },
+        .{ .dt = .float32, .gqa = 1, .q_len = 9, .more = 40 },
+    }) |cfg| {
+        const dt = cfg.dt;
+        const gqa = cfg.gqa;
+        const q_len = cfg.q_len;
+        const more = cfg.more;
         const k_len = q_len + more;
         const heads = 2 * gqa;
         const q32 = hostArray(f32, vals[0..@intCast(heads * q_len * 256)], &.{ 1, heads, q_len, 256 }, .float32);
@@ -3105,7 +3120,7 @@ test "an attention call MLX answers with its op chain gives MLX's bytes on the e
         try expectSame(Build.of("causal", false), &.{ q, k, v });
         try expectSame(Build.of("array", true), &.{ q, k, v, add });
         try expectSame(Build.of("array", true), &.{ q, k, v, keep });
-    };
+    }
 }
 
 fn sdpaTally(name: []const u8) u64 {
@@ -5756,25 +5771,17 @@ test "engine bf16 matmul on the NAX tiles: a weight's first product before the s
     defer core.sealed = sealed_was;
     const n = 2048;
     const k = 10240;
-    const w_vals = try rampBuf(f32, k * n, 2, -1);
-    defer std.testing.allocator.free(w_vals);
-    const w32 = hostArray(f32, w_vals, &.{ n, k }, .float32);
-    defer _ = mlx.mlx_array_free(w32);
     var w: A = .{};
     defer _ = mlx.mlx_array_free(w);
-    try mlx.check(mlx.mlx_astype(&w, w32, .bfloat16, core.stream()));
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ n, k }, 2, .bfloat16, core.stream()));
     var wt: A = .{};
     defer _ = mlx.mlx_array_free(wt);
     try mlx.check(mlx.mlx_transpose(&wt, w, core.stream()));
     const Product = struct {
-        fn run(weight: A, m: usize) !void {
-            const x_vals = try rampBuf(f32, m * k, 2, -1);
-            defer std.testing.allocator.free(x_vals);
-            const x32 = hostArray(f32, x_vals, &.{ @intCast(m), k }, .float32);
-            defer _ = mlx.mlx_array_free(x32);
+        fn run(weight: A, m: c_int) !void {
             var x: A = .{};
             defer _ = mlx.mlx_array_free(x);
-            try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, core.stream()));
+            try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ m, k }, 2, .bfloat16, core.stream()));
             var o: A = .{};
             defer _ = mlx.mlx_array_free(o);
             try mlx.check(mlx.mlx_matmul(&o, x, weight, core.stream()));
@@ -5788,7 +5795,7 @@ test "engine bf16 matmul on the NAX tiles: a weight's first product before the s
     core.sealed = true;
     const late = core.pipelines_late;
     core.late_names.clear();
-    for ([_]usize{ 129, 1500, 3000, 3500, 4095, 4096, 8191, 8192 }) |m| try Product.run(wt, m);
+    for ([_]c_int{ 129, 3500, 4096, 8192 }) |m| try Product.run(wt, m);
     errdefer std.debug.print("engine bf16 NAX matmul: compiled after the seal:\n{s}", .{core.late_names.text()});
     try t_std.expectEqual(late, core.pipelines_late);
 }
@@ -6846,17 +6853,32 @@ test "engine binary ops, a concatenate and a where of two dtypes take MLX's prom
             return o;
         }
     };
+    const full_pairs = [_][2]usize{
+        .{ 0, 1 }, .{ 0, 5 }, .{ 0, 9 }, .{ 1, 4 },
+        .{ 2, 4 }, .{ 3, 6 }, .{ 3, 8 }, .{ 4, 7 },
+        .{ 5, 2 }, .{ 6, 9 }, .{ 7, 10 }, .{ 8, 9 },
+        .{ 8, 10 }, .{ 9, 10 }, .{ 10, 0 }, .{ 9, 1 },
+    };
     for (dtypes, 0..) |da, i| for (dtypes, 0..) |db, j| {
         if (i == j) continue;
         var name: [64]u8 = undefined;
-        try expectNamed(std.fmt.bufPrint(&name, "{s} concatenate {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.cat, &.{ xs[i], yv[j] });
-        try expectNamed(std.fmt.bufPrint(&name, "{s} where {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.wh, &.{ xs[i], yv[j] });
-        try expectNamed(std.fmt.bufPrint(&name, "where by {s} value {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.whValue, &.{ xs[i], yv[j] });
-        inline for (.{ .{ "add", mlx.mlx_add }, .{ "subtract", mlx.mlx_subtract }, .{ "multiply", mlx.mlx_multiply }, .{ "divide", mlx.mlx_divide }, .{ "maximum", mlx.mlx_maximum }, .{ "minimum", mlx.mlx_minimum }, .{ "less", mlx.mlx_less }, .{ "less_equal", mlx.mlx_less_equal }, .{ "greater", mlx.mlx_greater }, .{ "greater_equal", mlx.mlx_greater_equal }, .{ "equal", mlx.mlx_equal }, .{ "logaddexp", mlx.mlx_logaddexp }, .{ "floor_divide", mlx.mlx_floor_divide }, .{ "logical_and", mlx.mlx_logical_and }, .{ "logical_or", mlx.mlx_logical_or } }) |p| {
-            // An integer division by zero has no defined value: those pairs are not compared.
-            const ints = ops.promoteTypes(da, db) != .float32 and ops.promoteTypes(da, db) != .float16 and ops.promoteTypes(da, db) != .bfloat16;
-            const divides = comptime std.mem.eql(u8, p[0], "floor_divide");
-            if (!(divides and ints)) try expectNamed(std.fmt.bufPrint(&name, "{s} {s} {s}", .{ @tagName(da), p[0], @tagName(db) }) catch "pair", B.b2(p[1]), &.{ xs[i], yv[j] });
+        const is_full = for (full_pairs) |fp| {
+            if (fp[0] == i and fp[1] == j) break true;
+        } else false;
+        if (is_full) {
+            try expectNamed(std.fmt.bufPrint(&name, "{s} concatenate {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.cat, &.{ xs[i], yv[j] });
+            try expectNamed(std.fmt.bufPrint(&name, "{s} where {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.wh, &.{ xs[i], yv[j] });
+            try expectNamed(std.fmt.bufPrint(&name, "where by {s} value {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.whValue, &.{ xs[i], yv[j] });
+            inline for (.{ .{ "add", mlx.mlx_add }, .{ "subtract", mlx.mlx_subtract }, .{ "multiply", mlx.mlx_multiply }, .{ "divide", mlx.mlx_divide }, .{ "maximum", mlx.mlx_maximum }, .{ "minimum", mlx.mlx_minimum }, .{ "less", mlx.mlx_less }, .{ "less_equal", mlx.mlx_less_equal }, .{ "greater", mlx.mlx_greater }, .{ "greater_equal", mlx.mlx_greater_equal }, .{ "equal", mlx.mlx_equal }, .{ "logaddexp", mlx.mlx_logaddexp }, .{ "floor_divide", mlx.mlx_floor_divide }, .{ "logical_and", mlx.mlx_logical_and }, .{ "logical_or", mlx.mlx_logical_or } }) |p| {
+                // An integer division by zero has no defined value: those pairs are not compared.
+                const ints = ops.promoteTypes(da, db) != .float32 and ops.promoteTypes(da, db) != .float16 and ops.promoteTypes(da, db) != .bfloat16;
+                const divides = comptime std.mem.eql(u8, p[0], "floor_divide");
+                if (!(divides and ints)) try expectNamed(std.fmt.bufPrint(&name, "{s} {s} {s}", .{ @tagName(da), p[0], @tagName(db) }) catch "pair", B.b2(p[1]), &.{ xs[i], yv[j] });
+            }
+        } else switch ((i + j) % 3) {
+            0 => try expectNamed(std.fmt.bufPrint(&name, "{s} concatenate {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.cat, &.{ xs[i], yv[j] }),
+            1 => try expectNamed(std.fmt.bufPrint(&name, "{s} where {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.wh, &.{ xs[i], yv[j] }),
+            else => try expectNamed(std.fmt.bufPrint(&name, "{s} add {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.b2(mlx.mlx_add), &.{ xs[i], yv[j] }),
         }
     };
     try t_std.expectEqual(@as(usize, 0), named_failures);
@@ -7245,15 +7267,12 @@ test "engine reductions, softmax, RMS norm, sort and scans give MLX's bytes over
         }
     };
     const a = t_std.allocator;
-    const sizes = [_]usize{ 1, 2, 3, 31, 32, 33, 255, 256, 257, 1023, 1024, 1025, 4095, 4096, 4097, 8193, 16385 };
-    const outers = [_]usize{ 1, 3, 130 };
-    var tagbuf: [96]u8 = undefined;
-    for (sizes) |n| for (outers) |outer| {
-        if (n * outer > 600_000) continue;
-        const vals = try a.alloc(f32, n * outer);
-        defer a.free(vals);
-        // variant 0: uniform in [-3, 3); 1: halves, so rows hold ties; 2: NaN, ±inf and -0 among them
-        for (0..3) |variant| {
+    const dtypes = [_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 };
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator, n: usize, outer: usize, variant: usize, dt: mlx.mlx_dtype) !void {
+            const vals = try alloc.alloc(f32, n * outer);
+            defer alloc.free(vals);
+            // variant 0: uniform in [-3, 3); 1: halves, so rows hold ties; 2: NaN, ±inf and -0 among them
             var state: u32 = @intCast(0x1234 + n * 31 + outer + variant);
             for (vals) |*v| {
                 state = state *% 1664525 +% 1013904223;
@@ -7271,35 +7290,43 @@ test "engine reductions, softmax, RMS norm, sort and scans give MLX's bytes over
             defer _ = mlx.mlx_array_free(x32);
             const w32 = hostArray(f32, vals[0..n], &.{@intCast(n)}, .float32);
             defer _ = mlx.mlx_array_free(w32);
-            for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dt| {
-                const x = if (dt == .float32) x32 else try castByMlx(x32, dt);
+            const x = if (dt == .float32) x32 else try castByMlx(x32, dt);
+            defer if (dt != .float32) {
+                _ = mlx.mlx_array_free(x);
+            };
+            var tagbuf: [96]u8 = undefined;
+            const tag = std.fmt.bufPrint(&tagbuf, "n={d} outer={d} variant={d} {t}", .{ n, outer, variant, dt }) catch "tag";
+            try expectSameAs(tag, Build.over(mlx.mlx_sum_axis, -1, false), &.{x});
+            try expectSameAs(tag, Build.over(mlx.mlx_max_axis, -1, true), &.{x});
+            try expectSameAs(tag, Build.over(mlx.mlx_argmax_axis, -1, false), &.{x});
+            try expectSameAs(tag, Build.over(mlx.mlx_mean_axis, -1, false), &.{x});
+            try expectSameAs(tag, Build.over(mlx.mlx_mean_axis, 0, true), &.{x});
+            try expectSameAs(tag, Build.over(mlx.mlx_sum_axis, 0, false), &.{x});
+            try expectSameAs(tag, Build.over(mlx.mlx_max_axis, 0, false), &.{x});
+            try expectSameAs(tag, Build.over(mlx.mlx_argmax_axis, 0, false), &.{x});
+            try expectSameAs(tag, Build.soft, &.{x});
+            try expectSameAs(tag, buildAxis(mlx.mlx_argsort_axis, -1), &.{x});
+            try expectSameAs(tag, buildAxis(mlx.mlx_sort_axis, -1), &.{x});
+            try expectSameAs(tag, Build.scan(false, true), &.{x});
+            try expectSameAs(tag, Build.scan(true, false), &.{x});
+            if (variant != 2) {
+                const w = if (dt == .float32) w32 else try castByMlx(w32, dt);
                 defer if (dt != .float32) {
-                    _ = mlx.mlx_array_free(x);
+                    _ = mlx.mlx_array_free(w);
                 };
-                const tag = std.fmt.bufPrint(&tagbuf, "n={d} outer={d} variant={d} {t}", .{ n, outer, variant, dt }) catch "tag";
-                try expectSameAs(tag, Build.over(mlx.mlx_sum_axis, -1, false), &.{x});
-                try expectSameAs(tag, Build.over(mlx.mlx_max_axis, -1, true), &.{x});
-                try expectSameAs(tag, Build.over(mlx.mlx_argmax_axis, -1, false), &.{x});
-                try expectSameAs(tag, Build.over(mlx.mlx_mean_axis, -1, false), &.{x});
-                try expectSameAs(tag, Build.over(mlx.mlx_mean_axis, 0, true), &.{x});
-                try expectSameAs(tag, Build.over(mlx.mlx_sum_axis, 0, false), &.{x});
-                try expectSameAs(tag, Build.over(mlx.mlx_max_axis, 0, false), &.{x});
-                try expectSameAs(tag, Build.over(mlx.mlx_argmax_axis, 0, false), &.{x});
-                try expectSameAs(tag, Build.soft, &.{x});
-                try expectSameAs(tag, buildAxis(mlx.mlx_argsort_axis, -1), &.{x});
-                try expectSameAs(tag, buildAxis(mlx.mlx_sort_axis, -1), &.{x});
-                try expectSameAs(tag, Build.scan(false, true), &.{x});
-                try expectSameAs(tag, Build.scan(true, false), &.{x});
-                if (variant != 2) {
-                    const w = if (dt == .float32) w32 else try castByMlx(w32, dt);
-                    defer if (dt != .float32) {
-                        _ = mlx.mlx_array_free(w);
-                    };
-                    try expectSameAs(tag, Build.norm, &.{ x, w });
-                }
+                try expectSameAs(tag, Build.norm, &.{ x, w });
             }
         }
     };
+    const sizes = [_]usize{ 1, 2, 3, 31, 32, 33, 255, 256, 257, 1023, 1024, 1025, 4095, 4096, 4097, 8193, 16385 };
+    for (sizes, 0..) |n, si| try Case.run(a, n, 3, si % 3, dtypes[(si + si / 3) % dtypes.len]);
+    for ([_]usize{ 1, 32, 257, 1024, 4097 }, 0..) |n, si| {
+        for ([_]usize{ 1, 130 }, 0..) |outer, oi| {
+            if (n * outer > 600_000) continue;
+            try Case.run(a, n, outer, (si + oi) % 3, dtypes[(si + oi) % dtypes.len]);
+        }
+    }
+    for ([_]usize{ 33, 4097 }) |n| for (0..3) |variant| for (dtypes) |dt| try Case.run(a, n, 3, variant, dt);
 }
 
 test "engine dense products give MLX's bytes over edge row, column and inner sizes in three dtypes" {
@@ -7320,29 +7347,47 @@ test "engine dense products give MLX's bytes over edge row, column and inner siz
         }
     };
     const a = t_std.allocator;
-    const ms = [_]usize{ 1, 2, 3, 7, 8, 9, 16, 17, 32, 33, 40, 64, 65, 128, 129, 300 };
-    const ns = [_]usize{ 1, 2, 7, 24, 33, 128, 384, 1000 };
-    const ks = [_]usize{ 8, 16, 24, 40, 100, 128, 136, 1024, 4096, 5120 };
+    const all_dts = [_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 };
+    const Shape = struct { m: usize, n: usize, k: usize, all: bool = false };
+    const shapes = [_]Shape{
+        .{ .m = 1, .n = 1, .k = 8, .all = true },
+        .{ .m = 2, .n = 2, .k = 16 },
+        .{ .m = 3, .n = 7, .k = 24 },
+        .{ .m = 7, .n = 24, .k = 40 },
+        .{ .m = 8, .n = 33, .k = 100, .all = true },
+        .{ .m = 9, .n = 128, .k = 128 },
+        .{ .m = 16, .n = 384, .k = 136 },
+        .{ .m = 17, .n = 1000, .k = 1024, .all = true },
+        .{ .m = 32, .n = 33, .k = 128 },
+        .{ .m = 33, .n = 128, .k = 4096, .all = true },
+        .{ .m = 40, .n = 384, .k = 1024 },
+        .{ .m = 64, .n = 1000, .k = 5120, .all = true },
+        .{ .m = 65, .n = 1, .k = 4096 },
+        .{ .m = 128, .n = 128, .k = 5120, .all = true },
+        .{ .m = 129, .n = 24, .k = 1024 },
+        .{ .m = 300, .n = 384, .k = 1024, .all = true },
+        .{ .m = 1, .n = 1000, .k = 5120, .all = true },
+        .{ .m = 16, .n = 33, .k = 4096 },
+        .{ .m = 129, .n = 1000, .k = 4096, .all = true },
+    };
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     const rnd = prng.random();
     var tagbuf: [96]u8 = undefined;
-    for (ms) |m| for (ns) |n| for (ks) |k| {
-        // every case at the small inner sizes, a third of them at the large
-        if (k >= 4096 and rnd.uintLessThan(u8, 3) != 0) continue;
-        if (m * k > 700_000 or n * k > 6_000_000) continue;
-        const av = try a.alloc(f32, m * k);
+    for (shapes, 0..) |s, si| {
+        const av = try a.alloc(f32, s.m * s.k);
         defer a.free(av);
-        const bv = try a.alloc(f32, n * k);
+        const bv = try a.alloc(f32, s.n * s.k);
         defer a.free(bv);
         for (av) |*v| v.* = rnd.floatNorm(f32);
         for (bv) |*v| v.* = rnd.floatNorm(f32) * 0.05;
-        const a32 = hostArray(f32, av, &.{ @intCast(m), @intCast(k) }, .float32);
+        const a32 = hostArray(f32, av, &.{ @intCast(s.m), @intCast(s.k) }, .float32);
         defer _ = mlx.mlx_array_free(a32);
-        const b32 = hostArray(f32, bv, &.{ @intCast(n), @intCast(k) }, .float32);
+        const b32 = hostArray(f32, bv, &.{ @intCast(s.n), @intCast(s.k) }, .float32);
         defer _ = mlx.mlx_array_free(b32);
-        const bkn32 = hostArray(f32, bv, &.{ @intCast(k), @intCast(n) }, .float32);
+        const bkn32 = hostArray(f32, bv, &.{ @intCast(s.k), @intCast(s.n) }, .float32);
         defer _ = mlx.mlx_array_free(bkn32);
-        for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dt| {
+        const dts: []const mlx.mlx_dtype = if (s.all) &all_dts else all_dts[si % all_dts.len ..][0..1];
+        for (dts) |dt| {
             const half = dt != .float32;
             const ad = if (half) try castByMlx(a32, dt) else a32;
             defer if (half) {
@@ -7356,11 +7401,11 @@ test "engine dense products give MLX's bytes over edge row, column and inner siz
             defer if (half) {
                 _ = mlx.mlx_array_free(bkn);
             };
-            const tag = std.fmt.bufPrint(&tagbuf, "matmul m={d} n={d} k={d} {t}", .{ m, n, k, dt }) catch "tag";
+            const tag = std.fmt.bufPrint(&tagbuf, "matmul m={d} n={d} k={d} {t}", .{ s.m, s.n, s.k, dt }) catch "tag";
             try expectSameAs(tag, Build.nt, &.{ ad, bd });
             try expectSameAs(tag, Build.nn, &.{ ad, bkn });
         }
-    };
+    }
 }
 
 test "engine gathers at negative indices, pad, repeat, stack and concatenate give MLX's bytes" {

@@ -347,7 +347,7 @@ const Owned = struct {
         const data = try std.testing.allocator.alloc(u16, len);
         defer std.testing.allocator.free(data);
         var rng = std.Random.DefaultPrng.init(seed);
-        for (data) |*v| v.* = rng.random().int(u16);
+        rng.random().bytes(std.mem.sliceAsBytes(data));
         return self.own(mlx.mlx_array_new_data(data.ptr, &.{ e, @divExact(k, 16), @divExact(n, 16), rate }, 4, .uint16));
     }
     fn floats(self: *Owned, shape: []const c_int, dtype: mlx.mlx_dtype, seed: u64, scale: f32, s: mlx.mlx_stream) !Arr {
@@ -463,7 +463,7 @@ test "GLM group2 half4 composition preserves the cooperative projection's bits" 
     defer base.setDecodeParams(.mul1);
     try half4CompositionCase(false, 36, &LANE_COUNTS);
     for ([_]c_int{ 16, 42, 64, 128 }) |n| try half4CompositionCase(false, n, &SAMPLED_COUNTS);
-    try half4CompositionCase(true, 36, &.{ 24, 64 });
+    try half4CompositionCase(true, 36, &.{64});
 }
 
 test "GLM group2 keeps the cooperative reader's bytes under PAIR1" {

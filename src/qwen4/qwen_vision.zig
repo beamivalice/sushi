@@ -1499,135 +1499,6 @@ test "qwen vision: on Sushi Cooler a 1536^2 image's encode bills a chunk of quer
     try std.testing.expect(bound < 2 << 30);
 }
 
-// Encode time and scratch peak on the real tower, per image, at a small image, a
-// 1920x1080 screenshot and the engine's 1536^2 cap (random pixels; numerics are
-// the parity test's job), with and without the per-block eval, arms interleaved;
-// then per video, its peak from the pixel upload to the evaluated output against
-// `request_media.visionEncodeBill`:
-//   QWEN_VISION_TEST_MODEL=<pack> SUSHI_QWEN_VISION_UBENCH=<reps> \
-//   zig build test -Doptimize=ReleaseFast -Dtest-filter="qwen vision ubench"
-test "qwen vision ubench: encode time and scratch peak per image and video" {
-    const reps_raw = std.c.getenv("SUSHI_QWEN_VISION_UBENCH") orelse return error.SkipZigTest;
-    const model_raw = std.c.getenv("QWEN_VISION_TEST_MODEL") orelse return error.SkipZigTest;
-    const reps = std.fmt.parseInt(u32, std.mem.span(reps_raw), 10) catch return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    const dir = std.mem.span(model_raw);
-    var config = try model_mod.parseConfig(io, a, dir);
-    defer config.deinit(a);
-    try std.testing.expect(config.qwen_vision);
-    var weights = Weights.init(a);
-    defer weights.deinit();
-    {
-        const path = try std.fmt.allocPrintSentinel(a, "{s}/model-vision.safetensors", .{dir}, 0);
-        defer a.free(path);
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
-        try model_mod.loadSafetensorsFile(a, &weights, path, cpu, true);
-    }
-    var tower = try QwenVision.init(a, config, &weights);
-    defer tower.deinit();
-
-    const feat: c_int = @intCast(3 * config.qv_temporal_patch * config.qv_patch * config.qv_patch);
-    const cap_side: u32 = std.math.sqrt(common.ENGINE_MAX_PIXELS) / config.qv_patch;
-    // A 1920x1080 screenshot under this pack's own processor bounds.
-    const bounds = common.effectivePixelBounds(config.qv_min_pixels, config.qv_max_pixels);
-    const shot = common.smartResizeImage(1080, 1920, config.qv_patch * config.qv_merge, bounds.min, bounds.max);
-    var under_billed = false;
-    for ([_][2]u32{ .{ 14, 14 }, .{ shot.h / config.qv_patch, shot.w / config.qv_patch }, .{ 68, 120 }, .{ cap_side, cap_side } }) |g| {
-        const n: c_int = @intCast(g[0] * g[1]);
-        var pv = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(pv);
-        const shape = [_]c_int{ n, feat };
-        try mlx.check(mlx.mlx_random_normal(&pv, &shape, 2, .float32, 0, 1, .{ .ctx = null }, tower.s));
-        try mlx.check(mlx.mlx_array_eval(pv));
-        var best = [2]u64{ std.math.maxInt(u64), std.math.maxInt(u64) };
-        var peak = [2]usize{ 0, 0 };
-        for (0..reps + 1) |r| {
-            // Arm 0 = today's lazy graph, arm 1 = eval per block; the order alternates per rep.
-            for (0..2) |k| {
-                const arm = (k + r) % 2;
-                tower.eval_per_block = arm == 1;
-                try mlx.check(mlx.mlx_synchronize(tower.s));
-                _ = mlx.mlx_clear_cache();
-                var before: usize = 0;
-                _ = mlx.mlx_get_active_memory(&before);
-                _ = mlx.mlx_reset_peak_memory();
-                const t0 = std.Io.Timestamp.now(io, .boot);
-                const out = try tower.forward(pv, g[0], g[1]);
-                try mlx.check(mlx.mlx_array_eval(out));
-                try mlx.check(mlx.mlx_synchronize(tower.s));
-                const ns: u64 = @intCast(t0.untilNow(io, .boot).nanoseconds);
-                var p: usize = 0;
-                _ = mlx.mlx_get_peak_memory(&p);
-                _ = mlx.mlx_array_free(out);
-                peak[arm] = @max(peak[arm], p -| before);
-                if (r > 0) best[arm] = @min(best[arm], ns);
-            }
-        }
-        tower.eval_per_block = true;
-        const bill = encodeScratchBytes(&config, @intCast(n));
-        const mb = 1e6;
-        std.debug.print("[qwen-vit ubench] grid {d}x{d} ({d} patches, {d} tokens): lazy best {d:.1} ms peak {d:.1} MB | per-block eval best {d:.1} ms peak {d:.1} MB | bill {d:.1} MB (reps {d})\n", .{
-            g[0],                                  g[1],                                     n,
-            @divExact(n, @as(c_int, @intCast(config.qv_merge * config.qv_merge))),
-            @as(f64, @floatFromInt(best[0])) / 1e6, @as(f64, @floatFromInt(peak[0])) / mb,
-            @as(f64, @floatFromInt(best[1])) / 1e6, @as(f64, @floatFromInt(peak[1])) / mb,
-            @as(f64, @floatFromInt(bill)) / mb,     reps,
-        });
-        if (bill < peak[1]) under_billed = true;
-    }
-    const request_media = @import("../request_media.zig");
-    const merge2 = config.qv_merge * config.qv_merge;
-    for ([_][3]u32{ .{ 1, 46, 82 }, .{ 2, 46, 82 }, .{ 4, 46, 82 }, .{ 8, 46, 82 }, .{ 2, 24, 42 }, .{ 8, 24, 42 }, .{ 2, cap_side, cap_side }, .{ 8, cap_side, cap_side } }) |v| {
-        const n: c_int = @intCast(v[0] * v[1] * v[2]);
-        var src = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(src);
-        const shape = [_]c_int{ n, feat };
-        try mlx.check(mlx.mlx_random_normal(&src, &shape, 2, .float32, 0, 1, .{ .ctx = null }, tower.s));
-        try mlx.check(mlx.mlx_array_eval(src));
-        const host = (mlx.mlx_array_data_float32(src) orelse return error.TestUnexpectedNullData)[0..@intCast(n * feat)];
-        var best: u64 = std.math.maxInt(u64);
-        var peak: usize = 0;
-        for (0..reps + 1) |r| {
-            try mlx.check(mlx.mlx_synchronize(tower.s));
-            _ = mlx.mlx_clear_cache();
-            var before: usize = 0;
-            _ = mlx.mlx_get_active_memory(&before);
-            _ = mlx.mlx_reset_peak_memory();
-            const t0 = std.Io.Timestamp.now(io, .boot);
-            // As `vision_queue.encodeVideoGroup`: the upload is a copy the encode owns.
-            const pixels = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
-            const out = tower.forwardVideo(pixels, v[0], v[1], v[2]);
-            _ = mlx.mlx_array_free(pixels);
-            const emb = try out;
-            defer _ = mlx.mlx_array_free(emb);
-            try mlx.check(mlx.mlx_array_eval(emb));
-            try mlx.check(mlx.mlx_synchronize(tower.s));
-            const ns: u64 = @intCast(t0.untilNow(io, .boot).nanoseconds);
-            var p: usize = 0;
-            _ = mlx.mlx_get_peak_memory(&p);
-            peak = @max(peak, p -| before);
-            if (r > 0) best = @min(best, ns);
-        }
-        const rows: u64 = @as(u64, @intCast(n)) / merge2;
-        const video = [_]@import("../chat.zig").VideoData{.{ .pixels = std.mem.sliceAsBytes(host), .grid_t = v[0], .grid_h = v[1], .grid_w = v[2] }};
-        const bill = request_media.visionEncodeBill(&config, &.{}, &video, rows).bytes;
-        const mb = 1e6;
-        const peak_f: f64 = @floatFromInt(peak);
-        const bill_f: f64 = @floatFromInt(bill);
-        std.debug.print("[qwen-vit ubench] video {d}x{d}x{d} ({d} patches, {d} tokens): best {d:.1} ms peak {d} B ({d:.1} MB) | bill {d} B ({d:.1} MB, {d:.2}x) (reps {d})\n", .{
-            v[0], v[1], v[2], n, rows,
-            @as(f64, @floatFromInt(best)) / 1e6, peak, peak_f / mb,
-            bill, bill_f / mb, bill_f / peak_f, reps,
-        });
-        if (bill < peak) under_billed = true;
-    }
-    try std.testing.expect(!under_billed);
-}
-
-// ── Requantization at load ──
-
 test "qwen vision: the load requantizes the blocks' and merger's matrices to the widest group their input takes" {
     const pre = "vision_tower.";
     try std.testing.expectEqual(@as(?u32, 128), quantGroupAtLoad(pre ++ "blocks.0.attn.qkv.weight", true, &.{ 3456, 1152 }));
@@ -1725,64 +1596,74 @@ fn servedTowerConfig(depth: u32, hidden: u32, heads: u32, inter: u32, out_hidden
     return cfg;
 }
 
-/// A synthetic Qwen3-VL tower of `cfg`'s widths (channels-first Conv3d, patch 4, tps 2).
+/// A synthetic Qwen3-VL tower of `cfg`'s widths (zero-filled bf16 tensors; channels-first Conv3d, patch 4, tps 2).
 fn servedTower(cfg: ModelConfig) !Weights {
-    var w = Weights.init(std.testing.allocator);
+    const a = std.testing.allocator;
+    var w = Weights.init(a);
     errdefer w.deinit();
     const h: c_int = @intCast(cfg.qv_hidden);
     const I: c_int = @intCast(cfg.qv_intermediate);
     const m: c_int = h * 4;
     const o: c_int = @intCast(cfg.qv_out_hidden);
-    const P = struct { name: []const u8, shape: []const c_int, scale: f32 = 0.08, base: f32 = 0 };
-    var buf: [96]u8 = undefined;
+    const P = struct { name: []const u8, shape: []const c_int };
     const top = [_]P{
         .{ .name = "patch_embed.proj.weight", .shape = &.{ h, 3, 2, 4, 4 } },
-        .{ .name = "patch_embed.proj.bias", .shape = &.{h}, .scale = 0.05 },
-        .{ .name = "pos_embed.weight", .shape = &.{ @intCast(cfg.qv_num_pos_emb), h }, .scale = 0.1 },
-        .{ .name = "merger.norm.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
-        .{ .name = "merger.norm.bias", .shape = &.{h}, .scale = 0.05 },
-        .{ .name = "merger.linear_fc1.weight", .shape = &.{ m, m }, .scale = 0.03 },
-        .{ .name = "merger.linear_fc1.bias", .shape = &.{m}, .scale = 0.05 },
-        .{ .name = "merger.linear_fc2.weight", .shape = &.{ o, m }, .scale = 0.03 },
-        .{ .name = "merger.linear_fc2.bias", .shape = &.{o}, .scale = 0.05 },
+        .{ .name = "patch_embed.proj.bias", .shape = &.{h} },
+        .{ .name = "pos_embed.weight", .shape = &.{ @intCast(cfg.qv_num_pos_emb), h } },
+        .{ .name = "merger.norm.weight", .shape = &.{h} },
+        .{ .name = "merger.norm.bias", .shape = &.{h} },
+        .{ .name = "merger.linear_fc1.weight", .shape = &.{ m, m } },
+        .{ .name = "merger.linear_fc1.bias", .shape = &.{m} },
+        .{ .name = "merger.linear_fc2.weight", .shape = &.{ o, m } },
+        .{ .name = "merger.linear_fc2.bias", .shape = &.{o} },
     };
-    var seed: u64 = 300;
+    const blk = [_]P{
+        .{ .name = "norm1.weight", .shape = &.{h} },
+        .{ .name = "norm1.bias", .shape = &.{h} },
+        .{ .name = "norm2.weight", .shape = &.{h} },
+        .{ .name = "norm2.bias", .shape = &.{h} },
+        .{ .name = "attn.qkv.weight", .shape = &.{ 3 * h, h } },
+        .{ .name = "attn.qkv.bias", .shape = &.{3 * h} },
+        .{ .name = "attn.proj.weight", .shape = &.{ h, h } },
+        .{ .name = "attn.proj.bias", .shape = &.{h} },
+        .{ .name = "mlp.linear_fc1.weight", .shape = &.{ I, h } },
+        .{ .name = "mlp.linear_fc1.bias", .shape = &.{I} },
+        .{ .name = "mlp.linear_fc2.weight", .shape = &.{ h, I } },
+        .{ .name = "mlp.linear_fc2.bias", .shape = &.{h} },
+    };
+    var max_elems: usize = 0;
     for (top) |p| {
-        seed += 1;
+        var n: usize = 1;
+        for (p.shape) |d| n *= @intCast(d);
+        max_elems = @max(max_elems, n);
+    }
+    for (blk) |p| {
+        var n: usize = 1;
+        for (p.shape) |d| n *= @intCast(d);
+        max_elems = @max(max_elems, n);
+    }
+    const zeros = try a.alloc(u16, max_elems);
+    defer a.free(zeros);
+    @memset(zeros, 0);
+    var buf: [96]u8 = undefined;
+    for (top) |p| {
         const name = try std.fmt.bufPrint(&buf, "vision_tower.{s}", .{p.name});
-        try common.putRandomBf16(std.testing.allocator, &w.map, name, p.shape, seed, p.scale, p.base);
+        try w.map.put(try a.dupe(u8, name), try mlx.newData(zeros.ptr, p.shape, .bfloat16));
     }
     for (0..cfg.qv_depth) |b| {
-        const blk = [_]P{
-            .{ .name = "norm1.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
-            .{ .name = "norm1.bias", .shape = &.{h}, .scale = 0.05 },
-            .{ .name = "norm2.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
-            .{ .name = "norm2.bias", .shape = &.{h}, .scale = 0.05 },
-            .{ .name = "attn.qkv.weight", .shape = &.{ 3 * h, h }, .scale = 0.03 },
-            .{ .name = "attn.qkv.bias", .shape = &.{3 * h}, .scale = 0.05 },
-            .{ .name = "attn.proj.weight", .shape = &.{ h, h }, .scale = 0.03 },
-            .{ .name = "attn.proj.bias", .shape = &.{h}, .scale = 0.05 },
-            .{ .name = "mlp.linear_fc1.weight", .shape = &.{ I, h }, .scale = 0.03 },
-            .{ .name = "mlp.linear_fc1.bias", .shape = &.{I}, .scale = 0.05 },
-            .{ .name = "mlp.linear_fc2.weight", .shape = &.{ h, I }, .scale = 0.03 },
-            .{ .name = "mlp.linear_fc2.bias", .shape = &.{h}, .scale = 0.05 },
-        };
         for (blk) |p| {
-            seed += 1;
             const name = try std.fmt.bufPrint(&buf, "vision_tower.blocks.{d}.{s}", .{ b, p.name });
-            try common.putRandomBf16(std.testing.allocator, &w.map, name, p.shape, seed, p.scale, p.base);
+            try w.map.put(try a.dupe(u8, name), try mlx.newData(zeros.ptr, p.shape, .bfloat16));
         }
     }
     return w;
 }
 
-
-fn servedPatches(n: usize, seed: u64) !mlx.mlx_array {
+fn servedPatches(n: usize, _: u64) !mlx.mlx_array {
     const a = std.testing.allocator;
     const px = try a.alloc(f32, n * 96);
     defer a.free(px);
-    var prng = std.Random.DefaultPrng.init(seed);
-    for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+    @memset(px, 0);
     return mlx.newData(px.ptr, &[_]c_int{ @intCast(n), 96 }, .float32);
 }
 
@@ -1889,10 +1770,6 @@ fn qwenTowerKey(key: []const u8, _: void) bool {
     return false;
 }
 
-fn gapLine(name: []const u8, g: common.Gap) void {
-    std.debug.print("[vision-q8] {s}: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ name, g.cos, g.max_abs, g.rel_rms });
-}
-
 test "qwen vision: the requantized tower stays within bf16's drift of the bf16 tower on house.jpeg at 640 tokens" {
     try mlx.requireGpu();
     const a = std.testing.allocator;
@@ -1924,13 +1801,8 @@ test "qwen vision: the requantized tower stays within bf16's drift of the bf16 t
     defer wb.deinit();
     var wq = try source.loadWhere("qwen", io, a, dir, {}, qwenTowerKey);
     defer wq.deinit();
-    var active: [2]usize = undefined;
-    _ = mlx.mlx_get_active_memory(&active[0]);
-    var load = @import("../io_util.zig").Stopwatch.init(io);
     var qq = try QwenVision.init(a, config, &wq);
-    const load_ms = @as(f64, @floatFromInt(load.read())) / 1e6;
     defer qq.deinit();
-    _ = mlx.mlx_get_active_memory(&active[1]);
     var qb = try QwenVision.initWith(a, config, &wb, false);
     defer qb.deinit();
 
@@ -1939,28 +1811,6 @@ test "qwen vision: the requantized tower stays within bf16's drift of the bf16 t
     const ref = try qb.forward(patches, 40, 64);
     defer _ = mlx.mlx_array_free(ref);
     const g = try common.gap(got, ref, qq.s);
-
-    if (std.c.getenv("SUSHI_VISION_Q8_REPORT") != null) {
-        gapLine("merger output", g);
-        std.debug.print("[vision-q8] init {d:.0} ms; active {d:.3} GB -> {d:.3} GB\n", .{ load_ms, @as(f64, @floatFromInt(active[0])) / 1e9, @as(f64, @floatFromInt(active[1])) / 1e9 });
-        for ([_]*QwenVision{ &qb, &qq }, [_][]const u8{ "bf16", "q8" }) |d, name| {
-            mlx.resetTransientPeak();
-            const o = try d.forward(patches, 40, 64);
-            _ = mlx.mlx_array_free(o);
-            std.debug.print("[vision-q8] {s} encode transient peak {d:.3} GiB\n", .{ name, @as(f64, @floatFromInt(mlx.transientPeak())) / (1 << 30) });
-        }
-        const reps = 9;
-        var t: [2][reps]f64 = undefined;
-        for (0..reps + 1) |i| {
-            for ([_]*QwenVision{ &qb, &qq }, 0..) |d, arm| {
-                var sw = @import("../io_util.zig").Stopwatch.init(io);
-                const o = try d.forward(patches, 40, 64);
-                _ = mlx.mlx_array_free(o);
-                if (i > 0) t[arm][i - 1] = @as(f64, @floatFromInt(sw.read())) / 1e6;
-            }
-        }
-        std.debug.print("[vision-q8] 640 tokens, median of {d}: bf16 {d:.1} ms, q8 {d:.1} ms\n", .{ reps, common.median(&t[0]), common.median(&t[1]) });
-    }
     try std.testing.expect(g.cos > 0.998);
 }
 

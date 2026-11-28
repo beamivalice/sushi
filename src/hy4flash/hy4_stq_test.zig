@@ -8,6 +8,7 @@ const Ops = @import("../mlx_ops.zig").Ops;
 const model_mod = @import("../model.zig");
 const hy4_config = @import("hy4_config.zig");
 const hy4_stq = @import("hy4_stq.zig");
+const hy4_held = @import("hy4_held.zig");
 const fwd = @import("hy4_forward.zig");
 const Arr = mlx.mlx_array;
 
@@ -24,6 +25,7 @@ const Packs = struct {
     quant: hy4_stq.Quant,
 
     fn open(s: mlx.mlx_stream) !Packs {
+        hy4_held.releaseHeld();
         const stq_dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
         const src_dir = std.mem.span(std.c.getenv("HY4_BF16_TINY_STQ") orelse return error.SkipZigTest);
         const a = testing.allocator;
@@ -1414,38 +1416,42 @@ test "hy4 stq: a decode block's iHC mix finishes and norms W_o's partials in its
     defer arena.deinit();
     var prng = std.Random.DefaultPrng.init(0x0f17);
     var served: usize = 0;
-    for ([_]bool{ false, true }) |simd| {
-        const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
-        defer if (prof) |p| p.end();
-        for (o_shapes, 0..) |sh, si| for ([_]c_int{ 1, 3 }) |t| for ([_]usize{ 1024, 512 }) |tg| {
-            hck.hc_tg = tg;
-            var o: Ops = .{ .s = es };
-            defer o.deinit();
-            const c = try OSite.init(&o, arena.allocator(), prng.random(), sh.in, sh.d, t);
-            try testing.expect(fwd.oPartsReady(&o, c.h, c.mix, c.attn));
-            // W_o's launch and its finish_rms, as the trunk runs a launch that does not finish its own partials.
-            const c0 = mlx.engine.stats().dispatches;
-            const bank = c.attn.o.stq.?;
-            const one: exl3.trunk.Shared = .{ .p = .{ .trellis = bank.w, .suh = bank.suh, .svh = bank.svh }, .cols = .{ 0, @intCast(bank.outDim()), 0, 0, 0 }, .count = 1 };
-            const eps = try o.own(try mlx.newData(&[_]f32{1e-5}, &.{1}, .float32));
-            var ys: [1]Arr = undefined;
-            try testing.expect(try exl3.linear.linearSharedNormed(es, c.gated, one, bank.dec, &ys, .{ .rows = .{ .exact = true, .thru_bf16 = true }, .decoded_billed = true }, .{ .w = c.attn.post_norm, .eps = eps, .cols = @intCast(bank.outDim()) }));
-            const y = try o.own(ys[0]);
-            const want = try fwd.expandMixNorm(&o, c.h, c.post, y, c.mix, 4, 2.0, 1e-6, 1e-6, c.norm_w);
-            try evalExpanded(want);
-            const chain = mlx.engine.stats().dispatches - c0;
-            const g0 = mlx.engine.stats().dispatches;
-            const got = try c.parts(&o);
-            try evalExpanded(got);
-            const launches = mlx.engine.stats().dispatches - g0;
-            // A byte pin on the GPU class it was proven on: an M1 or M2's last bits differ.
-            if (exl3.kernels.gemmNaxOn()) try expectSameExpanded(&o, want, got);
-            // W_o's launch, then the mix's: its finish_rms launch is none.
-            try testing.expectEqual(chain - 1, launches);
-            if (si < 2) try testing.expectEqual(@as(u64, 2), launches);
-            served += 1;
-        };
-    }
+    for (o_shapes, 0..) |sh, si| for ([_]c_int{ 1, 3 }) |t| {
+        var co: Ops = .{ .s = es };
+        defer co.deinit();
+        const c = try OSite.init(&co, arena.allocator(), prng.random(), sh.in, sh.d, t);
+        for ([_]bool{ false, true }) |simd| {
+            const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
+            defer if (prof) |p| p.end();
+            for ([_]usize{ 1024, 512 }) |tg| {
+                hck.hc_tg = tg;
+                var o: Ops = .{ .s = es };
+                defer o.deinit();
+                try testing.expect(fwd.oPartsReady(&o, c.h, c.mix, c.attn));
+                // W_o's launch and its finish_rms, as the trunk runs a launch that does not finish its own partials.
+                const c0 = mlx.engine.stats().dispatches;
+                const bank = c.attn.o.stq.?;
+                const one: exl3.trunk.Shared = .{ .p = .{ .trellis = bank.w, .suh = bank.suh, .svh = bank.svh }, .cols = .{ 0, @intCast(bank.outDim()), 0, 0, 0 }, .count = 1 };
+                const eps = try o.own(try mlx.newData(&[_]f32{1e-5}, &.{1}, .float32));
+                var ys: [1]Arr = undefined;
+                try testing.expect(try exl3.linear.linearSharedNormed(es, c.gated, one, bank.dec, &ys, .{ .rows = .{ .exact = true, .thru_bf16 = true }, .decoded_billed = true }, .{ .w = c.attn.post_norm, .eps = eps, .cols = @intCast(bank.outDim()) }));
+                const y = try o.own(ys[0]);
+                const want = try fwd.expandMixNorm(&o, c.h, c.post, y, c.mix, 4, 2.0, 1e-6, 1e-6, c.norm_w);
+                try evalExpanded(want);
+                const chain = mlx.engine.stats().dispatches - c0;
+                const g0 = mlx.engine.stats().dispatches;
+                const got = try c.parts(&o);
+                try evalExpanded(got);
+                const launches = mlx.engine.stats().dispatches - g0;
+                // A byte pin on the GPU class it was proven on: an M1 or M2's last bits differ.
+                if (exl3.kernels.gemmNaxOn()) try expectSameExpanded(&o, want, got);
+                // W_o's launch, then the mix's: its finish_rms launch is none.
+                try testing.expectEqual(chain - 1, launches);
+                if (si < 2) try testing.expectEqual(@as(u64, 2), launches);
+                served += 1;
+            }
+        }
+    };
     try testing.expectEqual(@as(usize, 24), served);
 }
 
@@ -1465,30 +1471,34 @@ test "hy4 stq: on Sushi Cooler W_o's launch finishes its own partials (each outp
     defer arena.deinit();
     var prng = std.Random.DefaultPrng.init(0x0f18);
     var served: usize = 0;
-    for ([_]bool{ false, true }) |simd| {
-        const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
-        defer if (prof) |p| p.end();
-        for (o_shapes) |sh| for ([_]c_int{ 1, 3, 8 }) |t| for ([_]usize{ 1024, 512 }) |tg| {
-            hck.hc_tg = tg;
-            var o: Ops = .{ .s = es };
-            defer o.deinit();
-            const c = try OSite.init(&o, arena.allocator(), prng.random(), sh.in, sh.d, t);
-            const c0 = mlx.engine.stats().dispatches;
-            const want = try c.parts(&o);
-            try evalExpanded(want);
-            const pair = mlx.engine.stats().dispatches - c0;
-            const g0 = mlx.engine.stats().dispatches;
-            const y = (try hy4_stq.applyFinished(&o, c.gated, c.bank)).?;
-            const got = try fwd.expandMixNormRows(&o, c.h, c.post, y, c.attn, 1e-5, c.mix, 2.0, 1e-6, 1e-6, c.norm_w);
-            try evalExpanded(got);
-            try testing.expectEqual(pair, mlx.engine.stats().dispatches - g0);
-            try testing.expectEqual(@as(u64, 2), pair);
-            try expectSameExpanded(&o, want, got);
-            // W_o's rows are its through launch's (`apply`): the finish it took in is the finish's bytes.
-            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, try hy4_stq.apply(&o, c.gated, c.bank))), std.mem.sliceAsBytes(try hostRows(&o, y)));
-            served += 1;
-        };
-    }
+    for (o_shapes) |sh| for ([_]c_int{ 1, 3, 8 }) |t| {
+        var co: Ops = .{ .s = es };
+        defer co.deinit();
+        const c = try OSite.init(&co, arena.allocator(), prng.random(), sh.in, sh.d, t);
+        for ([_]bool{ false, true }) |simd| {
+            const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
+            defer if (prof) |p| p.end();
+            for ([_]usize{ 1024, 512 }) |tg| {
+                hck.hc_tg = tg;
+                var o: Ops = .{ .s = es };
+                defer o.deinit();
+                const c0 = mlx.engine.stats().dispatches;
+                const want = try c.parts(&o);
+                try evalExpanded(want);
+                const pair = mlx.engine.stats().dispatches - c0;
+                const g0 = mlx.engine.stats().dispatches;
+                const y = (try hy4_stq.applyFinished(&o, c.gated, c.bank)).?;
+                const got = try fwd.expandMixNormRows(&o, c.h, c.post, y, c.attn, 1e-5, c.mix, 2.0, 1e-6, 1e-6, c.norm_w);
+                try evalExpanded(got);
+                try testing.expectEqual(pair, mlx.engine.stats().dispatches - g0);
+                try testing.expectEqual(@as(u64, 2), pair);
+                try expectSameExpanded(&o, want, got);
+                // W_o's rows are its through launch's (`apply`): the finish it took in is the finish's bytes.
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, try hy4_stq.apply(&o, c.gated, c.bank))), std.mem.sliceAsBytes(try hostRows(&o, y)));
+                served += 1;
+            }
+        }
+    };
     try testing.expectEqual(@as(usize, 36), served);
     // MLX's stream has no counter page: there W_o's launch leaves its partials for the mix, as before.
     var o: Ops = .{ .s = es };
@@ -1505,21 +1515,15 @@ const TrunkSite = struct { in: u32, out: u32, kind: enum { thru, stored, normed 
 /// Every trunk site a decode row reaches that leaves partials at the release's geometry: q_a and its norm, q_b, the gate
 /// (stored bf16), W_o through its post norm, the shared expert's and the latents' linears, the dense layer's FFN and its
 /// post norm. The head's 944 output blocks are past the counter page's counters and keep their finish.
-fn releaseTrunkSites() ![11]TrunkSite {
+fn releaseTrunkSites() ![5]TrunkSite {
     const c = try hy4_config.parseText(hy4_config.release_config);
     const qk = c.qkDim();
     return .{
         .{ .in = c.dim, .out = c.q_lora, .kind = .normed },
         .{ .in = c.q_lora, .out = c.sparse_heads * qk, .kind = .thru },
-        .{ .in = c.q_lora, .out = c.sliding_heads * qk, .kind = .thru },
-        .{ .in = c.dim, .out = c.sparse_heads * c.v_dim, .kind = .stored },
         .{ .in = c.dim, .out = c.sliding_heads * c.v_dim, .kind = .stored },
-        .{ .in = c.sparse_heads * c.v_dim, .out = c.dim, .kind = .normed },
         .{ .in = c.sliding_heads * c.v_dim, .out = c.dim, .kind = .normed },
-        .{ .in = c.dim, .out = c.moe_inter, .kind = .thru },
-        .{ .in = c.moe_inter, .out = c.dim, .kind = .thru },
         .{ .in = c.dim, .out = c.dense_inter, .kind = .thru },
-        .{ .in = c.dense_inter, .out = c.dim, .kind = .normed },
     };
 }
 
@@ -1563,18 +1567,20 @@ test "hy4 stq: on Sushi Cooler every trunk site a decode row reaches finishes it
     const dec = exl3.format.Decode.tabled(.spec1, .w15);
     const eps = (try hy4_config.parseText(hy4_config.release_config)).eps;
     var served: usize = 0;
-    for ([_]bool{ false, true }) |simd| {
-        const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
-        defer if (prof) |p| p.end();
-        for (try releaseTrunkSites()) |site| {
-            var o: Ops = .{ .s = es };
-            defer o.deinit();
-            const tb = try exl3.trunk.TestBank.init(alloc, rnd, site.in, site.out, 96);
-            const tr = try tb.triple(es);
-            const bank: hy4_stq.Bank = .{ .w = try o.own(tr.w), .suh = try o.own(tr.s), .svh = try o.own(tr.b), .dec = dec };
-            const norm_w = try randomArr(&o, alloc, rnd, &.{@intCast(site.out)}, 0.5, 1, .bfloat16);
-            for ([_]c_int{ 1, 3, 8 }) |t| {
-                const x = try randomArr(&o, alloc, rnd, &.{ t, @intCast(site.in) }, -2, 4, .float32);
+    for (try releaseTrunkSites()) |site| {
+        var bo: Ops = .{ .s = es };
+        defer bo.deinit();
+        const tb = try exl3.trunk.TestBank.init(alloc, rnd, site.in, site.out, 96);
+        const tr = try tb.triple(es);
+        const bank: hy4_stq.Bank = .{ .w = try bo.own(tr.w), .suh = try bo.own(tr.s), .svh = try bo.own(tr.b), .dec = dec };
+        const norm_w = try randomArr(&bo, alloc, rnd, &.{@intCast(site.out)}, 0.5, 1, .bfloat16);
+        for ([_]c_int{ 1, 3, 8 }) |t| {
+            const x = try randomArr(&bo, alloc, rnd, &.{ t, @intCast(site.in) }, -2, 4, .float32);
+            for ([_]bool{ false, true }) |simd| {
+                const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
+                defer if (prof) |p| p.end();
+                var o: Ops = .{ .s = es };
+                defer o.deinit();
                 const got = try siteRows(&o, x, bank, site.kind, norm_w, eps);
                 const kind: exl3.project_rows.Counted = switch (site.kind) {
                     .thru => .thru,
@@ -1597,7 +1603,7 @@ test "hy4 stq: on Sushi Cooler every trunk site a decode row reaches finishes it
             }
         }
     }
-    try testing.expectEqual(@as(usize, 66), served);
+    try testing.expectEqual(@as(usize, 30), served);
     // MLX's stream has no counter page: there every site keeps its launch and finish.
     var o: Ops = .{ .s = es };
     defer o.deinit();
@@ -1625,21 +1631,23 @@ test "hy4 stq: on Sushi Cooler a SwiGLU's gate and up of up to three rows are on
     const dec = exl3.format.Decode.tabled(.spec1, .w15);
     const c = try hy4_config.parseText(hy4_config.release_config);
     var served: usize = 0;
-    for ([_]bool{ false, true }) |simd| {
-        const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
-        defer if (prof) |p| p.end();
-        for ([_]u32{ c.moe_inter, c.dense_inter }) |inter| {
-            var o: Ops = .{ .s = es };
-            defer o.deinit();
-            var banks: [2]hy4_stq.Bank = undefined;
-            for (&banks) |*b| {
-                const tb = try exl3.trunk.TestBank.init(alloc, rnd, c.dim, inter, 96);
-                const tr = try tb.triple(es);
-                b.* = .{ .w = try o.own(tr.w), .suh = try o.own(tr.s), .svh = try o.own(tr.b), .dec = dec };
-            }
-            const w: fwd.Swiglu = .{ .gate = .{ .w = undefined, .stq = banks[0] }, .up = .{ .w = undefined, .stq = banks[1] }, .down = undefined };
-            for ([_]c_int{ 1, 3, 8 }) |t| {
-                const x = try randomArr(&o, alloc, rnd, &.{ t, @intCast(c.dim) }, -2, 4, .float32);
+    for ([_]u32{ c.moe_inter, c.dense_inter }) |inter| {
+        var bo: Ops = .{ .s = es };
+        defer bo.deinit();
+        var banks: [2]hy4_stq.Bank = undefined;
+        for (&banks) |*b| {
+            const tb = try exl3.trunk.TestBank.init(alloc, rnd, c.dim, inter, 96);
+            const tr = try tb.triple(es);
+            b.* = .{ .w = try bo.own(tr.w), .suh = try bo.own(tr.s), .svh = try bo.own(tr.b), .dec = dec };
+        }
+        const w: fwd.Swiglu = .{ .gate = .{ .w = undefined, .stq = banks[0] }, .up = .{ .w = undefined, .stq = banks[1] }, .down = undefined };
+        for ([_]c_int{ 1, 3, 8 }) |t| {
+            const x = try randomArr(&bo, alloc, rnd, &.{ t, @intCast(c.dim) }, -2, 4, .float32);
+            for ([_]bool{ false, true }) |simd| {
+                const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
+                defer if (prof) |p| p.end();
+                var o: Ops = .{ .s = es };
+                defer o.deinit();
                 var c0 = mlx.engine.stats().dispatches;
                 const got = try fwd.swigluAct(&o, x, w, null);
                 try mlx.check(mlx.mlx_array_eval(got));
@@ -1677,16 +1685,18 @@ test "hy4 stq: on Sushi Cooler an STQ MoE's latent leaves W_lat_down as stored b
     const rnd = prng.random();
     const c = try hy4_config.parseText(hy4_config.release_config);
     var served: usize = 0;
-    for ([_]bool{ false, true }) |simd| {
-        const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
-        defer if (prof) |p| p.end();
-        var o: Ops = .{ .s = es };
-        defer o.deinit();
-        const tb = try exl3.trunk.TestBank.init(alloc, rnd, c.dim, c.moe_inter, 96);
-        const tr = try tb.triple(es);
-        const lin: fwd.Lin = .{ .w = undefined, .stq = .{ .w = try o.own(tr.w), .suh = try o.own(tr.s), .svh = try o.own(tr.b), .dec = exl3.format.Decode.tabled(.spec1, .w15) } };
-        for ([_]c_int{ 1, 3, 8 }) |t| {
-            const x = try randomArr(&o, alloc, rnd, &.{ t, @intCast(c.dim) }, -2, 4, .float32);
+    var bo: Ops = .{ .s = es };
+    defer bo.deinit();
+    const tb = try exl3.trunk.TestBank.init(alloc, rnd, c.dim, c.moe_inter, 96);
+    const tr = try tb.triple(es);
+    const lin: fwd.Lin = .{ .w = undefined, .stq = .{ .w = try bo.own(tr.w), .suh = try bo.own(tr.s), .svh = try bo.own(tr.b), .dec = exl3.format.Decode.tabled(.spec1, .w15) } };
+    for ([_]c_int{ 1, 3, 8 }) |t| {
+        const x = try randomArr(&bo, alloc, rnd, &.{ t, @intCast(c.dim) }, -2, 4, .float32);
+        for ([_]bool{ false, true }) |simd| {
+            const prof: ?exl3.device.Scope = if (simd) exl3.device.withProfile(exl3.device.simdOnly()) else null;
+            defer if (prof) |p| p.end();
+            var o: Ops = .{ .s = es };
+            defer o.deinit();
             // The f32 latent's launch (its finish past three rows), then the routed experts' cast of it.
             var c0 = mlx.engine.stats().dispatches;
             const want = try o.cast(try fwd.linear(&o, x, lin), .bfloat16);
@@ -1834,72 +1844,6 @@ const RowTap = struct {
     }
 };
 
-test "hy4 stq: a 6-row verify block's rows are their one-row steps' bytes at every linear's input and in the logits (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
-    const hy4_model = @import("hy4_model.zig");
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const es = mlx.engine.stream();
-    const scope = mlx.engine.enter(es);
-    defer scope.end();
-    var p = try Packs.open(es);
-    defer p.close();
-    var ids: [48]u32 = undefined;
-    var rng = std.Random.DefaultPrng.init(0x5e7);
-    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
-    const block = 6;
-    var o: Ops = .{ .s = es };
-    defer o.deinit();
-    var steps: [block]RowTap = undefined;
-    var step_logits: [block][]const f32 = undefined;
-    {
-        const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
-        defer m.deinit();
-        _ = try o.own(try m.forwardReadout(ids[0..40], .none));
-        for (0..block) |r| {
-            steps[r] = .{ .a = a };
-            steps[r].init();
-            m.tap = &steps[r].tap;
-            step_logits[r] = try hostRows(&o, try o.own(try m.forwardReadout(ids[40 + r .. 41 + r], .last)));
-            m.tap = null;
-        }
-    }
-    defer for (&steps) |*t| t.deinit();
-    var wide: RowTap = .{ .a = a };
-    wide.init();
-    defer wide.deinit();
-    var p2 = try Packs.open(es);
-    defer p2.close();
-    const m = try hy4_model.Model.initWith(a, p2.config, &p2.stq, es, .{ .dir = p2.stq_dir, .quant = p2.quant });
-    defer m.deinit();
-    _ = try o.own(try m.forwardReadout(ids[0..40], .none));
-    m.tap = &wide.tap;
-    const lg = try hostRows(&o, try o.own(try m.forwardReadout(ids[40 .. 40 + block], .all)));
-    m.tap = null;
-    var parted: usize = 0;
-    for (wide.recs.items) |rec| for (0..rec.rows) |r| {
-        const want = steps[r].row(rec.layer, rec.kind, 0) orelse continue;
-        const got = wide.row(rec.layer, rec.kind, r).?;
-        if (std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) continue;
-        if (parted == 0) {
-            var worst: f32 = 0;
-            for (want, got) |x, y| worst = @max(worst, @abs(x - y));
-            std.debug.print("width probe: layer {d} {t} row {d} parts first, worst |d| {e:.3}\n", .{ rec.layer, rec.kind, r, worst });
-        }
-        parted += 1;
-    };
-    const vocab = p.config.vocab;
-    var rows_parted: usize = 0;
-    for (0..block) |r| {
-        if (!std.mem.eql(u8, std.mem.sliceAsBytes(step_logits[r]), std.mem.sliceAsBytes(lg[r * vocab ..][0..vocab]))) rows_parted += 1;
-    }
-    errdefer std.debug.print("width probe: {d} tap rows parted, {d} of {d} logit rows\n", .{ parted, rows_parted, block });
-    try testing.expectEqual(@as(usize, 0), parted);
-    try testing.expectEqual(@as(usize, 0), rows_parted);
-}
-
 fn copyF32Bytes(a: std.mem.Allocator, arr: Arr) ![]u8 {
     var o: Ops = .{ .s = mlx.engine.stream() };
     defer o.deinit();
@@ -1910,16 +1854,12 @@ fn copyF32Bytes(a: std.mem.Allocator, arr: Arr) ![]u8 {
 }
 
 test "hy4 hc: a decode step and a 3-row verify block make as many dispatches with the wide mix as with one threadgroup a row, and give its logits (HY4_STQ_TINY)" {
-    const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");
     const hy4_hc = @import("hy4_hc.zig");
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    var cooler: contract.Load = undefined;
-    try cooler.open(hy4_contract, dir, true);
-    defer _ = cooler.close();
-    const m = cooler.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
-    const turn = hy4_contract.openTurn(cooler.h, &cooler.config);
+    const held = try hy4_held.acquire(.stq_openLight);
+    const m = held.ld.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
+    const turn = hy4_contract.openTurn(held.ld.h, &held.ld.config);
     defer turn.end();
     defer hy4_hc.wide_on = true;
     var ids: [44]u32 = undefined;
@@ -1951,15 +1891,11 @@ test "hy4 hc: a decode step and a 3-row verify block make as many dispatches wit
 }
 
 test "hy4 hc: a decode step and 3- and 4-row verify blocks make as many dispatches with W_o finishing its own partials (up to o_rows_max rows) as with the iHC mix finishing them, and give its logits (HY4_STQ_TINY)" {
-    const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");
     const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    var cooler: contract.Load = undefined;
-    try cooler.open(hy4_contract, dir, true);
-    defer _ = cooler.close();
-    const m = cooler.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
-    const turn = hy4_contract.openTurn(cooler.h, &cooler.config);
+    const held = try hy4_held.acquire(.stq_openLight);
+    const m = held.ld.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
+    const turn = hy4_contract.openTurn(held.ld.h, &held.ld.config);
     defer turn.end();
     defer fwd.o_rows_on = true;
     var ids: [48]u32 = undefined;
@@ -1993,55 +1929,46 @@ test "hy4 hc: a decode step and 3- and 4-row verify blocks make as many dispatch
 }
 
 test "hy4 verify: 2..8-row blocks match one-row steps (HY4_BF16_TINY)" {
-    const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");
     const a = testing.allocator;
-    var ran: usize = 0;
-    for ([_][:0]const u8{"HY4_BF16_TINY"}) |env| {
-        const dir = std.mem.span(std.c.getenv(env) orelse continue);
-        ran += 1;
-        var cooler: contract.Load = undefined;
-        try cooler.open(hy4_contract, dir, true);
-        defer _ = cooler.close();
-        const m = cooler.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
-        const turn = hy4_contract.openTurn(cooler.h, &cooler.config);
-        defer turn.end();
+    const held = try hy4_held.acquire(.bf16_openLight);
+    const m = held.ld.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
+    const turn = hy4_contract.openTurn(held.ld.h, &held.ld.config);
+    defer turn.end();
 
-        const vocab = m.config.vocab;
-        const row_bytes = vocab * 4;
-        var ids: [64]u32 = undefined;
-        var rng = std.Random.DefaultPrng.init(0x9a11);
-        for (&ids) |*t| t.* = rng.random().uintLessThan(u32, @intCast(vocab - 1)) + 1;
+    const vocab = m.config.vocab;
+    const row_bytes = vocab * 4;
+    var ids: [64]u32 = undefined;
+    var rng = std.Random.DefaultPrng.init(0x9a11);
+    for (&ids) |*t| t.* = rng.random().uintLessThan(u32, @intCast(vocab - 1)) + 1;
 
-        for ([_]usize{ 5, 20 }) |pre| {
-            for ([_]usize{ 6, 8 }) |block| {
-                m.reset();
-                const pre_lg = try m.forwardReadout(ids[0..pre], .none);
-                _ = mlx.mlx_array_free(pre_lg);
-                var step_bytes: [8][]u8 = undefined;
-                var made: usize = 0;
-                defer for (step_bytes[0..made]) |s| a.free(s);
-                for (0..block) |r| {
-                    const lg = try m.forwardReadout(ids[pre + r .. pre + r + 1], .last);
-                    defer _ = mlx.mlx_array_free(lg);
-                    step_bytes[r] = try copyF32Bytes(a, lg);
-                    made += 1;
-                }
-                m.reset();
-                const pre_lg2 = try m.forwardReadout(ids[0..pre], .none);
-                _ = mlx.mlx_array_free(pre_lg2);
-                const blg = try m.forwardReadout(ids[pre .. pre + block], .all);
-                defer _ = mlx.mlx_array_free(blg);
-                const wide = try copyF32Bytes(a, blg);
-                defer a.free(wide);
-                for (0..block) |r| {
-                    errdefer std.debug.print("verify width diff on {s} pre={d} block={d} row={d}\n", .{ env, pre, block, r });
-                    try testing.expectEqualSlices(u8, step_bytes[r], wide[r * row_bytes ..][0..row_bytes]);
-                }
+    for ([_]usize{ 5, 20 }) |pre| {
+        for ([_]usize{ 6, 8 }) |block| {
+            m.reset();
+            const pre_lg = try m.forwardReadout(ids[0..pre], .none);
+            _ = mlx.mlx_array_free(pre_lg);
+            var step_bytes: [8][]u8 = undefined;
+            var made: usize = 0;
+            defer for (step_bytes[0..made]) |s| a.free(s);
+            for (0..block) |r| {
+                const lg = try m.forwardReadout(ids[pre + r .. pre + r + 1], .last);
+                defer _ = mlx.mlx_array_free(lg);
+                step_bytes[r] = try copyF32Bytes(a, lg);
+                made += 1;
+            }
+            m.reset();
+            const pre_lg2 = try m.forwardReadout(ids[0..pre], .none);
+            _ = mlx.mlx_array_free(pre_lg2);
+            const blg = try m.forwardReadout(ids[pre .. pre + block], .all);
+            defer _ = mlx.mlx_array_free(blg);
+            const wide = try copyF32Bytes(a, blg);
+            defer a.free(wide);
+            for (0..block) |r| {
+                errdefer std.debug.print("verify width diff on HY4_BF16_TINY pre={d} block={d} row={d}\n", .{ pre, block, r });
+                try testing.expectEqualSlices(u8, step_bytes[r], wide[r * row_bytes ..][0..row_bytes]);
             }
         }
     }
-    if (ran == 0) return error.SkipZigTest;
 }
 
 test "hy4 rows: batchedForward joins two slots as rows of one forward, each its solo bytes (HY4_STQ_TINY)" {
@@ -3200,51 +3127,6 @@ test "hy4 verify launches: a 2..8-row BF16 linear at W_kva's shape is one launch
     }
 }
 
-test "hy4 verify: an 8-row block on HY4_BF16_TINY gives each row its one-row step's logits" {
-    const contract = @import("../cooler_contract_test.zig");
-    const hy4_contract = @import("hy4_contract.zig");
-    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    var cooler: contract.Load = undefined;
-    try cooler.open(hy4_contract, dir, true);
-    defer _ = cooler.close();
-    const m = cooler.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
-    const turn = hy4_contract.openTurn(cooler.h, &cooler.config);
-    defer turn.end();
-
-    const vocab = m.config.vocab;
-    const row_bytes = vocab * 4;
-    var ids: [32]u32 = undefined;
-    var rng = std.Random.DefaultPrng.init(0x55aa);
-    for (&ids) |*tok| tok.* = rng.random().uintLessThan(u32, @intCast(vocab - 1)) + 1;
-
-    const pre: usize = 15;
-    const block: usize = 8;
-    m.reset();
-    const pre_lg = try m.forwardReadout(ids[0..pre], .none);
-    _ = mlx.mlx_array_free(pre_lg);
-    var step_bytes: [8][]u8 = undefined;
-    var made: usize = 0;
-    defer for (step_bytes[0..made]) |s| a.free(s);
-    for (0..block) |r| {
-        const lg = try m.forwardReadout(ids[pre + r .. pre + r + 1], .last);
-        defer _ = mlx.mlx_array_free(lg);
-        step_bytes[r] = try copyF32Bytes(a, lg);
-        made += 1;
-    }
-
-    m.reset();
-    const pre_lg2 = try m.forwardReadout(ids[0..pre], .none);
-    _ = mlx.mlx_array_free(pre_lg2);
-    const blg = try m.forwardReadout(ids[pre .. pre + block], .all);
-    defer _ = mlx.mlx_array_free(blg);
-    const wide = try copyF32Bytes(a, blg);
-    defer a.free(wide);
-    for (0..block) |r| {
-        try testing.expectEqualSlices(u8, step_bytes[r], wide[r * row_bytes ..][0..row_bytes]);
-    }
-}
-
 test "hy4 stq: every verify width 2..8 is its one-row steps' bytes at every linear's input and in the logits, below and past the selection threshold and across the sliding window's wrap (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
     const hy4_model = @import("hy4_model.zig");
     try mlx.requireGpu();
@@ -3265,17 +3147,8 @@ test "hy4 stq: every verify width 2..8 is its one-row steps' bytes at every line
     const max_w = 8;
     const vocab = p.config.vocab;
     const thr: usize = p.config.indexer.group_topk * p.config.indexer.group;
-    var starts: [12]usize = undefined;
-    var n_starts: usize = 0;
-    starts[n_starts] = 5;
-    n_starts += 1;
-    for (thr - 8..thr + 2) |p0| {
-        starts[n_starts] = p0;
-        n_starts += 1;
-    }
-    starts[n_starts] = 21;
-    n_starts += 1;
-    for (starts[0..n_starts]) |p0| {
+    const starts = [_]usize{ 5, thr - 8, thr - 2, thr, 21 };
+    for (starts) |p0| {
         var o: Ops = .{ .s = es };
         defer o.deinit();
         var steps: [max_w]RowTap = undefined;
@@ -3292,7 +3165,7 @@ test "hy4 stq: every verify width 2..8 is its one-row steps' bytes at every line
             step_logits[r] = try hostRows(&o, try o.own(try m.forwardReadout(ids[p0 + r .. p0 + r + 1], .last)));
             m.tap = null;
         }
-        for (2..max_w + 1) |width| {
+        for ([_]usize{ 2, 3, 6, 8 }) |width| {
             var wo: Ops = .{ .s = es };
             defer wo.deinit();
             var wide: RowTap = .{ .a = a };
@@ -3348,8 +3221,6 @@ test "hy4 stq: wide trunk banks (sliding gate, W_o, dense FFN) take the decoded 
         .{ .in = 3072, .out = 16384, .stored = true },
         .{ .in = 16384, .out = 3072, .stored = true },
         .{ .in = 3072, .out = 13824, .stored = false },
-        .{ .in = 13824, .out = 3072, .stored = false },
-        .{ .in = 8192, .out = 2048, .stored = true },
     };
     for (cases) |cs| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);

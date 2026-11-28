@@ -2100,6 +2100,7 @@ pub const Engine = struct {
     fallback_imports: u64 = 0,
     fill_experts_total: u64 = 0,
     fill_bytes_total: u64 = 0,
+    bulk_bytes_read: u64 = 0,
     fill_ns_total: u64 = 0,
     /// Full cache copies a route took to be able to undo itself (`CacheUndo`).
     cache_snapshots: u64 = 0,
@@ -2510,6 +2511,8 @@ pub const Engine = struct {
             out.bytes_bounced += more.bytes_bounced;
             out.bytes_reshuffled += more.bytes_reshuffled;
         }
+        out.bytes_read += self.bulk_bytes_read;
+        out.bytes_issued += self.bulk_bytes_read;
         return out;
     }
 
@@ -3393,6 +3396,7 @@ pub const Engine = struct {
         committed = true;
         self.fill_experts_total += total_misses;
         self.fill_bytes_total += total_bytes;
+        self.bulk_bytes_read += total_bytes;
         self.fill_ns_total += elapsed;
         return true;
     }

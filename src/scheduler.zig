@@ -1371,6 +1371,8 @@ pub const Scheduler = struct {
     /// Set by `beginShutdown`, the first step of a shutdown (queue_mu): from here no new request, load, image encode,
     /// unload or cache job is taken, while the inference thread still settles what was already in flight.
     draining: bool,
+    /// Inference loop is parked on `queue_cond` under `queue_mu` (all idle cleanup/turn teardown for prior work is done).
+    parked: bool = false,
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
     started_cond: std.Io.Condition,
@@ -2942,6 +2944,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             while (!hasWorkPendingLocked(sch) and !rearmCheckDue(sch) and !sch.shutdown.load(.acquire)) {
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(false);
+                sch.parked = true;
+                defer sch.parked = false;
                 if (effectiveGpuWarmParkNs(if (warm_since) |sw| sw.read() else null, warm_ns)) |park_ns| {
                     const timed_out = if (sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{
                         .raw = .fromNanoseconds(@intCast(park_ns)),
@@ -2950,6 +2954,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (timed_out and gpuWarmTickDue(hasWorkPendingLocked(sch), if (warm_since) |sw| sw.read() else null, warm_ns)) {
                         if (warm_ticks == 0) log.debug("[gpu-warm] keeping the GPU awake for {d} s\n", .{gpu_warm_secs});
                         warm_ticks += 1;
+                        sch.parked = false;
                         sch.queue_mu.unlock(sch.io);
                         gpuWarmTick(sch);
                         sch.queue_mu.lockUncancelable(sch.io);
@@ -2964,6 +2969,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             .clock = .awake,
                         } })) |_| false else |err| err == error.Timeout;
                         if (timed_out and !hasWorkPendingLocked(sch)) {
+                            sch.parked = false;
                             sch.queue_mu.unlock(sch.io);
                             flushLiveStates(sch, "idle");
                             sch.queue_mu.lockUncancelable(sch.io);
@@ -3849,11 +3855,17 @@ fn chunkWidthCb(
     return next;
 }
 
+var passes_waiting_for_test: std.atomic.Value(u32) = .init(0);
+
 /// Called with `mu` held; returns with it held. Drops `mu` while waiting so the
 /// pass holding the slot can finish its tick (which takes `mu` itself).
 fn waitPassesOut(io: std.Io, mu: *std.Io.Mutex, in_pass: *std.atomic.Value(u32)) void {
     if (in_pass.load(.acquire) == 0) return;
     mu.unlock(io);
+    if (comptime @import("builtin").is_test) _ = passes_waiting_for_test.fetchAdd(1, .acq_rel);
+    defer if (comptime @import("builtin").is_test) {
+        _ = passes_waiting_for_test.fetchSub(1, .acq_rel);
+    };
     while (in_pass.load(.acquire) != 0) std.Io.sleep(io, .fromMilliseconds(1), .real) catch {};
     mu.lockUncancelable(io);
 }
@@ -5708,7 +5720,7 @@ test "complete keeps a slot in decoding until its pass is out, so admission neve
     try sch.decoding.append(allocator, slot);
     _ = slot.in_pass.fetchAdd(1, .acq_rel);
     const t = try std.Thread.spawn(.{}, Scheduler.complete, .{ &sch, slot });
-    std.Io.sleep(testing.io, .fromMilliseconds(30), .real) catch {};
+    while (passes_waiting_for_test.load(.acquire) == 0) std.Thread.yield() catch {};
     sch.queue_mu.lockUncancelable(sch.io);
     const visible = sch.decoding.items.len + sch.cleanup_queue.items.len;
     sch.queue_mu.unlock(sch.io);
@@ -5843,15 +5855,15 @@ test "complete waits out an inference pass that still holds the slot" {
     const Pass = struct {
         in_pass: std.atomic.Value(u32) = .init(1),
         read_done: std.atomic.Value(bool) = .init(false),
-        fn run(p: *@This(), pio: std.Io) void {
-            std.Io.sleep(pio, .fromMilliseconds(30), .real) catch {};
+        fn run(p: *@This()) void {
+            while (passes_waiting_for_test.load(.acquire) == 0) std.Thread.yield() catch {};
             p.read_done.store(true, .release);
             _ = p.in_pass.fetchSub(1, .acq_rel);
         }
     };
     var pass: Pass = .{};
     var mu: std.Io.Mutex = .init;
-    const t = try std.Thread.spawn(.{}, Pass.run, .{ &pass, io });
+    const t = try std.Thread.spawn(.{}, Pass.run, .{&pass});
     mu.lockUncancelable(io);
     waitPassesOut(io, &mu, &pass.in_pass);
     const done = pass.read_done.load(.acquire);

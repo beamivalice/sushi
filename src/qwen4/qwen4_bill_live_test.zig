@@ -689,10 +689,10 @@ test "Flash-Next: the context the auto search names at a budget is admitted at e
     const no_tier = bills.TierGuard.pin(true, 0);
     defer no_tier.restore();
     var cfgs = [_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4MeasuredTestConfig() };
+    const targets = [_]u64{ 1_000, 4_000, 16_000, 32_768, 65_536, 131_072, 262_144, 400_000, 550_000 };
     var refused: u32 = 0;
     for (&cfgs, 0..) |*cfg, ci| for ([_]u32{ 0, 512 }) |pin| {
-        var target: u64 = 1000;
-        while (target < 600_000) : (target = target * 23 / 20) for ([_]i64{ -3, 0 }) |nudge| {
+        for (targets) |target| for ([_]i64{ -3, 0 }) |nudge| {
             cfg.pinned_context = 0;
             cfg.pinned_prefill_chunk = pin;
             const w: bills.WarmPrefix = .{ .mtp_on = bills.mtpHeadDefaultOn(cfg) };

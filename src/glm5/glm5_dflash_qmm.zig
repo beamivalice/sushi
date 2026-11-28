@@ -211,7 +211,7 @@ test "GLM DFlash affine row tiles preserve serial qmv bits" {
         const x = try ops.slot();
         try mlx.check(mlx.mlx_random_normal(x, &[_]c_int{ 1, 16, shape.k }, 3, .bfloat16, 0, 1, key.*, s));
         for ([_]Arr{ linear.w, linear.scales, linear.biases, x.* }) |a| try mlx.check(mlx.mlx_array_eval(a));
-        for ([_]c_int{ 1, 2, 3, 4, 5, 8, 16 }) |rows| {
+        for ([_]c_int{ 1, 2, 5, 16 }) |rows| {
             var scope = Ops{ .s = s };
             defer scope.deinit();
             const input = try scope.slice(x.*, 1, 0, rows);

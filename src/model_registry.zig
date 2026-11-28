@@ -1562,6 +1562,8 @@ pub const ModelRegistry = struct {
 
     /// `waitForRefcountZeroLocked` for at most `ms`; false when a reader still holds `entry` then.
     pub fn waitForRefcountZeroWithinLocked(self: *ModelRegistry, entry: *LoadedModel, ms: i64) error{Shutdown}!bool {
+        _ = self.state_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.state_waiters.fetchSub(1, .acq_rel);
         const deadline = io_util.nowMsMonotonic(self.io) + ms;
         while (entry.refcount.load(.acquire) != 0) {
             if (self.shutting_down.load(.acquire)) return error.Shutdown;
@@ -2442,12 +2444,19 @@ const StartupWaiter = struct {
         self.done.store(true, .release);
     }
     fn stillWaiting(self: *@This()) bool {
-        for (0..50) |_| {
-            if (self.done.load(.acquire)) return false;
+        var i: usize = 0;
+        while (self.reg.state_waiters.load(.acquire) == 0 and !self.done.load(.acquire) and i < 500) : (i += 1) {
+            std.Thread.yield() catch {};
+        }
+        return !self.done.load(.acquire);
+    }
+    fn waitAnswered(self: *@This()) bool {
+        for (0..500) |_| {
+            if (self.done.load(.acquire)) return true;
             const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
             _ = std.c.nanosleep(&ts, null);
         }
-        return !self.done.load(.acquire);
+        return self.done.load(.acquire);
     }
 };
 
@@ -2489,7 +2498,7 @@ test "ModelRegistry: a shutdown ends a wait on a loading or evicting entry and a
         const t = try std.Thread.spawn(.{}, StartupWaiter.run, .{&w});
         try testing.expect(w.stillWaiting());
         reg.beginShutdown();
-        const answered = !w.stillWaiting();
+        const answered = w.waitAnswered();
         if (!answered) {
             reg.mutex.lockUncancelable(reg.io);
             reg.markUnloadedLocked(e);
@@ -2515,8 +2524,7 @@ test "ModelRegistry: a shutdown ends a wait on a loading or evicting entry and a
     };
     var drained: error{Shutdown}!bool = true;
     const t = try std.Thread.spawn(.{}, Drain.run, .{ reg, e, &drained });
-    const ts = std.c.timespec{ .sec = 0, .nsec = 50_000_000 };
-    _ = std.c.nanosleep(&ts, null);
+    while (reg.state_waiters.load(.acquire) == 0) std.Thread.yield() catch {};
     reg.beginShutdown();
     t.join();
     try testing.expectError(error.Shutdown, drained);

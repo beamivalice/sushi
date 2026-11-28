@@ -787,7 +787,7 @@ test "verify shared projection preserves solo qmv values across request widths" 
     for ([_][2]c_int{ .{ 2560, 640 }, .{ 640, 2560 } }) |shape| {
         const k = shape[0];
         const n = shape[1];
-        const weight = try attn256RandBf16(prng.random(), &.{ n, k }, s);
+        const weight = try testRandWeightBf16(prng.random(), &.{ n, k }, s);
         defer _ = mlx.mlx_array_free(weight);
         var triple = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(triple);
@@ -849,7 +849,7 @@ test "verify GDN projections preserve solo qmv values across request widths" {
     for ([_][2]c_int{ .{ 2560, 10240 }, .{ 2560, 6144 }, .{ 2560, 48 }, .{ 6144, 2560 } }) |shape| {
         const k = shape[0];
         const n = shape[1];
-        const weight = try attn256RandBf16(prng.random(), &.{ n, k }, s);
+        const weight = try testRandWeightBf16(prng.random(), &.{ n, k }, s);
         defer _ = mlx.mlx_array_free(weight);
         var triple = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(triple);
@@ -911,7 +911,7 @@ test "verify attention projections preserve solo qmv values across request width
     for ([_][2]c_int{ .{ 2560, 12288 }, .{ 2560, 512 }, .{ 6144, 2560 } }) |shape| {
         const k = shape[0];
         const n = shape[1];
-        const weight = try attn256RandBf16(prng.random(), &.{ n, k }, s);
+        const weight = try testRandWeightBf16(prng.random(), &.{ n, k }, s);
         defer _ = mlx.mlx_array_free(weight);
         var triple = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(triple);

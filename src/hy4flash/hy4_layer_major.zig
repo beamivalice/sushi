@@ -1157,6 +1157,7 @@ const Tiny = struct {
     windows: [tiny_lengths.len][]u32,
 
     fn open(a: std.mem.Allocator, io: std.Io) !*Tiny {
+        @import("hy4_held.zig").releaseHeld();
         const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
         try mlx.requireGpu();
         const self = try a.create(Tiny);
@@ -1350,23 +1351,25 @@ fn batchedParity() !void {
 
     // The capture's products (f32) and the served ones (BF16), over windows of different lengths, three to a batch, in
     // 4-row and window-wide pieces; a small `ffn_rows` makes a layer's FFN run in several groups.
-    for ([_]fwd.Products{ .f32, .bf16 }) |kind| {
-        for ([_]struct { chunk: usize, batch: u32, rows: usize }{ .{ .chunk = 4, .batch = 3, .rows = 16384 }, .{ .chunk = 4, .batch = 3, .rows = 12 }, .{ .chunk = 4096, .batch = 3, .rows = 16384 }, .{ .chunk = 4, .batch = 7, .rows = 16384 } }) |cell| {
-            fwd.products = kind;
-            ffn_rows = cell.rows;
-            const want = try std.fmt.allocPrint(arena, "{s}/per-piece-{t}-{d}-{d}-{d}", .{ tiny.root, kind, cell.chunk, cell.batch, cell.rows });
-            const got = try std.fmt.allocPrint(arena, "{s}/batched-{t}-{d}-{d}-{d}", .{ tiny.root, kind, cell.chunk, cell.batch, cell.rows });
-            var run = tiny.opts;
-            run.out_dir = want;
-            per_piece_for_test = true;
-            defer per_piece_for_test = false;
-            try runLoaded(a, io, tiny.loaded, run, cell.batch, cell.chunk, &quiet, .{});
-            per_piece_for_test = false;
-            run.out_dir = got;
-            try runLoaded(a, io, tiny.loaded, run, cell.batch, cell.chunk, &quiet, .{});
-            try expectSameTree(arena, io, want, got, "");
-            try expectSameTree(arena, io, got, want, "");
-        }
+    for ([_]struct { kind: fwd.Products, chunk: usize, batch: u32, rows: usize }{
+        .{ .kind = .f32, .chunk = 4, .batch = 3, .rows = 16384 },
+        .{ .kind = .bf16, .chunk = 4096, .batch = 3, .rows = 12 },
+        .{ .kind = .f32, .chunk = 4, .batch = 7, .rows = 16384 },
+    }) |cell| {
+        fwd.products = cell.kind;
+        ffn_rows = cell.rows;
+        const want = try std.fmt.allocPrint(arena, "{s}/per-piece-{t}-{d}-{d}-{d}", .{ tiny.root, cell.kind, cell.chunk, cell.batch, cell.rows });
+        const got = try std.fmt.allocPrint(arena, "{s}/batched-{t}-{d}-{d}-{d}", .{ tiny.root, cell.kind, cell.chunk, cell.batch, cell.rows });
+        var run = tiny.opts;
+        run.out_dir = want;
+        per_piece_for_test = true;
+        defer per_piece_for_test = false;
+        try runLoaded(a, io, tiny.loaded, run, cell.batch, cell.chunk, &quiet, .{});
+        per_piece_for_test = false;
+        run.out_dir = got;
+        try runLoaded(a, io, tiny.loaded, run, cell.batch, cell.chunk, &quiet, .{});
+        try expectSameTree(arena, io, want, got, "");
+        try expectSameTree(arena, io, got, want, "");
     }
 
     // The first batch committed by the per-piece FFN, the rest by the batched one.
@@ -1765,9 +1768,10 @@ const ServedResident = struct {
 
 /// The region a served load of `dir` measures (`hy4_plan.regionAt` at its chunk).
 fn servedRegion(dir: []const u8) !@import("../tensor/plan/plan_api.zig").region.Need {
+    @import("hy4_held.zig").releaseHeld();
     const contract = @import("../cooler_contract_test.zig");
     var ld: contract.Load = undefined;
-    try ld.open(ServedResident, dir, true);
+    try ld.openLight(ServedResident, dir, true);
     defer _ = ld.close();
     return ld.xfm.arch_state.hy4flash.model.?.plans.?.region;
 }

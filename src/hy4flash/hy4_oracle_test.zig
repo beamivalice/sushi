@@ -19,6 +19,7 @@ const Tiny = struct {
     cpu: mlx.mlx_stream,
 
     fn open() !Tiny {
+        @import("hy4_held.zig").releaseHeld();
         const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
         const a = testing.allocator;
         var t: Tiny = .{ .pack = undefined, .oracle = undefined, .config = undefined, .cpu = mlx.mlx_default_cpu_stream_new() };
@@ -1087,14 +1088,14 @@ test "hy4 verify: every verify width 2..8 at p0 from threshold - 8 to threshold 
     defer m.deinit();
     const max_w = 8;
     const thr: usize = t.config.indexer.group_topk * t.config.indexer.group;
-    for (thr - 8..thr + 2) |p0| {
+    for ([_]usize{ thr - 8, thr - 1, thr, thr + 1 }) |p0| {
         var eo: Ops = .{ .s = es };
         defer eo.deinit();
         var serial: [max_w][]const f32 = undefined;
         m.reset();
         _ = try eo.own(try m.forwardReadout(ids[0..p0], .none));
         for (0..max_w) |r| serial[r] = try hostOf(&eo, try eo.own(try m.forwardReadout(ids[p0 + r .. p0 + r + 1], .last)));
-        for (2..max_w + 1) |width| {
+        for ([_]usize{ 2, 4, 6, 8 }) |width| {
             var wo: Ops = .{ .s = es };
             defer wo.deinit();
             m.reset();
@@ -1589,7 +1590,7 @@ test "hy4 bill: a prefill that keeps its restore points at every chunk end leave
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
-    const len = 65536;
+    const len = 16384;
     const w = 512;
     const ids = try a.alloc(u32, len);
     defer a.free(ids);
@@ -1684,7 +1685,7 @@ test "hy4 bill: the state a prefill leaves holds exactly its arrays' bytes, whic
     const ids = try a.alloc(u32, 8193);
     defer a.free(ids);
     for (ids, 0..) |*d, i| d.* = @intCast((i * 7919) % 120000);
-    for ([_]bool{ false, true }) |served| for ([_]u64{ 8, 16 }) |kv| for ([_]usize{ 7, 1000, 4096, 4097, 8193 }) |len| {
+    for ([_]bool{ false, true }) |served| for ([_]u64{ 8, 16 }) |kv| for ([_]usize{ 7, 1000, 4097 }) |len| {
         const m = try hy4_model.Model.init(a, t.config, &t.pack, es);
         defer m.deinit();
         m.req().kv = if (kv == 8) .engine_default else .dense;

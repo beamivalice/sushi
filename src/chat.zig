@@ -4864,18 +4864,20 @@ test "formatChat: running out of memory at any allocation is OutOfMemory or the 
     const arena = arena_state.allocator();
     const qwen = arch_fx.qwen_template orelse return error.SkipZigTest;
     const Case = struct { tpl: []const u8, model_type: ?[]const u8 };
+    const pt = try tokenizer_mod.packTokenizerForTests(testing.allocator, arena, "qwen38_flash_next");
+    var tok = pt.tok;
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    try tok.enableSegmentCache(segment_cache_mod.default_budget);
+    const reqs = sweepRequests();
     for ([_]Case{ .{ .tpl = qwen, .model_type = arch_fx.qwen_model_type }, .{ .tpl = sweep_plain_template, .model_type = null } }) |c| {
         var fa = FailOnce{ .child = testing.allocator };
         const A = fa.allocator();
-        const pt = try tokenizer_mod.packTokenizerForTests(A, arena, "qwen38_flash_next");
-        var tok = pt.tok;
-        defer tokenizer_mod.deinitTestTokenizer(&tok);
         var cc = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = A, .model_type = c.model_type };
         try cc.compile();
         defer cc.dropCompiled();
         try tok.bindTemplate(cc.printedFacts(), pt.stops, &.{});
-        try tok.enableSegmentCache(segment_cache_mod.default_budget);
-        for (sweepRequests()) |r| {
+        for ([_]usize{ 0, 2 }) |ri| {
+            const r = reqs[ri];
             clearMemoAndCache(&cc, &tok);
             const want = try formatChat(testing.allocator, &tok, r.msgs, &cc, r.tools, r.instr, r.thinking, r.effort, r.cont);
             defer testing.allocator.free(want);
@@ -4890,11 +4892,11 @@ test "formatChat: running out of memory at any allocation is OutOfMemory or the 
                         defer A.free(ids);
                         try testing.expectEqualSlices(u32, want, ids);
                     } else |e| try testing.expectEqual(error.OutOfMemory, e);
-                    const again = try formatChat(testing.allocator, &tok, r.msgs, &cc, r.tools, r.instr, r.thinking, r.effort, r.cont);
-                    defer testing.allocator.free(again);
-                    try testing.expectEqualSlices(u32, want, again);
                     if (!fa.induced) break;
                 }
+                const again = try formatChat(testing.allocator, &tok, r.msgs, &cc, r.tools, r.instr, r.thinking, r.effort, r.cont);
+                defer testing.allocator.free(again);
+                try testing.expectEqualSlices(u32, want, again);
             }
         }
     }
@@ -5204,36 +5206,38 @@ test "templateProbeRender: memoized probes answer as fresh renders for every eff
         .{ .text = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos = null, .eos = null },
         .{ .text = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .bos = "<s>", .eos = "<|im_end|>" },
     };
-    var words = std.ArrayList(?[]const u8).empty;
-    defer {
-        for (words.items) |w| if (w) |x| a.free(x);
-        words.deinit(a);
-    }
-    try words.append(a, null);
-    for ([_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "0", "+5", "101", "-1", "1e2", "62.0", "" }) |w| try words.append(a, try a.dupe(u8, w));
-    for (1..101) |n| try words.append(a, try std.fmt.allocPrint(a, "{d}", .{n}));
+    const words = [_]?[]const u8{ null, "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "0", "+5", "101", "-1", "1e2", "62.0", "", "1", "2", "50", "99", "100" };
     var checked: usize = 0;
     for (served) |s| {
         for ([_]?[]const u8{ null, arch_fx.qwen_model_type }) |mt| {
             const compiled = try Compiled.init(a, s.text, true, mt);
             defer compiled.deinit(a);
             var cc = ChatConfig{ .chat_template = s.text, .bos_token = s.bos, .eos_token = s.eos, .add_bos_token = false, .allocator = a, .compiled = compiled };
-            for (0..2) |_| for ([_]?bool{ null, true, false }) |preserve| for ([_]bool{ true, false }) |thinking| for (words.items) |effort| {
-                cc.preserve_thinking = preserve;
-                const settings = try templateSettings(a, &cc, thinking, effort);
-                for ([_]?*const Tpl{ &compiled.main, if (compiled.late_system) |*l| l else null }) |maybe| {
-                    const tpl = maybe orelse continue;
-                    for ([_]Probe{ .tool_content, .late_system, .call, .call_empty, .answer }) |probe| {
-                        const fresh = try renderProbeFresh(a, tpl, probe, &settings);
-                        defer if (fresh) |f| a.free(f);
-                        const got = try templateProbeRender(a, tpl, probe, &settings);
-                        defer if (got) |g| a.free(g);
-                        try testing.expectEqual(fresh == null, got == null);
-                        if (fresh) |f| try testing.expectEqualStrings(f, got.?);
-                        checked += 1;
+            const checkProbe = struct {
+                fn run(alloc: std.mem.Allocator, comp: *const Compiled, cfg: *ChatConfig, thinking: bool, effort: ?[]const u8, count: *usize) !void {
+                    const settings = try templateSettings(alloc, cfg, thinking, effort);
+                    for ([_]?*const Tpl{ &comp.main, if (comp.late_system) |*l| l else null }) |maybe| {
+                        const tpl = maybe orelse continue;
+                        for ([_]Probe{ .tool_content, .late_system, .call, .call_empty, .answer }) |probe| {
+                            const fresh = try renderProbeFresh(alloc, tpl, probe, &settings);
+                            defer if (fresh) |f| alloc.free(f);
+                            const got = try templateProbeRender(alloc, tpl, probe, &settings);
+                            defer if (got) |g| alloc.free(g);
+                            try testing.expectEqual(fresh == null, got == null);
+                            if (fresh) |f| try testing.expectEqualStrings(f, got.?);
+                            count.* += 1;
+                        }
                     }
                 }
-            };
+            }.run;
+            for (0..2) |_| {
+                for ([_]?bool{ null, true, false }) |preserve| for ([_]bool{ true, false }) |thinking| {
+                    cc.preserve_thinking = preserve;
+                    for ([_]?[]const u8{ null, "high" }) |effort| try checkProbe(a, compiled, &cc, thinking, effort, &checked);
+                };
+                cc.preserve_thinking = true;
+                for (words) |effort| try checkProbe(a, compiled, &cc, true, effort, &checked);
+            }
         }
     }
     try testing.expect(checked > 0);

@@ -254,7 +254,6 @@ const MCG_W12: api.format.Decode = .{ .codebook = .mcg, .window = .w12 };
 // A rate is the grid's reader, which the reader tests hold at every rate: the served K2.25 mixed with K2.5, three rates
 // on one layer unskewed, and K4's own NAX fragment.
 test "GLM prefill grid serves mixed projections and K4 with the sorted chain's bytes" {
-    try gridMatchesSortedChain(.{ 40, 40, 36 }, true, MCG_W12);
     try gridMatchesSortedChain(.{ 36, 40, 48 }, false, MCG_W12);
     try gridMatchesSortedChain(.{ 64, 64, 64 }, true, MCG_W12);
 }

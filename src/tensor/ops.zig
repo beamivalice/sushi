@@ -351,6 +351,7 @@ fn exprInputs(comptime expr: []const u8) usize {
 pub fn makeCopiesAhead() Error!void {
     inline for (.{ Dtype.bfloat16, Dtype.float16, Dtype.float32, Dtype.int32, Dtype.uint32, Dtype.uint8 }) |d| {
         _ = try flatKernel("copy", 0, &.{d}, d);
+        _ = try opsKernel("copy_into", "", &.{d}, d);
         inline for (concat_widths) |k| _ = try opsKernel(std.fmt.comptimePrint("concat{d}", .{k}), "", &.{d}, d);
     }
 }

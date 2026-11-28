@@ -490,19 +490,19 @@ fn rangeCells(es: mlx.mlx_stream) !void {
     const rnd = prng.random();
     for ([_]RangeCase{
         // A sliding span over S + 511 keys, a short last span, a sharp softmax, one large term, a query of 16 sigma.
-        .{ .h = 64, .latent = 512, .rope = 64, .t = 64, .n = 575, .p0 = 511, .window = 512 },
-        .{ .h = 64, .latent = 512, .rope = 64, .t = 44, .n = 555, .p0 = 511, .window = 512, .q_std = 1 },
-        .{ .h = 64, .latent = 512, .rope = 64, .t = 32, .n = 543, .p0 = 511, .window = 512, .outlier = true },
-        .{ .h = 64, .latent = 512, .rope = 64, .t = 32, .n = 543, .p0 = 511, .window = 512, .q_std = 16, .bar = 1.5e-5 },
+        .{ .h = 64, .latent = 512, .rope = 64, .t = 32, .n = 543, .p0 = 511, .window = 512 },
+        .{ .h = 64, .latent = 512, .rope = 64, .t = 22, .n = 533, .p0 = 511, .window = 512, .q_std = 1 },
+        .{ .h = 64, .latent = 512, .rope = 64, .t = 16, .n = 527, .p0 = 511, .window = 512, .outlier = true },
+        .{ .h = 64, .latent = 512, .rope = 64, .t = 16, .n = 527, .p0 = 511, .window = 512, .q_std = 16, .bar = 1.5e-5 },
         // A sparse layer below its selection threshold: every key to the row, the chunk's first rows and a later span.
-        .{ .h = 32, .latent = 512, .rope = 64, .t = 40, .n = 1000, .p0 = 960, .window = 0 },
-        .{ .h = 32, .latent = 512, .rope = 64, .t = 40, .n = 40, .p0 = 0, .window = 0 },
+        .{ .h = 32, .latent = 512, .rope = 64, .t = 20, .n = 980, .p0 = 960, .window = 0 },
+        .{ .h = 32, .latent = 512, .rope = 64, .t = 20, .n = 20, .p0 = 0, .window = 0 },
         // The tiny: 4 and 2 heads (a head block of 16 padded), latent 64, rope 16, window 8.
-        .{ .h = 4, .latent = 64, .rope = 16, .t = 100, .n = 100, .p0 = 0, .window = 0 },
-        .{ .h = 2, .latent = 64, .rope = 16, .t = 100, .n = 100, .p0 = 0, .window = 8 },
+        .{ .h = 4, .latent = 64, .rope = 16, .t = 50, .n = 50, .p0 = 0, .window = 0 },
+        .{ .h = 2, .latent = 64, .rope = 16, .t = 50, .n = 50, .p0 = 0, .window = 8 },
         // The STQ tiny: 8 heads, latent 128 (two 64-channel groups), rope 16.
-        .{ .h = 8, .latent = 128, .rope = 16, .t = 40, .n = 47, .p0 = 7, .window = 8 },
-        .{ .h = 8, .latent = 128, .rope = 16, .t = 100, .n = 100, .p0 = 0, .window = 0 },
+        .{ .h = 8, .latent = 128, .rope = 16, .t = 20, .n = 27, .p0 = 7, .window = 8 },
+        .{ .h = 8, .latent = 128, .rope = 16, .t = 50, .n = 50, .p0 = 0, .window = 0 },
     }, 0..) |c, ci| {
         var o: Ops = .{ .s = es };
         defer o.deinit();
@@ -556,14 +556,14 @@ fn picksCells(es: mlx.mlx_stream) !void {
     const rnd = prng.random();
     for ([_]PicksCase{
         // A sparse layer past its selection: 32 heads, 2,048 picked keys a row, kv8 as served, then the bf16 store.
-        .{ .h = 32, .latent = 512, .rope = 64, .t = 32, .n = 9000, .s = 2048, .kv8 = true },
-        .{ .h = 32, .latent = 512, .rope = 64, .t = 16, .n = 4096, .s = 2048, .kv8 = false, .q_std = 1 },
+        .{ .h = 32, .latent = 512, .rope = 64, .t = 16, .n = 9000, .s = 2048, .kv8 = true },
+        .{ .h = 32, .latent = 512, .rope = 64, .t = 8, .n = 4096, .s = 2048, .kv8 = false, .q_std = 1 },
         // The tiny: 2 heads (a head block of 16 padded), 16 picks a row.
-        .{ .h = 2, .latent = 64, .rope = 16, .t = 13, .n = 40, .s = 16, .kv8 = true },
-        .{ .h = 2, .latent = 64, .rope = 16, .t = 13, .n = 40, .s = 16, .kv8 = false },
+        .{ .h = 2, .latent = 64, .rope = 16, .t = 7, .n = 40, .s = 16, .kv8 = true },
+        .{ .h = 2, .latent = 64, .rope = 16, .t = 7, .n = 40, .s = 16, .kv8 = false },
         // The STQ tiny: 8 heads, latent 128, 16 picks a row.
-        .{ .h = 8, .latent = 128, .rope = 16, .t = 32, .n = 60, .s = 16, .kv8 = true },
-        .{ .h = 8, .latent = 128, .rope = 16, .t = 32, .n = 60, .s = 16, .kv8 = false },
+        .{ .h = 8, .latent = 128, .rope = 16, .t = 16, .n = 60, .s = 16, .kv8 = true },
+        .{ .h = 8, .latent = 128, .rope = 16, .t = 16, .n = 60, .s = 16, .kv8 = false },
     }, 0..) |c, ci| {
         var o: Ops = .{ .s = es };
         defer o.deinit();

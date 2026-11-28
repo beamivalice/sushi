@@ -1858,47 +1858,56 @@ test "metal_search: every admitted rate and window matches the CPU search code f
     @memset(tiles[tile_len * 2 .. tile_len * 3], 0);
     for (tile_len * 3..tile_len * 4) |i| tiles[i] = r.floatNorm(f32) * (if (i % 7 == 0) @as(f32, 3.0) else @as(f32, 0.5));
 
-    const rates = [_]u32{ 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 80, 96, 128 };
-    const windows = [_]format.Window{ .w12, .w13, .w14, .w15, .w16 };
-    const tabled = [_]format.Decode{
-        .{ .codebook = .alpha },
-        .{ .codebook = .std1, .table = @import("sushi_exl3").codebook_tables.indexOf("std1") },
-        .{ .codebook = .spec1, .table = @import("sushi_exl3").codebook_tables.indexOf("spec1-test-per-rate") },
+    const std1 = @import("sushi_exl3").codebook_tables.indexOf("std1");
+    const spec1 = @import("sushi_exl3").codebook_tables.indexOf("spec1-test-per-rate");
+    const cases = [_]struct { dec: format.Decode, n: u32 }{
+        // All 5 codebooks and all 5 windows: pairs (w15, n=24), 256-thread (w13/w14), global_costs (w16), and n=128.
+        .{ .dec = .{ .codebook = .mcg, .window = .w12 }, .n = 24 },
+        .{ .dec = .{ .codebook = .mcg, .window = .w12 }, .n = 32 },
+        .{ .dec = .{ .codebook = .mcg, .window = .w12 }, .n = 48 },
+        .{ .dec = .{ .codebook = .mcg, .window = .w12 }, .n = 128 },
+        .{ .dec = .{ .codebook = .mcg, .window = .w13 }, .n = 40 },
+        .{ .dec = .{ .codebook = .mcg, .window = .w14 }, .n = 48 },
+        .{ .dec = .{ .codebook = .mcg, .window = .w15 }, .n = 24 },
+        .{ .dec = .{ .codebook = .mcg, .window = .w16 }, .n = 40 },
+        .{ .dec = .{ .codebook = .mcg, .window = .w16 }, .n = 64 },
+        .{ .dec = .{ .codebook = .mul1, .window = .w12 }, .n = 32 },
+        .{ .dec = .{ .codebook = .mul1, .window = .w15 }, .n = 64 },
+        .{ .dec = .{ .codebook = .alpha, .window = .w15 }, .n = 24 },
+        .{ .dec = .{ .codebook = .alpha, .window = .w12 }, .n = 48 },
+        .{ .dec = .{ .codebook = .std1, .window = .w15, .table = std1 }, .n = 32 },
+        .{ .dec = .{ .codebook = .spec1, .window = .w15, .table = spec1 }, .n = 32 },
+        .{ .dec = .{ .codebook = .alpha, .window = .w15 }, .n = 80 },
+        .{ .dec = .{ .codebook = .std1, .window = .w12, .table = std1 }, .n = 96 },
     };
-    for ([_]format.Decode{ .{ .codebook = .mcg }, .{ .codebook = .mul1 } } ++ tabled) |base| {
-        for (windows) |win| {
-            for (rates) |n| {
-                if (win != .w12 and win != .w15 and !(win == .w16 and (n == 40 or n == 64)) and !(win == .w13 and n == 40) and !(win == .w14 and n == 48)) continue;
-                const rate = format.Rate{ .n = n };
-                var dec = base;
-                dec.window = win;
-                if (!encode.searchable(dec, rate)) {
-                    try t.expect(dec.codebook.tabledHashMask() and n > 64);
-                    try t.expectError(error.CodebookUnsupported, encode.Encoder.init(t.allocator, rate, dec));
-                    continue;
-                }
-                var enc = try encode.Encoder.init(t.allocator, rate, dec);
-                defer enc.deinit();
+    for (cases) |c| {
+        const rate = format.Rate{ .n = c.n };
+        const dec = c.dec;
+        if (!encode.searchable(dec, rate)) {
+            try t.expect(dec.codebook.tabledHashMask() and c.n > 64);
+            try t.expectError(error.CodebookUnsupported, encode.Encoder.init(t.allocator, rate, dec));
+            continue;
+        }
+        var enc = try encode.Encoder.init(t.allocator, rate, dec);
+        defer enc.deinit();
 
-                const got_packed = try t.allocator.alloc(u16, n_tiles * n);
-                defer t.allocator.free(got_packed);
-                const got_recon = try t.allocator.alloc(f32, n_tiles * tile_len);
-                defer t.allocator.free(got_recon);
-                try encodeTiles(t.allocator, s, rate, dec, &tiles, got_packed, got_recon, encode.full_pin_pass);
+        const got_packed = try t.allocator.alloc(u16, n_tiles * c.n);
+        defer t.allocator.free(got_packed);
+        const got_recon = try t.allocator.alloc(f32, n_tiles * tile_len);
+        defer t.allocator.free(got_recon);
+        try encodeTiles(t.allocator, s, rate, dec, &tiles, got_packed, got_recon, encode.full_pin_pass);
 
-                for (0..n_tiles) |ti| {
-                    var want_packed: [128]u16 = undefined;
-                    var want_recon: [tile_len]f32 = undefined;
-                    _ = try enc.encodeTile(tiles[ti * tile_len ..][0..tile_len], want_packed[0..n], &want_recon);
-                    try t.expectEqualSlices(u16, want_packed[0..n], got_packed[ti * n ..][0..n]);
-                    try t.expectEqualSlices(f32, &want_recon, got_recon[ti * tile_len ..][0..tile_len]);
+        for (0..n_tiles) |ti| {
+            var want_packed: [128]u16 = undefined;
+            var want_recon: [tile_len]f32 = undefined;
+            _ = try enc.encodeTile(tiles[ti * tile_len ..][0..tile_len], want_packed[0..c.n], &want_recon);
+            try t.expectEqualSlices(u16, want_packed[0..c.n], got_packed[ti * c.n ..][0..c.n]);
+            try t.expectEqualSlices(f32, &want_recon, got_recon[ti * tile_len ..][0..tile_len]);
 
-                    var decoded: [tile_len]u16 = undefined;
-                    format.decodeTile(got_packed[ti * n ..][0..n], rate, dec, &decoded);
-                    for (got_recon[ti * tile_len ..][0..tile_len], decoded) |rv, dv| {
-                        try t.expectEqual(format.f32ToF16Bits(rv), dv);
-                    }
-                }
+            var decoded: [tile_len]u16 = undefined;
+            format.decodeTile(got_packed[ti * c.n ..][0..c.n], rate, dec, &decoded);
+            for (got_recon[ti * tile_len ..][0..tile_len], decoded) |rv, dv| {
+                try t.expectEqual(format.f32ToF16Bits(rv), dv);
             }
         }
     }
@@ -1946,6 +1955,11 @@ test "metal_search: a pipeline limit below the launch size searches the same cod
         const dec = c.dec;
         var enc = try encode.Encoder.initPinned(t.allocator, rate, dec, c.pin_pass);
         defer enc.deinit();
+        var want_packed: [n_tiles][128]u16 = undefined;
+        var want_recon: [n_tiles][tile_len]f32 = undefined;
+        for (0..n_tiles) |ti| {
+            _ = try enc.encodeTile(tiles[ti * tile_len ..][0..tile_len], want_packed[ti][0..c.n], &want_recon[ti]);
+        }
         for ([_]u32{ 2048, 832, 384, 128 }) |cap| {
             const got_packed = try t.allocator.alloc(u16, n_tiles * c.n);
             defer t.allocator.free(got_packed);
@@ -1955,11 +1969,8 @@ test "metal_search: a pipeline limit below the launch size searches the same cod
             defer search.deinit();
             try search.collect(null, got_packed, got_recon);
             for (0..n_tiles) |ti| {
-                var want_packed: [128]u16 = undefined;
-                var want_recon: [tile_len]f32 = undefined;
-                _ = try enc.encodeTile(tiles[ti * tile_len ..][0..tile_len], want_packed[0..c.n], &want_recon);
-                try t.expectEqualSlices(u16, want_packed[0..c.n], got_packed[ti * c.n ..][0..c.n]);
-                try t.expectEqualSlices(f32, &want_recon, got_recon[ti * tile_len ..][0..tile_len]);
+                try t.expectEqualSlices(u16, want_packed[ti][0..c.n], got_packed[ti * c.n ..][0..c.n]);
+                try t.expectEqualSlices(f32, &want_recon[ti], got_recon[ti * tile_len ..][0..tile_len]);
             }
         }
     }
@@ -2090,7 +2101,7 @@ test "metal_search: a batch of tensors quantizes to the same bytes as one tensor
     }
 }
 
-test "metal_search: a tensor of several 128-row chunks quantizes to the CPU quantizer's bytes, MCG and PAIR1" {
+test "metal_search: a tensor of several 128-row chunks quantizes to the CPU quantizer's bytes at MCG and GPU PAIR1 matches fixtures" {
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -2111,16 +2122,52 @@ test "metal_search: a tensor of several 128-row chunks quantizes to the CPU quan
         for (0..24) |m| acc += x[i * 24 + m] * x[j * 24 + m];
         h[i * in + j] = acc;
     };
+    const rate_mcg = format.Rate{ .n = 32 };
+    const dec_mcg = format.Decode{ .codebook = .mcg, .window = .w12 };
+    var want_mcg = try quantize.quantizeNamed(t.allocator, w, h, in, out, 5, "chunks", rate_mcg, dec_mcg, .auto);
+    defer want_mcg.deinit(t.allocator);
+    var got_mcg = try quantizeNamed(t.allocator, s, w, h, in, out, 5, "chunks", rate_mcg, dec_mcg, .auto, null);
+    defer got_mcg.deinit(t.allocator);
+    try t.expectEqualSlices(u16, want_mcg.packed_out, got_mcg.packed_out);
+    try t.expectEqualSlices(u16, want_mcg.suh, got_mcg.suh);
+    try t.expectEqualSlices(u16, want_mcg.svh, got_mcg.svh);
+
     const pair1: format.Decode = .{ .codebook = .pair1, .window = .w16, .table = @import("sushi_exl3").codebook_tables.indexOf("pair1-w16-v1") };
-    for ([_]struct { format.Rate, format.Decode }{ .{ .{ .n = 32 }, .{ .codebook = .mcg, .window = .w12 } }, .{ .{ .n = 28 }, pair1 } }) |c| {
-        const rate, const dec = c;
-        var want = try quantize.quantizeNamed(t.allocator, w, h, in, out, 5, "chunks", rate, dec, .auto);
-        defer want.deinit(t.allocator);
-        var got = try quantizeNamed(t.allocator, s, w, h, in, out, 5, "chunks", rate, dec, .auto, null);
-        defer got.deinit(t.allocator);
-        try t.expectEqualSlices(u16, want.packed_out, got.packed_out);
-        try t.expectEqualSlices(u16, want.suh, got.suh);
-        try t.expectEqualSlices(u16, want.svh, got.svh);
+    const n_tiles = pair_search.fixture_tiles;
+    const per_rate = n_tiles * (tile_len * 4 + pair_search.pairs * 2 + tile_len * 4);
+    var perm: [tile_len]usize = undefined;
+    format.tensorCorePerm(&perm);
+    for (pair_search.fixtures) |fx| {
+        for ([_]u32{ 24, 28, 30, 32, 34, 36, 40, 48, 64 }) |n| {
+            const rate = format.Rate{ .n = n };
+            const base = fx.raw[(n - 24) / 2 * per_rate ..][0..per_rate];
+            const tiles_b = base[0 .. n_tiles * tile_len * 4];
+            const idx_b = base[tiles_b.len..][0 .. n_tiles * pair_search.pairs * 2];
+            const q_b = base[tiles_b.len + idx_b.len ..];
+            var row_tiles: [n_tiles * tile_len]f32 = undefined;
+            for (0..n_tiles) |ti| {
+                for (perm, 0..) |p, i| {
+                    row_tiles[ti * tile_len + p] = pair_search.readF32(tiles_b, ti * tile_len + i);
+                }
+            }
+            const got_packed = try t.allocator.alloc(u16, n_tiles * n);
+            defer t.allocator.free(got_packed);
+            var got_recon: [n_tiles * tile_len]f32 = undefined;
+            try encodeTiles(t.allocator, s, rate, pair1, &row_tiles, got_packed, &got_recon, fx.pin * 2);
+            var want_packed: [64]u16 = undefined;
+            for (0..n_tiles) |ti| {
+                var cws: [pair_search.pairs]u16 = undefined;
+                for (&cws, 0..) |*cw, j| cw.* = std.mem.readInt(u16, idx_b[(ti * pair_search.pairs + j) * 2 ..][0..2], .little);
+                var states: [tile_len]u16 = undefined;
+                var ks: [tile_len]u8 = undefined;
+                pair_search.expandScalar(rate, &cws, &states, &ks);
+                encode.Encoder.packStates(rate, &ks, &states, want_packed[0..n]);
+                try t.expectEqualSlices(u16, want_packed[0..n], got_packed[ti * n ..][0..n]);
+                for (perm, 0..) |p, i| {
+                    try t.expectEqual(@as(u32, @bitCast(pair_search.readF32(q_b, ti * tile_len + i))), @as(u32, @bitCast(got_recon[ti * tile_len + p])));
+                }
+            }
+        }
     }
 }
 

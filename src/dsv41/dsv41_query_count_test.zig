@@ -201,6 +201,7 @@ fn decodeTokens(env: [:0]const u8) !?[6]u64 {
     config.expert_streaming = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.test_skip_warm = true;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
@@ -222,15 +223,17 @@ test "dsv41 queries: a decode token (DSV41_TINY, DSV41_STQ_TINY)" {
     defer kernels.hc_expand_probe_override = null;
     var ran = false;
     for ([_][:0]const u8{ "DSV41_TINY", "DSV41_STQ_TINY" }) |env| {
+        const is_tiny = std.mem.eql(u8, env, "DSV41_TINY");
+        const folds_list: []const bool = if (is_tiny) &.{true} else &.{ true, false };
         // A GPU whose f32 matmul is true f32 keeps the op chain where the fused expand would serve: both arms, pinned.
-        for ([_]bool{ true, false }) |folds| {
+        for (folds_list) |folds| {
             kernels.hc_expand_probe_override = folds;
             const got = (try decodeTokens(env)) orelse continue;
             ran = true;
             try testing.expectEqual(folds, kernels.hcExpandProbed());
             // The two counts alternate with the compressed-attention cycle (shared unpacked-picks cache across non-owner
             // layers; fused STQ decode attention checks array metadata once per layer). The Engram gate reads no width.
-            const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1142, 1191, 1142, 1191, 1142, 1191 } else if (folds) .{ 2298, 2354, 2298, 2354, 2298, 2354 } else .{ 2186, 2242, 2186, 2242, 2186, 2242 };
+            const want: [6]u64 = if (is_tiny) .{ 1142, 1191, 1142, 1191, 1142, 1191 } else if (folds) .{ 2298, 2354, 2298, 2354, 2298, 2354 } else .{ 2186, 2242, 2186, 2242, 2186, 2242 };
             try testing.expectEqual(want, got);
         }
     }

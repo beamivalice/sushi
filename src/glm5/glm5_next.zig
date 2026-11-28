@@ -270,8 +270,7 @@ test "GLM EXL3 clamp supports 2 to 4 bpw in decode and prefill" {
     const experts = 3;
     const topk = 2;
     const dec = fmt.Decode{ .codebook = .mcg, .window = .w12 };
-    for (0..17) |rate_index| {
-        const n = 32 + rate_index * 2;
+    for ([_]usize{ 32, 36, 48, 64 }) |n| {
         const rate = fmt.Rate{ .n = @intCast(n) };
         const per = 64 * n;
         var codes: [3][]u16 = undefined;

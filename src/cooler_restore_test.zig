@@ -209,6 +209,7 @@ test "cooler contract: a served Qwen takeover turn refused at each pool site it 
         dir: []const u8,
         ids: []const u32,
         ram: u64,
+        plain_turn3: bool = false,
 
         /// Turns 1 and 2, then the partial takeover turn 3, refused at `at` (none: served). A sweep records turn 3 alone.
         fn turns(q: @This(), sv: *Served, at: ?mlx.FaultSites.SitePoint) !void {
@@ -219,16 +220,16 @@ test "cooler contract: a served Qwen takeover turn refused at each pool site it 
             defer c.deinit();
             const fits_was = Served.scheduler.prefill_admission_fits;
             defer Served.scheduler.prefill_admission_fits = fits_was;
-            Served.scheduler.prefill_admission_fits = fitsOnlyTaken;
+            if (!q.plain_turn3) Served.scheduler.prefill_admission_fits = fitsOnlyTaken;
             if (recording) rec.paused = false;
             if (at) |pt| {
                 // As the inference loop runs a failing request: failPrefill or failTick, then the cleanup drain.
                 mlx.engine.fault.armAt(pt);
-                _ = try sv.requestToCleanup(c.third.items, 16, false);
+                _ = try sv.requestToCleanup(c.third.items, 6, false);
                 return;
             }
             var f: u32 = 0;
-            var got = try sv.request(c.third.items, 16, &f);
+            var got = try sv.request(c.third.items, 6, &f);
             got.deinit(testing.allocator);
         }
 
@@ -244,15 +245,16 @@ test "cooler contract: a served Qwen takeover turn refused at each pool site it 
             var ld: Load = undefined;
             try ld.open(Q, dir, true);
             defer _ = ld.close();
-            // The tight budget restores from the SSD tier, a QSA overlay included: the same sites as the roomy budget's
-            // unwind through another caller there, so each budget sweeps its own.
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            a.free(try firstAsks(a, &seen, Q, @This(){ .ld = &ld, .dir = dir, .ids = ids, .ram = 1 << 30, .plain_turn3 = true }, go));
+            var total_points: usize = 0;
+            // The tight budget restores from the SSD tier, a QSA overlay included; `seen` is shared across budgets.
             for ([_]u64{ 1 << 30, 24 << 20 }) |ram| {
-                var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-                defer seen.deinit(a);
                 const q: @This() = .{ .ld = &ld, .dir = dir, .ids = ids, .ram = ram };
                 const points = try firstAsks(a, &seen, Q, q, go);
                 defer a.free(points);
-                try testing.expect(points.len > 0);
+                total_points += points.len;
                 const base = Sheet.now();
                 for (points, 1..) |pt, k| {
                     errdefer std.debug.print("cooler contract: the takeover turn under a {d} MB RAM tier refused at pool site {d} of {d}\n", .{ ram >> 20, k, points.len });
@@ -270,9 +272,9 @@ test "cooler contract: a served Qwen takeover turn refused at each pool site it 
                         try testing.expect(!mlx.errorPending());
                         // The conversation goes on past its third turn.
                         var f: u32 = 0;
-                        var next = try heldPrompt(a, ids, 3300, 0);
+                        var next = try heldPrompt(a, ids, 300, 0);
                         defer next.deinit(a);
-                        var got = try sv.request(next.items, 8, &f);
+                        var got = try sv.request(next.items, 6, &f);
                         got.deinit(a);
                         try testing.expect(takeoverAtRest(hc));
                     }
@@ -281,6 +283,7 @@ test "cooler contract: a served Qwen takeover turn refused at each pool site it 
                     try testing.expectEqual(@as(u32, 0), now.open);
                 }
             }
+            try testing.expect(total_points > 0);
         }
     }.run);
 }

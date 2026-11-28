@@ -16,7 +16,6 @@ pub const tests = .{
     @import("dsv41_borrow.zig"),
     @import("dsv41_prefix.zig"),
     @import("dsv41_prefix_cache_test.zig"),
-    @import("dsv41_generate_test.zig"),
     @import("dsv41_serving.zig"),
     @import("dsv41_pipelines.zig"),
     @import("dsv41_query_count_test.zig"),
@@ -28,6 +27,7 @@ pub const tests = .{
     @import("arch.zig"),
     @import("dsv41_sched.zig"),
     @import("dsv41_scope.zig"),
+    @import("dsv41_generate_test.zig"),
 };
 
 /// The MLX-free test files `src/tests_host.zig` runs for this arch.

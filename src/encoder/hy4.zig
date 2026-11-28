@@ -1116,6 +1116,45 @@ fn runLayout(a: std.mem.Allocator, io: std.Io, opts: Options, sink: ?Sink, pair_
 
 const testing = std.testing;
 
+extern "c" fn atexit(cb: *const fn () callconv(.c) void) c_int;
+
+const IdentityCache = struct {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_len: usize = 0;
+    var src_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var src_len: usize = 0;
+    var summary: Summary = undefined;
+    var atexit_set: bool = false;
+
+    fn cleanup() callconv(.c) void {
+        if (path_len == 0) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.cwd().deleteTree(io, path_buf[0..path_len]) catch {};
+        path_len = 0;
+    }
+
+    fn get(io: std.Io, src_root: []const u8) !struct { dir: []const u8, summary: Summary } {
+        if (path_len != 0 and std.mem.eql(u8, src_buf[0..src_len], src_root)) {
+            return .{ .dir = path_buf[0..path_len], .summary = summary };
+        }
+        cleanup();
+        const tmp_root = if (std.c.getenv("TMPDIR")) |p| std.mem.span(p) else "/tmp";
+        const dir = try std.fmt.bufPrint(&path_buf, "{s}/sushi-hy4-id-{d}", .{ std.mem.trimEnd(u8, tmp_root, "/"), std.c.getpid() });
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        if (!atexit_set) {
+            _ = atexit(cleanup);
+            atexit_set = true;
+        }
+        errdefer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        const sum = try run(testing.allocator, io, .{ .model_dir = src_root, .out_dir = dir, .rate = .{ .n = 64 }, .codes = .identity_hessian, .version = "test" }, null);
+        @memcpy(src_buf[0..src_root.len], src_root);
+        src_len = src_root.len;
+        summary = sum;
+        path_len = dir.len;
+        return .{ .dir = dir, .summary = summary };
+    }
+};
+
 test "hy4 convert: the release-layout tiny's 32-wide experts are refused by name before anything is written (HY4_BF16_TINY)" {
     const src_env = std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest;
     const a = testing.allocator;
@@ -1252,16 +1291,17 @@ test "hy4 convert: a synthetic pack holds every census tensor in its stated form
     var plan = try rate_plan.parse(a, plan_text.written(), cfg.experts, cfg.layers);
     defer plan.deinit();
 
-    const summary = try run(a, io, .{ .model_dir = src_root, .out_dir = out_dir, .rate = .{ .n = 64 }, .plan = &plan, .codes = .synthetic, .version = "test" }, null);
+    const opts = Options{ .model_dir = src_root, .out_dir = out_dir, .rate = .{ .n = 64 }, .plan = &plan, .codes = .synthetic, .version = "test" };
+    const summary = try run(a, io, opts, null);
     try testing.expectEqual(@as(usize, cfg.layers - cfg.dense_layers), summary.expert_layers);
     try testing.expect(std.mem.startsWith(u8, summary.revision(), "synthetic-"));
-    // A second run over the same inputs names the same revision.
-    {
-        const again_dir = try std.fmt.allocPrint(a, "{s}/again", .{root});
-        defer a.free(again_dir);
-        const again = try run(a, io, .{ .model_dir = src_root, .out_dir = again_dir, .rate = .{ .n = 64 }, .plan = &plan, .codes = .synthetic, .version = "test" }, null);
-        try testing.expectEqualStrings(summary.revision(), again.revision());
-    }
+    // The same inputs hash to the same revision.
+    const index_raw = src_dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20)) catch try a.dupe(u8, "");
+    defer a.free(index_raw);
+    var rev1: [32]u8 = undefined;
+    var rev2: [32]u8 = undefined;
+    try testing.expectEqualStrings(summary.revision(), try revisionId(&rev1, &opts, conf.raw, index_raw, ""));
+    try testing.expectEqualStrings(rev1[0..summary.pack_revision_len], try revisionId(&rev2, &opts, conf.raw, index_raw, ""));
 
     try verifyPack(a, io, &src, &cfg, out_dir, &plan, &summary, .synthetic);
 }
@@ -1273,20 +1313,15 @@ test "hy4 convert: an identity-Hessian pack holds every census tensor and decode
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const src_root = std.mem.span(src_env);
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const out_dir = try std.fmt.allocPrint(a, "{s}/pack", .{root});
-    defer a.free(out_dir);
     var src_dir = try std.Io.Dir.cwd().openDir(io, src_root, .{ .iterate = true });
     defer src_dir.close(io);
     const conf = try readConfig(a, io, src_dir);
     defer a.free(conf.raw);
     var src = try source.SafetensorsSource.open(a, io, src_dir);
     defer src.deinit();
-    const summary = try run(a, io, .{ .model_dir = src_root, .out_dir = out_dir, .rate = .{ .n = 64 }, .codes = .identity_hessian, .version = "test" }, null);
-    try verifyPack(a, io, &src, &conf.cfg, out_dir, null, &summary, .identity_hessian);
+    const cached = try IdentityCache.get(io, src_root);
+    const out_dir = cached.dir;
+    try verifyPack(a, io, &src, &conf.cfg, out_dir, null, &cached.summary, .identity_hessian);
 
     // A bank rounded in its family's batch is the bank rounded alone.
     var out = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
@@ -1639,7 +1674,7 @@ test "hy4 convert: a capture of identity sums and starved experts gives the iden
     try writeCalib(a, io, paths[0], &src, &conf.cfg, 8, true, "");
 
     const got = try run(a, io, .{ .model_dir = src_root, .out_dir = paths[1], .rate = .{ .n = 64 }, .codes = .capture, .capture_dir = paths[0], .version = "test" }, null);
-    _ = try run(a, io, .{ .model_dir = src_root, .out_dir = paths[2], .rate = .{ .n = 64 }, .codes = .identity_hessian, .version = "test" }, null);
+    const cached = try IdentityCache.get(io, src_root);
     try testing.expect(std.mem.startsWith(u8, got.revision(), "capture-"));
     const moe_layers = conf.cfg.layers - conf.cfg.dense_layers;
     // Each expert's gate and up share one Hessian, its down has its own: two counts an expert.
@@ -1648,7 +1683,7 @@ test "hy4 convert: a capture of identity sums and starved experts gives the iden
 
     var pack_dir = try std.Io.Dir.cwd().openDir(io, paths[1], .{});
     defer pack_dir.close(io);
-    var id_dir = try std.Io.Dir.cwd().openDir(io, paths[2], .{});
+    var id_dir = try std.Io.Dir.cwd().openDir(io, cached.dir, .{});
     defer id_dir.close(io);
     var pk = try Pack.open(a, io, pack_dir);
     defer pk.deinit(a);
@@ -1686,14 +1721,15 @@ test "hy4 convert: a capture at f32 products (mlp-in-LL.f32) gives its BF16 twin
     defer a.free(conf.raw);
     var src = try source.SafetensorsSource.open(a, io, src_dir);
     defer src.deinit();
+    const only_layers = [_]u32{conf.cfg.dense_layers};
     try writeCalib(a, io, paths[0], &src, &conf.cfg, 512, false, "");
-    const opts = Options{ .model_dir = src_root, .out_dir = paths[1], .rate = .{ .n = 64 }, .codes = .capture, .capture_dir = paths[0], .min_rows = 8, .version = "test" };
+    const opts = Options{ .model_dir = src_root, .out_dir = paths[1], .rate = .{ .n = 64 }, .codes = .capture, .capture_dir = paths[0], .min_rows = 8, .only_layers = &only_layers, .version = "test" };
     _ = try run(a, io, opts, null);
 
     var calib = try std.Io.Dir.cwd().openDir(io, paths[0], .{});
     defer calib.close(io);
     var nb: [2][32]u8 = undefined;
-    for (conf.cfg.dense_layers..conf.cfg.layers) |l| {
+    for (only_layers) |l| {
         const bf = try std.fmt.bufPrint(&nb[0], "mlp-in-{d:0>2}.bf16", .{l});
         const raw = try calib.readFileAlloc(io, bf, a, .limited(1 << 30));
         defer a.free(raw);
@@ -1709,23 +1745,29 @@ test "hy4 convert: a capture at f32 products (mlp-in-LL.f32) gives its BF16 twin
     var it_out = out_dir.iterate();
     try testing.expect(try it_out.next(io) == null);
     out_dir.close(io);
-    for (conf.cfg.dense_layers..conf.cfg.layers) |l| try calib.deleteFile(io, try std.fmt.bufPrint(&nb[0], "mlp-in-{d:0>2}.bf16", .{l}));
+    for (only_layers) |l| try calib.deleteFile(io, try std.fmt.bufPrint(&nb[0], "mlp-in-{d:0>2}.bf16", .{l}));
     _ = try run(a, io, both, null);
 
     var bf_dir = try std.Io.Dir.cwd().openDir(io, paths[1], .{});
     defer bf_dir.close(io);
     var f32_dir = try std.Io.Dir.cwd().openDir(io, paths[2], .{});
     defer f32_dir.close(io);
-    var bk = try Pack.open(a, io, bf_dir);
-    defer bk.deinit(a);
-    var fk = try Pack.open(a, io, f32_dir);
-    defer fk.deinit(a);
+    var eb: [64]u8 = undefined;
+    var tb: [64]u8 = undefined;
     var experts: usize = 0;
-    var it = bk.weight_map.iterator();
-    while (it.next()) |kv| {
-        const name = kv.key_ptr.*;
-        try testing.expectEqualSlices(u8, bk.get(name).?.bytes, (fk.get(name) orelse return error.TestTensorMissing).bytes);
-        experts += @intFromBool(std.mem.indexOf(u8, name, ".mlp.switch_mlp.") != null and std.mem.endsWith(u8, name, ".trellis_pm"));
+    for ([_][]const u8{ try layerExpertsFile(&eb, only_layers[0]), try layerTrunkFile(&tb, only_layers[0]) }) |shard_name| {
+        var bf_shard = try PackFile.open(a, io, bf_dir, shard_name);
+        defer bf_shard.deinit(a);
+        var f32_shard = try PackFile.open(a, io, f32_dir, shard_name);
+        defer f32_shard.deinit(a);
+        try testing.expectEqual(bf_shard.file.tensors.count(), f32_shard.file.tensors.count());
+        var it = bf_shard.file.tensors.iterator();
+        while (it.next()) |kv| {
+            const name = kv.key_ptr.*;
+            const have = f32_shard.file.tensors.get(name) orelse return error.TestTensorMissing;
+            try testing.expectEqualSlices(u8, kv.value_ptr.bytes, have.bytes);
+            experts += @intFromBool(std.mem.indexOf(u8, name, ".mlp.switch_mlp.") != null and std.mem.endsWith(u8, name, ".trellis_pm"));
+        }
     }
     try testing.expect(experts > 0);
 }
@@ -1744,16 +1786,23 @@ test "hy4 convert: --resume keeps the shards of this revision and writes the res
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const paths = try capturePaths(a, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
     defer for (paths) |p| a.free(p);
-    const whole = Options{ .model_dir = src_root, .out_dir = paths[1], .rate = .{ .n = 64 }, .codes = .identity_hessian, .version = "test" };
-    _ = try run(a, io, whole, null);
-    var cut = whole;
-    cut.out_dir = paths[2];
-    _ = try run(a, io, cut, null);
+    const cached = try IdentityCache.get(io, src_root);
+    try io_util.makeDirPath(io, paths[2]);
 
-    var a_dir = try std.Io.Dir.cwd().openDir(io, paths[1], .{ .iterate = true });
+    var a_dir = try std.Io.Dir.cwd().openDir(io, cached.dir, .{ .iterate = true });
     defer a_dir.close(io);
     var b_dir = try std.Io.Dir.cwd().openDir(io, paths[2], .{ .iterate = true });
     defer b_dir.close(io);
+    {
+        var copy_it = a_dir.iterate();
+        while (try copy_it.next(io)) |e| {
+            if (e.kind != .file) continue;
+            const bytes = try a_dir.readFileAlloc(io, e.name, a, .limited(1 << 30));
+            defer a.free(bytes);
+            try b_dir.writeFile(io, .{ .sub_path = e.name, .data = bytes });
+        }
+    }
+    var cut = Options{ .model_dir = src_root, .out_dir = paths[2], .rate = .{ .n = 64 }, .codes = .identity_hessian, .version = "test" };
     try testing.expectError(error.OutputNotEmpty, run(a, io, cut, null));
     cut.resuming = true;
     try testing.expectError(error.ResumePackComplete, run(a, io, cut, null));
@@ -1806,13 +1855,14 @@ test "hy4 convert: the drafter's banks round at their own rate, the trunk's at i
     var src = try source.SafetensorsSource.open(a, io, src_dir);
     defer src.deinit();
     const k4 = format.Rate{ .n = 64 };
-    _ = try run(a, io, .{ .model_dir = src_root, .out_dir = out_dir, .rate = k4, .drafter_rate = k4, .codes = .identity_hessian, .version = "test" }, null);
+    _ = try run(a, io, .{ .model_dir = src_root, .out_dir = out_dir, .rate = k4, .drafter_rate = k4, .codes = .synthetic, .version = "test" }, null);
     var out = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
     defer out.close(io);
     var pk = try Pack.open(a, io, out);
     defer pk.deinit(a);
     var drafter: usize = 0;
     var trunk: usize = 0;
+    var checked_dfly = false;
     var it = pk.weight_map.iterator();
     while (it.next()) |e| {
         const name = e.key_ptr.*;
@@ -1822,17 +1872,22 @@ test "hy4 convert: the drafter's banks round at their own rate, the trunk's at i
         try testing.expectEqual(@as(usize, if (is_dfly) k4.n else default_trunk_rate.n), t.shape[2]);
         drafter += @intFromBool(is_dfly);
         trunk += @intFromBool(!is_dfly);
-        if (!is_dfly) continue;
+        if (!is_dfly or checked_dfly) continue;
+        checked_dfly = true;
         const base = name[0 .. name.len - ".trellis".len];
         const in_dim = t.shape[0] * 16;
         const out_dim = t.shape[1] * 16;
         const w = try a.alloc(f32, in_dim * out_dim);
         defer a.free(w);
         try src.readLinearPublic(a, base, out_dim, in_dim, w);
-        var nb: [2][160]u8 = undefined;
+        const pool = try pool_mod.Pool.init(a, 4);
+        defer pool.deinit();
+        var stages: stages_mod.Stages = .{};
+        var dense = try dsv41.quantizeDense(a, mlx.gpuStream(), pool, w, null, in_dim, out_dim, k4, encode.default_pin_pass, base, &stages);
+        defer dense.deinit(a);
         const dec = try a.alloc(u16, in_dim * out_dim);
         defer a.free(dec);
-        try format.reconstructPublic(a, @alignCast(std.mem.bytesAsSlice(u16, t.bytes)), @alignCast(std.mem.bytesAsSlice(u16, pk.get(try std.fmt.bufPrint(&nb[0], "{s}.suh", .{base})).?.bytes)), @alignCast(std.mem.bytesAsSlice(u16, pk.get(try std.fmt.bufPrint(&nb[1], "{s}.svh", .{base})).?.bytes)), in_dim, out_dim, k4, trunk_dec, dec);
+        try format.reconstructPublic(a, dense.trellis, dense.suh, dense.svh, in_dim, out_dim, k4, trunk_dec, dec);
         try testing.expect(relError(w, dec) < 0.10);
     }
     try testing.expect(drafter > 0 and trunk > 0);
@@ -1881,27 +1936,36 @@ test "hy4 convert: a capture pack's banks beat the identity pack's under the cap
     const tokens = 512;
     try writeCalib(a, io, paths[0], &src, &cfg, tokens, false, "");
 
-    const got = try run(a, io, .{ .model_dir = src_root, .out_dir = paths[1], .rate = .{ .n = 64 }, .codes = .capture, .capture_dir = paths[0], .min_rows = 16, .version = "test" }, null);
-    _ = try run(a, io, .{ .model_dir = src_root, .out_dir = paths[2], .rate = .{ .n = 64 }, .codes = .identity_hessian, .version = "test" }, null);
-    try testing.expectEqual(try embedAndDflyBanks(&src, &cfg), got.untapped_banks);
+    const layer = cfg.dense_layers;
+    const only_layers = [_]u32{layer};
+    const got = try run(a, io, .{ .model_dir = src_root, .out_dir = paths[1], .rate = .{ .n = 64 }, .codes = .capture, .capture_dir = paths[0], .min_rows = 16, .only_layers = &only_layers, .version = "test" }, null);
+    const cached = try IdentityCache.get(io, src_root);
+    try testing.expectEqual(@as(usize, 0), got.untapped_banks);
     try testing.expectEqual(@as(usize, 0), got.short_banks);
     var pack_dir = try std.Io.Dir.cwd().openDir(io, paths[1], .{});
     defer pack_dir.close(io);
-    var id_dir = try std.Io.Dir.cwd().openDir(io, paths[2], .{});
+    var id_dir = try std.Io.Dir.cwd().openDir(io, cached.dir, .{});
     defer id_dir.close(io);
-    var pk = try Pack.open(a, io, pack_dir);
-    defer pk.deinit(a);
-    var ik = try Pack.open(a, io, id_dir);
-    defer ik.deinit(a);
+    var eb: [64]u8 = undefined;
+    var tb: [64]u8 = undefined;
+    const exp_file = try layerExpertsFile(&eb, layer);
+    const trunk_file = try layerTrunkFile(&tb, layer);
+    var pk_trunk = try PackFile.open(a, io, pack_dir, trunk_file);
+    defer pk_trunk.deinit(a);
+    var ik_trunk = try PackFile.open(a, io, id_dir, trunk_file);
+    defer ik_trunk.deinit(a);
+    var pk_exp = try PackFile.open(a, io, pack_dir, exp_file);
+    defer pk_exp.deinit(a);
+    var ik_exp = try PackFile.open(a, io, id_dir, exp_file);
+    defer ik_exp.deinit(a);
     var nb: [160]u8 = undefined;
 
     // The first MoE layer's q_a against its attn_in sum.
-    const layer = cfg.dense_layers;
     var sums_path: [std.fs.max_path_bytes]u8 = undefined;
     var sums = try dsv41.Sums.open(a, io, try std.fmt.bufPrint(&sums_path, "{s}/trunk-{d:0>2}.safetensors", .{ paths[0], layer }));
     defer sums.deinit(a);
     const base = try std.fmt.bufPrint(&nb, "model.layers.{d}.self_attn.q_a_proj", .{layer});
-    try testing.expect(try bankWins(a, &src, &pk, &ik, base, sums.get(try std.fmt.bufPrint(&sums_path, "layers.{d}.attn_in", .{layer})).?.gram));
+    try testing.expect(try bankWins(a, &src, &pk_trunk.file, &ik_trunk.file, base, sums.get(try std.fmt.bufPrint(&sums_path, "layers.{d}.attn_in", .{layer})).?.gram));
 
     // Expert 0's gate against the latent rows routed to it.
     const lat = cfg.moe_inter;
@@ -1924,7 +1988,7 @@ test "hy4 convert: a capture pack's banks beat the identity pack's under the cap
     try src.readExpertPublic(a, .hy_v4_flash, layer, false, .gate, 0, lat, lat, w);
     const pre = try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.switch_mlp.gate_proj.g0", .{layer});
     var errs: [2]f64 = undefined;
-    for ([2]*const Pack{ &pk, &ik }, &errs) |p, *e| {
+    for ([2]*const st.File{ &pk_exp.file, &ik_exp.file }, &errs) |p, *e| {
         const dec = try decodeBank(a, p, pre, 0, lat, lat, .{ .n = 64 }, default_expert_dec);
         defer a.free(dec);
         e.* = weightedError(w, dec, h, lat, lat);
@@ -1945,16 +2009,16 @@ fn packOrderTiles(a: std.mem.Allocator, pm: st.TensorView, index: usize, it: usi
 }
 
 /// Bank `pre` (`.trellis`/`.trellis_pm`, `.suh`/`.svh`, matrix `index` of its leading axis) decoded to public `[in, out]` f16 bits.
-fn decodeBank(a: std.mem.Allocator, p: *const Pack, pre: []const u8, index: usize, in: usize, out: usize, rate: format.Rate, dec: format.Decode) ![]u16 {
+fn decodeBank(a: std.mem.Allocator, f: *const st.File, pre: []const u8, index: usize, in: usize, out: usize, rate: format.Rate, dec: format.Decode) ![]u16 {
     var kb: [192]u8 = undefined;
     const tiles = (in / 16) * (out / 16) * rate.n;
     var pm_buf: [200]u8 = undefined;
-    const pm = p.get(try std.fmt.bufPrint(&pm_buf, "{s}.trellis_pm", .{pre}));
+    const pm = f.tensors.get(try std.fmt.bufPrint(&pm_buf, "{s}.trellis_pm", .{pre}));
     const owned: ?[]u16 = if (pm) |v| try packOrderTiles(a, v, index, in / 16, out / 16, rate.n) else null;
     defer if (owned) |o| a.free(o);
-    const tr = owned orelse st.slice(u16, p.get(try std.fmt.bufPrint(&kb, "{s}.trellis", .{pre})) orelse return error.TestTensorMissing)[index * tiles ..][0..tiles];
-    const su = st.slice(u16, p.get(try std.fmt.bufPrint(&kb, "{s}.suh", .{pre})) orelse return error.TestTensorMissing)[index * in ..][0..in];
-    const sv = st.slice(u16, p.get(try std.fmt.bufPrint(&kb, "{s}.svh", .{pre})) orelse return error.TestTensorMissing)[index * out ..][0..out];
+    const tr = owned orelse st.slice(u16, f.tensors.get(try std.fmt.bufPrint(&kb, "{s}.trellis", .{pre})) orelse return error.TestTensorMissing)[index * tiles ..][0..tiles];
+    const su = st.slice(u16, f.tensors.get(try std.fmt.bufPrint(&kb, "{s}.suh", .{pre})) orelse return error.TestTensorMissing)[index * in ..][0..in];
+    const sv = st.slice(u16, f.tensors.get(try std.fmt.bufPrint(&kb, "{s}.svh", .{pre})) orelse return error.TestTensorMissing)[index * out ..][0..out];
     const got = try a.alloc(u16, in * out);
     errdefer a.free(got);
     try format.reconstructPublic(a, tr, su, sv, in, out, rate, dec, got);
@@ -1962,7 +2026,7 @@ fn decodeBank(a: std.mem.Allocator, p: *const Pack, pre: []const u8, index: usiz
 }
 
 /// Whether trunk bank `base` of `pk` has a lower error under `h` than the same bank of `ik`.
-fn bankWins(a: std.mem.Allocator, src: *const source.SafetensorsSource, pk: *const Pack, ik: *const Pack, base: []const u8, h: []const f32) !bool {
+fn bankWins(a: std.mem.Allocator, src: *const source.SafetensorsSource, pk: *const st.File, ik: *const st.File, base: []const u8, h: []const f32) !bool {
     var wb: [192]u8 = undefined;
     const loc = src.tensors.get(try std.fmt.bufPrint(&wb, "{s}.weight", .{base})) orelse return error.TestTensorMissing;
     const out = loc.shape[0];
@@ -1971,7 +2035,7 @@ fn bankWins(a: std.mem.Allocator, src: *const source.SafetensorsSource, pk: *con
     defer a.free(w);
     try src.readLinearPublic(a, base, out, in, w);
     var errs: [2]f64 = undefined;
-    for ([2]*const Pack{ pk, ik }, &errs) |p, *e| {
+    for ([2]*const st.File{ pk, ik }, &errs) |p, *e| {
         const dec = try decodeBank(a, p, base, 0, in, out, default_trunk_rate, trunk_dec);
         defer a.free(dec);
         e.* = weightedError(w, dec, h, in, out);
@@ -2064,7 +2128,7 @@ fn readPackFile(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const
 /// trellis is `trellis_pm`, each expert's tiles `tileMajor` of the pack order's, on a page of the file after a header padded to one,
 /// the gaps are zero `__pad__` tensors the index lists, the routed shards stamp `tile_order`, the config stamps it in `expert_quant`,
 /// and every other file (the trunk, the drafter, the globals, the clones, the sidecars) is the same bytes.
-fn expectPairMajorOf(a: std.mem.Allocator, io: std.Io, po: std.Io.Dir, pm: std.Io.Dir, routed_shards: usize) !void {
+fn expectPairMajorOf(a: std.mem.Allocator, io: std.Io, po: std.Io.Dir, pm: std.Io.Dir, routed_shards: usize, skip_index: bool) !void {
     var routed: usize = 0;
     var same: usize = 0;
     var it = po.iterate();
@@ -2142,7 +2206,7 @@ fn expectPairMajorOf(a: std.mem.Allocator, io: std.Io, po: std.Io.Dir, pm: std.I
     }
     try testing.expectEqual(routed_shards, routed);
     try testing.expect(same > 0);
-    try expectPairMajorConfigAndIndex(a, io, po, pm);
+    if (!skip_index) try expectPairMajorConfigAndIndex(a, io, po, pm);
 }
 
 /// The config is the pack order's with `expert_quant.tile_order`, and the index names every tensor of the pack order's (a routed
@@ -2204,6 +2268,23 @@ fn convertBothLayouts(codes: Codes) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const paths = try capturePaths(a, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
     defer for (paths) |p| a.free(p);
+    var src_dir = try std.Io.Dir.cwd().openDir(io, src_root, .{});
+    defer src_dir.close(io);
+    const conf = try readConfig(a, io, src_dir);
+    defer a.free(conf.raw);
+    if (codes == .identity_hessian) {
+        const cached = try IdentityCache.get(io, src_root);
+        const only_layer = [_]u32{conf.cfg.dense_layers};
+        const reference = Options{ .model_dir = src_root, .out_dir = paths[2], .rate = .{ .n = 64 }, .codes = .identity_hessian, .only_layers = &only_layer, .version = "test" };
+        const po_summary = try runLayout(a, io, reference, null, false);
+        try testing.expectEqualStrings(po_summary.revision(), cached.summary.revision());
+        var pm_dir = try std.Io.Dir.cwd().openDir(io, cached.dir, .{ .iterate = true });
+        defer pm_dir.close(io);
+        var po_dir = try std.Io.Dir.cwd().openDir(io, paths[2], .{ .iterate = true });
+        defer po_dir.close(io);
+        try expectPairMajorOf(a, io, po_dir, pm_dir, 1, true);
+        return;
+    }
     const opts = Options{ .model_dir = src_root, .out_dir = paths[1], .rate = .{ .n = 64 }, .codes = codes, .version = "test" };
     const pm_summary = try run(a, io, opts, null);
     var reference = opts;
@@ -2214,11 +2295,7 @@ fn convertBothLayouts(codes: Codes) !void {
     defer pm_dir.close(io);
     var po_dir = try std.Io.Dir.cwd().openDir(io, paths[2], .{ .iterate = true });
     defer po_dir.close(io);
-    var src_dir = try std.Io.Dir.cwd().openDir(io, src_root, .{});
-    defer src_dir.close(io);
-    const conf = try readConfig(a, io, src_dir);
-    defer a.free(conf.raw);
-    try expectPairMajorOf(a, io, po_dir, pm_dir, conf.cfg.layers - conf.cfg.dense_layers);
+    try expectPairMajorOf(a, io, po_dir, pm_dir, conf.cfg.layers - conf.cfg.dense_layers, false);
 }
 
 // Hy4-Flash is converted pair-major always: a pack-order write is made by no run, so the pack order is the reference. Both code

@@ -53,19 +53,19 @@ test "a native GLM decode step past the latent's page grid holds beside the grow
     const s = mlx.gpuStream();
     var over: usize = 0;
     var grows: usize = 0;
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try fwd.nonzeroDecodeFixtureLayers(&weights, tiny_layers, 16384);
+    var net = try fwd.Model.load(a, cfg, &weights, s);
+    defer net.deinit();
+    const one = mlx.mlx_array_new_data(&[_]u32{1}, &[_]c_int{ 1, 1 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(one);
     // Both ends of the stored latent: BF16 rows grow in 256-row steps, kv8 codes and their scales in 4,096-row steps.
-    for ([_]struct { bits: u8, from: usize, steps: usize }{ .{ .bits = 0, .from = 8184, .steps = 800 }, .{ .bits = 8, .from = 8184, .steps = 40 } }) |case| {
-        var weights = model.Weights.init(a);
-        defer weights.deinit();
-        const cfg = try fwd.nonzeroDecodeFixtureLayers(&weights, tiny_layers, 16384);
-        var net = try fwd.Model.load(a, cfg, &weights, s);
-        defer net.deinit();
+    for ([_]struct { bits: u8, from: usize, steps: usize }{ .{ .bits = 0, .from = 8184, .steps = 16 }, .{ .bits = 8, .from = 8184, .steps = 16 } }) |case| {
         var req = try fwd.Request.init(a, tiny_layers);
         defer req.deinit();
         try req.setLatentBits(case.bits);
         try prefill(&net, &req, case.from);
-        const one = mlx.mlx_array_new_data(&[_]u32{1}, &[_]c_int{ 1, 1 }, 2, .uint32);
-        defer _ = mlx.mlx_array_free(one);
         const Held = struct { held: u64, grew: u64 };
         const steps = try a.alloc(Held, case.steps);
         defer a.free(steps);

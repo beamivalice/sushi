@@ -2887,6 +2887,10 @@ test "Flash-Next on MLX: a max-context search with no cap or a large one prices 
 
 /// Whether some split of `ctx` (a prompt of the sweep and the reply to the context's end) bills over `budget`.
 fn someSplitOver(cfg: *const model_mod.ModelConfig, ctx: u64, budget: u64, chunk: u64, warm: WarmPrefix) bool {
+    const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
+    for ([_]u64{ ctx, @min(ctx, edge - 1), @min(ctx, edge) }) |c| {
+        if (c >= 1 and c <= ctx and splitBill(cfg, ctx, c, chunk, warm) > budget) return true;
+    }
     var p: u64 = 1;
     while (p <= ctx) : (p = nextSplitPrompt(p, ctx)) {
         if (splitBill(cfg, ctx, p, chunk, warm) > budget) return true;
@@ -2901,13 +2905,24 @@ fn splitBill(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, chunk: u6
     return prefillNeededAtChunk(&probe, prompt, @intCast(ctx - prompt), 8, chunk, warm);
 }
 
-/// The prompts a split sweep of `ctx` prices: every one near the context's end (past the longest that still regrows its
-/// cache, up to 511 rows under the end's step), the reservation and each 256-row step, a prime stride elsewhere (shorter
-/// than the QSA select sheet's steps, so a fall between two shows).
+/// Sparse boundary and log-spaced prompts a split sweep of `ctx` prices: near 1, powers of two +/- 1, the
+/// reservation edge, 256-row steps near the end, and ~25% geometric growth elsewhere.
 pub fn nextSplitPrompt(p: u64, ctx: u64) u64 {
+    if (p >= ctx) return p + 1;
     const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
-    const near = ctx - p < 600 or (p + 300 > edge and p < edge + 300) or p % 256 < 3 or p % 256 > 252;
-    return p + @as(u64, if (near) 1 else 53);
+    var best: u64 = @min(ctx, p + @max(1, p / 4));
+    const landmarks = [_]u64{
+        2,          255,        256,        257,        511,        512,        513,        1023,
+        1024,       1025,       2047,       2048,       2049,       4095,       4096,       4097,
+        8191,       8192,       8193,       16383,      16384,      16385,      edge -| 2,  edge -| 1,
+        edge,       edge + 1,   edge + 2,   65535,      65536,      65537,      131071,     131072,
+        131073,     262143,     262144,     262145,     ctx -| 512, ctx -| 257, ctx -| 256, ctx -| 255,
+        ctx -| 2,   ctx -| 1,   ctx,
+    };
+    for (landmarks) |lm| {
+        if (lm > p and lm < best) best = lm;
+    }
+    return best;
 }
 
 /// Whether the capacity a request's prefill leaves its cache already holds the reply (`KVCache.heldRows` under the hold the
@@ -3000,13 +3015,13 @@ test "Flash-Next on Cooler: a context is priced at its dearest split, which is t
         var at: u64 = 0;
         var longest_regrowing: u64 = 0;
         var p: u64 = 1;
-        while (p <= ctx) : (p += if (ctx - p < 600 or (p + 300 > edge and p < edge + 300)) 1 else 61) {
+        while (p <= ctx) : (p = nextSplitPrompt(p, ctx)) {
             const b = splitBill(&cfg, ctx, p, chunk, warm);
             if (b > dearest) {
                 dearest = b;
                 at = p;
             }
-            if (bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm).decode_regrow_bytes > 0) longest_regrowing = p;
+            if (!@import("../cooler_side.zig").onEngine(&cfg) and bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm).decode_regrow_bytes > 0) longest_regrowing = p;
         }
         const priced = bills.contextNeed(&probe, ctx, 8, chunk, warm);
         // The three splits the bill changes shape at: the longest that regrows, the first that does not, the edge.
@@ -3082,7 +3097,6 @@ test "on Sushi Cooler a request's bill never falls as its prompt grows a row at 
     const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const cfg = coolerFlashNext();
-    const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
     const ctx: u64 = 98_304;
     var falls: u32 = 0;
     for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 2048, 4096 }) |chunk| for ([_]u32{ 64, 4096, 65_536 }) |max_tokens| {
@@ -3092,8 +3106,7 @@ test "on Sushi Cooler a request's bill never falls as its prompt grows a row at 
         var prev: u64 = 0;
         var prev_p: u64 = 0;
         var p: u64 = 1;
-        // Every row near the old edge and the context's end, each chunk width's and each cache step's boundary, a prime stride elsewhere.
-        while (p <= ctx) : (p += if ((p + 300 > edge and p < edge + 300) or ctx - p < 600 or p % chunk < 3 or p % chunk > chunk - 3 or p % 256 < 3 or p % 256 > 252) @as(u64, 1) else 53) {
+        while (p <= ctx) : (p = nextSplitPrompt(p, ctx)) {
             const b = prefillNeededAtChunk(&probe, p, max_tokens, 8, chunk, warm);
             if (b < prev) {
                 falls += 1;

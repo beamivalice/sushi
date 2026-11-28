@@ -1303,9 +1303,12 @@ test "hy4 chain: N decode rows' score and value products in one launch each keep
         for (0..g) |i| {
             const d0 = mlx.engine.stats().dispatches;
             const sc = try steelScores(es, ql[i], qp[i], ck[i], pe[i]);
+            _ = try o.own(sc.s1);
+            _ = try o.own(sc.s2);
             want_s1[i] = try hostF32(&o, sc.s1);
             want_s2[i] = try hostF32(&o, sc.s2);
             const u = try steelValues(es, pr[i], ck[i]);
+            _ = try o.own(u);
             want_u[i] = try hostF32(&o, u);
             solo_l += mlx.engine.stats().dispatches - d0;
         }
@@ -1319,7 +1322,10 @@ test "hy4 chain: N decode rows' score and value products in one launch each keep
         try testing.expect(steelValuesGroupsApplies(es, @intCast(g), v_l, c_l));
         const d1 = mlx.engine.stats().dispatches;
         const sc = try steelScoresGroups(es, @intCast(g), s1l, s2l, c_l, e_l);
+        _ = try o.own(sc.s1);
+        _ = try o.own(sc.s2);
         const u = try steelValuesGroups(es, @intCast(g), v_l, c_l);
+        _ = try o.own(u);
         const joined_l = mlx.engine.stats().dispatches - d1;
         for (0..g) |i| {
             const sl = @as(usize, @intCast(i));

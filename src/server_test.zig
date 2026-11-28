@@ -26,8 +26,10 @@ const io = std.testing.io;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
-/// The allocator every server test serves with (`Poison`), for the client side's own buffers too.
+/// The allocator the client side uses (`Poison`), and the allocator the server uses (`server_gpa`: `Poison` on isolated
+/// `withServer`, `SharedPoison` on `SharedServer` so server allocations outlive a single test's leak check).
 var gpa: std.mem.Allocator = undefined;
+var server_gpa: std.mem.Allocator = undefined;
 var scenario: *const fn () anyerror!void = undefined;
 var failed: ?anyerror = null;
 
@@ -35,6 +37,31 @@ const Poison = struct {
     const vt: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
     fn child() std.mem.Allocator {
         return testing.allocator;
+    }
+    fn alloc(_: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        return child().rawAlloc(len, al, ra);
+    }
+    fn resize(_: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        if (!child().rawResize(mem, al, new_len, ra)) return false;
+        if (new_len < mem.len) @memset(mem[new_len..], 0xAA);
+        return true;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(_: *anyopaque, mem: []u8, al: std.mem.Alignment, ra: usize) void {
+        @memset(mem, 0xAA);
+        child().rawFree(mem, al, ra);
+    }
+    fn allocator() std.mem.Allocator {
+        return .{ .ptr = undefined, .vtable = &vt };
+    }
+};
+
+const SharedPoison = struct {
+    const vt: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn child() std.mem.Allocator {
+        return std.heap.smp_allocator;
     }
     fn alloc(_: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
         return child().rawAlloc(len, al, ra);
@@ -110,6 +137,12 @@ const Arch = struct { name: []const u8, tmp: testing.TmpDir, ssd_budget_gb: ?u32
 const Needs = struct {
     /// A chat or Responses reply that runs on for hundreds of tokens (`cooler_contract.server_long_replies`).
     long_replies: bool = false,
+    /// Only one built arch needs to run (arch-independent HTTP/WS/shutdown/drain checks).
+    one_arch: bool = false,
+    /// Only archs whose admission evicts hot cache (`qwen4`).
+    evicts_hot_cache: bool = false,
+    /// Reuse one persistent resident server per arch for steady-state tests (`max_concurrent = 4`).
+    shared: bool = false,
     /// A second copy of the fixture, served as `tiny2`.
     tiny2: bool = false,
     /// How many models the registry keeps resident.
@@ -127,6 +160,272 @@ const Needs = struct {
     kv_cap_tokens: ?u64 = null,
 };
 
+const test_rest = @import("test_rest.zig");
+
+const SharedServer = struct {
+    const shared_alloc = SharedPoison.allocator();
+    const shared_io = std.Io.Threaded.global_single_threaded.io();
+
+    var active: bool = false;
+    var active_name: []const u8 = "";
+    var active_long_replies: bool = false;
+    var active_evicts: bool = false;
+    var active_ssd: ?u32 = null;
+    var tmp: testing.TmpDir = undefined;
+    var old_home_buf: [1024]u8 = undefined;
+    var old_home_len: ?usize = null;
+    var home_z: [1024:0]u8 = undefined;
+    var cache_z: [1024:0]u8 = undefined;
+    var settings_buf: [1024]u8 = undefined;
+    var was_enabled: bool = false;
+    var prev_max: u32 = 1;
+    var prev_flag: ?u32 = null;
+    var prev_file: ?u32 = null;
+    var unwire_was: u32 = 0;
+    var prev_gpu_warm_secs: u32 = 60;
+    var reg: *ModelRegistry = undefined;
+    var stub: model_load.CpuState = undefined;
+    var serve_params: model_load.LoadParams = undefined;
+    var serve_thread: std.Thread = undefined;
+    var serve_err: ?anyerror = null;
+    var ready_event: std.Io.Event = .unset;
+    var stop_event: std.Io.Event = .unset;
+
+    fn clientThreadMain() void {
+        ready_event.set(shared_io);
+        stop_event.waitUncancelable(shared_io);
+        server.requestShutdown();
+    }
+
+    fn startClientWait() anyerror!std.Thread {
+        return std.Thread.spawn(.{}, clientThreadMain, .{});
+    }
+
+    fn serveMain() void {
+        server.serve(shared_io, shared_alloc, serve_params, stub.config, "127.0.0.1", 0, .{
+            .embedded_client = startClientWait,
+            .request_timeout_sec = 300,
+            .test_on_cooler = true,
+            .test_skip_warm = true,
+        }) catch |err| {
+            serve_err = err;
+            ready_event.set(shared_io);
+        };
+    }
+
+    fn matches(name: []const u8, needs: Needs) bool {
+        if (!active) return false;
+        if (!std.mem.eql(u8, active_name, name)) return false;
+        if (needs.long_replies and !active_long_replies) return false;
+        if (needs.evicts_hot_cache and !active_evicts) return false;
+        return true;
+    }
+
+    fn start(x: *Arch, long_replies: bool, evicts: bool) !void {
+        stop();
+        var clean_tmp = true;
+        errdefer if (clean_tmp) x.tmp.cleanup();
+
+        tmp = x.tmp;
+        x.tmp = undefined;
+        clean_tmp = false;
+        errdefer tmp.cleanup();
+
+        try tmp.dir.createDirPath(shared_io, "home/.sushi");
+        try tmp.dir.createDirPath(shared_io, "cache");
+        var root_buf: [512]u8 = undefined;
+        const root = root_buf[0..try tmp.dir.realPath(shared_io, &root_buf)];
+        var pb: [1024]u8 = undefined;
+        const model_dir = try std.fmt.bufPrint(&pb, "{s}/m", .{root});
+        const home = try std.fmt.bufPrintSentinel(&home_z, "{s}/home", .{root}, 0);
+        const cache = try std.fmt.bufPrintSentinel(&cache_z, "{s}/cache", .{root}, 0);
+
+        old_home_len = null;
+        if (std.c.getenv("HOME")) |h| {
+            const hs = std.mem.span(h);
+            const copied = try std.fmt.bufPrintSentinel(&old_home_buf, "{s}", .{hs}, 0);
+            old_home_len = copied.len;
+        }
+        _ = setenv("HOME", home.ptr, 1);
+        errdefer if (old_home_len) |l| {
+            old_home_buf[l] = 0;
+            _ = setenv("HOME", @ptrCast(&old_home_buf), 1);
+        };
+        _ = setenv("SUSHI_PREFIX_CACHE_DIR", cache.ptr, 1);
+        errdefer _ = unsetenv("SUSHI_PREFIX_CACHE_DIR");
+
+        was_enabled = mlx.engine.enabled;
+        mlx.engine.enabled = true;
+        errdefer test_support.restoreEngine(was_enabled);
+
+        reg = try ModelRegistry.init(shared_alloc, shared_io, null, 2, 0, null);
+        errdefer reg.deinit();
+        reg.settings_path = try std.fmt.bufPrint(&settings_buf, "{s}/.sushi/model-settings.json", .{home});
+        if (x.ssd_budget_gb) |gb| {
+            const settings = try std.fmt.allocPrint(shared_alloc, "{{\"{s}\":{{\"ssd_budget_gb\":{d}}}}}", .{ model_dir, gb });
+            defer shared_alloc.free(settings);
+            try tmp.dir.writeFile(shared_io, .{ .sub_path = "home/.sushi/model-settings.json", .data = settings });
+        }
+        const entry = try reg.registerStub("tiny", model_dir, 90 << 20);
+        try reg.setDefault("tiny");
+
+        stub = try model_load.headlessStubCpuState(shared_alloc);
+        errdefer model_load.freeCpuState(shared_alloc, &stub);
+        serve_params = .{
+            .registry = reg,
+            .entry = entry,
+            .config = stub.config,
+            .tok = stub.tok,
+            .chat_config = stub.chat_config,
+            .model_dir = "",
+            .no_initial_load = true,
+            .load_vision = false,
+            .warmup_eager = false,
+            .prefix_cache_capacity = server_state.prefix_cache_capacity,
+            .prefix_cache_ram_enabled = server_state.prefix_cache_ram_enabled,
+            .prefix_cache_mem_bytes = server_state.prefix_cache_mem_bytes,
+            .prefix_cache_mem_resolver = server.prefixCacheMemForLoad,
+            .prefix_cache_disk_resolver = server.prefixCacheDiskForLoad,
+            .expert_cache_fit_resolver = server.expertCacheFitForLoad,
+            .ssm_checkpoint_stride = server_state.ssm_checkpoint_stride,
+            .ssm_checkpoint_max = server_state.ssm_checkpoint_max,
+        };
+
+        unwire_was = model_load.unwire_wait_max_ms;
+        model_load.unwire_wait_max_ms = 0;
+        errdefer model_load.unwire_wait_max_ms = unwire_was;
+
+        prev_gpu_warm_secs = scheduler_mod.gpu_warm_secs;
+        scheduler_mod.gpu_warm_secs = 0;
+        errdefer scheduler_mod.gpu_warm_secs = prev_gpu_warm_secs;
+
+        prev_max = server_state.max_concurrent;
+        prev_flag = server_state.max_concurrent_flag;
+        prev_file = server_state.maxConcurrentFile();
+        server_state.max_concurrent = 4;
+        server_state.max_concurrent_flag = 4;
+        errdefer {
+            server_state.max_concurrent = prev_max;
+            server_state.max_concurrent_flag = prev_flag;
+            server_state.setMaxConcurrentFile(prev_file);
+        }
+
+        server_state.shutdown_requested.store(false, .release);
+        server.accept_spawned_with_hooks = false;
+        ready_event.reset();
+        stop_event.reset();
+        serve_err = null;
+        serve_thread = try std.Thread.spawn(.{}, serveMain, .{});
+        ready_event.waitUncancelable(shared_io);
+        if (serve_err) |e| {
+            stop_event.set(shared_io);
+            serve_thread.join();
+            server_state.shutdown_requested.store(false, .release);
+            return e;
+        }
+        active = true;
+        active_name = x.name;
+        active_long_replies = long_replies;
+        active_evicts = evicts;
+        active_ssd = x.ssd_budget_gb;
+
+        gpa = Poison.allocator();
+        server_gpa = shared_alloc;
+        scenario_limit_ms = load_limit_ms;
+        failed = null;
+        ready() catch |e| {
+            stop();
+            return e;
+        };
+        drainQuiet();
+        test_rest.held = .{
+            .holds = mlx.engine.holdCount(),
+            .quiesce = drainQuiet,
+            .rest = sharedRest,
+            .close = sharedClose,
+        };
+    }
+
+    fn drainQuiet() void {
+        var waited: usize = 0;
+        while (waited < 5000) : (waited += 1) {
+            var busy = server.activeConnections() != 0 or !mlx.engine.turnIdle();
+            if (!busy) if (server_state.global_scheduler) |sch| {
+                sch.queue_mu.lockUncancelable(sch.io);
+                busy = !sch.parked or sch.in_flight != 0 or sch.cleanup_queue.items.len != 0 or sch.decoding.items.len != 0 or sch.prefilling.items.len != 0 or sch.pending.items.len != 0;
+                sch.queue_mu.unlock(sch.io);
+            };
+            if (!busy) return;
+            var none = [_]std.posix.pollfd{};
+            _ = std.posix.poll(&none, 1) catch {};
+        }
+    }
+
+    fn run(body: *const fn () anyerror!void, needs: Needs) !void {
+        gpa = Poison.allocator();
+        server_gpa = shared_alloc;
+        scenario_limit_ms = if (needs.loads) load_limit_ms else if (needs.decodes) decode_limit_ms else read_limit_ms;
+        failed = null;
+        defer {
+            drainQuiet();
+        }
+        try body();
+    }
+
+    fn stop() void {
+        if (!active) return;
+        active = false;
+        active_name = "";
+        test_rest.held = .{};
+        stop_event.set(shared_io);
+        serve_thread.join();
+        server_state.shutdown_requested.store(false, .release);
+        model_load.freeCpuState(shared_alloc, &stub);
+        reg.deinit();
+        server_state.max_concurrent = prev_max;
+        server_state.max_concurrent_flag = prev_flag;
+        server_state.setMaxConcurrentFile(prev_file);
+        model_load.unwire_wait_max_ms = unwire_was;
+        scheduler_mod.gpu_warm_secs = prev_gpu_warm_secs;
+        test_support.restoreEngine(was_enabled);
+        _ = unsetenv("SUSHI_PREFIX_CACHE_DIR");
+        if (old_home_len) |l| {
+            old_home_buf[l] = 0;
+            _ = setenv("HOME", @ptrCast(&old_home_buf), 1);
+        }
+        tmp.cleanup();
+    }
+
+    fn sharedRest(w: *std.Io.Writer) bool {
+        if (!active) return false;
+        drainQuiet();
+        var bad = false;
+        if (server.activeConnections() != 0) {
+            w.print(" {d} active HTTP connections left;", .{server.activeConnections()}) catch {};
+            bad = true;
+        }
+        if (server_state.shutdown_requested.load(.acquire)) {
+            w.writeAll(" server shutdown requested;") catch {};
+            bad = true;
+        }
+        if (server_state.global_scheduler) |sch| {
+            sch.queue_mu.lockUncancelable(sch.io);
+            const busy = sch.in_flight != 0 or sch.pending.items.len != 0 or sch.prefilling.items.len != 0 or sch.decoding.items.len != 0 or sch.cleanup_queue.items.len != 0;
+            sch.queue_mu.unlock(sch.io);
+            if (busy) {
+                w.writeAll(" scheduler queues left non-empty;") catch {};
+                bad = true;
+            }
+        }
+        return bad;
+    }
+
+    fn sharedClose(w: *std.Io.Writer) bool {
+        stop();
+        return mlx.engine.leftByTest(w, 0) catch true;
+    }
+};
+
 /// `body` as the embedded client of a server of `max_concurrent` rows, once per arch that declares a servable fixture
 /// with what `needs` asks. An arch whose fixture is missing is left out before any load and named on the test's log
 /// line (`test_note.notePartSkipped`); the test skips only when no arch is left.
@@ -135,40 +434,99 @@ var arch_missing_for_test: ?[]const u8 = null;
 
 fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void) !void {
     try mlx.requireGpu();
-    var archs: [std.meta.tags(registry.Tag).len]?Arch = @splat(null);
+    if (needs.shared) {
+        std.debug.assert(max_concurrent == 4 or max_concurrent == 2);
+        std.debug.assert(!needs.tiny2 and !needs.cold and !needs.listener and needs.kv_cap_tokens == null);
+    }
+    if (needs.shared and needs.one_arch and SharedServer.active and SharedServer.matches(SharedServer.active_name, needs)) {
+        serving_arch = SharedServer.active_name;
+        return SharedServer.run(body, needs) catch |e| {
+            if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ serving_arch, @errorName(e) });
+            if (e == error.ReadTimedOut or e == error.FdPastWireTable) std.debug.print("  {s}\n", .{waitedOn()});
+            return e;
+        };
+    }
+    const N = std.meta.tags(registry.Tag).len;
+    var archs: [N]?Arch = @splat(null);
+    var arch_long: [N]bool = @splat(false);
+    var arch_evicts: [N]bool = @splat(false);
     defer for (&archs) |*a| if (a.*) |*x| x.tmp.cleanup();
     inline for (comptime std.meta.tags(registry.Tag), 0..) |t, i| {
         const M = registry.Mod(t);
-        if (comptime @hasDecl(M, "cooler_contract") and @hasDecl(M.cooler_contract, "serverDir")) if (!needs.long_replies or M.cooler_contract.server_long_replies) {
+        if (comptime @hasDecl(M, "cooler_contract") and @hasDecl(M.cooler_contract, "serverDir")) if (!needs.long_replies or M.cooler_contract.server_long_replies) if (!needs.evicts_hot_cache or t == .qwen4) {
+            const reuse_shared = needs.shared and SharedServer.matches(@tagName(t), needs);
             var tmp = testing.tmpDir(.{});
-            archs[i] = .{ .name = @tagName(t), .tmp = tmp, .ssd_budget_gb = if (@hasDecl(M.cooler_contract, "server_ssd_budget_gb")) M.cooler_contract.server_ssd_budget_gb else null };
-            const dirs = [_][]const u8{ "m", "m2" };
-            for (dirs[0..if (needs.tiny2) 2 else 1]) |sub| {
-                try tmp.dir.createDirPath(io, sub);
-                var m = try tmp.dir.openDir(io, sub, .{});
-                defer m.close(io);
-                const dir: anyerror!void = if (arch_missing_for_test) |n| (if (std.mem.eql(u8, n, @tagName(t))) error.SkipZigTest else M.cooler_contract.serverDir(m)) else M.cooler_contract.serverDir(m);
-                dir catch |e| {
-                    if (e != error.SkipZigTest) return e;
-                    archs[i].?.tmp.cleanup();
-                    archs[i] = null;
-                    @import("test_note.zig").notePartSkipped(@tagName(t) ++ ": its server fixture is missing");
-                    break;
-                };
+            var ok = true;
+            if (!reuse_shared) {
+                const dirs = [_][]const u8{ "m", "m2" };
+                for (dirs[0..if (needs.tiny2) 2 else 1]) |sub| {
+                    try tmp.dir.createDirPath(io, sub);
+                    var m = try tmp.dir.openDir(io, sub, .{});
+                    defer m.close(io);
+                    const dir: anyerror!void = if (arch_missing_for_test) |n| (if (std.mem.eql(u8, n, @tagName(t))) error.SkipZigTest else M.cooler_contract.serverDir(m)) else M.cooler_contract.serverDir(m);
+                    dir catch |e| {
+                        if (e != error.SkipZigTest) {
+                            tmp.cleanup();
+                            return e;
+                        }
+                        tmp.cleanup();
+                        ok = false;
+                        @import("test_note.zig").notePartSkipped(@tagName(t) ++ ": its server fixture is missing");
+                        break;
+                    };
+                }
+            }
+            if (ok) {
+                archs[i] = .{ .name = @tagName(t), .tmp = tmp, .ssd_budget_gb = if (@hasDecl(M.cooler_contract, "server_ssd_budget_gb")) M.cooler_contract.server_ssd_budget_gb else null };
+                arch_long[i] = M.cooler_contract.server_long_replies;
+                arch_evicts[i] = (t == .qwen4);
             }
         };
     }
     var any = false;
     for (archs) |a| any = any or a != null;
     if (!any) return error.SkipZigTest;
-    for (&archs) |*a| if (a.*) |*x| (blk: {
-        serving_arch = x.name;
-        break :blk withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, needs, body);
-    }) catch |e| {
-        if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ x.name, @errorName(e) });
-        if (e == error.ReadTimedOut or e == error.FdPastWireTable) std.debug.print("  {s}\n", .{waitedOn()});
-        return e;
+
+    // Order so an already-resident shared server runs first (0 extra reloads).
+    var order: [N]usize = undefined;
+    var order_len: usize = 0;
+    for (archs, 0..) |a, i| if (a) |x| {
+        if (needs.shared and SharedServer.matches(x.name, needs)) {
+            order[order_len] = i;
+            order_len += 1;
+        }
     };
+    for (archs, 0..) |a, i| if (a) |x| {
+        if (!(needs.shared and SharedServer.matches(x.name, needs))) {
+            order[order_len] = i;
+            order_len += 1;
+        }
+    };
+
+    for (order[0..order_len]) |idx| {
+        var x = &archs[idx].?;
+        serving_arch = x.name;
+        if (needs.shared) {
+            if (!SharedServer.matches(x.name, needs)) {
+                var moved = archs[idx].?;
+                archs[idx] = null;
+                try SharedServer.start(&moved, arch_long[idx], arch_evicts[idx]);
+            }
+            SharedServer.run(body, needs) catch |e| {
+                if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ serving_arch, @errorName(e) });
+                if (e == error.ReadTimedOut or e == error.FdPastWireTable) std.debug.print("  {s}\n", .{waitedOn()});
+                return e;
+            };
+        } else {
+            SharedServer.stop();
+            withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, needs, body) catch |e| {
+                if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ serving_arch, @errorName(e) });
+                if (e == error.ReadTimedOut or e == error.FdPastWireTable) std.debug.print("  {s}\n", .{waitedOn()});
+                return e;
+            };
+        }
+        if (needs.one_arch) break;
+    }
 }
 
 var each_arch_ran: u32 = 0;
@@ -180,7 +538,7 @@ test "server: a served cell runs on every arch whose fixture is present and note
     arch_missing_for_test = "qwen4";
     defer arch_missing_for_test = null;
     each_arch_ran = 0;
-    try eachArch(1, .{}, struct {
+    try eachArch(1, .{ .cold = true }, struct {
         fn body() anyerror!void {
             each_arch_ran += 1;
         }
@@ -258,6 +616,7 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, ne
         .ssm_checkpoint_max = server_state.ssm_checkpoint_max,
     };
     gpa = a;
+    server_gpa = a;
     scenario = body;
     loads_first = !needs.cold;
     scenario_limit_ms = if (needs.cold or needs.loads or needs.tiny2) load_limit_ms else if (needs.decodes) decode_limit_ms else read_limit_ms;
@@ -304,7 +663,7 @@ fn connect() !std.posix.fd_t {
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
     try track(sv[1], scenario_limit_ms);
-    server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
+    server.spawnConnection(server_gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
 
@@ -489,7 +848,7 @@ fn buffered(client: std.posix.fd_t) !usize {
 }
 
 test "server: a Responses continuation keeps the history it continues when that response is deleted mid-generation" {
-    try eachArch(4, .{ .long_replies = true }, struct {
+    try eachArch(4, .{ .long_replies = true, .shared = true }, struct {
         fn run() !void {
             const r1 = try request("POST", "/v1/responses", "{\"model\":\"tiny\",\"input\":\"remember the word salmon please\",\"max_output_tokens\":4,\"temperature\":0}");
             defer gpa.free(r1);
@@ -549,7 +908,7 @@ fn wsSend(fd: std.posix.fd_t, text: []const u8) !void {
 }
 
 test "server: a WebSocket store:false chain stays on its connection, never in the shared store, mid-turn too" {
-    try eachArch(4, .{ .long_replies = true }, struct {
+    try eachArch(4, .{ .long_replies = true, .shared = true }, struct {
         fn run() !void {
             const fd = try wsConnect();
             defer _ = std.c.close(fd);
@@ -590,7 +949,7 @@ fn within(ms: u32, done: *const fn () bool) bool {
 }
 
 test "server: a headless boot starts accepting only once the request hooks are installed" {
-    try eachArch(1, .{ .listener = true }, struct {
+    try eachArch(1, .{ .listener = true, .cold = true, .one_arch = true }, struct {
         fn run() !void {
             try testing.expect(server.accept_spawned_with_hooks);
         }
@@ -601,7 +960,7 @@ test "server: a boot that stops before its gate opened releases the request park
     const boot_gate = @import("boot_gate.zig");
     // The gate is the process's: a boot that never opened leaves it failed, which the other cells' servers must not see.
     defer boot_gate.process.open(io);
-    try eachArch(1, .{}, struct {
+    try eachArch(1, .{ .one_arch = true }, struct {
         fn parked() bool {
             return boot_gate.process.waiting.load(.acquire) == 1;
         }
@@ -686,7 +1045,7 @@ test "server: a shutdown with the submit queue full ends the request waiting for
 }
 
 test "server: a request whose connection thread reads it after the shutdown was asked is answered with the shutdown error" {
-    try eachArch(1, .{ .loads = true }, struct {
+    try eachArch(1, .{ .loads = true, .cold = true, .one_arch = true }, struct {
         fn run() !void {
             // The flag is up before the connection exists, so its thread's first read finds the shutdown with the
             // whole request already in the socket, as a thread the box scheduled late does.
@@ -772,7 +1131,7 @@ test "server: a client that stops reading its stream gives up its model, so an u
     const was = http_conn.send_limit_ms;
     http_conn.send_limit_ms = 200;
     defer http_conn.send_limit_ms = was;
-    try eachArch(4, .{ .loads = true }, struct {
+    try eachArch(4, .{ .loads = true, .one_arch = true }, struct {
         fn run() !void {
             const got = try behindAStalledReader(120_000);
             defer for (got) |g| gpa.free(g);
@@ -786,7 +1145,7 @@ test "server: an unload whose model stays held past its drain bound is refused b
     const was = scheduler_mod.Scheduler.unload_drain_ms;
     scheduler_mod.Scheduler.unload_drain_ms = 200;
     defer scheduler_mod.Scheduler.unload_drain_ms = was;
-    try eachArch(4, .{ .loads = true }, struct {
+    try eachArch(4, .{ .loads = true, .one_arch = true }, struct {
         fn run() !void {
             const got = try behindAStalledReader(120_000);
             defer for (got) |g| gpa.free(g);
@@ -800,7 +1159,7 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
     const was = http_conn.send_limit_ms;
     http_conn.send_limit_ms = 3000;
     defer http_conn.send_limit_ms = was;
-    try eachArch(4, .{ .loads = true }, struct {
+    try eachArch(4, .{ .loads = true, .one_arch = true }, struct {
         var asked: [3]Asked = undefined;
         fn allDone() bool {
             for (asked) |q| if (!q.done.load(.acquire)) return false;
@@ -847,101 +1206,50 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
     }.run);
 }
 
-test "server: a request asked after the shutdown for a model whose files fail to read answers the shutdown error" {
-    try eachArch(4, .{ .tiny2 = true }, struct {
-        fn run() !void {
-            gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
-            const reg = server_state.global_registry.?;
-            const path = reg.entries.get("tiny2").?.path;
-            var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
-            defer dir.close(io);
-            // A link (Flash-Next's tokenizer is the cut fixture's) goes first, so the shared fixture is never written.
-            dir.deleteFile(io, "tokenizer.json") catch {};
-            try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "not json" });
-            server.requestShutdown();
-            // The completion twice: the first must not store a failure the second answers from.
-            for ([_][2][]const u8{
-                .{ "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}" },
-                .{ "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}" },
-                .{ "/v1/load-model", "{\"model\":\"tiny2\"}" },
-                .{ "/v1/unload-model", "{\"model\":\"tiny2\"}" },
-            }) |q| {
-                const answer = try request("POST", q[0], q[1]);
-                defer gpa.free(answer);
-                if (!std.mem.startsWith(u8, answer, "HTTP/1.1 503") or std.mem.indexOf(u8, answer, @import("http.zig").shutting_down_message) == null) {
-                    std.debug.print("{s} {s} after the shutdown: {s}\n", .{ q[0], q[1], answer[0..@min(answer.len, 200)] });
-                    return error.NotTheShutdownError;
-                }
-            }
-        }
-    }.run);
-}
-
-test "server: a load-model asked after the shutdown answers the shutdown error, for a resident model or one to load" {
-    try eachArch(4, .{ .tiny2 = true }, struct {
-        fn run() !void {
-            gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
-            server.requestShutdown();
-            for ([_][]const u8{ "{\"model\":\"tiny\"}", "{\"model\":\"tiny2\"}" }) |body| {
-                const answer = try request("POST", "/v1/load-model", body);
-                defer gpa.free(answer);
-                if (!std.mem.startsWith(u8, answer, "HTTP/1.1 503") or std.mem.indexOf(u8, answer, @import("http.zig").shutting_down_message) == null or
-                    std.mem.indexOf(u8, answer, "\"shutting_down\"") == null)
-                {
-                    std.debug.print("/v1/load-model {s} after the shutdown: {s}\n", .{ body, answer[0..@min(answer.len, 300)] });
-                    return error.NotTheShutdownError;
-                }
-            }
-        }
-    }.run);
-}
-
 test "server: a load that fails after evicting the model in use leaves no view of the evicted model, so its retry serves" {
     const ram_was = server_state.prefix_cache_ram_enabled;
     defer server_state.prefix_cache_ram_enabled = ram_was;
     const Scenario = struct {
         var failed_loads: u32 = 0;
     };
-    for ([_]bool{ false, true }) |ram| {
-        server_state.prefix_cache_ram_enabled = ram;
-        try eachArch(4, .{ .tiny2 = true, .max_resident = 1 }, struct {
-            var revise_before: u64 = 0;
-            fn revisedAfterLoad() bool {
-                return server_state.global_scheduler.?.budget_revise_gen.load(.acquire) > revise_before;
-            }
-            fn run() !void {
-                var b: [512]u8 = undefined;
-                gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "the river runs to the sea and on and on", 8, false)));
-                const sch = server_state.global_scheduler.?;
-                revise_before = sch.budget_revise_gen.load(.acquire);
-                // The load of tiny2 evicts tiny, then fails at its first pool buffer.
-                mlx.engine.fault.arm(1);
-                const failed_load = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
-                defer gpa.free(failed_load);
-                const fired = !mlx.engine.fault.armed();
-                mlx.engine.fault.disarm();
-                if (!fired) return error.FaultNeverFired;
-                // An arch whose load absorbs that refusal (Flash-Next's does) has no failed load to look past; the count
-                // below fails the test when every arch absorbs it.
-                if (std.mem.startsWith(u8, failed_load, "HTTP/1.1 200")) return;
-                Scenario.failed_loads += 1;
-                const reg = server_state.global_registry.?;
-                reg.mutex.lockUncancelable(reg.io);
-                const tiny = reg.entries.get("tiny").?;
-                const evicted = tiny.state == .unloaded;
-                reg.mutex.unlock(reg.io);
-                if (!evicted) return error.VictimNotEvicted;
-                // The inference loop runs its post-load revise between jobs.
-                if (!within(5000, revisedAfterLoad)) return error.PostLoadReviseNeverRan;
-                if (sch.current_model == tiny or sch.hotPrefixCache() != null) return error.EvictedModelStillInView;
-                if (tiny.hot_gauge.resident.load(.monotonic) != 0) return error.EvictedModelHotCacheCredited;
-                gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
-                const retry = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
-                defer gpa.free(retry);
-                if (!std.mem.startsWith(u8, retry, "HTTP/1.1 200")) return error.RetryFailed;
-            }
-        }.run);
-    }
+    server_state.prefix_cache_ram_enabled = true;
+    try eachArch(4, .{ .tiny2 = true, .max_resident = 1 }, struct {
+        var revise_before: u64 = 0;
+        fn revisedAfterLoad() bool {
+            return server_state.global_scheduler.?.budget_revise_gen.load(.acquire) > revise_before;
+        }
+        fn run() !void {
+            var b: [512]u8 = undefined;
+            gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "the river runs to the sea and on and on", 8, false)));
+            const sch = server_state.global_scheduler.?;
+            revise_before = sch.budget_revise_gen.load(.acquire);
+            // The load of tiny2 evicts tiny, then fails at its first pool buffer.
+            mlx.engine.fault.arm(1);
+            const failed_load = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
+            defer gpa.free(failed_load);
+            const fired = !mlx.engine.fault.armed();
+            mlx.engine.fault.disarm();
+            if (!fired) return error.FaultNeverFired;
+            // An arch whose load absorbs that refusal (Flash-Next's does) has no failed load to look past; the count
+            // below fails the test when every arch absorbs it.
+            if (std.mem.startsWith(u8, failed_load, "HTTP/1.1 200")) return;
+            Scenario.failed_loads += 1;
+            const reg = server_state.global_registry.?;
+            reg.mutex.lockUncancelable(reg.io);
+            const tiny = reg.entries.get("tiny").?;
+            const evicted = tiny.state == .unloaded;
+            reg.mutex.unlock(reg.io);
+            if (!evicted) return error.VictimNotEvicted;
+            // The inference loop runs its post-load revise between jobs.
+            if (!within(5000, revisedAfterLoad)) return error.PostLoadReviseNeverRan;
+            if (sch.current_model == tiny or sch.hotPrefixCache() != null) return error.EvictedModelStillInView;
+            if (tiny.hot_gauge.resident.load(.monotonic) != 0) return error.EvictedModelHotCacheCredited;
+            gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
+            const retry = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
+            defer gpa.free(retry);
+            if (!std.mem.startsWith(u8, retry, "HTTP/1.1 200")) return error.RetryFailed;
+        }
+    }.run);
     try testing.expect(Scenario.failed_loads > 0);
 }
 
@@ -997,7 +1305,7 @@ test "server: a request for the model that is not current is credited only with 
     const Scenario = struct {
         var seen: u32 = 0;
     };
-    try eachArch(4, .{ .tiny2 = true, .max_resident = 2 }, struct {
+    try eachArch(4, .{ .tiny2 = true, .max_resident = 2, .evicts_hot_cache = true }, struct {
         fn run() !void {
             var p: [6000]u8 = undefined;
             var w: std.Io.Writer = .fixed(&p);
@@ -1225,7 +1533,7 @@ fn clearWiredFloor() void {
 }
 
 test "server: a Responses WebSocket turn refused before it runs ends in the error frame, whichever check refused it" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         const Case = struct { name: []const u8, frame: []const u8 };
         const long_input = blk: {
             var s: []const u8 = "";
@@ -1320,7 +1628,7 @@ test "server: an error on an Anthropic route takes Anthropic's envelope and stat
 }
 
 test "server: a message role no template renders is refused 400 naming it on chat, Messages and Responses, and the next request is served" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .shared = true }, struct {
         const Case = struct { path: []const u8, body: []const u8, field: []const u8 };
         fn run() !void {
             const cases = [_]Case{
@@ -1345,7 +1653,7 @@ test "server: a message role no template renders is refused 400 naming it on cha
 
 test "server: a continued reply holding only its thought resumes after its closed think block, on the chat and Anthropic routes" {
     // A thinking-on prompt is longer than DeepSeek's tiny holds (128 tokens), as a long reply is.
-    try eachArch(4, .{ .long_replies = true }, struct {
+    try eachArch(4, .{ .long_replies = true, .shared = true }, struct {
         const user = "{\"role\":\"user\",\"content\":\"What time is it?\"}";
         const thought = "I should check the clock.";
         fn chatTurn(comptime assistant: []const u8) []const u8 {
@@ -1387,7 +1695,7 @@ test "server: a continued reply holding only its thought resumes after its close
 
 test "server: a reply whose turn ends inside its thought is continued once after its closed think block, on every surface" {
     // A thinking-on prompt is longer than DeepSeek's tiny holds (128 tokens), as a long reply is.
-    try eachArch(4, .{ .long_replies = true }, struct {
+    try eachArch(4, .{ .long_replies = true, .shared = true }, struct {
         const user = "[{\"role\":\"user\",\"content\":\"What time is it?\"}]";
         /// The requests the seam ends: only a slot under this key.
         const key = "\"prompt_cache_key\":\"thought-seam\",";
@@ -1464,7 +1772,7 @@ test "server: a reply whose turn ends inside its thought is continued once after
 }
 
 test "server: a completions stream that fails mid-reply ends in a completions chunk, not a chat delta" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .shared = true }, struct {
         fn run() !void {
             defer mlx.engine.fault.disarm();
             var b: [512]u8 = undefined;
@@ -1491,7 +1799,7 @@ test "server: a completions stream that fails mid-reply ends in a completions ch
 }
 
 test "server: a WebSocket turn's response says the store the client asked for" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const fd = try wsConnect();
             defer _ = std.c.close(fd);
@@ -1573,7 +1881,7 @@ fn wsCompletedTurn(fd: std.posix.fd_t) !void {
 }
 
 test "server: a Responses WebSocket message sent as a binary frame is answered by an error frame and a 1003 close, never silence" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const fd = try wsConnect();
             defer _ = std.c.close(fd);
@@ -1593,7 +1901,7 @@ test "server: a Responses WebSocket message sent as a binary frame is answered b
 }
 
 test "server: a WebSocket upgrade the server cannot complete is answered 400, never closed bare" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const fd = try connect();
             defer _ = std.c.close(fd);
@@ -1615,7 +1923,7 @@ fn readLimit(fd: std.posix.fd_t, sec: i64) !void {
 }
 
 test "server: a shutdown closes a WebSocket idle between turns with 1001 and an idle connection at once, and serve runs its teardown" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true }, struct {
         fn run() !void {
             // Between turns, as Codex keeps one.
             const ws = try wsConnect();
@@ -1640,7 +1948,7 @@ test "server: a WebSocket idle between turns does not hold its model against an 
     const was = scheduler_mod.Scheduler.unload_drain_ms;
     scheduler_mod.Scheduler.unload_drain_ms = 2000;
     defer scheduler_mod.Scheduler.unload_drain_ms = was;
-    try eachArch(4, .{ .loads = true }, struct {
+    try eachArch(4, .{ .loads = true, .one_arch = true }, struct {
         fn run() !void {
             const ws = try wsConnect();
             defer _ = std.c.close(ws);
@@ -1658,7 +1966,7 @@ test "server: a WebSocket idle between turns does not hold its model against an 
 }
 
 test "server: a WebSocket turn routes its own model: an unregistered model path is refused in its error frame, as its HTTP route refuses it" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const http_answer = try request("POST", "/v1/responses", "{\"model\":\"/nonexistent/sushi-test/model\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
             defer gpa.free(http_answer);
@@ -1794,7 +2102,7 @@ fn connectWide() !std.posix.fd_t {
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     try track(sv[1], scenario_limit_ms);
-    server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
+    server.spawnConnection(server_gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
 
@@ -1904,7 +2212,7 @@ fn cancelById(id: u64) !void {
 const blocker_body = "{\"model\":\"tiny\",\"max_tokens\":1,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
 
 test "server: a request cancelled before its first token or mid-reply ends on every surface in one terminal that says cancelled, with usage counting what it returned" {
-    try eachArch(4, .{ .long_replies = true }, struct {
+    try eachArch(4, .{ .long_replies = true, .shared = true }, struct {
         fn run() !void {
             gpa.free(try request("POST", "/v1/chat/completions", blocker_body));
             try PrefillHold.install();
@@ -2052,7 +2360,7 @@ fn connectReceiveWide() !std.posix.fd_t {
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     try track(sv[1], 10_000);
-    server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
+    server.spawnConnection(server_gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
 
@@ -2072,7 +2380,7 @@ fn msUntilClosed(fd: std.posix.fd_t) !i64 {
 }
 
 test "server: a chunked upload sent whole, larger than the reader's buffer, is answered rather than left waiting in a read" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             // Loads the model first, so the 10 s each answer may take is the request's own.
             var wb: [512]u8 = undefined;
@@ -2120,7 +2428,7 @@ test "server: a chunked upload sent whole, larger than the reader's buffer, is a
 }
 
 test "server: a shutdown while a body trickles, a chunked upload waits and a frame is half sent ends each connection at once" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .cold = true, .one_arch = true }, struct {
         fn run() !void {
             const a1 = try connect();
             defer _ = std.c.close(a1);
@@ -2159,7 +2467,7 @@ test "server: a shutdown while a body trickles, a chunked upload waits and a fra
 }
 
 test "server: a Content-Length body read past the reader's buffer, then stalled, ends at a shutdown" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .cold = true, .one_arch = true }, struct {
         fn run() !void {
             const fd = try connectReceiveWide();
             defer _ = std.c.close(fd);
@@ -2211,7 +2519,7 @@ fn parseBody(bytes: []const u8) !std.json.Parsed(std.json.Value) {
 }
 
 test "server: h21 a Responses envelope echoing service_tier is valid JSON" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             // A tier with a quote and a backslash, and one that closes the string to inject a sibling field.
             const tiers = [_][]const u8{ "a\\\"b\\\\", "x\\\",\\\"injected\\\":\\\"1" };
@@ -2256,7 +2564,7 @@ test "server: h21 a Responses envelope echoing service_tier is valid JSON" {
 }
 
 test "server: a chat object tool_choice naming no function, and a Responses field of the wrong type, are refused by name on every route that reads them" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         const Case = struct { path: []const u8, body: []const u8, field: []const u8 };
         const chat_tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         const cases = [_]Case{
@@ -2281,7 +2589,7 @@ test "server: a chat object tool_choice naming no function, and a Responses fiel
 }
 
 test "server: a non-zero think_penalty or non-empty logit_bias is refused with 400 on every route" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .shared = true }, struct {
         const Case = struct { path: []const u8, body: []const u8, param: []const u8 };
         const chat_tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         const cases = [_]Case{
@@ -2306,7 +2614,7 @@ test "server: a non-zero think_penalty or non-empty logit_bias is refused with 4
 }
 
 test "server: /v1/responses serves Codex's namespace tool, echoes it, and refuses its hosted web_search naming the setting" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         const function = "{\"type\":\"function\",\"name\":\"exec_command\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}}}}";
         const namespace = "{\"type\":\"namespace\",\"name\":\"multi_agent_v1\",\"description\":\"Sub-agents.\",\"tools\":[{\"type\":\"function\",\"name\":\"close_agent\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"}}}}]}";
         // tool_choice none keeps the tools out of the prompt, which a tiny context cannot hold; the request still reads them.
@@ -2336,7 +2644,7 @@ test "server: /v1/responses serves Codex's namespace tool, echoes it, and refuse
 }
 
 test "server: h21 a request field of the wrong type is refused by name, never read as absent" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         const Case = struct { path: []const u8, body: []const u8, field: []const u8 };
         const chat_tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         const cases = [_]Case{
@@ -2375,7 +2683,7 @@ test "server: h21 a request field of the wrong type is refused by name, never re
 }
 
 test "server: h21 a Responses stream cut by max_output_tokens ends in response.incomplete" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const resp = try request("POST", "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":1,\"temperature\":0,\"stream\":true,\"reasoning\":{\"effort\":\"none\"},\"input\":\"hi\"}");
             defer gpa.free(resp);
@@ -2435,7 +2743,7 @@ fn jsonInt(v: std.json.Value, path: []const []const u8) ?i64 {
 }
 
 test "server: h21 a null or zero token-budget field leaves the surface's alias in force" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const resp = try request("POST", "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":null,\"max_tokens\":1,\"temperature\":0,\"reasoning\":{\"effort\":\"none\"},\"input\":\"hi\"}");
             defer gpa.free(resp);
@@ -2454,7 +2762,7 @@ test "server: h21 a null or zero token-budget field leaves the surface's alias i
 }
 
 test "server: h21 a tool_choice the surface does not serve is refused by name, never read as auto" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         const Case = struct { path: []const u8, body: []const u8, field: []const u8 };
         const tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         const cases = [_]Case{
@@ -2485,7 +2793,7 @@ fn askedBeforeServed(path: []const u8, body: []const u8) ![]u8 {
     defer _ = std.c.close(sv[1]);
     try track(sv[1], 30_000);
     try send(sv[1], "POST", path, body);
-    server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
+    server.spawnConnection(server_gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return readUntil(sv[1], null);
 }
 
@@ -2498,10 +2806,17 @@ fn saysShutdown(path: []const u8, answer: []const u8) bool {
         (std.mem.indexOf(u8, answer, ty) != null or (!anthropic and std.mem.indexOf(u8, answer, code) != null));
 }
 
-test "server: every route asked after the shutdown answers the one shutdown error" {
-    try eachArch(4, .{ .tiny2 = true }, struct {
+test "server: every route, load-model, and corrupt-file request asked after the shutdown answers the one shutdown error" {
+    try eachArch(4, .{ .tiny2 = true, .one_arch = true }, struct {
         fn run() !void {
             gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
+            const reg = server_state.global_registry.?;
+            const path = reg.entries.get("tiny2").?.path;
+            var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+            defer dir.close(io);
+            // A link (Flash-Next's tokenizer is the cut fixture's) goes first, so the shared fixture is never written.
+            dir.deleteFile(io, "tokenizer.json") catch {};
+            try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "not json" });
             server.requestShutdown();
             const rows = [_][2][]const u8{
                 .{ "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}" },
@@ -2512,16 +2827,19 @@ test "server: every route asked after the shutdown answers the one shutdown erro
                 .{ "/v1/messages", "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
                 .{ "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":2,\"input\":\"hi\"}" },
                 .{ "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":2,\"stream\":true,\"input\":\"hi\"}" },
+                // Twice for tiny2 with corrupt tokenizer.json: the first must not store a failure the second answers from.
+                .{ "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}" },
                 .{ "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}" },
                 .{ "/v1/load-model", "{\"model\":\"tiny2\"}" },
                 .{ "/v1/load-model", "{\"model\":\"tiny\"}" },
+                .{ "/v1/unload-model", "{\"model\":\"tiny2\"}" },
                 .{ "/v1/unload-model", "{\"model\":\"tiny\"}" },
             };
             var bad: usize = 0;
             for (rows) |row| {
                 const answer = try askedBeforeServed(row[0], row[1]);
                 defer gpa.free(answer);
-                if (!saysShutdown(row[0], answer)) {
+                if (!std.mem.startsWith(u8, answer, "HTTP/1.1 503") or !saysShutdown(row[0], answer)) {
                     std.debug.print("after shutdown {s} {s}: {s}\n", .{ row[0], row[1], answer[0..@min(answer.len, 320)] });
                     bad += 1;
                 }
@@ -2555,7 +2873,7 @@ const Flood = struct {
 };
 
 test "server: a shutdown ends a chunked upload whose client floods carriage returns, and a WebSocket fed empty continuation frames" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .cold = true, .one_arch = true }, struct {
         var active_floods: *[2]Flood = undefined;
         fn floodsActive() bool {
             return (active_floods[0].writes.load(.acquire) >= 4 or active_floods[0].ended_ms.load(.acquire) != 0) and
@@ -2616,7 +2934,7 @@ fn rawExchange(bytes: []const u8) ![]u8 {
 }
 
 test "server: an unload whose Content-Length has no space after its colon unloads the model it names, or is refused, never another" {
-    try eachArch(4, .{ .tiny2 = true }, struct {
+    try eachArch(4, .{ .tiny2 = true, .one_arch = true }, struct {
         fn run() !void {
             gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
             gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
@@ -2637,17 +2955,18 @@ test "server: an unload whose Content-Length has no space after its colon unload
 test "server: an unload whose Content-Length has whitespace before its colon, is folded or follows a bare LF unloads the model it names, or is refused" {
     // RFC 9112 §5.1 (whitespace before the colon: MUST 400), §5.2 (obs-fold: 400 or SP), §2.2 (bare LF: a line end or
     // refused). The contract of h15-1's served test: unloads the model it names, or a 400, never another.
-    try eachArch(4, .{ .tiny2 = true }, struct {
+    try eachArch(4, .{ .tiny2 = true, .one_arch = true }, struct {
         fn run() !void {
             var bad: usize = 0;
+            gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
+            gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
             for ([_][]const u8{
                 "Content-Length : 17\r\n",
                 "Content-Length\t:17\r\n",
                 "Content-Length: 1\r\n 7\r\n",
                 "X-A: b\nContent-Length: 17\r\n",
             }) |field| {
-                gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
-                gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
+                if (modelState("tiny2") != .ready) gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
                 const before = .{ modelState("tiny"), modelState("tiny2") };
                 const sent = try std.mem.concat(gpa, u8, &.{ "POST /v1/unload-model HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n", field, "\r\n{\"model\":\"tiny2\"}" });
                 defer gpa.free(sent);
@@ -2666,7 +2985,7 @@ test "server: an unload whose Content-Length has whitespace before its colon, is
 }
 
 test "server: a ping sent in the same write as the WebSocket upgrade gets its pong" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const fd = try connect();
             defer _ = std.c.close(fd);
@@ -2692,7 +3011,7 @@ test "server: a ping sent in the same write as the WebSocket upgrade gets its po
 }
 
 test "server: a second serve in one process takes downloads, as the first did: its shutdown closed them, its boot opens them" {
-    for (0..2) |_| try eachArch(1, .{}, struct {
+    for (0..2) |_| try eachArch(1, .{ .cold = true, .one_arch = true }, struct {
         fn run() !void {
             if (!downloads.serving()) return error.DownloadsStoppedByAnEarlierServe;
         }
@@ -2700,7 +3019,7 @@ test "server: a second serve in one process takes downloads, as the first did: i
 }
 
 test "server: a request that asks for logprobs is refused 400 naming the field on chat, completions and Responses, and one that turns them off is served" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         const Case = struct { path: []const u8, body: []const u8, field: ?[]const u8 };
         const chat = "/v1/chat/completions";
         const comp = "/v1/completions";
@@ -2844,7 +3163,7 @@ test "server: a request that fits once the running one finishes waits for it and
 }
 
 test "server: a non-stream reply on every surface frees every allocation of its result" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .shared = true }, struct {
         fn run() !void {
             const plain = [_]struct { path: []const u8, body: []const u8 }{
                 .{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"prompt\":\"a long tale\",\"max_tokens\":3,\"temperature\":0,\"ignore_eos\":true}" },
@@ -2879,7 +3198,7 @@ fn expectEachRefusedByName(cases: []const FieldCase) !void {
 }
 
 test "server: request fields: chat and completions refuse a field of the wrong shape, or one they do not read, by name" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         const msg = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         const chat = "/v1/chat/completions";
         const comp = "/v1/completions";
@@ -2901,7 +3220,7 @@ test "server: request fields: chat and completions refuse a field of the wrong s
 }
 
 test "server: return_progress streams llama.cpp's prompt_progress on chat completions and completions, and a stream without it carries none" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         /// The first chunk of a `return_progress` stream is the 0% report: the whole
         /// prompt's total, nothing processed yet, and the delta llama.cpp ships.
         fn firstProgress(body: []const u8) !std.json.Parsed(std.json.Value) {
@@ -3006,7 +3325,7 @@ fn firstReplyEvent(body: []const u8) ?usize {
 }
 
 test "server: a return_progress stream wakes its reader at a prefill chunk's store and ships 100% before the first content token" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const body = "{\"model\":\"tiny\",\"max_tokens\":4,\"stream\":true,\"return_progress\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
             // A tiny fixture's prompt is one chunk, so the test stores a chunk's numbers on the held slot and wakes it as
@@ -3094,7 +3413,7 @@ fn listProgress(comptime list: []const u8) ?SlotProgress {
 const SlotProgress = struct { cache: u64, processed: u64, time_ms: u64 };
 
 test "server: a prefill no return_progress stream and no metrics watch stores no prompt_progress" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const body = "{\"model\":\"tiny\",\"prompt\":\"The quick brown fox jumps over the lazy dog, twice, and then sits down to rest beside the river bank.\",\"max_tokens\":2,\"temperature\":0,\"stream\":false}";
             // A first request leaves the prompt a hot-cache entry the next one restores: that restore's count is the
@@ -3139,7 +3458,7 @@ fn anthropicTextAndReason(resp: []const u8, out_reason: *[64]u8) ![]u8 {
 }
 
 test "server: request fields: /v1/messages refuses a field it does not read or of the wrong shape, by name, and count_tokens runs the same checks" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         const msg = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         const path = "/v1/messages";
         const head = "{\"model\":\"tiny\",\"max_tokens\":2,";
@@ -3175,7 +3494,7 @@ test "server: request fields: /v1/messages refuses a field it does not read or o
 }
 
 test "server: request fields: /v1/messages reads stop_sequences as a string as it reads the array form" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const base = try request("POST", "/v1/messages", "{\"model\":\"tiny\",\"max_tokens\":16,\"temperature\":0,\"thinking\":{\"type\":\"disabled\"},\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
             defer gpa.free(base);
@@ -3216,7 +3535,7 @@ test "server: request fields: /v1/messages reads stop_sequences as a string as i
 }
 
 test "server: request fields: /v1/responses and its compaction refuse a field they do not read or of the wrong shape, by name" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         const resp = "/v1/responses";
         const head = "{\"model\":\"tiny\",\"max_output_tokens\":2,";
         const cases = [_]FieldCase{
@@ -3246,7 +3565,7 @@ test "server: request fields: /v1/responses and its compaction refuse a field th
 }
 
 test "server: request fields: a Responses stop sequence cuts the reply, and a text format of type text means plain text" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         fn text(body: []const u8) ![]u8 {
             const resp = try request("POST", "/v1/responses", body);
             defer gpa.free(resp);
@@ -3297,7 +3616,7 @@ test "server: request fields: a Responses stop sequence cuts the reply, and a te
 }
 
 test "server: request fields: a Responses max_tool_calls as a whole float echoes as the integer the check accepted" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const resp = try request("POST", "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":2,\"max_tool_calls\":3.0,\"input\":\"hi\"}");
             defer gpa.free(resp);
@@ -3313,7 +3632,7 @@ test "server: request fields: a Responses max_tool_calls as a whole float echoes
 }
 
 test "server: request fields: a key that silently dropped behaviour is a 400 naming it, and a custom tool and Responses stream_options are served" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .one_arch = true, .shared = true }, struct {
         const msg = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         const chat = "/v1/chat/completions";
         const head = "{\"model\":\"tiny\",\"max_tokens\":2,";
@@ -3357,7 +3676,7 @@ test "server: request fields: a key that silently dropped behaviour is a 400 nam
 }
 
 test "server: /v1/messages reads a system message inside messages into the prompt" {
-    try eachArch(2, .{}, struct {
+    try eachArch(2, .{ .shared = true }, struct {
         const with_sys = "{\"model\":\"x\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"system\",\"content\":\"note\"},{\"role\":\"user\",\"content\":\"say ok\"}]}";
         const without_sys = "{\"model\":\"x\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":\"say ok\"}]}";
         const bad_role = "{\"model\":\"x\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"developer\",\"content\":\"note\"},{\"role\":\"user\",\"content\":\"say ok\"}]}";
@@ -3428,7 +3747,7 @@ test "server: test_skip_warm skips cooler_warm.warmServed on cold loads" {
     const cooler_warm = @import("cooler_warm.zig");
     try testing.expectEqual(false, (server_state.ServerConfig{}).test_skip_warm);
     const before = cooler_warm.runs_for_test;
-    try eachArch(1, .{}, struct {
+    try eachArch(1, .{ .one_arch = true }, struct {
         fn body() anyerror!void {}
     }.body);
     try testing.expectEqual(before, cooler_warm.runs_for_test);
@@ -3456,7 +3775,7 @@ test "server: stopServing waits for an embedded client's post-shutdown requests 
     State.drained_before_client.store(false, .release);
     server.after_drain_loop_for_test = State.hook;
     defer server.after_drain_loop_for_test = null;
-    try eachArch(4, .{}, State.run);
+    try eachArch(4, .{ .cold = true, .one_arch = true }, State.run);
     try testing.expect(!State.drained_before_client.load(.acquire));
 }
 
@@ -3574,7 +3893,7 @@ test "server: a reply continued after its thought is one request in the counters
 }
 
 test "server: request fields: a model of the wrong type is refused by name on every surface, never quietly the default's answer" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         const Case = struct { path: []const u8, body: []const u8 };
         const cases = [_]Case{
             .{ .path = "/v1/chat/completions", .body = "{\"model\":5,\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
@@ -3611,7 +3930,7 @@ test "server: request fields: a model of the wrong type is refused by name on ev
 }
 
 test "server: a Responses stream's usage is null until measured, then the terminal event carries the real counts" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const fd = try connect();
             defer _ = std.c.close(fd);
@@ -3649,7 +3968,7 @@ test "server: a Responses stream's usage is null until measured, then the termin
 }
 
 test "server: a completions stream's usage chunk is a text_completion chunk and carries the cached details" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const fd = try connect();
             defer _ = std.c.close(fd);
@@ -3683,7 +4002,7 @@ test "server: a completions stream's usage chunk is a text_completion chunk and 
 }
 
 test "server: a completions reply's usage carries the cache details chat's does" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .one_arch = true, .shared = true }, struct {
         fn run() !void {
             const resp = try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"max_tokens\":2,\"temperature\":0,\"prompt\":\"hi\"}");
             defer gpa.free(resp);
@@ -3699,4 +4018,9 @@ test "server: a completions reply's usage carries the cache details chat's does"
             }
         }
     }.run);
+}
+
+test "server: shared server tears down cleanly before later modules" {
+    SharedServer.stop();
+    try testing.expect(!SharedServer.active);
 }

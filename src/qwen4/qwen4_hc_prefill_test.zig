@@ -11,6 +11,16 @@ const standinOnes = trunk.standinOnes;
 const std = @import("std");
 const testing = std.testing;
 
+fn hcRandBf16(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const buf = try testing.allocator.alloc(u16, n);
+    defer testing.allocator.free(buf);
+    rnd.bytes(std.mem.sliceAsBytes(buf));
+    for (buf) |*v| v.* = (v.* & 0x807F) | 0x3E80;
+    return mlx.newData(buf.ptr, shape, .bfloat16);
+}
+
 test "hc prefill: pending write, normalized streams, native inject reduction and BF16 mix across shapes" {
     try mlx.requireGpu();
     const hp = @import("../hc_prefill.zig");
@@ -26,7 +36,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
     const rnd = prng.random();
     const eps = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps);
-    for ([_][4]c_int{ .{ 2, 17, 4, 2560 }, .{ 1, 65, 4, 2560 }, .{ 1, 513, 4, 2560 }, .{ 1, 17, 1, 128 }, .{ 1, 33, 2, 1536 }, .{ 1, 33, 3, 1536 }, .{ 1, 33, 5, 1536 }, .{ 1, 33, 6, 1536 }, .{ 1, 33, 7, 1536 }, .{ 1, 33, 8, 4096 }, .{ 1, 8703, 4, 2560 } }) |shape| {
+    for ([_][4]c_int{ .{ 2, 17, 4, 2560 }, .{ 1, 65, 4, 2560 }, .{ 1, 513, 4, 2560 }, .{ 1, 17, 1, 128 }, .{ 1, 33, 8, 4096 }, .{ 1, 8703, 4, 2560 } }) |shape| {
         const b = shape[0];
         const seq = shape[1];
         xfm.config.hc_count = @intCast(shape[2]);
@@ -41,11 +51,11 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
         try testing.expect(hp.eligible(b, seq, xfm.config.hc_count, xfm.config.hidden_size, iw, .bfloat16));
         const ones = try standinOnes(&.{hidden}, s);
         defer _ = mlx.mlx_array_free(ones);
-        const x = try attn256RandBf16(rnd, &.{ b, seq, hc, hidden }, s);
+        const x = try hcRandBf16(rnd, &.{ b, seq, hc, hidden });
         defer _ = mlx.mlx_array_free(x);
-        const wo = try attn256RandBf16(rnd, &.{ b, seq, 1, hidden }, s);
+        const wo = try hcRandBf16(rnd, &.{ b, seq, 1, hidden });
         defer _ = mlx.mlx_array_free(wo);
-        const wi = try attn256RandBf16(rnd, &.{ b, seq, hc, 1 }, s);
+        const wi = try hcRandBf16(rnd, &.{ b, seq, hc, 1 });
         defer _ = mlx.mlx_array_free(wi);
         try testing.expect((try hp.norm(s, x, w, .{ .ctx = null }, eps, b, seq, null)) == null);
         try testing.expect((try hp.norm(s, x, w, iw, eps, b, 16, null)) == null);

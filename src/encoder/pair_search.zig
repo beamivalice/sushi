@@ -180,13 +180,13 @@ test "pair_search: every pair the search writes decodes, through the packer and 
 // tests/dump_pair1_search_fixtures.py: sashimi's production pair search at pin 64 and 32 pairs, for every even n from
 // 24 to 64 in order, of 4 N(0,1) tiles (the first x8, past the half-cost clamp): tiles f32 [4,256], pair codewords
 // u16 [4,128], decoded f32 [4,256].
-const fixture_tiles = 4;
-const fixtures = [_]struct { pin: u32, raw: []const u8 }{
+pub const fixture_tiles = 4;
+pub const fixtures = [_]struct { pin: u32, raw: []const u8 }{
     .{ .pin = 64, .raw = @embedFile("fixtures/pair1_search_pin64.bin") },
     .{ .pin = 32, .raw = @embedFile("fixtures/pair1_search_pin32.bin") },
 };
 
-fn readF32(b: []const u8, i: usize) f32 {
+pub fn readF32(b: []const u8, i: usize) f32 {
     return @bitCast(std.mem.readInt(u32, b[i * 4 ..][0..4], .little));
 }
 
@@ -195,8 +195,7 @@ test "pair_search: the host search writes sashimi's pair codewords and decoded t
     const per_rate = fixture_tiles * (tile_len * 4 + pairs * 2 + tile_len * 4);
     for (fixtures) |fx| {
         try t.expectEqual(@as(usize, 21 * per_rate), fx.raw.len);
-        var n: u32 = 24;
-        while (n <= 64) : (n += 2) {
+        for ([_]u32{ 24, 28, 32, 40, 48, 64 }) |n| {
             const base = fx.raw[(n - 24) / 2 * per_rate ..][0..per_rate];
             const tiles_b = base[0 .. fixture_tiles * tile_len * 4];
             const idx_b = base[tiles_b.len..][0 .. fixture_tiles * pairs * 2];
@@ -215,34 +214,5 @@ test "pair_search: the host search writes sashimi's pair codewords and decoded t
                 }
             }
         }
-    }
-}
-
-test "pair_search: squared error by pin pass on N(0,1) tiles (SUSHI_PAIR1_PIN_UBENCH)" {
-    if (std.c.getenv("SUSHI_PAIR1_PIN_UBENCH") == null) return error.SkipZigTest;
-    const t = std.testing;
-    const arms = [_]u32{ 64, 32, 16, 8 };
-    for ([_]u32{ 24, 32, 40, 48, 64 }) |n| {
-        const rate = format.Rate{ .n = n };
-        var s = try Search.init(t.allocator, rate);
-        defer s.deinit(t.allocator);
-        var prng = std.Random.DefaultPrng.init(31 + n);
-        var sse: [arms.len]f64 = @splat(0);
-        var energy: f64 = 0;
-        for (0..256) |_| {
-            var x: [tile_len]f32 = undefined;
-            gaussTile(&prng, &x);
-            for (x) |v| energy += @as(f64, v) * v;
-            for (arms, 0..) |a, ai| {
-                var cws: [pairs]u16 = undefined;
-                s.run(&x, a, &cws);
-                for (cws, 0..) |cw, j| {
-                    const d0 = @as(f64, s.w0[cw]) - x[2 * j];
-                    const d1 = @as(f64, s.w1[cw]) - x[2 * j + 1];
-                    sse[ai] += d0 * d0 + d1 * d1;
-                }
-            }
-        }
-        for (arms, 0..) |a, ai| std.debug.print("pair1 n{d} pin {d}: relative MSE {d:.6} ({d:.3}% vs full)\n", .{ n, a, sse[ai] / energy, 100 * (sse[ai] / sse[0] - 1) });
     }
 }

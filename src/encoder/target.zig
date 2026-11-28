@@ -310,66 +310,6 @@ test "target: the blocked triangular solves invert a Cholesky factor larger than
     };
 }
 
-test "target: solve throughput (SUSHI_ENCODER_TARGET_UBENCH)" {
-    if (std.c.getenv("SUSHI_ENCODER_TARGET_UBENCH") == null) return error.SkipZigTest;
-    const t = std.testing;
-    const n = 2560;
-    const k = 1280;
-    var prng = std.Random.DefaultPrng.init(9);
-    const r = prng.random();
-    const h = try t.allocator.alloc(f32, n * n);
-    defer t.allocator.free(h);
-    for (h) |*v| v.* = r.floatNorm(f32) * 0.01;
-    for (0..n) |i| for (0..i) |j| {
-        h[i * n + j] = h[j * n + i];
-    };
-    for (0..n) |i| h[i * n + i] = 4;
-    const w = try t.allocator.alloc(f32, n * k);
-    defer t.allocator.free(w);
-    const cw = try t.allocator.alloc(f32, n * k);
-    defer t.allocator.free(cw);
-    for (w, cw) |*a, *b| {
-        a.* = r.floatNorm(f32);
-        b.* = r.floatNorm(f32);
-    }
-    for (0..2) |_| {
-        const t0 = @import("stages.zig").nowNs();
-        try compensate(t.allocator, w, h, cw, n, k, alpha);
-        std.debug.print("compensate n={d} k={d}: {d:.0} ms\n", .{ n, k, @as(f64, @floatFromInt(@import("stages.zig").nowNs() - t0)) / 1e6 });
-    }
-    // A bank as the convert loop runs it: 16 factors, then 8 column chunks each, across the worker pool.
-    const Pool = @import("pool.zig").Pool;
-    const pool = try Pool.init(t.allocator, 15);
-    defer pool.deinit();
-    const Bank = struct {
-        h: []const f32,
-        cw: []const f32,
-        ws: [16][]f32,
-        fs: [16]?Factor = @splat(null),
-        fn factor(self: *@This(), b: usize) void {
-            self.fs[b] = Factor.init(std.heap.c_allocator, self.h, n) catch null;
-        }
-        fn solve(self: *@This(), job: usize) void {
-            const f = self.fs[job / 8].?;
-            const c0 = k * (job % 8) / 8;
-            const c1 = k * (job % 8 + 1) / 8;
-            f.apply(std.heap.c_allocator, self.ws[job / 8], self.cw, k, c0, c1, alpha) catch unreachable;
-        }
-    };
-    var bank = Bank{ .h = h, .cw = cw, .ws = undefined };
-    for (&bank.ws) |*o| o.* = try t.allocator.dupe(f32, w);
-    defer for (bank.ws) |o| t.allocator.free(o);
-    const t0 = @import("stages.zig").nowNs();
-    pool.run(16, &bank, Bank.factor);
-    const t1 = @import("stages.zig").nowNs();
-    pool.run(16 * 8, &bank, Bank.solve);
-    const t2 = @import("stages.zig").nowNs();
-    var hash: u64 = 0;
-    for (bank.ws[15]) |v| hash = hash *% 1099511628211 +% @as(u32, @bitCast(v));
-    for (&bank.fs) |*f| if (f.*) |*fac| fac.deinit(std.heap.c_allocator);
-    std.debug.print("bank of 16 on 15 workers: factors {d:.0} ms, solves {d:.0} ms, result hash {x}\n", .{ @as(f64, @floatFromInt(t1 - t0)) / 1e6, @as(f64, @floatFromInt(t2 - t1)) / 1e6, hash });
-}
-
 // (1 + e)(1 - e) = 1 - e^2 with e = 2^-27 needs 55 bits: a product rounded on its own is 1 and the sum loses e^2.
 test "target: the update and the solves join each product to their sum with one rounding" {
     const t = std.testing;

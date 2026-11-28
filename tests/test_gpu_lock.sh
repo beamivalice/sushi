@@ -41,7 +41,7 @@ TMP=$(mktemp -d)
 BG=
 trap 'for p in $BG; do kill $p 2>/dev/null; done; rm -rf "$TMP"' EXIT
 export GPU_LOCK_DIR="$TMP/gpu.lock.d"
-export GPU_LOCK_POLL_S=1
+export GPU_LOCK_POLL_S=0.1
 export GPU_LOCK_SETTLE_MAX_S=0
 export GPU_LOCK_QUIET="$TMP/QUIET"
 
@@ -49,13 +49,13 @@ queued() { $LOCK status | sed -nE 's/^ +[0-9]+\. ([^ ]+).*/\1/p' | tr '\n' ' '; 
 # Wait (max 5 s) until <owner> is in the queue, so tickets are taken in a known order.
 wait_queued() {
   local i
-  for i in $(seq 50); do case " $(queued)" in *" $1 "*) return 0 ;; esac; sleep 0.1; done
+  for i in $(seq 100); do case " $(queued)" in *" $1 "*) return 0 ;; esac; sleep 0.05; done
   return 1
 }
 # Wait (max <s> s) for a background pid to exit; returns its status, or 124 on timeout.
 wait_exit() {
   local i
-  for i in $(seq $(($2 * 10))); do kill -0 "$1" 2>/dev/null || { wait "$1"; return $?; }; sleep 0.1; done
+  for i in $(seq $(($2 * 20))); do kill -0 "$1" 2>/dev/null || { wait "$1"; return $?; }; sleep 0.05; done
   return 124
 }
 
@@ -65,7 +65,8 @@ $LOCK acquire alpha; check $? "acquire succeeds on a free lock"
 $LOCK status | grep -q '^alpha '; check $? "status names the holder"
 
 $LOCK acquire beta & WAITER=$!; BG="$BG $WAITER"
-sleep 2
+wait_queued beta
+sleep 0.2
 kill -0 $WAITER 2>/dev/null; check $? "a second acquire waits while the lock is held"
 
 $LOCK release beta 2>/dev/null; [ $? != 0 ]; check $? "release by a queued non-holder is refused"
@@ -82,9 +83,9 @@ $LOCK release beta
 # FIFO: w1 arrives first but polls slowest; a poll race would hand the lock to w3.
 : > "$TMP/order"
 $LOCK acquire alpha
-for w in w1:1 w2:0.5 w3:0.1; do
+for w in w1:0.3 w2:0.15 w3:0.05; do
   name=${w%%:*}
-  ( GPU_LOCK_POLL_S=${w#*:} $LOCK acquire "$name" && echo "$name" >> "$TMP/order" && sleep 0.3 \
+  ( GPU_LOCK_POLL_S=${w#*:} $LOCK acquire "$name" && echo "$name" >> "$TMP/order" && sleep 0.05 \
       && $LOCK release "$name" ) &
   BG="$BG $!"
   wait_queued "$name"; check $? "$name takes a ticket"
@@ -92,9 +93,9 @@ done
 $LOCK status | head -1 | grep -q '^alpha '; check $? "status shows the holder first"
 [ "$(queued)" = "w1 w2 w3 " ]; check $? "status lists the queue in ticket order (got: $(queued))"
 $LOCK release alpha
-for i in $(seq 100); do [ "$(wc -l < "$TMP/order")" -ge 3 ] && break; sleep 0.1; done
+for i in $(seq 100); do [ "$(wc -l < "$TMP/order")" -ge 3 ] && break; sleep 0.05; done
 [ "$(tr '\n' ' ' < "$TMP/order")" = "w1 w2 w3 " ]; check $? "waiters are served in arrival order (got: $(tr '\n' ' ' < "$TMP/order"))"
-for i in $(seq 20); do [ "$($LOCK status)" = free ] && break; sleep 0.1; done
+for i in $(seq 40); do [ "$($LOCK status)" = free ] && break; sleep 0.05; done
 [ "$($LOCK status)" = free ]; check $? "status is free once the queue drains"
 
 # A dead waiter must not block the queue.
@@ -170,7 +171,8 @@ $LOCK release after-dead
 forge oldfmt -
 $LOCK status | head -2 | tr '\n' '|' | grep -q '^oldfmt .*|  no pid recorded|$'; check $? "status shows an old-format lock without a PID"
 GPU_LOCK_POLL_S=0.1 $LOCK acquire behind-old & OLD=$!; BG="$BG $OLD"
-sleep 1
+wait_queued behind-old
+sleep 0.2
 kill -0 $OLD 2>/dev/null; check $? "a lock without a PID file is not auto-freed"
 $LOCK status | grep -q '^oldfmt '; check $? "the old-format holder is kept"
 $LOCK break oldfmt; check $? "break clears an old-format lock"
@@ -192,9 +194,9 @@ $LOCK acquire x --max-min abc 2>/dev/null; [ $? = 2 ]; check $? "a non-numeric -
 $LOCK run x --pid 1 -- true 2>/dev/null; [ $? = 2 ]; check $? "run refuses --pid"
 
 $LOCK run term -- sleep 60 & RUN=$!; BG="$BG $RUN"
-for i in $(seq 50); do [ "$($LOCK status | head -1 | cut -d' ' -f1)" = term ] && break; sleep 0.1; done
-for i in $(seq 50); do CMD=$(pgrep -P $RUN); [ -n "$CMD" ] && break; sleep 0.1; done
-for i in $(seq 50); do $LOCK status | grep -q "^  pid $CMD alive" && break; sleep 0.1; done
+for i in $(seq 50); do [ "$($LOCK status | head -1 | cut -d' ' -f1)" = term ] && break; sleep 0.05; done
+for i in $(seq 50); do CMD=$(pgrep -P $RUN); [ -n "$CMD" ] && break; sleep 0.05; done
+for i in $(seq 50); do $LOCK status | grep -q "^  pid $CMD alive" && break; sleep 0.05; done
 $LOCK status | grep -q "^  pid $CMD alive"; check $? "run records the command's PID as the holder"
 kill -TERM $RUN
 wait_exit $RUN 5; [ $? = 143 ]; check $? "run exits 143 on SIGTERM"
@@ -202,7 +204,7 @@ wait_exit $RUN 5; [ $? = 143 ]; check $? "run exits 143 on SIGTERM"
 kill -0 "$CMD" 2>/dev/null; [ $? != 0 ]; check $? "SIGTERM reached the command"
 
 $LOCK run second-in-line -- true & BG="$BG $!"
-$LOCK run first-in-line -- sleep 1 & BG="$BG $!"
+$LOCK run first-in-line -- sleep 0.2 & BG="$BG $!"
 wait; [ "$($LOCK status)" = free ]; check $? "run waiters drain the queue"
 
 # OVERDUE
@@ -217,7 +219,7 @@ $LOCK release slow
 forge ghosts "$(dead_pid)"
 : > "$TMP/overlap"
 for w in c1 c2 c3 c4; do
-  ( GPU_LOCK_POLL_S=0.05 $LOCK acquire $w && { mkdir "$TMP/in" 2>/dev/null || echo $w >> "$TMP/overlap"; sleep 0.2; rmdir "$TMP/in" 2>/dev/null; $LOCK release $w; } ) &
+  ( GPU_LOCK_POLL_S=0.05 $LOCK acquire $w && { mkdir "$TMP/in" 2>/dev/null || echo $w >> "$TMP/overlap"; sleep 0.05; rmdir "$TMP/in" 2>/dev/null; $LOCK release $w; } ) &
   BG="$BG $!"
 done
 wait
@@ -241,7 +243,7 @@ GPU_LOCK_SETTLE_MAX_S=30 GPU_LOCK_SETTLE_POLL_S=1 GPU_LOCK_MEM_CMD="$TMP/flat.sh
 [ $(($(date +%s) - t0)) -le 3 ]; check $? "with memory flat, run starts within one poll"
 printf '#!/bin/bash\nn=$(cat "$1"); echo $((n + 1)) > "$1"; echo $((n * 4096))\n' > "$TMP/rise.sh"; chmod +x "$TMP/rise.sh"
 echo 0 > "$TMP/rise.n"
-err=$(GPU_LOCK_SETTLE_MAX_S=2 GPU_LOCK_SETTLE_POLL_S=1 GPU_LOCK_MEM_CMD="$TMP/rise.sh $TMP/rise.n" $LOCK run riser -- true 2>&1)
+err=$(GPU_LOCK_SETTLE_MAX_S=1 GPU_LOCK_SETTLE_POLL_S=1 GPU_LOCK_MEM_CMD="$TMP/rise.sh $TMP/rise.n" $LOCK run riser -- true 2>&1)
 [ $? = 0 ] && case "$err" in *"still rising"*) true ;; *) false ;; esac; check $? "memory that keeps rising starts the command at the cap, with a note"
 [ "$($LOCK status)" = free ]; check $? "status is free after the settle runs"
 

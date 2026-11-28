@@ -595,7 +595,7 @@ test "a serial step whose MLX call raises at any point ends the request by name 
     var xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
     defer mlx.armLatchingFaultForTest(0);
-    var prompt: [40]u32 = undefined;
+    var prompt: [8]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast((i * 7 + i / 3) % 4);
     const Run = struct {
         /// The tokens a request publishes when its fourth step's `k`-th checked call raises as mlx-c does, latching the

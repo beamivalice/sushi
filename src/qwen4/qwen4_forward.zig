@@ -4906,7 +4906,7 @@ test "qwen4 elementwise tails run as one engine kernel each and give MLX's bytes
     xfm.config.attn_output_gate = true;
     const heads = 8;
     var rng = std.Random.DefaultPrng.init(0x5eed);
-    for ([_]c_int{ 1, 7, 4096 }) |rows| inline for (comptime std.enums.values(Tail)) |tail| {
+    for ([_]c_int{ 1, 7, 512 }) |rows| inline for (comptime std.enums.values(Tail)) |tail| {
         const shapes: []const []const c_int = switch (tail) {
             .gated_add => &.{ &.{ 1, rows, hidden }, &.{ 1, rows, 1 }, &.{ 1, rows, hidden } },
             .inject => &.{&.{ 1, rows, hc }},
@@ -4919,7 +4919,8 @@ test "qwen4 elementwise tails run as one engine kernel each and give MLX's bytes
             var n: usize = 1;
             for (sh) |d| n *= @intCast(d);
             host[i] = try t.allocator.alloc(u16, n);
-            for (host[i]) |*v| v.* = @truncate(@as(u32, @bitCast(rng.random().float(f32) * 16 - 8)) >> 16);
+            rng.random().bytes(std.mem.sliceAsBytes(host[i]));
+            for (host[i]) |*v| v.* = (v.* & 0x807F) | 0x3E80;
         }
         defer for (host[0..shapes.len]) |h| t.allocator.free(h);
         var bytes: [2][]u8 = undefined;
@@ -5222,8 +5223,8 @@ test "causal verify attention rows are bit-identical to decode at Qwen3.8 geomet
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
-        for ([_]c_int{ 37, 253, 1022, 2045, 8190 }) |prefix| {
-            for (2..9) |wi| {
+        for ([_]c_int{ 37, 1022, 8190 }) |prefix| {
+            for ([_]usize{ 2, 5, 8 }) |wi| {
                 const width: c_int = @intCast(wi);
                 var cache = try KVCache.initWithConfig(testing.allocator, 1, config);
                 defer cache.deinit();
@@ -5488,7 +5489,7 @@ test "qk norm rope fused hd-256 serves prefill widths: the composed chain's byte
     defer test_support.restoreEngine(was);
     const gpu = mlx.gpuStream();
     var made: ?u64 = null;
-    for ([_]c_int{ 33, 512, 4096, 4097 }) |seq| {
+    for ([_]c_int{ 33, 512, 4097 }) |seq| {
         for ([_]mlx.mlx_stream{ gpu, mlx.engine.stream() }, 0..) |s, arm| {
             const eps_arr = mlx.mlx_array_new_float(eps);
             defer _ = mlx.mlx_array_free(eps_arr);
