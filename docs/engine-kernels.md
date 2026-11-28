@@ -389,6 +389,31 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - `matmul2d::run` and a cooperative tensor's `store` take lvalue tensors: bind a `slice<...>(...)` to a name before
   passing it.
 
+<a id="function-constant-design"></a>
+## Function-constant (`fc_int` / `fc_bool`) design rules
+
+New and refactored Cooler kernels default to Metal function constants (`fc_int` / `fc_bool`) for numeric and mode
+parameters rather than `.ct_int` / `.ct_bool` build-time sweeps ([sushi.metallib](engine-own-forward.md#sushi-metallib)):
+
+- **Small structural leaf arms.** Structure rate/mode dispatch as shallow `if (N == ...)` / `if (MODE == ...)` leaf arms
+  on function constants (as in single-rate EXL3 `FC_NHW` readers `exl3_lane_fc`, `smat_group_fc`, and `nax_wfrag_fc`,
+  with direct per-rate codec constants in FCs) so Metal constant-folds shifts/masks and dead-code-eliminates every unused
+  arm and vector channel at PSO specialization time. Keep runtime multi-rate switches (mixed-rate MoE) on `FC_I46/47`
+  rate-mask bitfields so only the pack's active rates survive specialization.
+- **Unroll fixed-cap loops and hoist small tables for SROA.** When an `fc_int` bounds a register-array loop (`R`, `RT`,
+  `DT`, `TL`, lane codewords), write a fixed compile-time upper bound with `#pragma clang loop unroll(full)` and an early
+  `if (i >= FC) break;` (and hoist small lookup arrays like `const uint sh[8]` outside the `tk` loop). Without full
+  unrolling, Metal can fail to SROA the array and spill registers.
+- **Never `break` across a `threadgroup_barrier`.** In FC-bounded loops containing a barrier, predicate work per thread
+  or keep the early exit outside the barriered region so every thread in the threadgroup reaches every barrier.
+- **Guard every static cap in Zig.** When replacing a `.ct_int`-sized `threadgroup` or register array with a fixed static
+  cap (`t_y[3072]`, `sm[5160]`, `pes[8 * 128]`, `MAX_R`), enforce the exact same upper bound (and `>= 1` / alignment
+  invariants) in every Zig entry point and startup probe (`probeForms`) so direct callers cannot cause GPU OOB writes or
+  silent truncation.
+- **Check PSO occupancy and TG SRAM on every converted kernel.** Static `threadgroup` memory must stay `<= 16 KiB` (or
+  use a small `.ct_int` capacity bucket like `CAP ∈ {2, 4, 9}` when smaller TG SRAM preserves wave overlap); verify every
+  specialized PSO holds `maxTotalThreadsPerThreadgroup = 1024` on M3+/M5 and keeps `>= 640`-thread headroom on M1–M4.
+
 ## Proving a kernel
 
 - GPU parity = no-worse-than fp32 ground truth, never kernel-vs-kernel; a parity loop asserts FINITENESS before it

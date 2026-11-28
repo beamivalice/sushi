@@ -200,8 +200,12 @@ release item about it. Deferred repo work goes to `docs/private/future.md`, neve
 - No lower precision than the reference: a product the model's reference computes in f32 (router, indexer,
   mixes, attention scores where it keeps them f32) stays f32 on every path; no bf16, f16 or split-bf16 arm for it.
 - A new or changed Cooler kernel is registered in `src/tensor/metallib_{shared,exl3}.zig` or `src/<arch>/metallib.zig`;
-  an unregistered one is refused by name, and `stock metallib` checks completeness
-  ([engine-own-forward](docs/engine-own-forward.md#sushi-metallib)).
+  an unregistered one is refused by name, and `stock metallib` checks completeness. **Function-constant-first by default:**
+  parameterize numeric/mode knobs (rates, dimensions, row counts, threadgroup/partition counts, flags) with Metal function
+  constants (`fc_int` / `fc_bool`) rather than `.ct_int` / `.ct_bool` sweeps; reserve `.ct_int` / `.ct_bool` strictly for
+  buffer/dtype signatures, `constexpr` tile/MPP descriptors, or small static threadgroup capacity buckets required for
+  occupancy ([engine-own-forward](docs/engine-own-forward.md#sushi-metallib),
+  [engine-kernels](docs/engine-kernels.md#function-constant-design)).
 - The engine reads only aggregate machine load and its own I/O timings, states them only in a visible log line, and
   never names another program ([server-lifecycle](docs/server-lifecycle.md#machine-state)).
 

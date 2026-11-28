@@ -704,12 +704,23 @@ calls `newLibraryWithSource` at runtime and never falls back to `mlx.metallib`:
   (`src/tensor/metallib_shared.zig`, `src/tensor/metallib_exl3.zig`, and each enabled arch's `src/<arch>/metallib.zig`
   registered in `src/arch/registry.zig`), compiled with `-fmetal-math-mode=safe` so FP32 transcendentals match
   `MTLCompileOptions.mathMode = Safe` bit-for-bit.
-- **Adding or changing a Cooler custom kernel.** Register its `KernelSpec` in `metallib_shared.zig`,
-  `metallib_exl3.zig`, or `src/<arch>/metallib.zig`. Prefer `fc_int` / `fc_bool` (`[[function_constant]]`) over
-  `ct_int` / `ct_bool` whenever a parameter does not size a register/threadgroup array or template type, so the catalog
-  stays compact and links fast. Mark NAX (`MetalPerformancePrimitives`) specs `.nax = true` so they isolate into `*_nax`
-  units and non-NAX GPUs (M1/M2/M3/M4) load cleanly. Any kernel or specialization missing from the catalog is refused
-  by name (`error.MetalCompile`, surfaced via `metal.lastError()`).
+- **Function-constant-first `KernelSpec` design.** Register every new or changed Cooler custom kernel in
+  `metallib_shared.zig`, `metallib_exl3.zig`, or `src/<arch>/metallib.zig`. **Default to Metal function constants
+  (`fc_int` / `fc_bool`, `[[function_constant]]`) for most parameters** — rates (`FC_NHW`), dimensions, row/tile counts
+  (`R`, `RT`, `TL`), threadgroup sizes (`TG`), partition counts (`NPART`), mode flags, and direct per-rate codec
+  constants — instead of `.ct_int` / `.ct_bool` compile-time sweeps. Metal specializes, constant-folds, and
+  dead-code-eliminates branches at PSO creation time and persists the specialized machine code in `archive.bin`
+  (`compiled=0` on warm loads), keeping `sushi.metallib` compact, fast to build, and fast to load. Reserve `.ct_int` /
+  `.ct_bool` strictly for:
+  1. Buffer element types (`T` / `OUT_T`) or distinct buffer argument signatures (e.g., `_wide` extra output buffers).
+  2. MSL/MPP template literals that strictly require `constexpr` (`matmul2d_descriptor(M, N, K)`, `simdgroup_matrix`
+     tile dimensions).
+  3. Small static `threadgroup` capacity buckets when one worst-case cap would cross the occupancy cliff (e.g.,
+     `CAP ∈ {2, 4, 9}` in `gdn_verify_fold` to preserve wave overlap, or `IH <= 16` in `hy4_index_wide`).
+  Mark NAX (`MetalPerformancePrimitives`) specs `.nax = true` so they isolate into `*_nax` units and non-NAX GPUs
+  (M1–M4) load cleanly. Any kernel or specialization missing from the catalog is refused by name (`error.MetalCompile`,
+  surfaced via `metal.lastError()`). See [function-constant design rules](engine-kernels.md#function-constant-design)
+  for unrolling, SROA, bounds guards, and occupancy checks.
 - **Completeness by construction.** `stock metallib` in `src/tensor/stock.zig` walks `metallib_spec.visitOps` and
   `metallib_catalog.visitAll` (the exact same tables `gen-metallib` emits from) and verifies every function resolves in
   `sushi.metallib` plus named refusal of unknown custom kernels.
