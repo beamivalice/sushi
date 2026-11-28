@@ -16,16 +16,41 @@ extern var NSRunLoopCommonModes: id;
 extern var NSPasteboardTypeString: id;
 extern var NSEventTrackingRunLoopMode: id;
 
-pub fn class(name: [*:0]const u8) id {
+fn CachedPtr(comptime kind: enum { class, sel }, comptime name: [*:0]const u8) type {
+    return struct {
+        pub const id_kind = kind;
+        pub const id_name = name;
+        var ptr = std.atomic.Value(usize).init(0);
+    };
+}
+
+pub fn class(comptime name: [*:0]const u8) id {
+    const Slot = CachedPtr(.class, name);
+    const cached = Slot.ptr.load(.acquire);
+    if (cached != 0) return @ptrFromInt(cached);
+    const got = objc_getClass(name);
+    if (got) |p| Slot.ptr.store(@intFromPtr(p), .release);
+    return got;
+}
+
+pub fn classDyn(name: [*:0]const u8) id {
     return objc_getClass(name);
 }
 
-pub fn sel(name: [*:0]const u8) SEL {
+pub fn sel(comptime name: [*:0]const u8) SEL {
+    const Slot = CachedPtr(.sel, name);
+    const cached = Slot.ptr.load(.acquire);
+    if (cached != 0) return @ptrFromInt(cached);
+    const got = sel_registerName(name);
+    if (got) |p| Slot.ptr.store(@intFromPtr(p), .release);
+    return got;
+}
+
+pub fn selDyn(name: [*:0]const u8) SEL {
     return sel_registerName(name);
 }
 
-/// `[target sel:args...]` with the argument types taken from `args` and the result type `R`.
-pub fn msg(comptime R: type, target: id, selector: [*:0]const u8, args: anytype) R {
+fn msgSend(comptime R: type, target: id, selector: SEL, args: anytype) R {
     const T = @typeInfo(@TypeOf(args)).@"struct".field_types;
     const F = switch (T.len) {
         0 => *const fn (id, SEL) callconv(.c) R,
@@ -38,7 +63,17 @@ pub fn msg(comptime R: type, target: id, selector: [*:0]const u8, args: anytype)
         else => @compileError("objc.msg: more arguments than a sushibar call uses"),
     };
     const f: F = @ptrCast(&objc_msgSend);
-    return @call(.auto, f, .{ target, sel_registerName(selector) } ++ args);
+    return @call(.auto, f, .{ target, selector } ++ args);
+}
+
+/// `[target sel:args...]` with comptime-cached `SEL`, argument types from `args`, and result type `R`.
+pub fn msg(comptime R: type, target: id, comptime selector: [*:0]const u8, args: anytype) R {
+    return msgSend(R, target, sel(selector), args);
+}
+
+/// Runtime-selector variant of `msg` for selectors chosen dynamically at run time.
+pub fn msgDyn(comptime R: type, target: id, selector: [*:0]const u8, args: anytype) R {
+    return msgSend(R, target, selDyn(selector), args);
 }
 
 /// An autoreleased NSString copy of `s`.
@@ -74,7 +109,7 @@ pub fn defineClass(name: [*:0]const u8, methods: []const Method) id {
     return defineSubclass("NSObject", name, methods);
 }
 
-pub fn defineSubclass(super: [*:0]const u8, name: [*:0]const u8, methods: []const Method) id {
+pub fn defineSubclass(comptime super: [*:0]const u8, name: [*:0]const u8, methods: []const Method) id {
     const cls = objc_allocateClassPair(class(super), name, 0);
     for (methods) |m| _ = class_addMethod(cls, sel_registerName(m.selector), m.imp, m.types);
     objc_registerClassPair(cls);
@@ -91,8 +126,8 @@ pub fn new(cls: id) id {
 
 /// Calls `[target selector:timer]` every `seconds` on the main run loop, menu tracking included; `invalidate` stops it.
 /// Sets a 20% timer tolerance so macOS can coalesce wakeups across processes.
-pub fn addTimer(seconds: f64, target: id, selector: [*:0]const u8) id {
-    const timer = msg(id, class("NSTimer"), "timerWithTimeInterval:target:selector:userInfo:repeats:", .{ seconds, target, sel_registerName(selector), @as(id, null), true });
+pub fn addTimer(seconds: f64, target: id, comptime selector: [*:0]const u8) id {
+    const timer = msg(id, class("NSTimer"), "timerWithTimeInterval:target:selector:userInfo:repeats:", .{ seconds, target, sel(selector), @as(id, null), true });
     msg(void, timer, "setTolerance:", .{seconds * 0.2});
     msg(void, msg(id, class("NSRunLoop"), "mainRunLoop", .{}), "addTimer:forMode:", .{ timer, NSRunLoopCommonModes });
     return timer;
@@ -213,7 +248,7 @@ pub fn fadeNext(view: id, seconds: f64) void {
 }
 
 pub fn color(name: [*:0]const u8) id {
-    return msg(id, class("NSColor"), name, .{});
+    return msgDyn(id, class("NSColor"), name, .{});
 }
 
 pub fn withAlpha(c: id, a: f64) id {

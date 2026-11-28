@@ -18,11 +18,14 @@ var opaque_bg = false;
 var invalid_shown = false;
 
 fn color(name: [*:0]const u8) id {
-    return msg(id, objc.class("NSColor"), name, .{});
+    return objc.color(name);
 }
 
 fn systemFont(size: f64, mono_digits: bool) id {
-    return msg(id, objc.class("NSFont"), if (mono_digits) "monospacedDigitSystemFontOfSize:weight:" else "systemFontOfSize:weight:", .{ size, @as(f64, 0) });
+    return if (mono_digits)
+        msg(id, objc.class("NSFont"), "monospacedDigitSystemFontOfSize:weight:", .{ size, @as(f64, 0) })
+    else
+        msg(id, objc.class("NSFont"), "systemFontOfSize:weight:", .{ size, @as(f64, 0) });
 }
 
 fn label(str: [*:0]const u8, frame: NSRect, size: f64, c: id) id {

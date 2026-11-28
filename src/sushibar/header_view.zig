@@ -25,19 +25,7 @@ const spark_h: f64 = 30;
 const caption_y: f64 = 162;
 pub const spark_window_ms: i64 = 5 * 60 * 1000;
 
-fn Buf(comptime N: usize) type {
-    return struct {
-        data: [N]u8 = undefined,
-        len: usize = 0,
-        fn set(self: *@This(), s: []const u8) void {
-            self.len = @min(s.len, N);
-            @memcpy(self.data[0..self.len], s[0..self.len]);
-        }
-        fn get(self: *const @This()) []const u8 {
-            return self.data[0..self.len];
-        }
-    };
-}
+const Buf = logic.FixedStr;
 
 const Shown = struct {
     version: Buf(96) = .{},
@@ -84,11 +72,14 @@ fn str(s: []const u8) id {
 }
 
 fn color(name: [*:0]const u8) id {
-    return msg(id, objc.class("NSColor"), name, .{});
+    return objc.color(name);
 }
 
 fn font(size: f64, weight: f64, mono_digits: bool) id {
-    return msg(id, objc.class("NSFont"), if (mono_digits) "monospacedDigitSystemFontOfSize:weight:" else "systemFontOfSize:weight:", .{ size, weight });
+    return if (mono_digits)
+        msg(id, objc.class("NSFont"), "monospacedDigitSystemFontOfSize:weight:", .{ size, weight })
+    else
+        msg(id, objc.class("NSFont"), "systemFontOfSize:weight:", .{ size, weight });
 }
 
 const weight_regular: f64 = 0.0;
@@ -108,8 +99,9 @@ fn paragraphStyle(line_break: isize, alignment: isize) id {
     if (style_cache_n < style_cache.len) {
         style_cache[style_cache_n] = .{ .line_break = line_break, .alignment = alignment, .style = style };
         style_cache_n += 1;
+        return style;
     }
-    return style;
+    return msg(id, style, "autorelease", .{});
 }
 
 /// `{NSFontAttributeName: font, NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style}`.
@@ -276,7 +268,7 @@ fn mouseDown(self: id, _: objc.SEL, ev: id) callconv(.c) void {
     const p = msg(NSPoint, self, "convertPoint:fromView:", .{ msg(NSPoint, ev, "locationInWindow", .{}), @as(id, null) });
     for (link_rects, link_kinds) |r, kind| if (inside(r, p)) {
         msg(void, menu, "cancelTracking", .{});
-        msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.sel(linkSelector(kind)), @as(id, null), @as(f64, 0) });
+        msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.selDyn(linkSelector(kind)), @as(id, null), @as(f64, 0) });
         return;
     };
 }

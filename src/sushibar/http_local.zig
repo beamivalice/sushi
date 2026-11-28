@@ -195,25 +195,38 @@ fn readChunk(fd: c_int, buf: []u8, deadline_ms: i64) ?usize {
     }
 }
 
-fn chunkedComplete(raw: []const u8) bool {
-    var i: usize = 0;
+const ChunkStatus = enum { incomplete, complete, malformed };
+
+/// Advances `pos.*` across complete HTTP chunks in `raw`. Distinguishes incomplete chunks (need more bytes)
+/// from malformed framing (invalid hex, oversized chunk, or missing trailing CRLF) so bad peers fail fast.
+fn chunkedAdvance(raw: []const u8, pos: *usize) ChunkStatus {
+    var i = pos.*;
     while (i < raw.len) {
-        const crlf = std.mem.indexOfPos(u8, raw, i, "\r\n") orelse return false;
+        const crlf = std.mem.indexOfPos(u8, raw, i, "\r\n") orelse return .incomplete;
         const size_line = raw[i..crlf];
         const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
         const trimmed = std.mem.trim(u8, size_line[0..semi], " \t");
-        const chunk_len = std.fmt.parseInt(usize, trimmed, 16) catch return false;
-        i = crlf + 2;
+        const chunk_len = std.fmt.parseInt(usize, trimmed, 16) catch return .malformed;
+        const data_start = crlf + 2;
         if (chunk_len == 0) {
             // Terminating chunk ends with empty trailer line ("\r\n") or trailers followed by "\r\n\r\n".
-            if (i + 2 <= raw.len and raw[i] == '\r' and raw[i + 1] == '\n') return true;
-            return std.mem.indexOfPos(u8, raw, i, "\r\n\r\n") != null;
+            if (data_start + 2 <= raw.len and raw[data_start] == '\r' and raw[data_start + 1] == '\n') {
+                pos.* = data_start + 2;
+                return .complete;
+            }
+            if (std.mem.indexOfPos(u8, raw, data_start, "\r\n\r\n")) |end_trail| {
+                pos.* = end_trail + 4;
+                return .complete;
+            }
+            return .incomplete;
         }
-        if (chunk_len > max_body_bytes or i + chunk_len + 2 > raw.len) return false;
-        if (raw[i + chunk_len] != '\r' or raw[i + chunk_len + 1] != '\n') return false;
-        i += chunk_len + 2;
+        if (chunk_len > max_body_bytes) return .malformed;
+        if (data_start + chunk_len + 2 > raw.len) return .incomplete;
+        if (raw[data_start + chunk_len] != '\r' or raw[data_start + chunk_len + 1] != '\n') return .malformed;
+        i = data_start + chunk_len + 2;
+        pos.* = i;
     }
-    return false;
+    return .incomplete;
 }
 
 pub fn decodeChunked(a: std.mem.Allocator, raw: []const u8) ?[]const u8 {
@@ -252,6 +265,28 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn formatRequest(w: *std.Io.Writer, method: Method, u: ParsedUrl, origin: ?[]const u8, auth: []const u8, payload: []const u8) !void {
+    const m_str = switch (method) {
+        .GET => "GET",
+        .POST => "POST",
+    };
+    try w.print("{s} {s} HTTP/1.1\r\n", .{ m_str, u.target });
+    if (u.ipv6) {
+        try w.print("Host: [{s}]:{d}\r\n", .{ u.host, u.port });
+    } else {
+        try w.print("Host: {s}:{d}\r\n", .{ u.host, u.port });
+    }
+    try w.writeAll("Connection: close\r\n");
+    if (origin) |o| try w.print("Origin: {s}\r\n", .{o});
+    if (auth.len > 0) try w.print("Authorization: {s}\r\n", .{auth});
+    if (method == .POST) {
+        if (payload.len > 0) try w.writeAll("Content-Type: application/json\r\n");
+        try w.print("Content-Length: {d}\r\n", .{payload.len});
+    }
+    try w.writeAll("\r\n");
+    if (method == .POST and payload.len > 0) try w.writeAll(payload);
+}
+
 /// Sends a single HTTP/1.1 request to `url` with `timeout_ms` wall-clock budget.
 /// Memory for the returned body is allocated from `a` (typically a per-poll arena).
 pub fn fetch(
@@ -273,36 +308,25 @@ pub fn fetch(
     };
     defer _ = std.c.close(fd);
 
-    var req: std.Io.Writer.Allocating = .init(a);
-    defer req.deinit();
-    const m_str = switch (method) {
-        .GET => "GET",
-        .POST => "POST",
+    var stack_req: [1024]u8 = undefined;
+    var fixed: std.Io.Writer = .fixed(&stack_req);
+    var heap_req: std.Io.Writer.Allocating = .init(a);
+    defer heap_req.deinit();
+    const req_bytes: []const u8 = if (formatRequest(&fixed, method, u, origin, auth, payload)) |_|
+        fixed.buffered()
+    else |_| blk: {
+        formatRequest(&heap_req.writer, method, u, origin, auth, payload) catch return .failed;
+        break :blk heap_req.written();
     };
-    const w = &req.writer;
-    w.print("{s} {s} HTTP/1.1\r\n", .{ m_str, u.target }) catch return .failed;
-    if (u.ipv6) {
-        w.print("Host: [{s}]:{d}\r\n", .{ u.host, u.port }) catch return .failed;
-    } else {
-        w.print("Host: {s}:{d}\r\n", .{ u.host, u.port }) catch return .failed;
-    }
-    w.writeAll("Connection: close\r\n") catch return .failed;
-    if (origin) |o| w.print("Origin: {s}\r\n", .{o}) catch return .failed;
-    if (auth.len > 0) w.print("Authorization: {s}\r\n", .{auth}) catch return .failed;
-    if (method == .POST) {
-        if (payload.len > 0) w.writeAll("Content-Type: application/json\r\n") catch return .failed;
-        w.print("Content-Length: {d}\r\n", .{payload.len}) catch return .failed;
-    }
-    w.writeAll("\r\n") catch return .failed;
-    if (method == .POST and payload.len > 0) w.writeAll(payload) catch return .failed;
 
-    if (!writeAll(fd, req.written(), deadline_ms)) return .failed;
+    if (!writeAll(fd, req_bytes, deadline_ms)) return .failed;
 
     var raw: std.ArrayList(u8) = .empty;
     var tmp: [8192]u8 = undefined;
     var header_end: ?usize = null;
     var content_length: ?usize = null;
     var chunked = false;
+    var chunk_pos: usize = 0;
     var status: u16 = 0;
 
     while (true) {
@@ -335,7 +359,11 @@ pub fn fetch(
         if (header_end) |he| {
             const body_have = raw.items.len - he;
             if (chunked) {
-                if (chunkedComplete(raw.items[he..])) break;
+                switch (chunkedAdvance(raw.items[he..], &chunk_pos)) {
+                    .complete => break,
+                    .incomplete => {},
+                    .malformed => return .failed,
+                }
             } else if (content_length) |cl| {
                 if (body_have >= cl) break;
             }
@@ -379,9 +407,21 @@ test "http_local: decodeChunked joins chunks and rejects truncation" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expect(chunkedComplete("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"));
-    try std.testing.expect(!chunkedComplete("5\r\nhello\r\n"));
-    try std.testing.expectEqualStrings("hello world", decodeChunked(a, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n").?);
+    const full = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    var pos: usize = 0;
+    try std.testing.expectEqual(ChunkStatus.incomplete, chunkedAdvance(full[0..6], &pos));
+    try std.testing.expectEqual(@as(usize, 0), pos);
+    try std.testing.expectEqual(ChunkStatus.incomplete, chunkedAdvance(full[0..12], &pos));
+    try std.testing.expectEqual(@as(usize, 10), pos);
+    try std.testing.expectEqual(ChunkStatus.complete, chunkedAdvance(full, &pos));
+    try std.testing.expectEqual(full.len, pos);
+    var bad_pos: usize = 0;
+    try std.testing.expectEqual(ChunkStatus.malformed, chunkedAdvance("zz\r\nhello\r\n", &bad_pos));
+    bad_pos = 0;
+    try std.testing.expectEqual(ChunkStatus.malformed, chunkedAdvance("5\r\nhelloXX", &bad_pos));
+    bad_pos = 0;
+    try std.testing.expectEqual(ChunkStatus.malformed, chunkedAdvance("ffffff\r\n", &bad_pos));
+    try std.testing.expectEqualStrings("hello world", decodeChunked(a, full).?);
     try std.testing.expectEqualStrings("", decodeChunked(a, "0\r\n\r\n").?);
     try std.testing.expect(decodeChunked(a, "5\r\nhi") == null);
 }

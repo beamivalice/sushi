@@ -358,7 +358,11 @@ fn refreshModels(only: ?u16) void {
         if (l.port != g_default_port and !g_saved.has(l.port)) continue;
         const c = cacheSlot(l.port);
         if (c.busy) continue;
-        c.port = l.port;
+        if (c.port != l.port) {
+            c.port = l.port;
+            c.known = .unknown;
+            c.model.set("");
+        }
         c.busy = true;
         ports[n] = l.port;
         n += 1;
@@ -422,8 +426,8 @@ fn refreshBarVersion(a: std.mem.Allocator) void {
     const got = capture(a, &.{ sushi.ptr, "--version" });
     if (got.code != 0) return;
     const v = logic.parseVersionOutput(got.text) orelse return;
-    if (g_launched_version.len == 0) g_launched_version.set(v);
     lock();
+    if (g_launched_version.len == 0) g_launched_version.set(v);
     shared.bar_version.set(v);
     // Whatever replaced the sibling (our update, a terminal `sushi update`, a server's /v1/update) restarts us.
     if (logic.relaunchNeeded(g_launched_version.get(), v)) shared.relaunch = true;
@@ -585,21 +589,25 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
         return setUpdateNote(std.fmt.allocPrint(a, "Update refused: {s}", .{if (why.len > 0) why else "the server did not accept it"}) catch "Update refused", true);
     }
     setUpdateNote("Updating…", false);
+    var poll_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer poll_arena.deinit();
     var down = false;
     var i: u32 = 0;
     while (i < update_wait_polls) : (i += 1) {
         std.Io.sleep(g_io, .fromMilliseconds(500), .real) catch {};
         if (port() != p) return setUpdateNote("Update started; no longer followed after the port change", false);
+        _ = poll_arena.reset(.retain_capacity);
+        const pa = poll_arena.allocator();
         var hb: [url_cap]u8 = undefined;
-        const alive = if (get(a, p, urlFor(&hb, p, "/health"))) |h| h.status == 200 else false;
+        const alive = if (get(pa, p, urlFor(&hb, p, "/health"))) |h| h.status == 200 else false;
         if (!alive) {
             down = true;
             continue;
         }
         if (down) break;
         var pb: [url_cap]u8 = undefined;
-        const props = get(a, p, urlFor(&pb, p, "/props")) orelse continue;
-        const u = (logic.parseProps(a, props.body) catch null) orelse continue;
+        const props = get(pa, p, urlFor(&pb, p, "/props")) orelse continue;
+        const u = (logic.parseProps(pa, props.body) catch null) orelse continue;
         if (!std.mem.eql(u8, u.current, from)) break;
     }
     var pb: [url_cap]u8 = undefined;
@@ -721,48 +729,41 @@ fn pollSoon() void {
     g_wake.set(g_io);
 }
 
-/// Digest of the fields `refresh()` renders while closed or open, so `pollLoop()` only wakes the main thread when
-/// something actually changed. Caller holds `shared.mu`.
+/// Digest of the fields `refresh()` actually acts on while the menu is closed (bar icon, rendered readout,
+/// reading-fill step, badge, update dot, tooltip, model persistence, probe completion, listener PIDs for child
+/// reaping, and self-relaunch). Open menus wake unconditionally via `menu_open`, so closed-menu-only fields like
+/// `hist_n`, versions, or notes never cause idle AppKit wakeups.
+/// Caller holds `shared.mu`.
 fn publishedSignature() u64 {
     var w = std.hash.Wyhash.init(0);
     w.update(std.mem.asBytes(&shared.port));
     w.update(std.mem.asBytes(&@intFromEnum(shared.view.link)));
-    w.update(std.mem.asBytes(&.{ @intFromBool(shared.view.decoding), @intFromBool(shared.view.prefilling), @intFromBool(shared.sushi_listening), @intFromBool(shared.lan_listening), @intFromBool(shared.port_taken), @intFromBool(shared.available), @intFromBool(shared.relaunch), @intFromBool(shared.note_problem) }));
+    w.update(std.mem.asBytes(&.{ @intFromBool(shared.view.decoding), @intFromBool(shared.view.prefilling), @intFromBool(shared.sushi_listening), @intFromBool(shared.port_taken), @intFromBool(shared.available), @intFromBool(shared.relaunch) }));
+    var rb: [2 * logic.readout_max + 8]u8 = undefined;
+    const ro = logic.readout(&rb, shared.view);
+    w.update(ro.caption);
+    w.update("\x00");
+    w.update(ro.value);
+    w.update("\x00");
     if (shared.view.read) |r| {
-        const step = logic.readingStep(r.fraction);
-        w.update(std.mem.asBytes(&.{ r.percent, @as(u8, @intCast(step)) }));
+        const step: u8 = @intCast(logic.readingStep(r.fraction));
+        w.update(std.mem.asBytes(&step));
     } else w.update("R");
-    if (shared.view.live) |v| {
-        const tenths: i64 = @intFromFloat(@round(v * 10.0));
-        w.update(std.mem.asBytes(&tenths));
-    } else w.update("L");
-    if (shared.view.last) |v| {
-        const tenths: i64 = @intFromFloat(@round(v * 10.0));
-        w.update(std.mem.asBytes(&tenths));
-    } else w.update("S");
     w.update(shared.model.get());
     w.update("\x00");
+    w.update(std.mem.asBytes(&shared.model_full_len));
     w.update(shared.model_loading.get());
     w.update("\x00");
-    w.update(shared.pack_latest.get());
-    w.update("\x00");
-    w.update(shared.server_version.get());
-    w.update("\x00");
-    w.update(shared.bar_version.get());
-    w.update("\x00");
-    w.update(shared.latest.get());
-    w.update("\x00");
-    w.update(shared.note.get());
-    w.update("\x00");
-    w.update(std.mem.asBytes(&.{ @intFromEnum(shared.busy), @intFromEnum(shared.manual_result) }));
-    w.update(std.mem.asBytes(&shared.listing_n));
-    for (shared.listings[0..shared.listing_n]) |l| {
-        w.update(std.mem.asBytes(&l.port));
-        w.update(std.mem.asBytes(&l.pid));
-        w.update(l.model.get());
-    }
-    w.update(std.mem.asBytes(&shared.hist_n));
     w.update(std.mem.asBytes(&shared.answered_n));
+    var pids_xor: u64 = 0;
+    for (shared.listings[0..shared.listing_n]) |l| {
+        var lw = std.hash.Wyhash.init(0);
+        lw.update(std.mem.asBytes(&l.port));
+        lw.update(std.mem.asBytes(&l.pid));
+        pids_xor ^= lw.final();
+    }
+    w.update(std.mem.asBytes(&shared.listing_n));
+    w.update(std.mem.asBytes(&pids_xor));
     return w.final();
 }
 
@@ -1019,12 +1020,8 @@ fn readDefaultPort() u16 {
 
 fn setPort(p: u16) void {
     if (p == port()) return;
-    g_port.store(p, .release);
-    invalidateOwnCache();
-    pollSoon();
-    g_saved.add(p, g_default_port);
-    writeSaved(p);
     lock();
+    shared.port = 0;
     shared.view = .{ .link = .offline };
     shared.model.set("");
     shared.model_full_len = 0;
@@ -1034,6 +1031,11 @@ fn setPort(p: u16) void {
     shared.props_command.set("");
     shared.props_url.set("");
     unlock();
+    g_port.store(p, .release);
+    invalidateOwnCache();
+    pollSoon();
+    g_saved.add(p, g_default_port);
+    writeSaved(p);
 }
 
 /// Forgets an added port; the watch moves to the default port when it was on it. A sushi still listening there
@@ -1404,7 +1406,7 @@ var open_mis: [4]objc.id = .{ null, null, null, null };
 var button_action: logic.ButtonAction = .none;
 var pack_mi: objc.id = null;
 var badge_view: objc.id = null;
-var shown_badge = false;
+var shown_badge: ?bool = null;
 var g_watch: logic.Watch = .{};
 /// What was copied to the clipboard last, and when: the button and the pack item say Copied for a few seconds.
 var copied_what: enum { none, upgrade, pack } = .none;
@@ -1457,7 +1459,7 @@ var readout_value: objc.id = null;
 var port_sig: [1536]u8 = undefined;
 var port_sig_len: usize = std.math.maxInt(usize);
 
-fn setText(setter_target: objc.id, selector: [*:0]const u8, text: []const u8) void {
+fn setText(setter_target: objc.id, comptime selector: [*:0]const u8, text: []const u8) void {
     objc.msg(void, setter_target, selector, .{objc.nsText(text)});
 }
 
@@ -1535,12 +1537,13 @@ fn placeIconView(button: objc.id) void {
 
 fn placeDots(button: objc.id) void {
     if (button == null) return;
+    if (shown_badge != true and shown_update_dot != true) return;
     const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
     const flipped = objc.msg(bool, button, "isFlipped", .{});
-    if (shown_badge and badge_view != null) {
+    if (shown_badge == true and badge_view != null) {
         objc.msg(void, badge_view, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - badge_size + 1, .y = if (flipped) r.y + r.h - badge_size + 2 else r.y - 2 }});
     }
-    if (shown_update_dot and update_dot != null) {
+    if (shown_update_dot == true and update_dot != null) {
         objc.msg(void, update_dot, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - update_dot_size + 1, .y = if (flipped) r.y - 1 else r.y + r.h - update_dot_size + 1 }});
     }
 }
@@ -1602,7 +1605,8 @@ fn showIcon(button: objc.id, icon: logic.Icon) void {
 /// it replaces the ready icon, and `showIcon` puts that back when the read ends.
 fn showReading(button: objc.id, step: usize) void {
     if (shown_reading == step) return;
-    if (shown_reading == null) objc.fadeNext(icon_view, 0.3);
+    const was_outline = shown_icon == .outline;
+    if (shown_reading == null and shown_icon != null) objc.fadeNext(if (was_outline) button else icon_view, 0.3);
     want_blink = false;
     shown_reading = step;
     shown_icon = .ready;
@@ -1633,11 +1637,26 @@ const readout_overlap: f64 = 2;
 /// The room between the icon and the readout, beyond the title's own.
 const readout_gap: f64 = 2;
 
-/// The stacked readout right of the icon: two labels in the bar's text colour over a clear title of fixed width, shown
-/// only while there is one.
+var readout_fixed_w: f64 = 44.0;
+
+/// The stacked readout right of the icon: two fixed-width labels sized once from prototype strings over a clear
+/// title spacer, shown only while there is a readout.
 fn makeReadout(button: objc.id) void {
     readout_caption = readoutLabel(header_view.readoutCaptionFont());
     readout_value = readoutLabel(header_view.readoutValueFont());
+    objc.msg(void, readout_caption, "setStringValue:", .{objc.nsString("TOK/S")});
+    objc.msg(void, readout_value, "setStringValue:", .{objc.nsString("00000")});
+    objc.msg(void, readout_caption, "sizeToFit", .{});
+    objc.msg(void, readout_value, "sizeToFit", .{});
+    const cf = objc.msg(objc.NSRect, readout_caption, "frame", .{});
+    const vf = objc.msg(objc.NSRect, readout_value, "frame", .{});
+    readout_fixed_w = @max(44.0, @max(cf.w, vf.w) + 4.0);
+    objc.msg(void, readout_caption, "setFrameSize:", .{objc.NSSize{ .width = readout_fixed_w, .height = cf.h }});
+    objc.msg(void, readout_value, "setFrameSize:", .{objc.NSSize{ .width = readout_fixed_w, .height = vf.h }});
+    objc.msg(void, readout_caption, "setStringValue:", .{objc.nsString("")});
+    objc.msg(void, readout_value, "setStringValue:", .{objc.nsString("")});
+    objc.msg(void, readout_caption, "setHidden:", .{true});
+    objc.msg(void, readout_value, "setHidden:", .{true});
     objc.msg(void, button, "addSubview:", .{readout_caption});
     objc.msg(void, button, "addSubview:", .{readout_value});
     shown_readout_len = std.math.maxInt(usize);
@@ -1678,17 +1697,8 @@ fn setReadout(button: objc.id, r: logic.Readout) void {
         }
         objc.msg(void, readout_value, "setStringValue:", .{objc.nsText(r.value)});
         if (vis_changed) {
-            // Size both labels once on show with fixed width wide enough for readout_max chars, so subsequent
-            // value ticks only call setStringValue: without triggering view geometry changes or ControlCenter XPC.
-            objc.msg(void, readout_caption, "sizeToFit", .{});
-            objc.msg(void, readout_value, "sizeToFit", .{});
-            const cf = objc.msg(objc.NSRect, readout_caption, "frame", .{});
-            const vf = objc.msg(objc.NSRect, readout_value, "frame", .{});
-            const fixed_w = @max(42.0, @max(cf.w, vf.w) + 4.0);
-            objc.msg(void, readout_caption, "setFrameSize:", .{objc.NSSize{ .width = fixed_w, .height = cf.h }});
-            objc.msg(void, readout_value, "setFrameSize:", .{objc.NSSize{ .width = fixed_w, .height = vf.h }});
             if (main_bar.mode() == .main_window) {
-                main_bar.setContentWidth(icon_w + readout_gap + fixed_w + 10.0);
+                main_bar.setContentWidth(icon_w + readout_gap + readout_fixed_w + 10.0);
             }
             placeReadout(button);
         }
@@ -1724,14 +1734,16 @@ fn placeReadout(button: objc.id) void {
 fn attachBarButton(button: objc.id) void {
     shown_icon = null;
     shown_reading = null;
-    shown_badge = false;
-    shown_update_dot = false;
+    shown_badge = null;
+    shown_update_dot = null;
     shown_tooltip_set = false;
     want_blink = false;
     active_anim = .none;
     button_uses_blank = false;
     makeIconView(button);
-    showIcon(button, .outline);
+    // Display the outline until the first refresh without setting `shown_icon`, so a hotplug rebuild + refresh
+    // snaps straight to the live icon instead of cross-fading from offline.
+    objc.msg(void, button, "setImage:", .{outline_icon});
     makeBadge(button);
     makeUpdateDot(button);
     makeReadout(button);
@@ -1739,7 +1751,7 @@ fn attachBarButton(button: objc.id) void {
 
 fn newItem(label: [*:0]const u8, action: ?[*:0]const u8, tag: isize, key: [*:0]const u8, sym: ?[]const u8) objc.id {
     const mi = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSMenuItem"), "alloc", .{}), "initWithTitle:action:keyEquivalent:", .{
-        objc.nsString(label), if (action) |a| objc.sel(a) else null, objc.nsString(key),
+        objc.nsString(label), if (action) |a| objc.selDyn(a) else null, objc.nsString(key),
     });
     objc.msg(void, mi, "setTarget:", .{menu_target});
     objc.msg(void, mi, "setTag:", .{tag});
@@ -1813,8 +1825,8 @@ fn sushiAlive(pid: i32) bool {
 
 /// The orange dot on the menu bar icon, at its lower right: it sits on the colour icon where the sushi does not hide it.
 fn showBadge(button: objc.id, on: bool) void {
-    if (on == shown_badge) return;
-    objc.fadeNext(button, 0.25);
+    if (shown_badge == on) return;
+    if (shown_badge != null) objc.fadeNext(button, 0.25);
     shown_badge = on;
     if (on) {
         const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
@@ -1827,7 +1839,7 @@ fn showBadge(button: objc.id, on: bool) void {
 const badge_size: f64 = 7;
 
 var update_dot: objc.id = null;
-var shown_update_dot = false;
+var shown_update_dot: ?bool = null;
 const update_dot_size: f64 = 6;
 
 /// The blue dot on the menu bar icon's upper right while an update waits.
@@ -1840,12 +1852,12 @@ fn makeUpdateDot(button: objc.id) void {
     objc.msg(void, update_dot, "setHidden:", .{true});
     objc.msg(void, button, "addSubview:", .{update_dot});
     objc.release(update_dot);
-    shown_update_dot = false;
+    shown_update_dot = null;
 }
 
 fn showUpdateDot(button: objc.id, on: bool) void {
-    if (on == shown_update_dot) return;
-    objc.fadeNext(button, 0.25);
+    if (shown_update_dot == on) return;
+    if (shown_update_dot != null) objc.fadeNext(button, 0.25);
     shown_update_dot = on;
     if (on) {
         const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
@@ -1882,12 +1894,12 @@ fn showWhy(why: []const u8) void {
 /// The note item: grey and inert for news, orange and a click to the Log window for a problem. The menu keeps its
 /// width by drawing `title`; the tooltip has the whole `full` text.
 fn showNote(title: []const u8, full: []const u8, problem: bool) void {
-    objc.msg(void, note_mi, "setHidden:", .{title.len == 0});
     var sig: [2 * note_cap + 8]u8 = undefined;
     const key = std.fmt.bufPrint(&sig, "{s}\x00{s}\x00{d}", .{ title, full, @intFromBool(problem) }) catch return;
     if (key.len == shown_note_sig_len and std.mem.eql(u8, key, shown_note_sig[0..key.len])) return;
     shown_note_sig_len = key.len;
     @memcpy(shown_note_sig[0..key.len], key);
+    objc.msg(void, note_mi, "setHidden:", .{title.len == 0});
     if (title.len == 0) return;
     setText(note_mi, "setTitle:", title);
     setText(note_mi, "setToolTip:", full);
@@ -2235,7 +2247,7 @@ fn refresh() void {
             @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         note_shown,
             @intFromBool(note_problem and note_shown.len > 0), header.pill.label, header.line1, header.line2,
             tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_tip,
-            update_button.label,        update_button.tip,     removable_buf[0..rn],   @intFromBool(shown_badge),
+            update_button.label,        update_button.tip,     removable_buf[0..rn],   @intFromBool(shown_badge == true),
             @intFromBool(header.line1_models), g_last_model.get(), mb.label, @intFromBool(mb.enabled), mb.why,
             header.stats[0].label,      header.stats[1].label, header.stats[2].label,  header.a11y,
             @intFromBool(g_lan),
@@ -2459,8 +2471,7 @@ fn screensChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 }
 
 fn spaceChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    main_bar.reposition();
-    if (main_bar.mode() == .main_window) realignBarSubviews();
+    if (main_bar.reposition()) realignBarSubviews();
 }
 
 fn accessibilityChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
@@ -2517,7 +2528,7 @@ fn loadIcons() void {
 
 const find_show_interface: isize = 1;
 
-fn addMainItem(menu: objc.id, title: [*:0]const u8, action: [*:0]const u8, key: [*:0]const u8) objc.id {
+fn addMainItem(menu: objc.id, title: [*:0]const u8, comptime action: [*:0]const u8, key: [*:0]const u8) objc.id {
     return objc.msg(objc.id, menu, "addItemWithTitle:action:keyEquivalent:", .{ objc.nsString(title), objc.sel(action), objc.nsString(key) });
 }
 
@@ -2601,12 +2612,19 @@ fn runMenuBar() noreturn {
         @as(objc.id, null),
     });
     const ws_nc = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSWorkspace"), "sharedWorkspace", .{}), "notificationCenter", .{});
-    objc.msg(void, ws_nc, "addObserver:selector:name:object:", .{
-        menu_target,
-        objc.sel("spaceChanged:"),
-        objc.nsString("NSWorkspaceActiveSpaceDidChangeNotification"),
-        @as(objc.id, null),
-    });
+    for ([_][*:0]const u8{
+        "NSWorkspaceActiveSpaceDidChangeNotification",
+        "NSWorkspaceDidActivateApplicationNotification",
+        "NSWorkspaceDidLaunchApplicationNotification",
+        "NSWorkspaceDidTerminateApplicationNotification",
+    }) |notif| {
+        objc.msg(void, ws_nc, "addObserver:selector:name:object:", .{
+            menu_target,
+            objc.sel("spaceChanged:"),
+            objc.nsString(notif),
+            @as(objc.id, null),
+        });
+    }
     objc.msg(void, ws_nc, "addObserver:selector:name:object:", .{
         menu_target,
         objc.sel("accessibilityChanged:"),
@@ -2780,6 +2798,7 @@ fn renderBadge(dir: []const u8) void {
     };
     for (cases) |c| for ([_]bool{ false, true }) |dark| {
         const box = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSBox"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = 168, .h = 24 }});
+        defer objc.release(box);
         objc.msg(void, box, "setBoxType:", .{@as(isize, 4)});
         objc.msg(void, box, "setBorderWidth:", .{@as(f64, 0)});
         objc.msg(void, box, "setContentViewMargins:", .{objc.NSSize{ .width = 0, .height = 0 }});
@@ -2799,14 +2818,28 @@ fn renderBadge(dir: []const u8) void {
         objc.msg(void, button, "setImage:", .{render_img});
         // The status bar draws a template image in the bar's text colour; a plain button would draw it dimmed.
         objc.msg(void, button, "setContentTintColor:", .{objc.color("labelColor")});
+        // Clear non-owning dot pointers before `setReadout` -> `placeDots` and before `box` is released, so
+        // deallocated subviews from the previous iteration are never dereferenced.
+        badge_view = null;
+        update_dot = null;
+        shown_badge = null;
+        shown_update_dot = null;
+        defer {
+            badge_view = null;
+            update_dot = null;
+            readout_caption = null;
+            readout_value = null;
+            shown_badge = null;
+            shown_update_dot = null;
+        }
         makeReadout(button);
         setReadout(button, c.readout);
         makeUpdateDot(button);
         showUpdateDot(button, c.update);
         makeBadge(button);
-        shown_badge = !c.badge;
         showBadge(button, c.badge);
         objc.msg(void, box, "addSubview:", .{button});
+        objc.release(button);
         const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
         objc.msg(void, box, "setAppearance:", .{objc.msg(objc.id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
         const bounds = objc.msg(NSRect, box, "bounds", .{});
@@ -3119,6 +3152,16 @@ test "the Load button tooltip keeps a long model name whole" {
     button_row.setLoad(.{ .label = "Load", .symbol = "arrow.down.circle", .tip = tip, .closes_menu = false });
     const load = objc.msg(objc.id, objc.msg(objc.id, row, "subviews", .{}), "objectAtIndex:", .{@as(usize, 1)});
     try std.testing.expectEqualStrings(tip, testToolTip(load));
+}
+
+test "objc: comptime sel and class caches stay distinct across names" {
+    try std.testing.expect(objc.sel("alloc") != null);
+    try std.testing.expect(objc.sel("init") != null);
+    try std.testing.expect(objc.sel("alloc") != objc.sel("init"));
+    try std.testing.expectEqual(objc.sel("alloc"), objc.selDyn("alloc"));
+    try std.testing.expect(objc.class("NSObject") != null);
+    try std.testing.expect(objc.class("NSString") != null);
+    try std.testing.expect(objc.class("NSObject") != objc.class("NSString"));
 }
 
 test "a server's error body gives its error.message, and anything else gives nothing" {

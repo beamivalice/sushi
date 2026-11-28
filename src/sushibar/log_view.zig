@@ -22,19 +22,7 @@ const bar_h: f64 = 38;
 
 const Range = extern struct { location: usize, length: usize };
 
-fn Buf(comptime N: usize) type {
-    return struct {
-        data: [N]u8 = undefined,
-        len: usize = 0,
-        fn set(self: *@This(), s: []const u8) void {
-            self.len = @min(s.len, N);
-            @memcpy(self.data[0..self.len], s[0..self.len]);
-        }
-        fn get(self: *const @This()) []const u8 {
-            return self.data[0..self.len];
-        }
-    };
-}
+const Buf = logic.FixedStr;
 
 var window: id = null;
 var text_view: id = null;
@@ -75,10 +63,10 @@ fn nsData(bytes: []const u8) id {
 }
 
 fn color(name: [*:0]const u8) id {
-    return msg(id, objc.class("NSColor"), name, .{});
+    return objc.color(name);
 }
 
-fn control(cls: [*:0]const u8, frame: NSRect) id {
+fn control(comptime cls: [*:0]const u8, frame: NSRect) id {
     return msg(id, msg(id, objc.class(cls), "alloc", .{}), "initWithFrame:", .{frame});
 }
 
@@ -193,7 +181,7 @@ fn pushButton(title: [*:0]const u8, frame: NSRect, selector: [*:0]const u8) id {
     msg(void, b, "setControlSize:", .{@as(isize, 1)});
     msg(void, b, "setFont:", .{msg(id, objc.class("NSFont"), "systemFontOfSize:", .{@as(f64, 12)})});
     msg(void, b, "setTarget:", .{controller});
-    msg(void, b, "setAction:", .{objc.sel(selector)});
+    msg(void, b, "setAction:", .{objc.selDyn(selector)});
     msg(void, b, "setAutoresizingMask:", .{@as(usize, 1 | 8)});
     return b;
 }
@@ -328,13 +316,18 @@ fn readAt(fd: c_int, offset: u64, want: usize, buf: []u8) []u8 {
     return buf[0..@intCast(@max(got, 0))];
 }
 
+const stack_read_cap: usize = 64 * 1024;
+
 /// Replaces the text with the last lines of the file.
 fn reload(o: Opened, restarted: bool) void {
-    const a = std.heap.page_allocator;
     const start: u64 = if (o.size > read_cap) o.size - read_cap else 0;
-    const buf = a.alloc(u8, read_cap) catch return;
-    defer a.free(buf);
-    var chunk = readAt(o.fd, start, @intCast(o.size - start), buf);
+    const want: usize = @intCast(o.size - start);
+    const a = std.heap.page_allocator;
+    var stack_buf: [stack_read_cap]u8 = undefined;
+    const heap_buf: ?[]u8 = if (want > stack_read_cap) (a.alloc(u8, want) catch return) else null;
+    defer if (heap_buf) |hb| a.free(hb);
+    const buf: []u8 = heap_buf orelse stack_buf[0..want];
+    var chunk = if (want > 0) readAt(o.fd, start, want, buf) else buf[0..0];
     var chunk_at = start;
     // A read that began mid-file starts mid-line.
     if (start > 0) {
@@ -356,13 +349,29 @@ fn reload(o: Opened, restarted: bool) void {
 }
 
 fn extend(o: Opened) void {
+    const want: usize = @intCast(@min(o.size - follow.offset, read_cap));
+    if (want == 0) return;
     const a = std.heap.page_allocator;
-    const buf = a.alloc(u8, read_cap) catch return;
-    defer a.free(buf);
-    const chunk = readAt(o.fd, follow.offset, @intCast(o.size - follow.offset), buf);
+    var stack_buf: [stack_read_cap]u8 = undefined;
+    const heap_buf: ?[]u8 = if (want > stack_read_cap) (a.alloc(u8, want) catch return) else null;
+    defer if (heap_buf) |hb| a.free(hb);
+    const buf: []u8 = heap_buf orelse stack_buf[0..want];
+    const chunk = readAt(o.fd, follow.offset, want, buf);
     var take = logic.completeLen(chunk);
-    // A line longer than one read would otherwise never be shown.
-    if (take == 0 and chunk.len == read_cap) take = chunk.len;
+    // A line longer than one read would otherwise never be shown; back off an incomplete trailing UTF-8 sequence.
+    if (take == 0 and chunk.len == read_cap) {
+        var end = chunk.len;
+        var cont: usize = 0;
+        while (cont < 3 and end > 0 and (chunk[end - 1] & 0xC0) == 0x80) : (cont += 1) end -= 1;
+        if (end > 0) {
+            const lead = chunk[end - 1];
+            const need: usize = if (lead < 0x80) 1 else if ((lead & 0xE0) == 0xC0) 2 else if ((lead & 0xF0) == 0xE0) 3 else if ((lead & 0xF8) == 0xF0) 4 else 1;
+            take = if (cont + 1 < need) end - 1 else chunk.len;
+        } else {
+            take = chunk.len;
+        }
+        if (take == 0) take = chunk.len;
+    }
     if (take == 0) return;
     append(chunk[0..take]);
     follow.offset += take;

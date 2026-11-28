@@ -7,6 +7,25 @@ const default_port_mod = @import("../default_port.zig");
 const json_text = @import("../json_text.zig");
 pub const default_port = default_port_mod.port;
 
+/// Fixed-capacity UTF-8 string that truncates cleanly on a character boundary so `objc.nsText` never receives
+/// invalid UTF-8 and returns `nil`.
+pub fn FixedStr(comptime N: usize) type {
+    return struct {
+        buf: [N]u8 = undefined,
+        len: usize = 0,
+
+        pub fn set(self: *@This(), s: []const u8) void {
+            self.len = @min(s.len, N);
+            while (self.len < s.len and self.len > 0 and (s[self.len] & 0xC0) == 0x80) self.len -= 1;
+            @memcpy(self.buf[0..self.len], s[0..self.len]);
+        }
+
+        pub fn get(self: *const @This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+}
+
 pub const Reason = enum { unknown_argument, missing_value, bad_port };
 pub const Command = union(enum) {
     run: ?u16,
@@ -1501,29 +1520,31 @@ pub const Saved = struct {
 /// A file from before added ports holds the one key `port`; one from before the model has no `model`; one from
 /// before the LAN switch has no `lan`.
 pub fn parseSaved(text: []const u8) Saved {
-    var arena: std.heap.FixedBufferAllocator = .init(&saved_scratch);
-    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{}) catch return .{};
-    const obj = switch (v) {
-        .object => |o| o,
-        else => return .{},
+    const WireSaved = struct {
+        port: ?std.json.Value = null,
+        ports: ?std.json.Value = null,
+        model: ?std.json.Value = null,
+        lan: ?std.json.Value = null,
     };
+    var scratch: [saved_max_bytes * 2]u8 = undefined;
+    var arena: std.heap.FixedBufferAllocator = .init(&scratch);
+    const doc = std.json.parseFromSliceLeaky(WireSaved, arena.allocator(), text, .{ .ignore_unknown_fields = true }) catch return .{};
     var out: Saved = .{};
-    if (obj.get("port")) |p| out.port = default_port_mod.fromValue(p);
-    if (obj.get("ports")) |list| if (list == .array) for (list.array.items) |item| {
+    if (doc.port) |p| out.port = default_port_mod.fromValue(p);
+    if (doc.ports) |list| if (list == .array) for (list.array.items) |item| {
         const p = default_port_mod.fromValue(item) orelse continue;
         out.ports.add(p, 0);
     };
-    if (obj.get("model")) |m| if (m == .string and m.string.len <= max_model) {
+    if (doc.model) |m| if (m == .string and m.string.len <= max_model) {
         @memcpy(out.model_buf[0..m.string.len], m.string);
         out.model_len = m.string.len;
     };
-    if (obj.get("lan")) |l| if (l == .bool) {
+    if (doc.lan) |l| if (l == .bool) {
         out.lan = l.bool;
     };
     return out;
 }
 pub const saved_max_bytes = 8192;
-var saved_scratch: [saved_max_bytes]u8 = undefined;
 
 pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8, lan: bool) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -1575,13 +1596,10 @@ pub fn unloadModelBody(buf: []u8, model: []const u8) []const u8 {
 /// The port the Port menu lists first and never lets go: `server.port` of `model-settings.json`, else the built-in
 /// one. The same rule as the server's, through `default_port.fromValue`.
 pub fn defaultPortOf(arena: std.mem.Allocator, settings_json: []const u8) u16 {
-    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, settings_json, .{}) catch return default_port;
-    const server = switch (v) {
-        .object => |o| o.get("server") orelse return default_port,
-        else => return default_port,
-    };
-    if (server != .object) return default_port;
-    return default_port_mod.fromValue(server.object.get("port") orelse return default_port) orelse default_port;
+    const Doc = struct { server: ?struct { port: ?std.json.Value = null } = null };
+    const doc = std.json.parseFromSliceLeaky(Doc, arena, settings_json, .{ .ignore_unknown_fields = true }) catch return default_port;
+    const server = doc.server orelse return default_port;
+    return default_port_mod.fromValue(server.port orelse return default_port) orelse default_port;
 }
 
 /// Where the watch goes when `removed` is forgotten: the default port if it was the watched one.
@@ -1829,6 +1847,19 @@ pub fn mainBarFrame(
         .w = item_w,
         .h = bar_h,
     };
+}
+
+test "FixedStr: cuts on a UTF-8 codepoint boundary so nsText never sees a split multibyte char" {
+    var s: FixedStr(6) = .{};
+    // "abc" (3) + "—" (3 bytes E2 80 94) fits exactly in 6 bytes.
+    s.set("abc\u{2014}z");
+    try std.testing.expectEqualStrings("abc\u{2014}", s.get());
+    // "abcd" (4) + "—" (3 bytes): byte 6 lands inside "—", so it backs up to "abcd".
+    s.set("abcd\u{2014}z");
+    try std.testing.expectEqualStrings("abcd", s.get());
+    // Purely shorter string stays intact.
+    s.set("ok");
+    try std.testing.expectEqualStrings("ok", s.get());
 }
 
 test "multimonitor: status_item on one screen or unified Spaces, main_window when multiple displays have separate Spaces" {

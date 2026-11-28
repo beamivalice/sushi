@@ -199,21 +199,21 @@ fn scanPidListeners(pid: i32, out: []logic.Listener, n: *usize, fds: *[2048]FdIn
     }
 }
 
-var kinfo_lock = std.atomic.Value(bool).init(false);
+var kinfo_lock: std.c.os_unfair_lock = .{};
 var kinfo_buf: []u8 = &.{};
 
 fn fetchUidProcs(out_got: *usize) ?[]const u8 {
-    while (kinfo_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    std.c.os_unfair_lock_lock(&kinfo_lock);
     const mib = [_]c_int{ ctl_kern, kern_proc, kern_proc_uid, @intCast(getuid()) };
     if (kinfo_buf.len == 0) {
         var sz: usize = 0;
         if (std.c.sysctl(&mib, mib.len, null, &sz, null, 0) != 0 or sz < kinfo_proc_size) {
-            kinfo_lock.store(false, .release);
+            std.c.os_unfair_lock_unlock(&kinfo_lock);
             return null;
         }
         const cap = @max(sz + sz / 2, 512 * 1024);
         kinfo_buf = std.heap.page_allocator.alloc(u8, cap) catch {
-            kinfo_lock.store(false, .release);
+            std.c.os_unfair_lock_unlock(&kinfo_lock);
             return null;
         };
     }
@@ -222,19 +222,19 @@ fn fetchUidProcs(out_got: *usize) ?[]const u8 {
         // Buffer too small (process count grew): re-size once and retry.
         var sz: usize = 0;
         if (std.c.sysctl(&mib, mib.len, null, &sz, null, 0) != 0 or sz < kinfo_proc_size) {
-            kinfo_lock.store(false, .release);
+            std.c.os_unfair_lock_unlock(&kinfo_lock);
             return null;
         }
         const cap = sz + sz / 2;
         std.heap.page_allocator.free(kinfo_buf);
         kinfo_buf = std.heap.page_allocator.alloc(u8, cap) catch {
             kinfo_buf = &.{};
-            kinfo_lock.store(false, .release);
+            std.c.os_unfair_lock_unlock(&kinfo_lock);
             return null;
         };
         got = kinfo_buf.len;
         if (std.c.sysctl(&mib, mib.len, kinfo_buf.ptr, &got, null, 0) != 0) {
-            kinfo_lock.store(false, .release);
+            std.c.os_unfair_lock_unlock(&kinfo_lock);
             return null;
         }
     }
@@ -243,7 +243,7 @@ fn fetchUidProcs(out_got: *usize) ?[]const u8 {
 }
 
 fn releaseUidProcs() void {
-    kinfo_lock.store(false, .release);
+    std.c.os_unfair_lock_unlock(&kinfo_lock);
 }
 
 /// Every process listening on a TCP port (own user's only), optionally only those whose executable is `only_exe`.

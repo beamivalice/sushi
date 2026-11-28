@@ -51,6 +51,12 @@ pub fn portOf(view: id) ?u16 {
 
 /// Forgets every row: call before the rows' menu items are removed.
 pub fn reset() void {
+    for (rows[0..row_n]) |*r| {
+        if (r.label != null) {
+            objc.release(r.label);
+            r.label = null;
+        }
+    }
     row_n = 0;
 }
 
@@ -77,9 +83,13 @@ fn attrsOf(size: f64, c: id) id {
 
 const tag = "Default";
 const tag_size: f64 = 11;
+var cached_tag_w: f64 = 0;
 
 fn tagWidth() f64 {
-    return msg(objc.NSSize, objc.nsString(tag), "sizeWithAttributes:", .{attrsOf(tag_size, objc.color("labelColor"))}).width;
+    if (cached_tag_w == 0) {
+        cached_tag_w = msg(objc.NSSize, objc.nsString(tag), "sizeWithAttributes:", .{attrsOf(tag_size, objc.color("labelColor"))}).width;
+    }
+    return cached_tag_w;
 }
 
 /// What the right end of a row holds: the remove button, or the default port's tag.
@@ -166,7 +176,7 @@ fn ignoreMove(_: id, _: bool) void {}
 fn fire(self: id, selector: [*:0]const u8) void {
     msg(void, menu, "cancelTracking", .{});
     // After the menu has closed: the action rebuilds the menu these views belong to.
-    msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.sel(selector), self, @as(f64, 0) });
+    msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.selDyn(selector), self, @as(f64, 0) });
 }
 
 fn mouseDown(self: id, _: objc.SEL, _: id) callconv(.c) void {
@@ -243,10 +253,12 @@ pub fn renderPng(list: []const Row, path: [*:0]const u8, dark: bool, hover: ?usi
     for (list) |r| w = @max(w, widthFor(r.label, r.removable));
     const total = height * @as(f64, @floatFromInt(list.len));
     const stack = msg(id, msg(id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = w, .h = total }});
+    defer objc.release(stack);
     for (list, 0..) |r, i| {
         const v = create(null, null, r, w) orelse continue;
         msg(void, v, "setFrameOrigin:", .{objc.NSPoint{ .x = 0, .y = total - height * @as(f64, @floatFromInt(i + 1)) }});
         msg(void, stack, "addSubview:", .{v});
+        objc.release(v);
         const st = &rows[row_n - 1];
         st.hover = hover == i;
         st.x_hover = st.hover and x_hover;

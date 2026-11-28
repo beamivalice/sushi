@@ -95,7 +95,7 @@ pub fn init(target: id, menu: id) id {
 pub fn syncScreens() bool {
     const want = desiredMode();
     if (want == g_mode) {
-        if (g_mode == .main_window) reposition();
+        if (g_mode == .main_window) _ = reposition();
         return false;
     }
     teardownActive();
@@ -107,7 +107,7 @@ pub fn syncScreens() bool {
 /// Updates panel width when the readout shows or hides (no-op for `NSStatusItem`, which auto-sizes).
 pub fn setContentWidth(w: f64) void {
     g_item_w = @max(w, 28);
-    if (g_mode == .main_window) reposition();
+    if (g_mode == .main_window) _ = reposition();
 }
 
 /// Shows or clears the subtle rounded menu-bar selection pill on the main-window panel while the menu is open.
@@ -190,7 +190,7 @@ fn buildActive() void {
             }
             msg(void, content, "addSubview:", .{g_panel_button});
             g_panel_hidden = true;
-            reposition();
+            _ = reposition();
         },
     }
 }
@@ -281,10 +281,11 @@ fn scanMainMenuBar(main_w: f64, self_win_num: i32) MenuBarScan {
 }
 
 /// Repositions the main-monitor panel onto `NSScreen.screens[0]`'s menu bar, hiding it if the bar is hidden.
-pub fn reposition() void {
-    if (g_mode != .main_window or g_panel == null) return;
+/// Returns true when the panel's frame changed or it became visible, so callers only realign subviews when needed.
+pub fn reposition() bool {
+    if (g_mode != .main_window or g_panel == null) return false;
     const screens = msg(id, objc.class("NSScreen"), "screens", .{});
-    if (screens == null or msg(usize, screens, "count", .{}) == 0) return;
+    if (screens == null or msg(usize, screens, "count", .{}) == 0) return false;
     const main = msg(id, screens, "objectAtIndex:", .{@as(usize, 0)});
     const frame = msg(NSRect, main, "frame", .{});
     const vis = msg(NSRect, main, "visibleFrame", .{});
@@ -305,6 +306,9 @@ pub fn reposition() void {
         scan.bar_visible,
     );
     if (placed) |r| {
+        const cur = msg(NSRect, g_panel, "frame", .{});
+        const same = !g_panel_hidden and cur.x == r.x and cur.y == r.y and cur.w == r.w and cur.h == r.h;
+        if (same) return false;
         msg(void, g_panel, "setFrame:display:", .{ NSRect{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, true });
         if (g_panel_button != null) {
             msg(void, g_panel_button, "setFrame:", .{NSRect{ .x = 0, .y = 0, .w = r.w, .h = r.h }});
@@ -317,8 +321,10 @@ pub fn reposition() void {
             msg(void, g_panel, "orderFrontRegardless", .{});
             g_panel_hidden = false;
         }
+        return true;
     } else if (!g_panel_hidden) {
         msg(void, g_panel, "orderOut:", .{@as(id, null)});
         g_panel_hidden = true;
     }
+    return false;
 }

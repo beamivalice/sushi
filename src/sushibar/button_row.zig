@@ -161,10 +161,10 @@ fn mouseDown(self: id, _: objc.SEL, _: id) callconv(.c) void {
     b.hover = false;
     msg(void, self, "display", .{});
     const selector = b.action orelse b.selector;
-    if (!b.closes_menu) return msg(void, target, selector, .{self});
+    if (!b.closes_menu) return objc.msgDyn(void, target, selector, .{self});
     msg(void, menu, "cancelTracking", .{});
     // After the menu has closed: an action that opens a window or an alert must not run inside menu tracking.
-    msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.sel(selector), self, @as(f64, 0) });
+    msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.selDyn(selector), self, @as(f64, 0) });
 }
 
 /// `target` receives `showLog:`, `updateButton:`, `quit:`, `toggle:` and `loadModel:`; `top_menu` is closed when
