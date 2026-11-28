@@ -16,7 +16,7 @@ const score_tg = 256;
 pub const score_source: [:0]const u8 =
     \\const int L = q_shape[0];
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
-    \\constexpr int KPT = TG / IH, P = IHD + 1;
+    \\const int KPT = TG / IH, P = IHD + 1;
     \\const int W = NOPE + HALF;
     \\const int nb = keys_shape[0];
     \\const int n0 = int(threadgroup_position_in_grid.x) * KPT;
@@ -28,7 +28,13 @@ pub const score_source: [:0]const u8 =
     \\  }
     \\  return;
     \\}
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float sm[5160];
+    \\threadgroup float* qs = sm;
+    \\threadgroup float* ks = sm + IH * P;
+    \\#else
     \\threadgroup float qs[IH * P], ks[KPT * P];
+    \\#endif
     \\for (int e = int(tid); e < KPT * W; e += TG) {
     \\  const int kki = e / W, ni = n0 + kki;
     \\  const uint j = uint(e % W);
@@ -125,8 +131,9 @@ pub fn scoresApply(s: mlx.mlx_stream, q: Arr, keys: Arr, heads: c_int, rope_dims
     const ks = mlx.getShape(keys);
     if (qs.len != 2 or ks.len != 2 or qs[0] < 1 or qs[0] > rows_max or heads <= 0 or heads > 32 or @rem(32, heads) != 0) return false;
     const d = ks[1];
+    const sm_need: i64 = @as(i64, heads + @divExact(score_tg, heads)) * (@as(i64, d) + 1);
     return mlx.streamIsGpu(s) and qs[1] == heads * d and ks[0] > 0 and @rem(rope_dims, 2) == 0 and rope_dims > 0 and
-        rope_dims <= d and mlx.mlx_array_dtype(q) == .float32 and mlx.mlx_array_dtype(keys) == .float32;
+        rope_dims <= d and sm_need <= 5160 and mlx.mlx_array_dtype(q) == .float32 and mlx.mlx_array_dtype(keys) == .float32;
 }
 
 const Key = struct { t: c_int, nb: c_int, ih: c_int, ihd: c_int, nope: c_int, half: c_int, base: c_int, kscale: c_int };
@@ -152,6 +159,9 @@ fn build(k: Key) !kcfg.Config {
 pub fn scores(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr, heads: c_int, rope_dims: c_int, theta: f32, wscale: f32, p0: c_int, ratio: c_int) !Arr {
     const ks = mlx.getShape(keys);
     const d = ks[1];
+    if (heads <= 0 or heads > 32 or @rem(32, heads) != 0) return error.Hy4IndexScratch;
+    const sm_need: i64 = @as(i64, heads + @divExact(score_tg, heads)) * (@as(i64, d) + 1);
+    if (sm_need > 5160) return error.Hy4IndexScratch;
     const half = @divExact(rope_dims, 2);
     const cfg = try cfgs.get(.{ .t = mlx.getShape(q)[0], .nb = ks[0], .ih = heads, .ihd = d, .nope = d - rope_dims, .half = half, .base = kcfg.bits(std.math.log2(theta)), .kscale = kcfg.bits(@floatFromInt(ratio)) }, build);
     const mv = [_]i32{ p0, ratio };

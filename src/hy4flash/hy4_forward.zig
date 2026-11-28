@@ -152,7 +152,7 @@ pub fn oPartsReady(o: *Ops, h: Arr, w: Mix, attn: Attn) bool {
     const b = attn.o.stq orelse return false;
     const d = mlx.getShape(h)[mlx.getShape(h).len - 1];
     const nd = mlx.mlx_array_dtype(attn.post_norm);
-    return hy4_hc.applies(o.s, h, w.fn_, w.scale) and @rem(d, 128) == 0 and d <= 4096 and b.outDim() == d and
+    return hy4_hc.applies(o.s, h, w.fn_, w.scale) and @rem(d, 128) == 0 and d <= 3072 and b.outDim() == d and
         mlx.mlx_array_size(attn.post_norm) == @as(usize, @intCast(d)) and (nd == .float32 or nd == .bfloat16);
 }
 

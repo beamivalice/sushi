@@ -855,49 +855,74 @@ pub const steel_scores_source: [:0]const u8 =
     \\const device float* qrow = ql + size_t(sg * 8) * size_t(qs);
     \\const device float* prow = qp + size_t(sg * 8) * size_t(ps);
     \\const device float* crow = c + size_t(key0) * size_t(cs);
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float pes[8 * 128];
+    \\#else
     \\threadgroup float pes[8 * R];
+    \\#endif
     \\for (int e = int(thread_position_in_threadgroup.x); e < 8 * R; e += H * 4)
     \\  pes[e] = static_cast<float>(pe[size_t(key0 + e / R) * size_t(pe_strides[EA]) + size_t(e % R)]);
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\simdgroup_float8x8 acc[NPART];
-    \\simdgroup_float8x8 rope = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\#pragma clang loop unroll(full)
-    \\for (int p = 0; p < NPART; ++p) acc[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\for (int kb = 0; kb < PK / 8; kb += U) {
-    \\  simdgroup_float8x8 a[NPART][U], b[NPART][U];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int p = 0; p < NPART; ++p) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int u = 0; u < U; ++u) {
-    \\      const int k0 = p * PK + (kb + u) * 8;
-    \\      simdgroup_load(b[p][u], crow + k0, cs, ulong2(0, 0), true);
-    \\      simdgroup_load(a[p][u], qrow + k0, qs);
-    \\    }
+    \\const int ksteps = PK / 8;
+    \\float v0 = 0.0f, v1 = 0.0f;
+    \\for (int p = 0; p < NPART; ++p) {
+    \\  simdgroup_float8x8 ap = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\  int kb = 0;
+    \\  for (; kb + 4 <= ksteps; kb += 4) {
+    \\    simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+    \\    const int k0 = p * PK + kb * 8;
+    \\    simdgroup_load(b0, crow + k0 + 0, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a0, qrow + k0 + 0, qs);
+    \\    simdgroup_load(b1, crow + k0 + 8, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a1, qrow + k0 + 8, qs);
+    \\    simdgroup_load(b2, crow + k0 + 16, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a2, qrow + k0 + 16, qs);
+    \\    simdgroup_load(b3, crow + k0 + 24, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a3, qrow + k0 + 24, qs);
+    \\    simdgroup_multiply_accumulate(ap, a0, b0, ap);
+    \\    simdgroup_multiply_accumulate(ap, a1, b1, ap);
+    \\    simdgroup_multiply_accumulate(ap, a2, b2, ap);
+    \\    simdgroup_multiply_accumulate(ap, a3, b3, ap);
     \\  }
-    \\  #pragma clang loop unroll(full)
-    \\  for (int u = 0; u < U; ++u) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int p = 0; p < NPART; ++p) simdgroup_multiply_accumulate(acc[p], a[p][u], b[p][u], acc[p]);
+    \\  for (; kb < ksteps; ++kb) {
+    \\    simdgroup_float8x8 a0, b0;
+    \\    const int k0 = p * PK + kb * 8;
+    \\    simdgroup_load(b0, crow + k0, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a0, qrow + k0, qs);
+    \\    simdgroup_multiply_accumulate(ap, a0, b0, ap);
     \\  }
+    \\  v0 += ap.thread_elements()[0];
+    \\  v1 += ap.thread_elements()[1];
     \\}
+    \\simdgroup_float8x8 rope = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     \\{
-    \\  simdgroup_float8x8 a[R / 8], b[R / 8];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int kk = 0; kk < R / 8; ++kk) {
-    \\    simdgroup_load(b[kk], pes + kk * 8, R, ulong2(0, 0), true);
-    \\    simdgroup_load(a[kk], prow + kk * 8, ps);
+    \\  const int rsteps = R / 8;
+    \\  int kk = 0;
+    \\  for (; kk + 4 <= rsteps; kk += 4) {
+    \\    simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+    \\    simdgroup_load(b0, pes + (kk + 0) * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a0, prow + (kk + 0) * 8, ps);
+    \\    simdgroup_load(b1, pes + (kk + 1) * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a1, prow + (kk + 1) * 8, ps);
+    \\    simdgroup_load(b2, pes + (kk + 2) * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a2, prow + (kk + 2) * 8, ps);
+    \\    simdgroup_load(b3, pes + (kk + 3) * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a3, prow + (kk + 3) * 8, ps);
+    \\    simdgroup_multiply_accumulate(rope, a0, b0, rope);
+    \\    simdgroup_multiply_accumulate(rope, a1, b1, rope);
+    \\    simdgroup_multiply_accumulate(rope, a2, b2, rope);
+    \\    simdgroup_multiply_accumulate(rope, a3, b3, rope);
     \\  }
-    \\  #pragma clang loop unroll(full)
-    \\  for (int kk = 0; kk < R / 8; ++kk) simdgroup_multiply_accumulate(rope, a[kk], b[kk], rope);
+    \\  for (; kk < rsteps; ++kk) {
+    \\    simdgroup_float8x8 a0, b0;
+    \\    simdgroup_load(b0, pes + kk * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a0, prow + kk * 8, ps);
+    \\    simdgroup_multiply_accumulate(rope, a0, b0, rope);
+    \\  }
     \\}
     \\simdgroup_float8x8 res;
-    \\#pragma clang loop unroll(full)
-    \\for (int e = 0; e < 2; ++e) {
-    \\  float v = 0.0f;
-    \\  #pragma clang loop unroll(full)
-    \\  for (int p = 0; p < NPART; ++p) v += acc[p].thread_elements()[e];
-    \\  res.thread_elements()[e] = v;
-    \\}
+    \\res.thread_elements()[0] = v0;
+    \\res.thread_elements()[1] = v1;
     \\simdgroup_store(res, s1 + size_t(sg * 8) * N + key0, N);
     \\simdgroup_store(rope, s2 + size_t(sg * 8) * N + key0, N);
 ;
@@ -910,34 +935,40 @@ pub const steel_values_source: [:0]const u8 =
     \\const ulong cs = ulong(c_strides[CA]);
     \\const device float* prow = pp + size_t(sg * 8) * size_t(ps);
     \\const device float* ccol = c + d0;
-    \\simdgroup_float8x8 acc[NPART];
-    \\#pragma clang loop unroll(full)
-    \\for (int p = 0; p < NPART; ++p) acc[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\for (int kb = 0; kb < PK / 8; kb += U) {
-    \\  simdgroup_float8x8 a[NPART][U], b[NPART][U];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int p = 0; p < NPART; ++p) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int u = 0; u < U; ++u) {
-    \\      const int k0 = p * PK + (kb + u) * 8;
-    \\      simdgroup_load(b[p][u], ccol + size_t(k0) * size_t(cs), cs);
-    \\      simdgroup_load(a[p][u], prow + k0, ps);
-    \\    }
+    \\const int ksteps = PK / 8;
+    \\float v0 = 0.0f, v1 = 0.0f;
+    \\for (int p = 0; p < NPART; ++p) {
+    \\  simdgroup_float8x8 ap = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\  int kb = 0;
+    \\  for (; kb + 4 <= ksteps; kb += 4) {
+    \\    simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+    \\    const int k0 = p * PK + kb * 8;
+    \\    simdgroup_load(b0, ccol + size_t(k0 + 0) * size_t(cs), cs);
+    \\    simdgroup_load(a0, prow + k0 + 0, ps);
+    \\    simdgroup_load(b1, ccol + size_t(k0 + 8) * size_t(cs), cs);
+    \\    simdgroup_load(a1, prow + k0 + 8, ps);
+    \\    simdgroup_load(b2, ccol + size_t(k0 + 16) * size_t(cs), cs);
+    \\    simdgroup_load(a2, prow + k0 + 16, ps);
+    \\    simdgroup_load(b3, ccol + size_t(k0 + 24) * size_t(cs), cs);
+    \\    simdgroup_load(a3, prow + k0 + 24, ps);
+    \\    simdgroup_multiply_accumulate(ap, a0, b0, ap);
+    \\    simdgroup_multiply_accumulate(ap, a1, b1, ap);
+    \\    simdgroup_multiply_accumulate(ap, a2, b2, ap);
+    \\    simdgroup_multiply_accumulate(ap, a3, b3, ap);
     \\  }
-    \\  #pragma clang loop unroll(full)
-    \\  for (int u = 0; u < U; ++u) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int p = 0; p < NPART; ++p) simdgroup_multiply_accumulate(acc[p], a[p][u], b[p][u], acc[p]);
+    \\  for (; kb < ksteps; ++kb) {
+    \\    simdgroup_float8x8 a0, b0;
+    \\    const int k0 = p * PK + kb * 8;
+    \\    simdgroup_load(b0, ccol + size_t(k0) * size_t(cs), cs);
+    \\    simdgroup_load(a0, prow + k0, ps);
+    \\    simdgroup_multiply_accumulate(ap, a0, b0, ap);
     \\  }
+    \\  v0 += ap.thread_elements()[0];
+    \\  v1 += ap.thread_elements()[1];
     \\}
     \\simdgroup_float8x8 res;
-    \\#pragma clang loop unroll(full)
-    \\for (int e = 0; e < 2; ++e) {
-    \\  float v = 0.0f;
-    \\  #pragma clang loop unroll(full)
-    \\  for (int p = 0; p < NPART; ++p) v += acc[p].thread_elements()[e];
-    \\  res.thread_elements()[e] = v;
-    \\}
+    \\res.thread_elements()[0] = v0;
+    \\res.thread_elements()[1] = v1;
     \\simdgroup_store(res, u + size_t(sg * 8) * W + d0, W);
 ;
 
@@ -1034,8 +1065,10 @@ pub fn steelScores(s: mlx.mlx_stream, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr) 
     }
     const h = rowsOf(q_lat);
     const n = rowsOf(c);
+    const rope = colsOf(k_pe);
+    if (rope < 0 or rope > 128) return error.Hy4SteelRope;
     const plan = steelPlan(h, n, colsOf(c)).?;
-    const cfg = try steel_cfgs.get(.{ .h = h, .n = n, .w = colsOf(c), .r = colsOf(k_pe), .parts = plan.parts, .pk = plan.pk, .a0 = rowAxis(q_lat).?, .a1 = rowAxis(q_pe).?, .a2 = rowAxis(c).?, .a3 = rowAxis(k_pe).?, .scores = true }, steelBuild);
+    const cfg = try steel_cfgs.get(.{ .h = h, .n = n, .w = colsOf(c), .r = rope, .parts = plan.parts, .pk = plan.pk, .a0 = rowAxis(q_lat).?, .a1 = rowAxis(q_pe).?, .a2 = rowAxis(c).?, .a3 = rowAxis(k_pe).?, .scores = true }, steelBuild);
     var out: [2]Arr = undefined;
     try applyOuts(s, steel_scores_kernel.?, &.{ q_lat, q_pe, c, k_pe }, cfg, &out);
     return .{ .s1 = out[0], .s2 = out[1] };
@@ -1088,49 +1121,74 @@ pub const steel_scores_groups_source: [:0]const u8 =
     \\const device float* qrow = ql + (size_t(grp) * size_t(H) + size_t(sg * 8)) * size_t(qs);
     \\const device float* prow = qp + (size_t(grp) * size_t(H) + size_t(sg * 8)) * size_t(ps);
     \\const device float* crow = c + (size_t(grp) * size_t(N) + size_t(key0)) * size_t(cs);
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float pes[8 * 128];
+    \\#else
     \\threadgroup float pes[8 * R];
+    \\#endif
     \\for (int e = int(thread_position_in_threadgroup.x); e < 8 * R; e += H * 4)
     \\  pes[e] = static_cast<float>(pe[(size_t(grp) * size_t(N) + size_t(key0 + e / R)) * size_t(R) + size_t(e % R)]);
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\simdgroup_float8x8 acc[NPART];
-    \\simdgroup_float8x8 rope = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\#pragma clang loop unroll(full)
-    \\for (int p = 0; p < NPART; ++p) acc[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\for (int kb = 0; kb < PK / 8; kb += U) {
-    \\  simdgroup_float8x8 a[NPART][U], b[NPART][U];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int p = 0; p < NPART; ++p) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int u = 0; u < U; ++u) {
-    \\      const int k0 = p * PK + (kb + u) * 8;
-    \\      simdgroup_load(b[p][u], crow + k0, cs, ulong2(0, 0), true);
-    \\      simdgroup_load(a[p][u], qrow + k0, qs);
-    \\    }
+    \\const int ksteps = PK / 8;
+    \\float v0 = 0.0f, v1 = 0.0f;
+    \\for (int p = 0; p < NPART; ++p) {
+    \\  simdgroup_float8x8 ap = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\  int kb = 0;
+    \\  for (; kb + 4 <= ksteps; kb += 4) {
+    \\    simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+    \\    const int k0 = p * PK + kb * 8;
+    \\    simdgroup_load(b0, crow + k0 + 0, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a0, qrow + k0 + 0, qs);
+    \\    simdgroup_load(b1, crow + k0 + 8, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a1, qrow + k0 + 8, qs);
+    \\    simdgroup_load(b2, crow + k0 + 16, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a2, qrow + k0 + 16, qs);
+    \\    simdgroup_load(b3, crow + k0 + 24, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a3, qrow + k0 + 24, qs);
+    \\    simdgroup_multiply_accumulate(ap, a0, b0, ap);
+    \\    simdgroup_multiply_accumulate(ap, a1, b1, ap);
+    \\    simdgroup_multiply_accumulate(ap, a2, b2, ap);
+    \\    simdgroup_multiply_accumulate(ap, a3, b3, ap);
     \\  }
-    \\  #pragma clang loop unroll(full)
-    \\  for (int u = 0; u < U; ++u) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int p = 0; p < NPART; ++p) simdgroup_multiply_accumulate(acc[p], a[p][u], b[p][u], acc[p]);
+    \\  for (; kb < ksteps; ++kb) {
+    \\    simdgroup_float8x8 a0, b0;
+    \\    const int k0 = p * PK + kb * 8;
+    \\    simdgroup_load(b0, crow + k0, cs, ulong2(0, 0), true);
+    \\    simdgroup_load(a0, qrow + k0, qs);
+    \\    simdgroup_multiply_accumulate(ap, a0, b0, ap);
     \\  }
+    \\  v0 += ap.thread_elements()[0];
+    \\  v1 += ap.thread_elements()[1];
     \\}
+    \\simdgroup_float8x8 rope = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     \\{
-    \\  simdgroup_float8x8 a[R / 8], b[R / 8];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int kk = 0; kk < R / 8; ++kk) {
-    \\    simdgroup_load(b[kk], pes + kk * 8, R, ulong2(0, 0), true);
-    \\    simdgroup_load(a[kk], prow + kk * 8, ps);
+    \\  const int rsteps = R / 8;
+    \\  int kk = 0;
+    \\  for (; kk + 4 <= rsteps; kk += 4) {
+    \\    simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+    \\    simdgroup_load(b0, pes + (kk + 0) * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a0, prow + (kk + 0) * 8, ps);
+    \\    simdgroup_load(b1, pes + (kk + 1) * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a1, prow + (kk + 1) * 8, ps);
+    \\    simdgroup_load(b2, pes + (kk + 2) * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a2, prow + (kk + 2) * 8, ps);
+    \\    simdgroup_load(b3, pes + (kk + 3) * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a3, prow + (kk + 3) * 8, ps);
+    \\    simdgroup_multiply_accumulate(rope, a0, b0, rope);
+    \\    simdgroup_multiply_accumulate(rope, a1, b1, rope);
+    \\    simdgroup_multiply_accumulate(rope, a2, b2, rope);
+    \\    simdgroup_multiply_accumulate(rope, a3, b3, rope);
     \\  }
-    \\  #pragma clang loop unroll(full)
-    \\  for (int kk = 0; kk < R / 8; ++kk) simdgroup_multiply_accumulate(rope, a[kk], b[kk], rope);
+    \\  for (; kk < rsteps; ++kk) {
+    \\    simdgroup_float8x8 a0, b0;
+    \\    simdgroup_load(b0, pes + kk * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a0, prow + kk * 8, ps);
+    \\    simdgroup_multiply_accumulate(rope, a0, b0, rope);
+    \\  }
     \\}
     \\simdgroup_float8x8 res;
-    \\#pragma clang loop unroll(full)
-    \\for (int e = 0; e < 2; ++e) {
-    \\  float v = 0.0f;
-    \\  #pragma clang loop unroll(full)
-    \\  for (int p = 0; p < NPART; ++p) v += acc[p].thread_elements()[e];
-    \\  res.thread_elements()[e] = v;
-    \\}
+    \\res.thread_elements()[0] = v0;
+    \\res.thread_elements()[1] = v1;
     \\const device float* s1g = s1 + (size_t(grp) * size_t(H) + size_t(sg * 8)) * size_t(N) + size_t(key0);
     \\const device float* s2g = s2 + (size_t(grp) * size_t(H) + size_t(sg * 8)) * size_t(N) + size_t(key0);
     \\simdgroup_store(res, const_cast<device float*>(s1g), N);
@@ -1146,34 +1204,40 @@ pub const steel_values_groups_source: [:0]const u8 =
     \\const ulong cs = ulong(c_strides[1]);
     \\const device float* prow = pp + (size_t(grp) * size_t(H) + size_t(sg * 8)) * size_t(ps);
     \\const device float* ccol = c + size_t(grp) * size_t(N) * size_t(W) + size_t(d0);
-    \\simdgroup_float8x8 acc[NPART];
-    \\#pragma clang loop unroll(full)
-    \\for (int p = 0; p < NPART; ++p) acc[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\for (int kb = 0; kb < PK / 8; kb += U) {
-    \\  simdgroup_float8x8 a[NPART][U], b[NPART][U];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int p = 0; p < NPART; ++p) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int u = 0; u < U; ++u) {
-    \\      const int k0 = p * PK + (kb + u) * 8;
-    \\      simdgroup_load(b[p][u], ccol + size_t(k0) * size_t(cs), cs);
-    \\      simdgroup_load(a[p][u], prow + k0, ps);
-    \\    }
+    \\const int ksteps = PK / 8;
+    \\float v0 = 0.0f, v1 = 0.0f;
+    \\for (int p = 0; p < NPART; ++p) {
+    \\  simdgroup_float8x8 ap = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\  int kb = 0;
+    \\  for (; kb + 4 <= ksteps; kb += 4) {
+    \\    simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+    \\    const int k0 = p * PK + kb * 8;
+    \\    simdgroup_load(b0, ccol + size_t(k0 + 0) * size_t(cs), cs);
+    \\    simdgroup_load(a0, prow + k0 + 0, ps);
+    \\    simdgroup_load(b1, ccol + size_t(k0 + 8) * size_t(cs), cs);
+    \\    simdgroup_load(a1, prow + k0 + 8, ps);
+    \\    simdgroup_load(b2, ccol + size_t(k0 + 16) * size_t(cs), cs);
+    \\    simdgroup_load(a2, prow + k0 + 16, ps);
+    \\    simdgroup_load(b3, ccol + size_t(k0 + 24) * size_t(cs), cs);
+    \\    simdgroup_load(a3, prow + k0 + 24, ps);
+    \\    simdgroup_multiply_accumulate(ap, a0, b0, ap);
+    \\    simdgroup_multiply_accumulate(ap, a1, b1, ap);
+    \\    simdgroup_multiply_accumulate(ap, a2, b2, ap);
+    \\    simdgroup_multiply_accumulate(ap, a3, b3, ap);
     \\  }
-    \\  #pragma clang loop unroll(full)
-    \\  for (int u = 0; u < U; ++u) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int p = 0; p < NPART; ++p) simdgroup_multiply_accumulate(acc[p], a[p][u], b[p][u], acc[p]);
+    \\  for (; kb < ksteps; ++kb) {
+    \\    simdgroup_float8x8 a0, b0;
+    \\    const int k0 = p * PK + kb * 8;
+    \\    simdgroup_load(b0, ccol + size_t(k0) * size_t(cs), cs);
+    \\    simdgroup_load(a0, prow + k0, ps);
+    \\    simdgroup_multiply_accumulate(ap, a0, b0, ap);
     \\  }
+    \\  v0 += ap.thread_elements()[0];
+    \\  v1 += ap.thread_elements()[1];
     \\}
     \\simdgroup_float8x8 res;
-    \\#pragma clang loop unroll(full)
-    \\for (int e = 0; e < 2; ++e) {
-    \\  float v = 0.0f;
-    \\  #pragma clang loop unroll(full)
-    \\  for (int p = 0; p < NPART; ++p) v += acc[p].thread_elements()[e];
-    \\  res.thread_elements()[e] = v;
-    \\}
+    \\res.thread_elements()[0] = v0;
+    \\res.thread_elements()[1] = v1;
     \\simdgroup_store(res, u + (size_t(grp) * size_t(H) + size_t(sg * 8)) * size_t(W) + size_t(d0), W);
 ;
 
@@ -1251,6 +1315,7 @@ pub fn steelScoresGroups(s: mlx.mlx_stream, groups: c_int, ql: Arr, qp: Arr, c: 
     const n = mlx.getShape(c)[1];
     const lat = mlx.getShape(c)[2];
     const rope = mlx.getShape(pe)[2];
+    if (rope < 0 or rope > 128) return error.Hy4SteelRope;
     const plan = steelPlan(h, n, lat).?;
     const cfg = try steel_groups_cfgs.get(.{ .h = h, .n = n, .w = lat, .r = rope, .parts = plan.parts, .pk = plan.pk, .groups = groups, .scores = true }, steelGroupsBuild);
     var out: [2]Arr = undefined;

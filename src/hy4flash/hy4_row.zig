@@ -20,6 +20,7 @@ pub const source: [:0]const u8 =
     \\using F4 = metal::vec<float, 4>;
     \\constexpr int TN = 4;
     \\constexpr int BLOCK_N = 32 * TN;
+    \\constexpr int MAX_R = 16;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\int out_row = (int(threadgroup_position_in_grid.x) * NSG + int(sg)) * TM;
@@ -27,9 +28,10 @@ pub const source: [:0]const u8 =
     \\#ifndef SUSHI_METALLIB
     \\static_assert(K % BLOCK_N == 0, "a row off the gemv tile");
     \\#endif
-    \\float result[R][TM];
+    \\float result[MAX_R][TM];
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < R; ++r) {
+    \\for (int r = 0; r < MAX_R; ++r) {
+    \\  if (r >= R) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int t = 0; t < TM; ++t) result[r][t] = 0.0f;
     \\}
@@ -44,7 +46,8 @@ pub const source: [:0]const u8 =
     \\    for (int tn = 0; tn < TN; ++tn) inter[t][tn] = static_cast<float>(mv[tn]);
     \\  }
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; ++r) {
+    \\  for (int r = 0; r < MAX_R; ++r) {
+    \\    if (r >= R) break;
     \\    const F4 cv = *(const device F4*)(x + (size_t)r * (size_t)K + bn);
     \\    #pragma clang loop unroll(full)
     \\    for (int t = 0; t < TM; ++t) {
@@ -55,7 +58,8 @@ pub const source: [:0]const u8 =
     \\  bn += BLOCK_N;
     \\}
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < R; ++r) {
+    \\for (int r = 0; r < MAX_R; ++r) {
+    \\  if (r >= R) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int t = 0; t < TM; ++t) {
     \\    #pragma clang loop unroll(full)
@@ -64,7 +68,8 @@ pub const source: [:0]const u8 =
     \\}
     \\if (lane == 0u) {
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; ++r) {
+    \\  for (int r = 0; r < MAX_R; ++r) {
+    \\    if (r >= R) break;
     \\    #pragma clang loop unroll(full)
     \\    for (int t = 0; t < TM; ++t) out[(size_t)r * (size_t)N + out_row + t] = result[r][t];
     \\  }
@@ -78,12 +83,14 @@ pub const source: [:0]const u8 =
 pub const wide_source: [:0]const u8 =
     \\constexpr int TM = 4, TN = 4, BN = 8, SN = 32;
     \\constexpr int BLOCK_N = BN * SN * TN;
+    \\constexpr int MAX_R = 16;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
-    \\threadgroup float tgp[BN * R * TM];
-    \\float result[R][TM];
+    \\threadgroup float tgp[BN * MAX_R * TM];
+    \\float result[MAX_R][TM];
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < R; r++) {
+    \\for (int r = 0; r < MAX_R; r++) {
+    \\  if (r >= R) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; tm++) result[r][tm] = 0.0f;
     \\}
@@ -103,7 +110,8 @@ pub const wide_source: [:0]const u8 =
     \\    mat_offset += K;
     \\  }
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; r++) {
+    \\  for (int r = 0; r < MAX_R; r++) {
+    \\    if (r >= R) break;
     \\    const device float* xr = x + (size_t)r * (size_t)K;
     \\    #pragma clang loop unroll(full)
     \\    for (int tn = 0; tn < TN; tn++) v_coeff[tn] = xr[bn + tn];
@@ -122,7 +130,8 @@ pub const wide_source: [:0]const u8 =
     \\    for (int tn = 0; tn < TN; tn++) inter[tm][tn] = bn + tn < K ? static_cast<float>(mat[tm * K + bn + tn]) : 0.0f;
     \\  }
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; r++) {
+    \\  for (int r = 0; r < MAX_R; r++) {
+    \\    if (r >= R) break;
     \\    const device float* xr = x + (size_t)r * (size_t)K;
     \\    #pragma clang loop unroll(full)
     \\    for (int tn = 0; tn < TN; tn++) v_coeff[tn] = bn + tn < K ? xr[bn + tn] : 0.0f;
@@ -134,7 +143,8 @@ pub const wide_source: [:0]const u8 =
     \\  }
     \\}
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < R; r++) {
+    \\for (int r = 0; r < MAX_R; r++) {
+    \\  if (r >= R) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; tm++) {
     \\    #pragma clang loop unroll(full)
@@ -144,7 +154,8 @@ pub const wide_source: [:0]const u8 =
     \\threadgroup float* mine = tgp + sg * (R * TM);
     \\if (lane == 0) {
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; r++) {
+    \\  for (int r = 0; r < MAX_R; r++) {
+    \\    if (r >= R) break;
     \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; tm++) mine[r * TM + tm] = result[r][tm];
     \\  }
@@ -154,13 +165,15 @@ pub const wide_source: [:0]const u8 =
     \\  #pragma clang loop unroll(full)
     \\  for (int sgn = 1; sgn < BN; sgn++) {
     \\    #pragma clang loop unroll(full)
-    \\    for (int r = 0; r < R; r++) {
+    \\    for (int r = 0; r < MAX_R; r++) {
+    \\      if (r >= R) break;
     \\      #pragma clang loop unroll(full)
     \\      for (int tm = 0; tm < TM; tm++) result[r][tm] += tgp[sgn * (R * TM) + r * TM + tm];
     \\    }
     \\  }
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; r++) {
+    \\  for (int r = 0; r < MAX_R; r++) {
+    \\    if (r >= R) break;
     \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; tm++) out[(size_t)r * (size_t)N + out_row + tm] = result[r][tm];
     \\  }
@@ -232,6 +245,7 @@ fn build(key: Key) !kcfg.Config {
 /// `x · Wᵀ` [T, N] f32 for `applies`' shapes, each row its one-row launch's bytes; `x` contiguous. The caller frees it.
 pub fn rowF32(s: mlx.mlx_stream, x: Arr, w: Arr) !Arr {
     const xs = mlx.getShape(x);
+    if (xs[0] < 1 or xs[0] > max_rows) return error.Hy4RowRows;
     const ws = mlx.getShape(w);
     const kern = try getKernel(wideTile(ws[0], ws[1]));
     const cfg = try cfgs.get(.{ .rows = xs[0], .n = ws[0], .k = ws[1] }, build);

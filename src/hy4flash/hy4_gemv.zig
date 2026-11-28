@@ -18,6 +18,7 @@ pub const source: [:0]const u8 =
     \\constexpr int NSG = 2;
     \\constexpr int TN = 4;
     \\constexpr int BLOCK_N = 32 * TN;
+    \\constexpr int MAX_R = 16;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\int out_row = (int(threadgroup_position_in_grid.x) * NSG + int(sg)) * TM;
@@ -25,18 +26,20 @@ pub const source: [:0]const u8 =
     \\#ifndef SUSHI_METALLIB
     \\static_assert(K % BLOCK_N == 0, "a row off the gemv tile");
     \\#endif
-    \\float result[R][TM];
+    \\float result[MAX_R][TM];
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < R; ++r) {
+    \\for (int r = 0; r < MAX_R; ++r) {
+    \\  if (r >= R) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; ++tm) result[r][tm] = 0.0f;
     \\}
     \\int bn = int(lane) * TN;
     \\const int n_iter = K / BLOCK_N;
     \\for (int i = 0; i < n_iter; ++i) {
-    \\  F4 cv[R];
+    \\  F4 cv[MAX_R];
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; ++r) {
+    \\  for (int r = 0; r < MAX_R; ++r) {
+    \\    if (r >= R) break;
     \\    const X4 xv = *(const device X4*)(x + (size_t)r * (size_t)K + (size_t)bn);
     \\    cv[r] = F4(
     \\      static_cast<float>(static_cast<bfloat16_t>(xv[0])),
@@ -50,7 +53,8 @@ pub const source: [:0]const u8 =
     \\    const float w0 = static_cast<float>(m0[0]), w1 = static_cast<float>(m0[1]);
     \\    const float w2 = static_cast<float>(m0[2]), w3 = static_cast<float>(m0[3]);
     \\    #pragma clang loop unroll(full)
-    \\    for (int r = 0; r < R; ++r) {
+    \\    for (int r = 0; r < MAX_R; ++r) {
+    \\      if (r >= R) break;
     \\      result[r][0] += w0 * cv[r][0];
     \\      result[r][0] += w1 * cv[r][1];
     \\      result[r][0] += w2 * cv[r][2];
@@ -61,7 +65,8 @@ pub const source: [:0]const u8 =
     \\    const float w0 = static_cast<float>(m1[0]), w1 = static_cast<float>(m1[1]);
     \\    const float w2 = static_cast<float>(m1[2]), w3 = static_cast<float>(m1[3]);
     \\    #pragma clang loop unroll(full)
-    \\    for (int r = 0; r < R; ++r) {
+    \\    for (int r = 0; r < MAX_R; ++r) {
+    \\      if (r >= R) break;
     \\      result[r][1] += w0 * cv[r][0];
     \\      result[r][1] += w1 * cv[r][1];
     \\      result[r][1] += w2 * cv[r][2];
@@ -71,7 +76,8 @@ pub const source: [:0]const u8 =
     \\  bn += BLOCK_N;
     \\}
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < R; ++r) {
+    \\for (int r = 0; r < MAX_R; ++r) {
+    \\  if (r >= R) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; ++tm) {
     \\    #pragma clang loop unroll(full)
@@ -80,7 +86,8 @@ pub const source: [:0]const u8 =
     \\}
     \\if (lane == 0u) {
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; ++r) {
+    \\  for (int r = 0; r < MAX_R; ++r) {
+    \\    if (r >= R) break;
     \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; ++tm) out[(size_t)r * (size_t)N + out_row + tm] = static_cast<OT>(static_cast<bfloat16_t>(result[r][tm]));
     \\  }
@@ -135,8 +142,10 @@ fn rowsAs(s: mlx.mlx_stream, x: Arr, w: Arr, out_dt: mlx.mlx_dtype) !Arr {
         if (made.ctx == null) return error.MetalKernelCompileFailed;
         kernel = made;
     }
+    const rows = mlx.getShape(x)[0];
+    if (rows < 1 or rows > max_rows) return error.Hy4GemvRows;
     const ws = mlx.getShape(w);
-    const cfg = try cfgs.get(.{ .rows = mlx.getShape(x)[0], .n = ws[0], .k = ws[1], .out_dt = out_dt }, build);
+    const cfg = try cfgs.get(.{ .rows = rows, .n = ws[0], .k = ws[1], .out_dt = out_dt }, build);
     const ins = [_]Arr{ w, x };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);

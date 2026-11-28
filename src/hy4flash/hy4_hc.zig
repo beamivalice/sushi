@@ -18,8 +18,12 @@ const Arr = mlx.mlx_array;
 const head =
     \\const int l = threadgroup_position_in_grid.y;
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\constexpr int N = HC * D, DT = (D + TG - 1) / TG;
+    \\const int N = HC * D, DT = (D + TG - 1) / TG;
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float t_d[MIXN][32], t_s[32], t_pre[HC], t_s2[32];
+    \\#else
     \\threadgroup float t_d[MIXN][TG / 32], t_s[TG / 32], t_pre[HC], t_s2[TG / 32];
+    \\#endif
     \\const float e0 = eps[0], e1 = eps[1], e2 = eps[2];
     \\const float zs = tid < uint(MIXN) ? scale[tid / uint(HC)] : 0.0f, zb = tid < uint(MIXN) ? float(base[tid]) : 0.0f;
     \\
@@ -27,20 +31,47 @@ const head =
 
 // The mixes' simd sums into `t_d` and `t_s`: thread `tid` the terms `k = tid + c·TG` in order.
 const mix_sums =
-    \\float sv[(D % TG == 0) ? (HC * DT) : 1];
+    \\constexpr int MAX_DT = 6;
+    \\const bool cache_sv = (D % TG == 0) && (DT <= MAX_DT);
+    \\float sv[HC][MAX_DT];
+    \\#pragma clang loop unroll(full)
+    \\for (int hc_i = 0; hc_i < HC; ++hc_i)
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < MAX_DT; ++i) sv[hc_i][i] = 0.0f;
     \\float dd[MIXN], ss = 0.0f;
+    \\#pragma clang loop unroll(full)
     \\for (int j = 0; j < MIXN; ++j) dd[j] = 0.0f;
-    \\for (int c = 0, k = tid; k < N; k += TG, ++c) {
-    \\  float fv[MIXN];
+    \\if (cache_sv) {
     \\  #pragma clang loop unroll(full)
-    \\  for (int j = 0; j < MIXN; ++j) fv[j] = fn[size_t(j) * N + k];
-    \\  const size_t o = size_t(l) * N + k;
-    \\  const float v = STREAM(o, k);
-    \\  STORE_M;
-    \\  if (D % TG == 0) sv[c] = v;
-    \\  #pragma clang loop unroll(full)
-    \\  for (int j = 0; j < MIXN; ++j) dd[j] = metal::fma(v, fv[j], dd[j]);
-    \\  ss = metal::fma(v, v, ss);
+    \\  for (int hc_i = 0; hc_i < HC; ++hc_i) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < MAX_DT; ++i) {
+    \\      if (i >= DT) break;
+    \\      const int k = int(tid) + (hc_i * DT + i) * TG;
+    \\      float fv[MIXN];
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < MIXN; ++j) fv[j] = fn[size_t(j) * N + k];
+    \\      const size_t o = size_t(l) * N + k;
+    \\      const float v = STREAM(o, k);
+    \\      STORE_M;
+    \\      sv[hc_i][i] = v;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < MIXN; ++j) dd[j] = metal::fma(v, fv[j], dd[j]);
+    \\      ss = metal::fma(v, v, ss);
+    \\    }
+    \\  }
+    \\} else {
+    \\  for (int k = int(tid); k < N; k += TG) {
+    \\    float fv[MIXN];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int j = 0; j < MIXN; ++j) fv[j] = fn[size_t(j) * N + k];
+    \\    const size_t o = size_t(l) * N + k;
+    \\    const float v = STREAM(o, k);
+    \\    STORE_M;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int j = 0; j < MIXN; ++j) dd[j] = metal::fma(v, fv[j], dd[j]);
+    \\    ss = metal::fma(v, v, ss);
+    \\  }
     \\}
     \\for (int j = 0; j < MIXN; ++j) { const float v = metal::simd_sum(dd[j]); if (lane == 0) t_d[j][sg] = v; }
     \\{ const float v = metal::simd_sum(ss); if (lane == 0) t_s[sg] = v; }
@@ -53,7 +84,9 @@ const mix_tail =
     \\if (tid < uint(MIXN)) {
     \\  const int j = int(tid), c = j % HC;
     \\  float a = 0.0f, b = 0.0f;
+    \\#ifndef SUSHI_METALLIB
     \\  #pragma clang loop unroll(full)
+    \\#endif
     \\  for (int g = 0; g < TG / 32; ++g) { a += t_d[j][g]; b += t_s[g]; }
     \\  const float z = a * metal::precise::rsqrt(b / float(N) + e0) * zs + zb;
     \\  if (j < HC) t_pre[c] = 1.0f / (1.0f + metal::precise::exp(-z)) + e1;
@@ -61,30 +94,66 @@ const mix_tail =
     \\}
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\float cp[HC];
+    \\#pragma clang loop unroll(full)
     \\for (int j = 0; j < HC; ++j) cp[j] = t_pre[j];
-    \\float s2 = 0.0f, hv[DT];
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < DT; ++i) {
-    \\  const int d = int(tid) + i * TG;
-    \\  hv[i] = 0.0f;
-    \\  if (d < D) {
-    \\    float h = 0.0f;
-    \\    for (int j = 0; j < HC; ++j) h += cp[j] * SV(j, i, d);
-    \\    hv[i] = h;
-    \\    s2 += h * h;
+    \\if (DT <= MAX_DT) {
+    \\  float s2 = 0.0f, hv[MAX_DT];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < MAX_DT; ++i) {
+    \\    if (i >= DT) break;
+    \\    const int d = int(tid) + i * TG;
+    \\    hv[i] = 0.0f;
+    \\    if (d < D) {
+    \\      float h = 0.0f;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < HC; ++j) h += cp[j] * SV(j, i, d);
+    \\      hv[i] = h;
+    \\      s2 += h * h;
+    \\    }
     \\  }
-    \\}
-    \\s2 = metal::simd_sum(s2);
-    \\if (lane == 0) t_s2[sg] = s2;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\float tot = 0.0f;
-    \\#pragma clang loop unroll(full)
-    \\for (int g = 0; g < TG / 32; ++g) tot += t_s2[g];
-    \\const float inv = metal::precise::rsqrt(tot / float(D) + e0);
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < DT; ++i) {
-    \\  const int d = int(tid) + i * TG;
-    \\  if (d < D) h_out[size_t(l) * D + d] = WV(i, d) * float(hv[i] * inv);
+    \\  s2 = metal::simd_sum(s2);
+    \\  if (lane == 0) t_s2[sg] = s2;
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  float tot = 0.0f;
+    \\#ifndef SUSHI_METALLIB
+    \\  #pragma clang loop unroll(full)
+    \\#endif
+    \\  for (int g = 0; g < TG / 32; ++g) tot += t_s2[g];
+    \\  const float inv = metal::precise::rsqrt(tot / float(D) + e0);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < MAX_DT; ++i) {
+    \\    if (i >= DT) break;
+    \\    const int d = int(tid) + i * TG;
+    \\    if (d < D) h_out[size_t(l) * D + d] = WV(i, d) * float(hv[i] * inv);
+    \\  }
+    \\} else {
+    \\  float s2 = 0.0f;
+    \\  for (int i = 0; i < DT; ++i) {
+    \\    const int d = int(tid) + i * TG;
+    \\    if (d < D) {
+    \\      float h = 0.0f;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < HC; ++j) h += cp[j] * STREAM((size_t(l) * HC + j) * D + d, j * D + d);
+    \\      h_out[size_t(l) * D + d] = h;
+    \\      s2 += h * h;
+    \\    }
+    \\  }
+    \\  s2 = metal::simd_sum(s2);
+    \\  if (lane == 0) t_s2[sg] = s2;
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  float tot = 0.0f;
+    \\#ifndef SUSHI_METALLIB
+    \\  #pragma clang loop unroll(full)
+    \\#endif
+    \\  for (int g = 0; g < TG / 32; ++g) tot += t_s2[g];
+    \\  const float inv = metal::precise::rsqrt(tot / float(D) + e0);
+    \\  for (int i = 0; i < DT; ++i) {
+    \\    const int d = int(tid) + i * TG;
+    \\    if (d < D) {
+    \\      const size_t o = size_t(l) * D + d;
+    \\      h_out[o] = float(w[d]) * float(h_out[o] * inv);
+    \\    }
+    \\  }
     \\}
 ;
 
@@ -95,17 +164,25 @@ const mix_tail =
 // into `t_d` and `t_s` and runs `mix_tail`, the rest return, so none waits for another. Each threadgroup first loads
 // the collapse's stream values and norm weight (`sv`, `wv`), so the last one's tail reads only the sums.
 const wide_sums =
+    \\constexpr int MAX_DT = 6;
     \\threadgroup bool t_last[1];
-    \\float sv[HC * DT], wv[DT];
+    \\float sv[HC][MAX_DT], wv[MAX_DT];
     \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < DT; ++i) {
-    \\  const int d = int(tid) + i * TG;
+    \\for (int i = 0; i < MAX_DT; ++i) {
     \\  wv[i] = 0.0f;
-    \\  for (int j = 0; j < HC; ++j) sv[j * DT + i] = 0.0f;
-    \\  if (d < D) {
-    \\    wv[i] = float(w[d]);
-    \\    #pragma clang loop unroll(full)
-    \\    for (int j = 0; j < HC; ++j) sv[j * DT + i] = STREAM((size_t(l) * HC + j) * D + d, j * D + d);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int j = 0; j < HC; ++j) sv[j][i] = 0.0f;
+    \\}
+    \\if (DT <= MAX_DT) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < MAX_DT; ++i) {
+    \\    if (i >= DT) break;
+    \\    const int d = int(tid) + i * TG;
+    \\    if (d < D) {
+    \\      wv[i] = float(w[d]);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < HC; ++j) sv[j][i] = STREAM((size_t(l) * HC + j) * D + d, j * D + d);
+    \\    }
     \\  }
     \\}
     \\{
@@ -115,8 +192,11 @@ const wide_sums =
     \\    const int j = int(p % uint(MIXN));
     \\    const uint vs = p / uint(MIXN);
     \\    float dd = 0.0f, ss = 0.0f;
+    \\    const int n_steps = (N + TG - 1) / TG;
+    \\#ifndef SUSHI_METALLIB
     \\    #pragma clang loop unroll(full)
-    \\    for (int c = 0; c < (N + TG - 1) / TG; ++c) {
+    \\#endif
+    \\    for (int c = 0; c < n_steps; ++c) {
     \\      const int k = int(vs * 32u + lane) + c * TG;
     \\      if (k < N) {
     \\        const float fv = fn[size_t(j) * N + k];
@@ -159,46 +239,92 @@ const wide_sums =
 // lanes), the normed row into `t_y`.
 fn backNorm(comptime add: bool) []const u8 {
     return
+        \\#ifdef SUSHI_METALLIB
+        \\threadgroup float t_y[3072], t_ls[32], t_inv[1];
+        \\#else
         \\threadgroup float t_y[D], t_ls[32], t_inv[1];
+        \\#endif
         \\{
-        \\  constexpr uint axis_size = uint(D);
-        \\  constexpr int RG = 32 * ((((D + 3) / 4) + 31) / 32), RR = (RG + TG - 1) / TG;
-        \\  float thread_x[RR][4];
+        \\  const uint axis_size = uint(D);
+        \\  const int RG = 32 * ((((D + 3) / 4) + 31) / 32), RR = (RG + TG - 1) / TG;
         \\  if (sg == 0) t_ls[lane] = 0;
         \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-        \\  for (int r = 0; r < RR; ++r) {
-        \\    const uint vt = tid + uint(r * TG);
-        \\    if (vt < uint(RG)) {
-        \\      float acc = 0;
-        \\      for (int i = 0; i < 4; i++) {
-        \\        uint c = vt * 4 + i;
-        \\        float v = 0;
-        \\        if (c < axis_size) {
-        \\          v = static_cast<float>(a[size_t(l) * D + c]);
+        \\  if (RR <= 2) {
+        \\    float thread_x[2][4];
+        \\    #pragma clang loop unroll(full)
+        \\    for (int r = 0; r < 2; ++r) {
+        \\      if (r >= RR) break;
+        \\      const uint vt = tid + uint(r * TG);
+        \\      if (vt < uint(RG)) {
+        \\        float acc = 0;
+        \\        for (int i = 0; i < 4; i++) {
+        \\          uint c = vt * 4 + i;
+        \\          float v = 0;
+        \\          if (c < axis_size) {
+        \\            v = static_cast<float>(a[size_t(l) * D + c]);
         \\
     ++ (if (add)
-        \\          v = v + static_cast<float>(b[size_t(l) * D + c]);
+        \\            v = v + static_cast<float>(b[size_t(l) * D + c]);
         \\
     else "") ++
+        \\          }
+        \\          thread_x[r][i] = v;
+        \\          acc += thread_x[r][i] * thread_x[r][i];
         \\        }
-        \\        thread_x[r][i] = v;
-        \\        acc += thread_x[r][i] * thread_x[r][i];
+        \\        acc = simd_sum(acc);
+        \\        if (lane == 0) t_ls[vt / 32] = acc;
         \\      }
-        \\      acc = simd_sum(acc);
-        \\      if (lane == 0) t_ls[vt / 32] = acc;
         \\    }
-        \\  }
-        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-        \\  if (sg == 0) {
-        \\    float acc = simd_sum(t_ls[lane]);
-        \\    if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
-        \\  }
-        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-        \\  for (int r = 0; r < RR; ++r) {
-        \\    const uint vt = tid + uint(r * TG);
-        \\    for (int i = 0; i < 4; i++) {
-        \\      uint c = vt * 4 + i;
-        \\      if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(thread_x[r][i] * t_inv[0]);
+        \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\    if (sg == 0) {
+        \\      float acc = simd_sum(t_ls[lane]);
+        \\      if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
+        \\    }
+        \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\    #pragma clang loop unroll(full)
+        \\    for (int r = 0; r < 2; ++r) {
+        \\      if (r >= RR) break;
+        \\      const uint vt = tid + uint(r * TG);
+        \\      for (int i = 0; i < 4; i++) {
+        \\        uint c = vt * 4 + i;
+        \\        if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(thread_x[r][i] * t_inv[0]);
+        \\      }
+        \\    }
+        \\  } else {
+        \\    for (int r = 0; r < RR; ++r) {
+        \\      const uint vt = tid + uint(r * TG);
+        \\      if (vt < uint(RG)) {
+        \\        float acc = 0;
+        \\        for (int i = 0; i < 4; i++) {
+        \\          uint c = vt * 4 + i;
+        \\          float v = 0;
+        \\          if (c < axis_size) {
+        \\            v = static_cast<float>(a[size_t(l) * D + c]);
+        \\
+    ++ (if (add)
+        \\            v = v + static_cast<float>(b[size_t(l) * D + c]);
+        \\
+    else "") ++
+        \\            t_y[c] = v;
+        \\          }
+        \\          acc += v * v;
+        \\        }
+        \\        acc = simd_sum(acc);
+        \\        if (lane == 0) t_ls[vt / 32] = acc;
+        \\      }
+        \\    }
+        \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\    if (sg == 0) {
+        \\      float acc = simd_sum(t_ls[lane]);
+        \\      if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
+        \\    }
+        \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\    for (int r = 0; r < RR; ++r) {
+        \\      const uint vt = tid + uint(r * TG);
+        \\      for (int i = 0; i < 4; i++) {
+        \\        uint c = vt * 4 + i;
+        \\        if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(t_y[c] * t_inv[0]);
+        \\      }
         \\    }
         \\  }
         \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -210,10 +336,14 @@ fn backNorm(comptime add: bool) []const u8 {
 const back_norm = backNorm(true);
 
 const back_inner_norm =
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float t_y[3072], t_ls[32], t_inv[1];
+    \\#else
     \\threadgroup float t_y[D], t_ls[32], t_inv[1];
+    \\#endif
     \\{
     \\#pragma clang fp contract(off)
-    \\  constexpr uint NB = uint(D) / 128u;
+    \\  const uint NB = uint(D) / 128u;
     \\  const float psc = 0.08838834764831845f;
     \\  for (uint blk = sg; blk < NB; blk += uint(TG) / 32u) {
     \\    const uint col = blk * 128u + lane;
@@ -227,36 +357,69 @@ const back_inner_norm =
     \\  }
     \\}
     \\{
-    \\  constexpr uint axis_size = uint(D);
-    \\  constexpr int RG = 32 * ((((D + 3) / 4) + 31) / 32), RR = (RG + TG - 1) / TG;
-    \\  float thread_x[RR][4];
+    \\  const uint axis_size = uint(D);
+    \\  const int RG = 32 * ((((D + 3) / 4) + 31) / 32), RR = (RG + TG - 1) / TG;
     \\  if (sg == 0) t_ls[lane] = 0;
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int r = 0; r < RR; ++r) {
-    \\    const uint vt = tid + uint(r * TG);
-    \\    if (vt < uint(RG)) {
-    \\      float acc = 0;
+    \\  if (RR <= 2) {
+    \\    float thread_x[2][4];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int r = 0; r < 2; ++r) {
+    \\      if (r >= RR) break;
+    \\      const uint vt = tid + uint(r * TG);
+    \\      if (vt < uint(RG)) {
+    \\        float acc = 0;
+    \\        for (int i = 0; i < 4; i++) {
+    \\          uint c = vt * 4 + i;
+    \\          float v = c < axis_size ? t_y[c] : 0;
+    \\          thread_x[r][i] = v;
+    \\          acc += thread_x[r][i] * thread_x[r][i];
+    \\        }
+    \\        acc = simd_sum(acc);
+    \\        if (lane == 0) t_ls[vt / 32] = acc;
+    \\      }
+    \\    }
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    if (sg == 0) {
+    \\      float acc = simd_sum(t_ls[lane]);
+    \\      if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
+    \\    }
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    #pragma clang loop unroll(full)
+    \\    for (int r = 0; r < 2; ++r) {
+    \\      if (r >= RR) break;
+    \\      const uint vt = tid + uint(r * TG);
     \\      for (int i = 0; i < 4; i++) {
     \\        uint c = vt * 4 + i;
-    \\        float v = c < axis_size ? t_y[c] : 0;
-    \\        thread_x[r][i] = v;
-    \\        acc += thread_x[r][i] * thread_x[r][i];
+    \\        if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(thread_x[r][i] * t_inv[0]);
     \\      }
-    \\      acc = simd_sum(acc);
-    \\      if (lane == 0) t_ls[vt / 32] = acc;
     \\    }
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (sg == 0) {
-    \\    float acc = simd_sum(t_ls[lane]);
-    \\    if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int r = 0; r < RR; ++r) {
-    \\    const uint vt = tid + uint(r * TG);
-    \\    for (int i = 0; i < 4; i++) {
-    \\      uint c = vt * 4 + i;
-    \\      if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(thread_x[r][i] * t_inv[0]);
+    \\  } else {
+    \\    for (int r = 0; r < RR; ++r) {
+    \\      const uint vt = tid + uint(r * TG);
+    \\      if (vt < uint(RG)) {
+    \\        float acc = 0;
+    \\        for (int i = 0; i < 4; i++) {
+    \\          uint c = vt * 4 + i;
+    \\          float v = c < axis_size ? t_y[c] : 0;
+    \\          acc += v * v;
+    \\        }
+    \\        acc = simd_sum(acc);
+    \\        if (lane == 0) t_ls[vt / 32] = acc;
+    \\      }
+    \\    }
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    if (sg == 0) {
+    \\      float acc = simd_sum(t_ls[lane]);
+    \\      if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
+    \\    }
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    for (int r = 0; r < RR; ++r) {
+    \\      const uint vt = tid + uint(r * TG);
+    \\      for (int i = 0; i < 4; i++) {
+    \\        uint c = vt * 4 + i;
+    \\        if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(t_y[c] * t_inv[0]);
+    \\      }
     \\    }
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -270,10 +433,14 @@ const back_inner_norm =
 /// neighbours of a block by fused multiply-adds, sums them a block by `simd_sum` and the blocks' sums by simdgroup 0,
 /// and leaves `ow · (y · inv)` in `t_y`, as that finish's one threadgroup does.
 const o_norm =
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float t_y[3072], t_ls[32], t_inv[1];
+    \\#else
     \\threadgroup float t_y[D], t_ls[32], t_inv[1];
+    \\#endif
     \\{
     \\#pragma clang fp contract(off)
-    \\  constexpr uint NB = uint(D) / 128u;
+    \\  const uint NB = uint(D) / 128u;
     \\  const float psc = 0.08838834764831845f;
     \\  if (sg == 0) t_ls[lane] = 0.0f;
     \\  for (uint blk = sg; blk < NB; blk += uint(TG) / 32u) {
@@ -322,38 +489,74 @@ const o_norm =
 /// The expand form's `y` as `rows_finish_rms_thru` norms W_o's finished rows `oy` (`[L, D]` f32) by `ow` and ε (`OEPS`):
 /// `o_norm` past its finish, each simdgroup's 128-blocks read from `oy` in that finish's lanes, into `t_y`.
 const o_rows_norm =
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float t_y[3072], t_ls[32], t_inv[1];
+    \\#else
     \\threadgroup float t_y[D], t_ls[32], t_inv[1];
+    \\#endif
     \\{
     \\#pragma clang fp contract(off)
-    \\  constexpr uint NB = uint(D) / 128u, SGN = uint(TG) / 32u, BR = (NB + SGN - 1u) / SGN;
+    \\  const uint NB = uint(D) / 128u, SGN = uint(TG) / 32u, BR = (NB + SGN - 1u) / SGN;
     \\  const device float *yr = oy + size_t(l) * D;
     \\  if (sg == 0 && lane >= NB) t_ls[lane] = 0.0f;
-    \\  float tx[BR][4];
-    \\  #pragma clang loop unroll(full)
-    \\  for (uint i = 0u; i < BR; i++) {
-    \\    const uint blk = sg + i * SGN;
-    \\    if (blk < NB) {
-    \\      float acc = 0.0f;
-    \\      for (int q = 0; q < 4; q++) {
-    \\        tx[i][q] = yr[blk * 128u + lane * 4u + uint(q)];
-    \\        acc = metal::fma(tx[i][q], tx[i][q], acc);
+    \\  if (BR <= 2u) {
+    \\    float tx[2][4];
+    \\    #pragma clang loop unroll(full)
+    \\    for (uint i = 0u; i < 2u; i++) {
+    \\      if (i >= BR) break;
+    \\      const uint blk = sg + i * SGN;
+    \\      if (blk < NB) {
+    \\        float acc = 0.0f;
+    \\        for (int q = 0; q < 4; q++) {
+    \\          tx[i][q] = yr[blk * 128u + lane * 4u + uint(q)];
+    \\          acc = metal::fma(tx[i][q], tx[i][q], acc);
+    \\        }
+    \\        acc = simd_sum(acc);
+    \\        if (lane == 0) t_ls[blk] = acc;
     \\      }
-    \\      acc = simd_sum(acc);
-    \\      if (lane == 0) t_ls[blk] = acc;
     \\    }
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (sg == 0) {
-    \\    const float acc = simd_sum(t_ls[lane]);
-    \\    if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / uint(D) + as_type<float>(OEPS));
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  #pragma clang loop unroll(full)
-    \\  for (uint i = 0u; i < BR; i++) {
-    \\    const uint blk = sg + i * SGN;
-    \\    if (blk < NB) for (int q = 0; q < 4; q++) {
-    \\      const uint c = blk * 128u + lane * 4u + uint(q);
-    \\      t_y[c] = float(ow[c]) * (tx[i][q] * t_inv[0]);
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    if (sg == 0) {
+    \\      const float acc = simd_sum(t_ls[lane]);
+    \\      if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / uint(D) + as_type<float>(OEPS));
+    \\    }
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    #pragma clang loop unroll(full)
+    \\    for (uint i = 0u; i < 2u; i++) {
+    \\      if (i >= BR) break;
+    \\      const uint blk = sg + i * SGN;
+    \\      if (blk < NB) for (int q = 0; q < 4; q++) {
+    \\        const uint c = blk * 128u + lane * 4u + uint(q);
+    \\        t_y[c] = float(ow[c]) * (tx[i][q] * t_inv[0]);
+    \\      }
+    \\    }
+    \\  } else {
+    \\    for (uint i = 0u; i < BR; i++) {
+    \\      const uint blk = sg + i * SGN;
+    \\      if (blk < NB) {
+    \\        float acc = 0.0f;
+    \\        for (int q = 0; q < 4; q++) {
+    \\          const uint c = blk * 128u + lane * 4u + uint(q);
+    \\          const float v = yr[c];
+    \\          t_y[c] = v;
+    \\          acc = metal::fma(v, v, acc);
+    \\        }
+    \\        acc = simd_sum(acc);
+    \\        if (lane == 0) t_ls[blk] = acc;
+    \\      }
+    \\    }
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    if (sg == 0) {
+    \\      const float acc = simd_sum(t_ls[lane]);
+    \\      if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / uint(D) + as_type<float>(OEPS));
+    \\    }
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    for (uint i = 0u; i < BR; i++) {
+    \\      const uint blk = sg + i * SGN;
+    \\      if (blk < NB) for (int q = 0; q < 4; q++) {
+    \\        const uint c = blk * 128u + lane * 4u + uint(q);
+    \\        t_y[c] = float(ow[c]) * (t_y[c] * t_inv[0]);
+    \\      }
     \\    }
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -384,7 +587,7 @@ pub fn kernelSource(comptime f: Form, comptime w: bool) [:0]const u8 {
         .expand_rows => o_rows_norm,
     };
     // Where the collapse reads its stream values and norm weight: the wide launch's prefetch, else the inputs.
-    const sums = if (w) "#define SV(j, i, d) sv[(j) * DT + (i)]\n#define WV(i, d) wv[i]\n" ++ wide_sums else "#define SV(j, i, d) ((D % TG == 0) ? sv[(j) * DT + (i)] : STREAM((size_t(l) * HC + (j)) * D + (d), (j) * D + (d)))\n#define WV(i, d) w[d]\n" ++ mix_sums;
+    const sums = if (w) "#define SV(j, i, d) sv[(j)][(i)]\n#define WV(i, d) wv[i]\n" ++ wide_sums else "#define SV(j, i, d) (cache_sv ? sv[(j)][(i)] : STREAM((size_t(l) * HC + (j)) * D + (d), (j) * D + (d)))\n#define WV(i, d) float(w[d])\n" ++ mix_sums;
     // A wide grid's padding row (`build`) returns before it reads.
     const gate = if (w) "if (l >= x_shape[0]) return;\n" else "";
     return stream ++ head ++ gate ++ first ++ "{\n#pragma clang fp contract(off)\n" ++ sums ++ mix_tail ++ "}\n";
@@ -497,6 +700,7 @@ fn run(s: mlx.mlx_stream, inputs: []const Arr, x: Arr, w: Arr, base: Arr, form: 
 
 fn runSplit(s: mlx.mlx_stream, inputs: []const Arr, x: Arr, w: Arr, base: Arr, form: Form, eps_bits: c_int, osplit: c_int) !Normed {
     const xs = mlx.getShape(x);
+    if (form != .plain and form != .expand and xs[2] > 3072) return error.Hy4HcPartsShape;
     var key: Key = .{ .rows = xs[0], .hc = xs[1], .d = xs[2], .tg = @intCast(hck.hc_tg), .form = form, .wide = true, .w_dt = mlx.mlx_array_dtype(w), .base_dt = mlx.mlx_array_dtype(base), .eps = eps_bits, .osplit = osplit };
     const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -640,6 +844,11 @@ pub fn probeForms(s: mlx.mlx_stream, d: c_int) !void {
         const c = try FormCase.zeros(&o, 1, d, if (d >= 3072) 32 else 16);
         var least: c_int = @intCast(hck.hc_tg);
         for (std.enums.values(Form)) |f| {
+            switch (f) {
+                .plain, .expand => {},
+                .back, .expand_norm => if (d > 3072) continue,
+                .back_inner, .expand_parts, .expand_rows => if (d > 3072 or @rem(d, 128) != 0) continue,
+            }
             const r = try c.run(&o, f);
             try mlx.check(mlx.mlx_array_eval(r.h));
             var it = narrow_tgs.valueIterator();
@@ -718,7 +927,7 @@ pub fn backInnerApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, a_svh: 
         if (mlx.mlx_array_dtype(sv) != .float16 or mlx.mlx_array_size(sv) != @as(usize, @intCast(d))) return false;
     }
     const wd = mlx.mlx_array_dtype(wn);
-    return @rem(d, 128) == 0 and d <= 4096 and std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32 and
+    return @rem(d, 128) == 0 and d <= 3072 and std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32 and
         mlx.getShape(wn).len == 1 and mlx.getShape(wn)[0] == d and (wd == .float32 or wd == .bfloat16);
 }
 
@@ -737,7 +946,7 @@ pub fn expandNormApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, wn: Ar
     const lanes = [_]c_int{ hs[0], hs[1] };
     const ad = mlx.mlx_array_dtype(a);
     const wd = mlx.mlx_array_dtype(wn);
-    return hs[2] <= 4096 and std.mem.eql(c_int, mlx.getShape(a), &rows) and (ad == .float32 or ad == .bfloat16) and
+    return hs[2] <= 3072 and std.mem.eql(c_int, mlx.getShape(a), &rows) and (ad == .float32 or ad == .bfloat16) and
         std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32 and
         mlx.getShape(wn).len == 1 and mlx.getShape(wn)[0] == hs[2] and (wd == .float32 or wd == .bfloat16);
 }
@@ -758,7 +967,7 @@ pub fn mixExpandNormRows(s: mlx.mlx_stream, h: Arr, post_in: Arr, oy: Arr, ow: A
 }
 
 /// Whether `mixExpandNormRows` takes `h` [L, HC, D] (`applies`), `post_in` [L, HC] f32, `oy` [L, D] f32 and `ow` [D]
-/// (f32 or BF16), D on the 128 grid within 32 blocks.
+/// (f32 or BF16), D on the 128 grid within `t_y`'s 3,072-float cap.
 pub fn expandRowsApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, oy: Arr, ow: Arr, fn_w: Arr, scale: Arr) bool {
     if (!applies(s, h, fn_w, scale)) return false;
     const hs = mlx.getShape(h);
@@ -766,13 +975,13 @@ pub fn expandRowsApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, oy: Arr, ow: A
     const lanes = [_]c_int{ hs[0], hs[1] };
     const rows = [_]c_int{ hs[0], d };
     const od = mlx.mlx_array_dtype(ow);
-    return @rem(d, 128) == 0 and d <= 4096 and std.mem.eql(c_int, mlx.getShape(oy), &rows) and mlx.mlx_array_dtype(oy) == .float32 and
+    return @rem(d, 128) == 0 and d <= 3072 and std.mem.eql(c_int, mlx.getShape(oy), &rows) and mlx.mlx_array_dtype(oy) == .float32 and
         mlx.mlx_array_size(ow) == @as(usize, @intCast(d)) and (od == .float32 or od == .bfloat16) and
         std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32;
 }
 
 /// Whether `mixExpandNormParts` takes `h` [L, HC, D] (`applies`), `post_in` [L, HC] f32, `op` [L * osplit, D] f32,
-/// `osvh` [D] f16 and `ow` [D] (f32 or BF16), D on the 128 grid within 32 blocks.
+/// `osvh` [D] f16 and `ow` [D] (f32 or BF16), D on the 128 grid within `t_y`'s 3,072-float cap.
 pub fn expandPartsApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, op: Arr, osvh: Arr, osplit: c_int, ow: Arr, fn_w: Arr, scale: Arr) bool {
     if (!applies(s, h, fn_w, scale) or osplit < 1) return false;
     const hs = mlx.getShape(h);
@@ -780,14 +989,14 @@ pub fn expandPartsApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, op: Arr, osvh
     const lanes = [_]c_int{ hs[0], hs[1] };
     const parts = [_]c_int{ hs[0] * osplit, d };
     const od = mlx.mlx_array_dtype(ow);
-    return @rem(d, 128) == 0 and d <= 4096 and std.mem.eql(c_int, mlx.getShape(op), &parts) and mlx.mlx_array_dtype(op) == .float32 and
+    return @rem(d, 128) == 0 and d <= 3072 and std.mem.eql(c_int, mlx.getShape(op), &parts) and mlx.mlx_array_dtype(op) == .float32 and
         mlx.mlx_array_size(osvh) == @as(usize, @intCast(d)) and mlx.mlx_array_dtype(osvh) == .float16 and
         mlx.mlx_array_size(ow) == @as(usize, @intCast(d)) and (od == .float32 or od == .bfloat16) and
         std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32;
 }
 
 /// Whether `backMixNorm` takes `h` [L, HC, D] (`applies`), `post_in` [L, HC] f32, the rows `a` and `b` [L, D] and the
-/// norm weight `wn` [D] (f32 or BF16, D within the norm's single-row arm).
+/// norm weight `wn` [D] (f32 or BF16, D within `t_y`'s 3,072-float cap).
 pub fn backApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, b: Arr, wn: Arr, fn_w: Arr, scale: Arr) bool {
     if (!applies(s, h, fn_w, scale)) return false;
     const hs = mlx.getShape(h);
@@ -798,7 +1007,7 @@ pub fn backApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, b: Arr, wn: 
         if (!std.mem.eql(c_int, mlx.getShape(r), &rows) or (dt != .float32 and dt != .bfloat16)) return false;
     }
     const wd = mlx.mlx_array_dtype(wn);
-    return hs[2] <= 4096 and std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32 and
+    return hs[2] <= 3072 and std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32 and
         mlx.getShape(wn).len == 1 and mlx.getShape(wn)[0] == hs[2] and (wd == .float32 or wd == .bfloat16);
 }
 

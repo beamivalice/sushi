@@ -18,6 +18,7 @@ pub const q_source: [:0]const u8 =
     \\constexpr int TM = 4;
     \\constexpr int TN = 4;
     \\constexpr int BLOCK_M = SM * TM;
+    \\constexpr int MAX_RT = 8;
     \\const int BLOCK_N = NSG * SN * TN;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
@@ -32,9 +33,10 @@ pub const q_source: [:0]const u8 =
     \\int thr_n = int(lane) % SN;
     \\int bm = thr_m * TM;
     \\int out_col = int(threadgroup_position_in_grid.x) * BLOCK_N + (SN * int(sg) + thr_n) * TN;
-    \\float result[RT][TN];
+    \\float result[MAX_RT][TN];
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r) {
+    \\for (int r = 0; r < MAX_RT; ++r) {
+    \\  if (r >= RT) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int tn = 0; tn < TN; ++tn) result[r][tn] = 0.0f;
     \\}
@@ -43,9 +45,10 @@ pub const q_source: [:0]const u8 =
     \\static_assert(NOPE % BLOCK_M == 0 && LAT % BLOCK_N == 0, "an absorbed shape off the gemv_t tile");
     \\#endif
     \\for (int i = 0; i < n_iter; ++i) {
-    \\  F4 qv[RT];
+    \\  F4 qv[MAX_RT];
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r) {
+    \\  for (int r = 0; r < MAX_RT; ++r) {
+    \\    if (r >= RT) break;
     \\    if (full_tile || r0 + r < R) {
     \\      qv[r] = *(const device F4*)(q_h + (size_t)(r0 + r) * qs1 + bm);
     \\    } else {
@@ -64,7 +67,8 @@ pub const q_source: [:0]const u8 =
     \\    const float w2 = static_cast<float>(mv[tm][2]);
     \\    const float w3 = static_cast<float>(mv[tm][3]);
     \\    #pragma clang loop unroll(full)
-    \\    for (int r = 0; r < RT; ++r) {
+    \\    for (int r = 0; r < MAX_RT; ++r) {
+    \\      if (r >= RT) break;
     \\      const float vc = qv[r][tm];
     \\      result[r][0] += vc * w0;
     \\      result[r][1] += vc * w1;
@@ -75,7 +79,8 @@ pub const q_source: [:0]const u8 =
     \\  bm += BLOCK_M;
     \\}
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r) {
+    \\for (int r = 0; r < MAX_RT; ++r) {
+    \\  if (r >= RT) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int tn = 0; tn < TN; ++tn) {
     \\    #pragma clang loop unroll(full)
@@ -84,7 +89,8 @@ pub const q_source: [:0]const u8 =
     \\}
     \\if (thr_m == 0) {
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r) {
+    \\  for (int r = 0; r < MAX_RT; ++r) {
+    \\    if (r >= RT) break;
     \\    int rr = r0 + r;
     \\    if (rr < R) {
     \\      const size_t dst_row = ROW_MAJOR ? ((size_t)rr * (size_t)HEADS + (size_t)h) : ((size_t)h * (size_t)R + (size_t)rr);
@@ -104,6 +110,7 @@ const v_main: [:0]const u8 =
     \\constexpr int TM = 4;
     \\constexpr int TN = 4;
     \\constexpr int BLOCK_N = 32 * TN;
+    \\constexpr int MAX_RT = 8;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint z = threadgroup_position_in_grid.z;
@@ -117,18 +124,20 @@ const v_main: [:0]const u8 =
     \\#ifndef SUSHI_METALLIB
     \\static_assert(LAT % BLOCK_N == 0 && VDIM % (4 * TM) == 0, "an absorbed shape off the gemv tile");
     \\#endif
-    \\float result[RT][TM];
+    \\float result[MAX_RT][TM];
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r) {
+    \\for (int r = 0; r < MAX_RT; ++r) {
+    \\  if (r >= RT) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; ++tm) result[r][tm] = 0.0f;
     \\}
     \\int bn = int(lane) * TN;
     \\const int n_iter = LAT / BLOCK_N;
     \\for (int i = 0; i < n_iter; ++i) {
-    \\  F4 uv[RT];
+    \\  F4 uv[MAX_RT];
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r) {
+    \\  for (int r = 0; r < MAX_RT; ++r) {
+    \\    if (r >= RT) break;
     \\    if (full_tile || r0 + r < R) {
     \\      uv[r] = *(const device F4*)(u_h + (size_t)(r0 + r) * us1 + bn);
     \\    } else {
@@ -147,7 +156,8 @@ const v_main: [:0]const u8 =
     \\    const float w2 = static_cast<float>(mv[tm][2]);
     \\    const float w3 = static_cast<float>(mv[tm][3]);
     \\    #pragma clang loop unroll(full)
-    \\    for (int r = 0; r < RT; ++r) {
+    \\    for (int r = 0; r < MAX_RT; ++r) {
+    \\      if (r >= RT) break;
     \\      result[r][tm] += w0 * uv[r][0];
     \\      result[r][tm] += w1 * uv[r][1];
     \\      result[r][tm] += w2 * uv[r][2];
@@ -157,7 +167,8 @@ const v_main: [:0]const u8 =
     \\  bn += BLOCK_N;
     \\}
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r) {
+    \\for (int r = 0; r < MAX_RT; ++r) {
+    \\  if (r >= RT) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; ++tm) {
     \\    #pragma clang loop unroll(full)
@@ -169,7 +180,8 @@ const v_main: [:0]const u8 =
 const v_out_plain: [:0]const u8 =
     \\if (lane == 0u) {
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r) {
+    \\  for (int r = 0; r < MAX_RT; ++r) {
+    \\    if (r >= RT) break;
     \\    int rr = r0 + r;
     \\    if (rr < R) {
     \\      device float* o = out + ((size_t)h * (size_t)R + (size_t)rr) * (size_t)VDIM + out_row;
@@ -184,7 +196,8 @@ const v_out_gated: [:0]const u8 =
     \\threadgroup float tg_res[4][32];
     \\if (lane == 0u) {
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r) {
+    \\  for (int r = 0; r < MAX_RT; ++r) {
+    \\    if (r >= RT) break;
     \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; ++tm) tg_res[sg][r * TM + tm] = result[r][tm];
     \\  }
@@ -804,6 +817,7 @@ fn run(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const Arr
     // The vector's [H, T, width] (a plain row [1, K] is one head's one row).
     const sh = mlx.getShape(inputs[1]);
     const rows: c_int = if (sh.len == 3) sh[1] else 1;
+    if (rows < 1) return error.Hy4AbsorbRows;
     const cfg = try cfgs.get(.{ .g = g, .rows = rows, .qs = sh[sh.len - 1], .out_cols = out_cols, .groups_x = groups_x, .simdgroups = simdgroups, .gated = gated, .row_major = row_major }, build);
     const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(in_vec);

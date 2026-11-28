@@ -24,61 +24,15 @@ const KernelSpec = custom.KernelSpec;
 const ParamSpec = custom.ParamSpec;
 const InputSlot = custom.InputSlot;
 const OutputSlot = custom.OutputSlot;
-const CtVal = custom.CtVal;
 const Dtype = custom.Dtype;
 
 const f32_bf16: []const Dtype = &.{ .float32, .bfloat16 };
 const bool_f32: []const Dtype = &.{ .bool_, .float32 };
 const u32_i32: []const Dtype = &.{ .uint32, .int32 };
 const map_dts: []const Dtype = &.{ .int32, .uint32, .float32, .bfloat16 };
-const rows_1_16: []const i32 = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
-const rows_1_8: []const i32 = &.{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
 fn idxSlot(n: []const u8) InputSlot {
     return .{ .name = n, .ty = .{ .fixed = .uint32 }, .allow_i32_as_u32 = true };
-}
-
-const hc_narrow_td = [_][2]i32{
-    .{ 1024, 128 }, .{ 512, 128 }, .{ 256, 128 }, .{ 128, 128 }, .{ 64, 128 },
-    .{ 1024, 256 }, .{ 512, 256 }, .{ 256, 256 },
-    .{ 1024, 384 }, .{ 512, 384 }, .{ 256, 384 },
-    .{ 1024, 512 }, .{ 512, 512 }, .{ 256, 512 },
-    .{ 1024, 3072 }, .{ 512, 3072 }, .{ 256, 3072 }, .{ 128, 3072 },
-};
-const hc_wide_td = [_][2]i32{
-    .{ 1024, 128 }, .{ 512, 128 }, .{ 256, 128 },
-    .{ 1024, 256 }, .{ 512, 256 },
-    .{ 1024, 384 }, .{ 512, 384 },
-    .{ 1024, 512 }, .{ 512, 512 },
-    .{ 1024, 3072 }, .{ 512, 3072 }, .{ 256, 3072 },
-};
-
-fn hcTuples(comptime wide: bool, comptime n_dt: usize) []const []const CtVal {
-    const tds = if (wide) hc_wide_td else hc_narrow_td;
-    const n_dt_combos: usize = @as(usize, 1) << @intCast(n_dt);
-    const total = tds.len * n_dt_combos;
-    comptime {
-        @setEvalBranchQuota(20000);
-        var out: [total][]const CtVal = undefined;
-        var idx: usize = 0;
-        for (tds) |td| {
-            for (0..n_dt_combos) |mask| {
-                var row: [4 + n_dt]CtVal = undefined;
-                row[0] = .{ .int = td[0] };
-                row[1] = .{ .int = 4 };
-                row[2] = .{ .int = 8 };
-                row[3] = .{ .int = td[1] };
-                for (0..n_dt) |b| {
-                    row[4 + b] = .{ .dtype = if (((mask >> @intCast(b)) & 1) == 0) .float32 else .bfloat16 };
-                }
-                const frozen = row;
-                out[idx] = &frozen;
-                idx += 1;
-            }
-        }
-        const final = out;
-        return &final;
-    }
 }
 
 fn hcSpec(comptime f: hy4_hc.Form, comptime wide: bool) KernelSpec {
@@ -192,10 +146,10 @@ fn hcSpec(comptime f: hy4_hc.Form, comptime wide: bool) KernelSpec {
     });
 
     const base_params: []const ParamSpec = &.{
-        .{ .name = "TG", .kind = .ct_int },
-        .{ .name = "HC", .kind = .ct_int },
-        .{ .name = "MIXN", .kind = .ct_int },
-        .{ .name = "D", .kind = .ct_int },
+        .{ .name = "TG", .kind = .fc_int },
+        .{ .name = "HC", .kind = .ct_int, .ints = &.{4} },
+        .{ .name = "MIXN", .kind = .ct_int, .ints = &.{8} },
+        .{ .name = "D", .kind = .fc_int },
     };
     const dt_params: []const ParamSpec = switch (f) {
         .plain, .back_inner, .expand_parts, .expand_rows => &.{
@@ -234,65 +188,8 @@ fn hcSpec(comptime f: hy4_hc.Form, comptime wide: bool) KernelSpec {
         .inputs = ins,
         .outputs = outs,
         .params = base_params ++ dt_params ++ ctr_params ++ extra_params,
-        .ct_tuples = hcTuples(wide, dt_params.len),
     };
 }
-
-// Steel attention (NPART, U) pairs: `NPART` in {1,2,4,8,16,32}, `U <= max(1, 16/NPART)` even (plus 1).
-const steel_nu_pairs = [_][2]i32{
-    .{ 1, 1 }, .{ 1, 2 }, .{ 1, 4 }, .{ 1, 6 }, .{ 1, 8 }, .{ 1, 10 }, .{ 1, 12 }, .{ 1, 14 }, .{ 1, 16 },
-    .{ 2, 1 }, .{ 2, 2 }, .{ 2, 4 }, .{ 2, 6 }, .{ 2, 8 },
-    .{ 4, 1 }, .{ 4, 2 }, .{ 4, 4 },
-    .{ 8, 1 }, .{ 8, 2 },
-    .{ 16, 1 },
-    .{ 32, 1 },
-};
-
-const steel_val_tuples: []const []const CtVal = blk: {
-    var out: [steel_nu_pairs.len][]const CtVal = undefined;
-    for (steel_nu_pairs, 0..) |p, i| {
-        const row = [2]CtVal{ .{ .int = p[0] }, .{ .int = p[1] } };
-        out[i] = &row;
-    }
-    const final = out;
-    break :blk &final;
-};
-
-const steel_score_tuples: []const []const CtVal = blk: {
-    const rs = [_]i32{ 16, 32, 64, 128 };
-    var out: [rs.len * steel_nu_pairs.len][]const CtVal = undefined;
-    var i: usize = 0;
-    for (rs) |r| {
-        for (steel_nu_pairs) |p| {
-            const row = [3]CtVal{ .{ .int = r }, .{ .int = p[0] }, .{ .int = p[1] } };
-            out[i] = &row;
-            i += 1;
-        }
-    }
-    const final = out;
-    break :blk &final;
-};
-
-const index_score_tuples: []const []const CtVal = blk: {
-    const shapes = [_][3]i32{
-        .{ 256, 16, 128 },
-        .{ 256, 4, 32 },
-        .{ 256, 4, 64 },
-        .{ 256, 8, 64 },
-        .{ 256, 8, 128 },
-    };
-    var out: [shapes.len * 2][]const CtVal = undefined;
-    var i: usize = 0;
-    for (shapes) |sh| {
-        for (f32_bf16) |dt| {
-            const row = [4]CtVal{ .{ .int = sh[0] }, .{ .int = sh[1] }, .{ .int = sh[2] }, .{ .dtype = dt } };
-            out[i] = &row;
-            i += 1;
-        }
-    }
-    const final = out;
-    break :blk &final;
-};
 
 fn engramHeadsSource(a: std.mem.Allocator, nh: usize) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -329,6 +226,7 @@ fn engramDeltaSource(a: std.mem.Allocator, nc: usize) ![]const u8 {
 
 fn engramHeadsInputs(comptime nh: usize) []const InputSlot {
     comptime {
+        @setEvalBranchQuota(10000);
         var ins: [1 + nh]InputSlot = undefined;
         ins[0] = .{ .name = "x", .ty = .{ .param = "T" } };
         for (0..nh) |i| {
@@ -341,6 +239,7 @@ fn engramHeadsInputs(comptime nh: usize) []const InputSlot {
 
 fn engramDeltaInputs(comptime nc: usize) []const InputSlot {
     comptime {
+        @setEvalBranchQuota(10000);
         var ins: [5 + 2 * nc]InputSlot = undefined;
         ins[0] = .{ .name = "h", .ty = .{ .param = "TH" } };
         ins[1] = .{ .name = "v", .ty = .{ .fixed = .float32 } };
@@ -426,7 +325,7 @@ pub const specs: []const KernelSpec = &.{
     // ── hy4_row ─────────────────────────────────────────────────────────────────
     .{
         .name = "sushi_hy4_row_f32",
-        .source = hy4_row.source,
+        .source = if (custom.is_codegen) hy4_row.source else "",
         .inputs = &.{
             .{ .name = "w", .ty = .{ .fixed = .bfloat16 } },
             .{ .name = "x", .ty = .{ .fixed = .float32 } },
@@ -435,21 +334,21 @@ pub const specs: []const KernelSpec = &.{
         .params = &.{
             .{ .name = "TM", .kind = .ct_int, .ints = &.{2} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{2} },
-            .{ .name = "R", .kind = .ct_int, .ints = rows_1_16 },
+            .{ .name = "R", .kind = .fc_int },
             .{ .name = "K", .kind = .fc_int },
             .{ .name = "N", .kind = .fc_int },
         },
     },
     .{
         .name = "sushi_hy4_row_f32_wide",
-        .source = hy4_row.wide_source,
+        .source = if (custom.is_codegen) hy4_row.wide_source else "",
         .inputs = &.{
             .{ .name = "w", .ty = .{ .fixed = .bfloat16 } },
             .{ .name = "x", .ty = .{ .fixed = .float32 } },
         },
         .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
         .params = &.{
-            .{ .name = "R", .kind = .ct_int, .ints = rows_1_16 },
+            .{ .name = "R", .kind = .fc_int },
             .{ .name = "K", .kind = .fc_int },
             .{ .name = "N", .kind = .fc_int },
         },
@@ -465,7 +364,7 @@ pub const specs: []const KernelSpec = &.{
         },
         .outputs = &.{.{ .name = "out", .ty = .{ .param = "OT" } }},
         .params = &.{
-            .{ .name = "R", .kind = .ct_int, .ints = rows_1_16 },
+            .{ .name = "R", .kind = .fc_int },
             .{ .name = "XT", .kind = .io_dtype, .dtypes = f32_bf16 },
             .{ .name = "OT", .kind = .ct_dtype, .dtypes = f32_bf16 },
             .{ .name = "K", .kind = .fc_int },
@@ -547,7 +446,7 @@ pub const specs: []const KernelSpec = &.{
     // ── hy4_absorb ──────────────────────────────────────────────────────────────
     .{
         .name = "sushi_hy4_absorb_q",
-        .source = hy4_absorb.q_source,
+        .source = if (custom.is_codegen) hy4_absorb.q_source else "",
         .inputs = &.{
             .{ .name = "kvb", .ty = .{ .param = "TW" } },
             .{ .name = "q", .ty = .{ .fixed = .float32 } },
@@ -555,7 +454,7 @@ pub const specs: []const KernelSpec = &.{
         .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
         .params = &.{
             .{ .name = "TW", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
-            .{ .name = "RT", .kind = .ct_int, .ints = rows_1_8 },
+            .{ .name = "RT", .kind = .fc_int },
             .{ .name = "NSG", .kind = .fc_int },
             .{ .name = "HEADS", .kind = .fc_int },
             .{ .name = "ROWS", .kind = .fc_int },
@@ -569,7 +468,7 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "sushi_hy4_absorb_v",
-        .source = hy4_absorb.v_source,
+        .source = if (custom.is_codegen) hy4_absorb.v_source else "",
         .inputs = &.{
             .{ .name = "kvb", .ty = .{ .param = "TW" } },
             .{ .name = "u", .ty = .{ .fixed = .float32 } },
@@ -577,7 +476,7 @@ pub const specs: []const KernelSpec = &.{
         .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
         .params = &.{
             .{ .name = "TW", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
-            .{ .name = "RT", .kind = .ct_int, .ints = rows_1_8 },
+            .{ .name = "RT", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ignored },
             .{ .name = "HEADS", .kind = .fc_int },
             .{ .name = "ROWS", .kind = .fc_int },
@@ -591,8 +490,8 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "sushi_hy4_absorb_v_gated",
-        .header = hy4_absorb.sigmoid_header,
-        .source = hy4_absorb.v_source_gated,
+        .header = if (custom.is_codegen) hy4_absorb.sigmoid_header else "",
+        .source = if (custom.is_codegen) hy4_absorb.v_source_gated else "",
         .inputs = &.{
             .{ .name = "kvb", .ty = .{ .param = "TW" } },
             .{ .name = "u", .ty = .{ .fixed = .float32 } },
@@ -601,7 +500,7 @@ pub const specs: []const KernelSpec = &.{
         .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
         .params = &.{
             .{ .name = "TW", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
-            .{ .name = "RT", .kind = .ct_int, .ints = rows_1_8 },
+            .{ .name = "RT", .kind = .fc_int },
             .{ .name = "TG", .kind = .io_dtype, .dtypes = f32_bf16 },
             .{ .name = "NSG", .kind = .ignored },
             .{ .name = "HEADS", .kind = .fc_int },
@@ -1011,7 +910,7 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "sushi_hy4_steel_scores",
-        .source = hy4_chain.steel_scores_source,
+        .source = if (custom.is_codegen) hy4_chain.steel_scores_source else "",
         .inputs = &.{
             .{ .name = "ql", .ty = .{ .fixed = .float32 } },
             .{ .name = "qp", .ty = .{ .fixed = .float32 } },
@@ -1023,9 +922,9 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "s2", .ty = .{ .fixed = .float32 } },
         },
         .params = &.{
-            .{ .name = "R", .kind = .ct_int },
-            .{ .name = "NPART", .kind = .ct_int },
-            .{ .name = "U", .kind = .ct_int },
+            .{ .name = "R", .kind = .fc_int },
+            .{ .name = "NPART", .kind = .fc_int },
+            .{ .name = "U", .kind = .ignored },
             .{ .name = "N", .kind = .fc_int },
             .{ .name = "QA", .kind = .fc_int },
             .{ .name = "PA", .kind = .fc_int },
@@ -1034,30 +933,28 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "H", .kind = .fc_int },
             .{ .name = "PK", .kind = .fc_int },
         },
-        .ct_tuples = steel_score_tuples,
     },
     .{
         .name = "sushi_hy4_steel_values",
-        .source = hy4_chain.steel_values_source,
+        .source = if (custom.is_codegen) hy4_chain.steel_values_source else "",
         .inputs = &.{
             .{ .name = "pp", .ty = .{ .fixed = .float32 } },
             .{ .name = "c", .ty = .{ .fixed = .float32 } },
         },
         .outputs = &.{.{ .name = "u", .ty = .{ .fixed = .float32 } }},
         .params = &.{
-            .{ .name = "NPART", .kind = .ct_int },
-            .{ .name = "U", .kind = .ct_int },
+            .{ .name = "NPART", .kind = .fc_int },
+            .{ .name = "U", .kind = .ignored },
             .{ .name = "W", .kind = .fc_int },
             .{ .name = "PA", .kind = .fc_int },
             .{ .name = "CA", .kind = .fc_int },
             .{ .name = "H", .kind = .fc_int },
             .{ .name = "PK", .kind = .fc_int },
         },
-        .ct_tuples = steel_val_tuples,
     },
     .{
         .name = "sushi_hy4_steel_scores_groups",
-        .source = hy4_chain.steel_scores_groups_source,
+        .source = if (custom.is_codegen) hy4_chain.steel_scores_groups_source else "",
         .inputs = &.{
             .{ .name = "ql", .ty = .{ .fixed = .float32 } },
             .{ .name = "qp", .ty = .{ .fixed = .float32 } },
@@ -1069,32 +966,30 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "s2", .ty = .{ .fixed = .float32 } },
         },
         .params = &.{
-            .{ .name = "R", .kind = .ct_int },
-            .{ .name = "NPART", .kind = .ct_int },
-            .{ .name = "U", .kind = .ct_int },
+            .{ .name = "R", .kind = .fc_int },
+            .{ .name = "NPART", .kind = .fc_int },
+            .{ .name = "U", .kind = .ignored },
             .{ .name = "N", .kind = .fc_int },
             .{ .name = "H", .kind = .fc_int },
             .{ .name = "PK", .kind = .fc_int },
         },
-        .ct_tuples = steel_score_tuples,
     },
     .{
         .name = "sushi_hy4_steel_values_groups",
-        .source = hy4_chain.steel_values_groups_source,
+        .source = if (custom.is_codegen) hy4_chain.steel_values_groups_source else "",
         .inputs = &.{
             .{ .name = "pp", .ty = .{ .fixed = .float32 } },
             .{ .name = "c", .ty = .{ .fixed = .float32 } },
         },
         .outputs = &.{.{ .name = "u", .ty = .{ .fixed = .float32 } }},
         .params = &.{
-            .{ .name = "NPART", .kind = .ct_int },
-            .{ .name = "U", .kind = .ct_int },
+            .{ .name = "NPART", .kind = .fc_int },
+            .{ .name = "U", .kind = .ignored },
             .{ .name = "W", .kind = .fc_int },
             .{ .name = "N", .kind = .fc_int },
             .{ .name = "H", .kind = .fc_int },
             .{ .name = "PK", .kind = .fc_int },
         },
-        .ct_tuples = steel_val_tuples,
     },
 
     // ── hy4_embed ───────────────────────────────────────────────────────────────
@@ -1220,7 +1115,7 @@ pub const specs: []const KernelSpec = &.{
     // ── hy4_index ───────────────────────────────────────────────────────────────
     .{
         .name = "sushi_hy4_index_scores",
-        .source = hy4_index.score_source,
+        .source = if (custom.is_codegen) hy4_index.score_source else "",
         .inputs = &.{
             .{ .name = "q", .ty = .{ .fixed = .float32 } },
             .{ .name = "keys", .ty = .{ .fixed = .float32 } },
@@ -1230,9 +1125,9 @@ pub const specs: []const KernelSpec = &.{
         },
         .outputs = &.{.{ .name = "scores", .ty = .{ .fixed = .float32 } }},
         .params = &.{
-            .{ .name = "TG", .kind = .ct_int },
-            .{ .name = "IH", .kind = .ct_int },
-            .{ .name = "IHD", .kind = .ct_int },
+            .{ .name = "TG", .kind = .fc_int },
+            .{ .name = "IH", .kind = .fc_int },
+            .{ .name = "IHD", .kind = .fc_int },
             .{ .name = "TW", .kind = .io_dtype, .dtypes = f32_bf16 },
             .{ .name = "NOPE", .kind = .fc_int },
             .{ .name = "HALF", .kind = .fc_int },
@@ -1240,7 +1135,6 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "QSCALE", .kind = .fc_int },
             .{ .name = "KSCALE", .kind = .fc_int },
         },
-        .ct_tuples = index_score_tuples,
     },
     .{
         .name = "sushi_hy4_index_pick",
