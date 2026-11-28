@@ -2,6 +2,7 @@
 //! Covers every Qwen4 custom kernel across `src/qwen4/*.zig` and `src/kernels/{gdn_pipelined,qsa_nax*}.metal`.
 //! Single source of truth for `gen-metallib`, runtime `kernel.zig` resolution, and `stock.zig` completeness test.
 
+const std = @import("std");
 const custom = @import("../tensor/metallib_custom.zig");
 const trunk = @import("../trunk.zig");
 const attn = @import("../attn_kernels.zig");
@@ -34,25 +35,69 @@ fn ci(v: i32) CtVal {
     return .{ .int = v };
 }
 
-fn gdnBlockedFilter(vals: []const CtVal) bool {
-    // vals: [InT, StT, OutT, Dk, GT, BT]
-    const in_t = vals[0].dtype;
-    const st_t = vals[1].dtype;
-    const out_t = vals[2].dtype;
-    const gt = vals[4].dtype;
-    const bt = vals[5].dtype;
-    if (st_t != in_t and st_t != .float32) return false;
-    if (out_t != in_t and out_t != .bfloat16) return false;
-    if (gt != in_t and gt != .float32) return false;
-    if (bt != in_t and bt != .float32) return false;
-    return true;
+fn findIntTarg(targs: []const custom.RuntimeTarg, name: []const u8) ?i32 {
+    for (targs) |ta| {
+        if (std.mem.eql(u8, ta.name, name)) {
+            return switch (ta.value) {
+                .int => |v| v,
+                .boolean => |b| @intFromBool(b),
+                .dtype => null,
+            };
+        }
+    }
+    return null;
 }
 
-fn gdnFoldFilter(vals: []const CtVal) bool {
-    // vals: [T, StT, GT, DK, DV, NT, SPLIT, TL, AL]
-    const nt = vals[5].int;
-    const tl = vals[7].int;
-    return nt == 1024 or (nt == 2048 and tl == 2);
+fn gdnDecodeRecurFilter(targs: []const custom.RuntimeTarg) bool {
+    const hk = findIntTarg(targs, "HK") orelse return false;
+    const hv = findIntTarg(targs, "HV") orelse return false;
+    const c = findIntTarg(targs, "C") orelse return false;
+    return hk > 0 and hv > 0 and @rem(hv, hk) == 0 and c > 0;
+}
+
+fn gdnDecodeSeqFilter(targs: []const custom.RuntimeTarg) bool {
+    if (!gdnDecodeRecurFilter(targs)) return false;
+    const tl = findIntTarg(targs, "TL") orelse return false;
+    return tl >= 1;
+}
+
+fn qsaRatioFilter(targs: []const custom.RuntimeTarg) bool {
+    const ratio = findIntTarg(targs, "RATIO") orelse return false;
+    return ratio >= 1;
+}
+
+fn hcReadNFilter(targs: []const custom.RuntimeTarg) bool {
+    const h = findIntTarg(targs, "H") orelse return false;
+    // Static staging `xv[16]` in `HC_FUSED_N_SOURCE` requires `PER = H / 256 <= 16`.
+    return h > 0 and h <= 4096 and @rem(h, 256) == 0;
+}
+
+fn hcReadDFilter(targs: []const custom.RuntimeTarg) bool {
+    const gs = findIntTarg(targs, "GS") orelse return false;
+    const bits = findIntTarg(targs, "BITS") orelse return false;
+    const hc = findIntTarg(targs, "HC") orelse return false;
+    const h = findIntTarg(targs, "H") orelse return false;
+    const r = findIntTarg(targs, "R") orelse return false;
+    const nrows = findIntTarg(targs, "NROWS") orelse return false;
+    if (gs <= 0 or h <= 0 or r <= 0 or nrows <= 0) return false;
+    if (bits != 2 and bits != 4 and bits != 8) return false;
+    const vpw: i32 = @divExact(32, bits);
+    const k: i64 = @as(i64, hc) * @as(i64, h);
+    const slice_den: i64 = 256 * @as(i64, vpw);
+    // Static staging `pw[16]` in `HC_FUSED_D_SOURCE` requires `ITERS = K / (256 * VPW) <= 16`.
+    return @rem(k, @as(i64, gs)) == 0 and @rem(k, slice_den) == 0 and @divExact(k, slice_den) <= 16;
+}
+
+fn hcReadUFilter(targs: []const custom.RuntimeTarg) bool {
+    const gs = findIntTarg(targs, "GS") orelse return false;
+    const bits = findIntTarg(targs, "BITS") orelse return false;
+    const h = findIntTarg(targs, "H") orelse return false;
+    const r = findIntTarg(targs, "R") orelse return false;
+    const nrows = findIntTarg(targs, "NROWS") orelse return false;
+    if (gs <= 0 or h <= 0 or r <= 0 or nrows <= 0) return false;
+    if (bits != 2 and bits != 4 and bits != 8) return false;
+    const vpw: i32 = @divExact(32, bits);
+    return @rem(r, vpw) == 0 and @rem(r, gs) == 0;
 }
 
 const gdn_blocked_ins = [_]InputSlot{
@@ -60,7 +105,7 @@ const gdn_blocked_ins = [_]InputSlot{
     .{ .name = "k", .ty = par("InT") },
     .{ .name = "v", .ty = par("InT") },
     .{ .name = "g", .ty = par("GT") },
-    .{ .name = "beta", .ty = par("BT") },
+    .{ .name = "beta", .ty = par("InT") },
     .{ .name = "state_in", .ty = par("StT") },
     .{ .name = "T", .ty = fix(.int32), .scalar = true },
 };
@@ -71,26 +116,24 @@ const gdn_blocked_outs = [_]OutputSlot{
 
 const gdn_blocked_params_narrow = [_]ParamSpec{
     .{ .name = "InT", .kind = .ct_dtype, .dtypes = &f16s },
-    .{ .name = "StT", .kind = .ct_dtype, .dtypes = &floats },
-    .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &floats },
+    .{ .name = "StT", .kind = .ct_dtype, .dtypes = &bf_f32 },
+    .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
     .{ .name = "Dk", .kind = .ct_int, .ints = &.{128} },
     .{ .name = "Dv", .kind = .fc_int },
     .{ .name = "Hk", .kind = .fc_int },
     .{ .name = "Hv", .kind = .fc_int },
-    .{ .name = "GT", .kind = .io_dtype, .dtypes = &floats },
-    .{ .name = "BT", .kind = .io_dtype, .dtypes = &floats },
+    .{ .name = "GT", .kind = .io_dtype, .dtypes = &bf_f32 },
 };
 
 const gdn_blocked_params_all = [_]ParamSpec{
     .{ .name = "InT", .kind = .ct_dtype, .dtypes = &floats },
-    .{ .name = "StT", .kind = .ct_dtype, .dtypes = &floats },
-    .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &floats },
+    .{ .name = "StT", .kind = .ct_dtype, .dtypes = &bf_f32 },
+    .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
     .{ .name = "Dk", .kind = .ct_int, .ints = &.{128} },
     .{ .name = "Dv", .kind = .fc_int },
     .{ .name = "Hk", .kind = .fc_int },
     .{ .name = "Hv", .kind = .fc_int },
-    .{ .name = "GT", .kind = .io_dtype, .dtypes = &floats },
-    .{ .name = "BT", .kind = .io_dtype, .dtypes = &floats },
+    .{ .name = "GT", .kind = .io_dtype, .dtypes = &bf_f32 },
 };
 
 const gdn_dec_ins = [_]InputSlot{
@@ -115,11 +158,11 @@ const qsa_select_params = [_]ParamSpec{
 const hc_du_params = [_]ParamSpec{
     .{ .name = "T", .kind = .ct_dtype, .dtypes = &f16s },
     .{ .name = "GS", .kind = .fc_int },
-    .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 4, 8 } },
-    .{ .name = "HC", .kind = .fc_int },
+    .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 4, 8 } },
+    .{ .name = "HC", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
     .{ .name = "H", .kind = .fc_int },
     .{ .name = "R", .kind = .fc_int },
-    .{ .name = "ROWS", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
+    .{ .name = "ROWS", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
     .{ .name = "NROWS", .kind = .fc_int },
 };
 
@@ -138,7 +181,7 @@ pub const specs: []const KernelSpec = &.{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
             .{ .name = "StT", .kind = .ct_dtype, .dtypes = &bf_f32 },
-            .{ .name = "GT", .kind = .ct_dtype, .dtypes = &bf_f32 },
+            .{ .name = "GATE_F32", .kind = .fc_int, .ints = &.{ 0, 1 } },
             .{ .name = "HK", .kind = .fc_int },
             .{ .name = "HV", .kind = .fc_int },
             .{ .name = "DK", .kind = .ct_int, .ints = &.{128} },
@@ -148,6 +191,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "SPLIT", .kind = .ct_int, .ints = &.{4} },
             .{ .name = "AL", .kind = .io_dtype, .dtypes = &bf_f32 },
         },
+        .fc_filter = gdnDecodeRecurFilter,
     },
     .{
         .name = "sushi_gdn_decode_recur_seq",
@@ -163,7 +207,7 @@ pub const specs: []const KernelSpec = &.{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
             .{ .name = "StT", .kind = .ct_dtype, .dtypes = &bf_f32 },
-            .{ .name = "GT", .kind = .ct_dtype, .dtypes = &bf_f32 },
+            .{ .name = "GATE_F32", .kind = .fc_int, .ints = &.{ 0, 1 } },
             .{ .name = "HK", .kind = .fc_int },
             .{ .name = "HV", .kind = .fc_int },
             .{ .name = "DK", .kind = .ct_int, .ints = &.{128} },
@@ -171,9 +215,10 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "C", .kind = .fc_int },
             .{ .name = "NT", .kind = .ct_int, .ints = &.{256} },
             .{ .name = "SPLIT", .kind = .ct_int, .ints = &.{4} },
-            .{ .name = "TL", .kind = .ct_int, .ints = &.{ 2, 3, 4, 5, 6, 7, 8, 9 } },
+            .{ .name = "TL", .kind = .fc_int },
             .{ .name = "AL", .kind = .io_dtype, .dtypes = &bf_f32 },
         },
+        .fc_filter = gdnDecodeSeqFilter,
     },
     .{
         .name = "sushi_gdn_decode_recur_seq_nocap",
@@ -188,7 +233,7 @@ pub const specs: []const KernelSpec = &.{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
             .{ .name = "StT", .kind = .ct_dtype, .dtypes = &bf_f32 },
-            .{ .name = "GT", .kind = .ct_dtype, .dtypes = &bf_f32 },
+            .{ .name = "GATE_F32", .kind = .fc_int, .ints = &.{ 0, 1 } },
             .{ .name = "HK", .kind = .fc_int },
             .{ .name = "HV", .kind = .fc_int },
             .{ .name = "DK", .kind = .ct_int, .ints = &.{128} },
@@ -196,9 +241,10 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "C", .kind = .fc_int },
             .{ .name = "NT", .kind = .ct_int, .ints = &.{256} },
             .{ .name = "SPLIT", .kind = .ct_int, .ints = &.{4} },
-            .{ .name = "TL", .kind = .ct_int, .ints = &.{ 2, 3, 4, 5, 6, 7, 8, 9 } },
+            .{ .name = "TL", .kind = .fc_int },
             .{ .name = "AL", .kind = .io_dtype, .dtypes = &bf_f32 },
         },
+        .fc_filter = gdnDecodeSeqFilter,
     },
     .{
         .name = "sushi_gdn_verify_fold",
@@ -219,19 +265,20 @@ pub const specs: []const KernelSpec = &.{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
             .{ .name = "StT", .kind = .ct_dtype, .dtypes = &bf_f32 },
-            .{ .name = "GT", .kind = .ct_dtype, .dtypes = &bf_f32 },
+            .{ .name = "GATE_F32", .kind = .fc_int, .ints = &.{ 0, 1 } },
             .{ .name = "HK", .kind = .fc_int },
             .{ .name = "HV", .kind = .fc_int },
             .{ .name = "DK", .kind = .ct_int, .ints = &.{128} },
             .{ .name = "DV", .kind = .ct_int, .ints = &.{128} },
             .{ .name = "C", .kind = .fc_int },
-            .{ .name = "NT", .kind = .ct_int, .ints = &.{ 1024, 2048 } },
+            .{ .name = "NT", .kind = .fc_int, .ints = &.{ 1024, 2048 } },
             .{ .name = "SPLIT", .kind = .ct_int, .ints = &.{1} },
-            .{ .name = "TL", .kind = .ct_int, .ints = &.{ 2, 3, 4, 5, 6, 7, 8, 9 } },
-            .{ .name = "SWISH", .kind = .fc_int },
+            .{ .name = "CAP", .kind = .ct_int, .ints = &.{ 2, 4, 9 } },
+            .{ .name = "TL", .kind = .fc_int },
+            .{ .name = "SWISH", .kind = .fc_int, .ints = &.{ 0, 1 } },
             .{ .name = "AL", .kind = .io_dtype, .dtypes = &bf_f32 },
         },
-        .filter = gdnFoldFilter,
+        .fc_filter = gdnDecodeSeqFilter,
     },
 
     // ── qwen4_gdn.zig (6 SIMD kernels) ──
@@ -241,7 +288,6 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &gdn_blocked_ins,
         .outputs = &gdn_blocked_outs,
         .params = &gdn_blocked_params_all,
-        .filter = gdnBlockedFilter,
     },
     .{
         .name = "gated_delta_blocked_tb32",
@@ -249,7 +295,6 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &gdn_blocked_ins,
         .outputs = &gdn_blocked_outs,
         .params = &gdn_blocked_params_narrow,
-        .filter = gdnBlockedFilter,
     },
     .{
         .name = "gated_delta_blocked_tb48",
@@ -257,15 +302,13 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &gdn_blocked_ins,
         .outputs = &gdn_blocked_outs,
         .params = &gdn_blocked_params_narrow,
-        .filter = gdnBlockedFilter,
     },
     .{
         .name = "gated_delta_pipelined_tb12",
         .source = if (custom.is_codegen) @embedFile("../kernels/gdn_pipelined.metal") else "",
         .inputs = &gdn_blocked_ins,
         .outputs = &gdn_blocked_outs,
-        .params = &gdn_blocked_params_narrow,
-        .filter = gdnBlockedFilter,
+        .params = &gdn_blocked_params_all,
     },
     .{
         .name = "sushi_gdn_prework2",
@@ -389,10 +432,11 @@ pub const specs: []const KernelSpec = &.{
         .outputs = &.{.{ .name = "out", .ty = par("T") }},
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
-            .{ .name = "NSG", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
+            .{ .name = "NSG", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
             .{ .name = "BK", .kind = .ct_int, .ints = &.{32} },
             .{ .name = "RATIO", .kind = .fc_int },
         },
+        .fc_filter = qsaRatioFilter,
     },
     .{
         .name = "sushi_attn_qsa256_packed",
@@ -412,12 +456,13 @@ pub const specs: []const KernelSpec = &.{
         .outputs = &.{.{ .name = "out", .ty = par("T") }},
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
-            .{ .name = "NSG", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
+            .{ .name = "NSG", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
             .{ .name = "BK", .kind = .ct_int, .ints = &.{32} },
             .{ .name = "RATIO", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 3, 4, 6, 8 } },
-            .{ .name = "GS", .kind = .ct_int, .ints = &.{ 32, 64, 128 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 6, 8 } },
+            .{ .name = "GS", .kind = .fc_int, .ints = &.{ 32, 64, 128 } },
         },
+        .fc_filter = qsaRatioFilter,
     },
     .{
         .name = "sushi_qsa_nax_precise",
@@ -461,9 +506,10 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{2} },
             .{ .name = "BK", .kind = .ct_int, .ints = &.{32} },
             .{ .name = "RATIO", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 3, 4, 6, 8 } },
-            .{ .name = "GS", .kind = .ct_int, .ints = &.{ 32, 64, 128 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 6, 8 } },
+            .{ .name = "GS", .kind = .fc_int, .ints = &.{ 32, 64, 128 } },
         },
+        .fc_filter = qsaRatioFilter,
     },
 
     // ── qwen4_qsa.zig (3 SIMD kernels) ──
@@ -520,11 +566,12 @@ pub const specs: []const KernelSpec = &.{
         },
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &f16s },
-            .{ .name = "HC", .kind = .fc_int },
+            .{ .name = "HC", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
             .{ .name = "H", .kind = .fc_int },
-            .{ .name = "INJ", .kind = .fc_int },
-            .{ .name = "WR", .kind = .fc_int },
+            .{ .name = "INJ", .kind = .fc_int, .ints = &.{ 0, 1 } },
+            .{ .name = "WR", .kind = .fc_int, .ints = &.{ 0, 1 } },
         },
+        .fc_filter = hcReadNFilter,
     },
     .{
         .name = "sushi_hc_read_d",
@@ -541,6 +588,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "inj_out", .ty = par("T") },
         },
         .params = &hc_du_params,
+        .fc_filter = hcReadDFilter,
     },
     .{
         .name = "sushi_hc_read_u",
@@ -554,6 +602,7 @@ pub const specs: []const KernelSpec = &.{
         },
         .outputs = &.{.{ .name = "mixed_out", .ty = par("T") }},
         .params = &hc_du_params,
+        .fc_filter = hcReadUFilter,
     },
 
     // ── qwen4_forward.zig (2 SIMD kernels) ──

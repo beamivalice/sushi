@@ -155,7 +155,7 @@ pub const ATTN_QSA256_KERNEL_SOURCE =
     \\constexpr int BD = 256;
     \\constexpr int LDK = BK + 8;
     \\constexpr int LDV = BD + 8;
-    \\constexpr int NT = 32 * NSG;
+    \\const int NT = 32 * NSG;
     \\constexpr int KT = BK / 8;
     \\
     \\const int qL = q_shape[2];
@@ -234,7 +234,7 @@ pub const ATTN_QSA256_KERNEL_SOURCE =
     \\    if (r < rows_k) {
     \\      const int pos = sushi_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
     \\#if QSA_PACKED
-    \\      w = sushi_qsa_unpack8<T, BITS, GS>(Kp + (long)pos * k_strides[2], Kscp + (long)pos * ksc_strides[2], Kbip + (long)pos * kbi_strides[2], c8);
+    \\      w = sushi_qsa_unpack8<T>(Kp + (long)pos * k_strides[2], Kscp + (long)pos * ksc_strides[2], Kbip + (long)pos * kbi_strides[2], c8, BITS, GS);
     \\#else
     \\      w = *((const device uint4*)(Kp + (long)pos * k_strides[2]) + c8);
     \\#endif
@@ -271,7 +271,7 @@ pub const ATTN_QSA256_KERNEL_SOURCE =
     \\    if (r < rows_k) {
     \\      const int pos = sushi_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
     \\#if QSA_PACKED
-    \\      w = sushi_qsa_unpack8<T, BITS, GS>(Vp + (long)pos * v_strides[2], Vscp + (long)pos * vsc_strides[2], Vbip + (long)pos * vbi_strides[2], c8);
+    \\      w = sushi_qsa_unpack8<T>(Vp + (long)pos * v_strides[2], Vscp + (long)pos * vsc_strides[2], Vbip + (long)pos * vbi_strides[2], c8, BITS, GS);
     \\#else
     \\      w = *((const device uint4*)(Vp + (long)pos * v_strides[2]) + c8);
     \\#endif
@@ -631,11 +631,18 @@ fn getQsaNaxKernel() !mlx.mlx_fast_metal_kernel {
 /// Prepended to a gather kernel's header to build its packed-cache variant: each staged row
 /// chunk of 8 is dequantized from the cache's affine words (the qsaSparseAttn arithmetic).
 pub const QSA_PACKED_HEADER = "#define QSA_PACKED 1\n" ++ KV_UNPACK_HEADER ++
-    \\template <typename T, int BITS, int GS>
-    \\inline uint4 sushi_qsa_unpack8(const device uint32_t* wq, const device T* sc, const device T* bi, int c8) {
-    \\  const int g = (c8 * 8) / GS;
+    \\template <typename T>
+    \\inline uint4 sushi_qsa_unpack8(const device uint32_t* wq, const device T* sc, const device T* bi, int c8, int bits, int gs) {
+    \\  const int g = (c8 * 8) / gs;
     \\  uint4 out = uint4(0);
-    \\  sushi_kv_unpack8<T, BITS>(wq, c8, float(sc[g]), float(bi[g]), (thread T*)&out);
+    \\  const float sj = float(sc[g]);
+    \\  const float bj = float(bi[g]);
+    \\  thread T* ev = (thread T*)&out;
+    \\  if (bits == 2)      sushi_kv_unpack8<T, 2>(wq, c8, sj, bj, ev);
+    \\  else if (bits == 3) sushi_kv_unpack8<T, 3>(wq, c8, sj, bj, ev);
+    \\  else if (bits == 4) sushi_kv_unpack8<T, 4>(wq, c8, sj, bj, ev);
+    \\  else if (bits == 6) sushi_kv_unpack8<T, 6>(wq, c8, sj, bj, ev);
+    \\  else if (bits == 8) sushi_kv_unpack8<T, 8>(wq, c8, sj, bj, ev);
     \\  return out;
     \\}
     \\
@@ -1935,3 +1942,155 @@ test "qsa packed gather: serves while each packed row is staged at most 4 times 
 /// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
 /// sizes its grows (`KVCache.heldRows`).
 const test_request_end: usize = 1 << 20;
+
+test "qsa packed FC: sushi_attn_qsa256_packed covers BITS {2,3,4,6,8}, GS {32,64,128}, NSG {1,2,8} bit-exact on sushi.metallib" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const s = mlx.engine.stream();
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+
+    var prng = std.Random.DefaultPrng.init(0x9A7E_F00D);
+    const rnd = prng.random();
+    const qL: c_int = 4;
+    const kL: c_int = 20;
+    const kb: c_int = 3;
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    const one = [_]c_int{1};
+    const scl_data = [_]f32{scale};
+    const scl = try mlx.newData(&scl_data, &one, .float32);
+    defer _ = mlx.mlx_array_free(scl);
+    var fx = try QsaBlockFixture.build(rnd, qL, kL, kb, ratio);
+    defer fx.deinit();
+
+    const dense_k = try getAttnQsa256Kernel();
+    const packed_k = try getQsaGatherPackedKernel(false);
+
+    const runKernel = struct {
+        fn go(
+            st: mlx.mlx_stream,
+            kern: mlx.mlx_fast_metal_kernel,
+            q_arr: mlx.mlx_array,
+            ins: []const mlx.mlx_array,
+            h_kv: c_int,
+            nsg: c_int,
+            rat: c_int,
+            bits: ?u8,
+            gs: ?u32,
+        ) !mlx.mlx_array {
+            const qs = mlx.getShape(q_arr);
+            const cfg = mlx.mlx_fast_metal_kernel_config_new();
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            const o_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &o_shape, 4, .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, qs[2] * 32, h_kv * nsg, qs[0]));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, nsg, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", nsg));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BK", QSA_GATHER_BK));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RATIO", rat));
+            if (bits) |b| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(b)));
+            if (gs) |g| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", @intCast(g)));
+            const iv = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
+            defer _ = mlx.mlx_vector_array_free(iv);
+            var ov = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ov);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, st));
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+            try mlx.check(mlx.mlx_array_eval(out));
+            return out;
+        }
+    }.go;
+
+    // Sweep all 5 bit widths (2, 3, 4, 6, 8) and all 3 group sizes (32, 64, 128) at NSG=2 (gqa=12).
+    const q12 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, qL, 256 }, s);
+    defer _ = mlx.mlx_array_free(q12);
+    inline for (.{ q12, scl, fx.blocks }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+    const k2 = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kL, 256 }, s);
+    defer _ = mlx.mlx_array_free(k2);
+    const v2 = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kL, 256 }, s);
+    defer _ = mlx.mlx_array_free(v2);
+
+    const combos = [_]struct { bits: u8, gs: u32 }{
+        .{ .bits = 2, .gs = 32 },
+        .{ .bits = 2, .gs = 64 },
+        .{ .bits = 2, .gs = 128 },
+        .{ .bits = 3, .gs = 32 },
+        .{ .bits = 3, .gs = 64 },
+        .{ .bits = 3, .gs = 128 },
+        .{ .bits = 4, .gs = 32 },
+        .{ .bits = 4, .gs = 64 },
+        .{ .bits = 4, .gs = 128 },
+        .{ .bits = 6, .gs = 32 },
+        .{ .bits = 6, .gs = 64 },
+        .{ .bits = 6, .gs = 128 },
+        .{ .bits = 8, .gs = 32 },
+        .{ .bits = 8, .gs = 64 },
+        .{ .bits = 8, .gs = 128 },
+    };
+    const have_nax = verifyQmmNaxAvailable() and qsaNaxOsOk();
+    const nax_packed_k: ?mlx.mlx_fast_metal_kernel = if (have_nax) try getQsaGatherPackedKernel(true) else null;
+
+    for (combos) |c| {
+        var kp = try kv_quant.quantizeAffine(s, k2, c.gs, c.bits);
+        defer kp.deinit();
+        var vp = try kv_quant.quantizeAffine(s, v2, c.gs, c.bits);
+        defer vp.deinit();
+        const kd = try kv_quant.dequantizeAffine(s, kp.q, kp.scales, kp.biases, c.gs, c.bits);
+        defer _ = mlx.mlx_array_free(kd);
+        const vd = try kv_quant.dequantizeAffine(s, vp.q, vp.scales, vp.biases, c.gs, c.bits);
+        defer _ = mlx.mlx_array_free(vd);
+        // Materialize quantize/dequantize inputs before counting Cooler kernel calls so lazy MLX graphs do not bridge inside runKernel.
+        inline for (.{ kp.q, kp.scales, kp.biases, vp.q, vp.scales, vp.biases, kd, vd }) |arr|
+            try mlx.check(mlx.mlx_array_eval(arr));
+
+        const mlx_before = mlx.engine.mlxCalls();
+        const want = try runKernel(s, dense_k, q12, &.{ q12, kd, vd, scl, fx.blocks }, 2, 2, ratio, null, null);
+        defer _ = mlx.mlx_array_free(want);
+        const got = try runKernel(s, packed_k, q12, &.{ q12, kp.q, vp.q, scl, fx.blocks, kp.scales, kp.biases, vp.scales, vp.biases }, 2, 2, ratio, c.bits, c.gs);
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqual(mlx_before, mlx.engine.mlxCalls());
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(got, want, s));
+
+        if (nax_packed_k) |nk| {
+            const nax_before = mlx.engine.mlxCalls();
+            const got_nax = try runKernel(s, nk, q12, &.{ q12, kp.q, vp.q, scl, fx.blocks, kp.scales, kp.biases, vp.scales, vp.biases }, 2, 2, ratio, c.bits, c.gs);
+            defer _ = mlx.mlx_array_free(got_nax);
+            try std.testing.expectEqual(nax_before, mlx.engine.mlxCalls());
+            try std.testing.expect(try attn256MaxDiff(got_nax, want, s) < 0.005);
+        }
+    }
+
+    // Exercise NSG = 1 (gqa=4) and NSG = 8 (gqa=60) on both sushi_attn_qsa256 and sushi_attn_qsa256_packed.
+    const k1 = try testRandWeightBf16(rnd, &[_]c_int{ 1, 1, kL, 256 }, s);
+    defer _ = mlx.mlx_array_free(k1);
+    const v1 = try testRandWeightBf16(rnd, &[_]c_int{ 1, 1, kL, 256 }, s);
+    defer _ = mlx.mlx_array_free(v1);
+    var kp1 = try kv_quant.quantizeAffine(s, k1, 64, 3);
+    defer kp1.deinit();
+    var vp1 = try kv_quant.quantizeAffine(s, v1, 64, 3);
+    defer vp1.deinit();
+    const kd1 = try kv_quant.dequantizeAffine(s, kp1.q, kp1.scales, kp1.biases, 64, 3);
+    defer _ = mlx.mlx_array_free(kd1);
+    const vd1 = try kv_quant.dequantizeAffine(s, vp1.q, vp1.scales, vp1.biases, 64, 3);
+    defer _ = mlx.mlx_array_free(vd1);
+    inline for (.{ kp1.q, kp1.scales, kp1.biases, vp1.q, vp1.scales, vp1.biases, kd1, vd1 }) |arr|
+        try mlx.check(mlx.mlx_array_eval(arr));
+    for ([_][2]c_int{ .{ 4, 1 }, .{ 60, 8 } }) |gn| {
+        const qn = try attn256RandBf16(rnd, &[_]c_int{ 1, gn[0], qL, 256 }, s);
+        defer _ = mlx.mlx_array_free(qn);
+        try mlx.check(mlx.mlx_array_eval(qn));
+        const mlx_before = mlx.engine.mlxCalls();
+        const want = try runKernel(s, dense_k, qn, &.{ qn, kd1, vd1, scl, fx.blocks }, 1, gn[1], ratio, null, null);
+        defer _ = mlx.mlx_array_free(want);
+        const got = try runKernel(s, packed_k, qn, &.{ qn, kp1.q, vp1.q, scl, fx.blocks, kp1.scales, kp1.biases, vp1.scales, vp1.biases }, 1, gn[1], ratio, 3, 64);
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqual(mlx_before, mlx.engine.mlxCalls());
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(got, want, s));
+    }
+}

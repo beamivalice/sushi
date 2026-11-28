@@ -707,7 +707,11 @@ pub const HC_FUSED_D_SOURCE =
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint n = threadgroup_position_in_grid.y;
     \\const uint row0 = threadgroup_position_in_grid.z * uint(ROWS);
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float part[64];
+    \\#else
     \\threadgroup float part[8 * ROWS];
+    \\#endif
     \\const int K = HC * H;
     \\const int VPW = 32 / BITS;
     \\const int K_by_p = K / VPW;
@@ -725,7 +729,11 @@ pub const HC_FUSED_D_SOURCE =
     \\  uint32_t pw[ITERS];
     \\  #endif
     \\  for (int i = 0; i < ITERS; ++i) pw[i] = dw_q[wbase + (size_t)(p0 + 32 * i)];
+    \\  #ifdef SUSHI_METALLIB
+    \\  float a0[8], a1[8], a2[8], a3[8];
+    \\  #else
     \\  float a0[ROWS], a1[ROWS], a2[ROWS], a3[ROWS];
+    \\  #endif
     \\  for (int r = 0; r < ROWS; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; a2[r] = 0.0f; a3[r] = 0.0f; }
     \\  for (int i = 0; i < ITERS; ++i) {
     \\    int k_base = (p0 + 32 * i) * VPW;
@@ -779,13 +787,21 @@ pub const HC_FUSED_U_SOURCE =
     \\const int R_by_gs = R / GS;
     \\const int RIT = (R_by_p + 31) / 32;
     \\uint mask = (1u << BITS) - 1u;
+    \\#ifdef SUSHI_METALLIB
+    \\float sum[8];
+    \\#else
     \\float sum[ROWS];
+    \\#endif
     \\for (int r = 0; r < ROWS; ++r) sum[r] = 0.0f;
     \\for (int h = 0; h < HC; ++h) {
     \\  size_t row = (size_t)h * (size_t)H + (size_t)j;
     \\  size_t wbase = row * (size_t)R_by_p;
     \\  size_t gbase = row * (size_t)R_by_gs;
+    \\  #ifdef SUSHI_METALLIB
+    \\  float a0[8], a1[8], a2[8], a3[8];
+    \\  #else
     \\  float a0[ROWS], a1[ROWS], a2[ROWS], a3[ROWS];
+    \\  #endif
     \\  for (int r = 0; r < ROWS; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; a2[r] = 0.0f; a3[r] = 0.0f; }
     \\  for (int i = 0; i < RIT; ++i) {
     \\    int pack = int(lane) + 32 * i;
@@ -1076,8 +1092,8 @@ pub fn hcReadFused(
     if (ush[0] != K or ush[1] * vpw != R) return null;
     const gsi: c_int = @intCast(group_size);
     if (@rem(K, gsi) != 0 or @rem(R, gsi) != 0) return null;
-    // N: 256 threads per stream; D: 8 simdgroups × 32 lanes split each row's words.
-    if (@rem(hidden, 256) != 0 or @rem(dsh[1], 256) != 0 or @rem(R, vpw) != 0) return null;
+    // N: 256 threads per stream (`xv[16]` caps hidden <= 4096); D: 8 simdgroups × 32 lanes (`pw[16]` caps dsh[1] <= 4096).
+    if (@rem(hidden, 256) != 0 or hidden > 4096 or @rem(dsh[1], 256) != 0 or dsh[1] > 4096 or @rem(R, vpw) != 0) return null;
     const inj: c_int = @intFromBool(iw.ctx != null);
     const wr: c_int = @intFromBool(pend != null);
     if (pend) |pd| {
@@ -2224,4 +2240,245 @@ test "qwen4 hc: a joined verify read on the engine's stream reads every request'
             }
         }
     }
+}
+
+test "qwen4 metallib FC bounds: resolver rejects OOB static TG/register parameters and accepts valid specs" {
+    const catalog = @import("../metallib_catalog.zig");
+    var res: catalog.Resolved = .{};
+
+    // sushi_hc_read_n: H <= 4096, H % 256 == 0, HC in 1..8, INJ/WR in {0, 1}.
+    const n_in = [_]catalog.RuntimeInput{
+        .{ .name = "x_in", .dtype = .bfloat16 },
+        .{ .name = "nw", .dtype = .bfloat16 },
+        .{ .name = "iw", .dtype = .bfloat16 },
+        .{ .name = "eps", .dtype = .float32 },
+        .{ .name = "wo_in", .dtype = .bfloat16 },
+        .{ .name = "wi_in", .dtype = .bfloat16 },
+    };
+    const n_out = [_]catalog.Dtype{ .bfloat16, .float32, .bfloat16 };
+    try testing.expect(catalog.resolve("sushi_hc_read_n", &n_in, &n_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "H", .value = .{ .int = 2560 } },
+        .{ .name = "INJ", .value = .{ .int = 1 } },
+        .{ .name = "WR", .value = .{ .int = 0 } },
+    }, &res));
+    try testing.expectEqualStrings("sushi_k_sushi_hc_read_n_bf16__bf16_bf16_bf16_f32_bf16_bf16__bf16_f32_bf16", res.fnName());
+    try testing.expect(!catalog.resolve("sushi_hc_read_n", &n_in, &n_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "HC", .value = .{ .int = 9 } },
+        .{ .name = "H", .value = .{ .int = 2560 } },
+        .{ .name = "INJ", .value = .{ .int = 1 } },
+        .{ .name = "WR", .value = .{ .int = 0 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_hc_read_n", &n_in, &n_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "H", .value = .{ .int = 4352 } },
+        .{ .name = "INJ", .value = .{ .int = 1 } },
+        .{ .name = "WR", .value = .{ .int = 0 } },
+    }, &res));
+
+    // sushi_hc_read_d: ROWS in 1..8, BITS in {2,4,8}, HC in 1..8, ITERS = HC*H/(256*VPW) <= 16.
+    const d_in = [_]catalog.RuntimeInput{
+        .{ .name = "xn_in", .dtype = .bfloat16 },
+        .{ .name = "dw_q", .dtype = .uint32 },
+        .{ .name = "dw_s", .dtype = .bfloat16 },
+        .{ .name = "dw_b", .dtype = .bfloat16 },
+        .{ .name = "ipart_in", .dtype = .float32 },
+    };
+    const d_out = [_]catalog.Dtype{ .bfloat16, .bfloat16 };
+    try testing.expect(catalog.resolve("sushi_hc_read_d", &d_in, &d_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "BITS", .value = .{ .int = 8 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "H", .value = .{ .int = 2560 } },
+        .{ .name = "R", .value = .{ .int = 320 } },
+        .{ .name = "ROWS", .value = .{ .int = 8 } },
+        .{ .name = "NROWS", .value = .{ .int = 320 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_hc_read_d", &d_in, &d_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "BITS", .value = .{ .int = 8 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "H", .value = .{ .int = 2560 } },
+        .{ .name = "R", .value = .{ .int = 320 } },
+        .{ .name = "ROWS", .value = .{ .int = 9 } },
+        .{ .name = "NROWS", .value = .{ .int = 320 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_hc_read_d", &d_in, &d_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "BITS", .value = .{ .int = 6 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "H", .value = .{ .int = 2560 } },
+        .{ .name = "R", .value = .{ .int = 320 } },
+        .{ .name = "ROWS", .value = .{ .int = 4 } },
+        .{ .name = "NROWS", .value = .{ .int = 320 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_hc_read_d", &d_in, &d_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "BITS", .value = .{ .int = 8 } },
+        .{ .name = "HC", .value = .{ .int = 8 } },
+        .{ .name = "H", .value = .{ .int = 2560 } },
+        .{ .name = "R", .value = .{ .int = 320 } },
+        .{ .name = "ROWS", .value = .{ .int = 4 } },
+        .{ .name = "NROWS", .value = .{ .int = 320 } },
+    }, &res));
+
+    // sushi_hc_read_u: ROWS in 1..8, BITS in {2,4,8}, R % GS == 0.
+    const u_in = [_]catalog.RuntimeInput{
+        .{ .name = "xn_in", .dtype = .bfloat16 },
+        .{ .name = "act_in", .dtype = .bfloat16 },
+        .{ .name = "uw_q", .dtype = .uint32 },
+        .{ .name = "uw_s", .dtype = .bfloat16 },
+        .{ .name = "uw_b", .dtype = .bfloat16 },
+    };
+    const u_out = [_]catalog.Dtype{.bfloat16};
+    try testing.expect(catalog.resolve("sushi_hc_read_u", &u_in, &u_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "BITS", .value = .{ .int = 4 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "H", .value = .{ .int = 2560 } },
+        .{ .name = "R", .value = .{ .int = 320 } },
+        .{ .name = "ROWS", .value = .{ .int = 8 } },
+        .{ .name = "NROWS", .value = .{ .int = 10240 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_hc_read_u", &u_in, &u_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "BITS", .value = .{ .int = 4 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "H", .value = .{ .int = 2560 } },
+        .{ .name = "R", .value = .{ .int = 320 } },
+        .{ .name = "ROWS", .value = .{ .int = 9 } },
+        .{ .name = "NROWS", .value = .{ .int = 10240 } },
+    }, &res));
+
+    // sushi_attn_qsa256_packed: NSG in 1..8, BITS in {2,3,4,6,8}, GS in {32,64,128}, RATIO >= 1.
+    const qp_in = [_]catalog.RuntimeInput{
+        .{ .name = "q", .dtype = .bfloat16 },
+        .{ .name = "k", .dtype = .uint32 },
+        .{ .name = "v", .dtype = .uint32 },
+        .{ .name = "scl", .dtype = .float32 },
+        .{ .name = "blocks", .dtype = .int32 },
+        .{ .name = "ksc", .dtype = .bfloat16 },
+        .{ .name = "kbi", .dtype = .bfloat16 },
+        .{ .name = "vsc", .dtype = .bfloat16 },
+        .{ .name = "vbi", .dtype = .bfloat16 },
+    };
+    const qp_out = [_]catalog.Dtype{.bfloat16};
+    try testing.expect(catalog.resolve("sushi_attn_qsa256_packed", &qp_in, &qp_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "NSG", .value = .{ .int = 8 } },
+        .{ .name = "BK", .value = .{ .int = 32 } },
+        .{ .name = "RATIO", .value = .{ .int = 4 } },
+        .{ .name = "BITS", .value = .{ .int = 3 } },
+        .{ .name = "GS", .value = .{ .int = 128 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_attn_qsa256_packed", &qp_in, &qp_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "NSG", .value = .{ .int = 9 } },
+        .{ .name = "BK", .value = .{ .int = 32 } },
+        .{ .name = "RATIO", .value = .{ .int = 4 } },
+        .{ .name = "BITS", .value = .{ .int = 4 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_attn_qsa256_packed", &qp_in, &qp_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "NSG", .value = .{ .int = 2 } },
+        .{ .name = "BK", .value = .{ .int = 32 } },
+        .{ .name = "RATIO", .value = .{ .int = 4 } },
+        .{ .name = "BITS", .value = .{ .int = 5 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+    }, &res));
+
+    // sushi_gdn_verify_fold: TL >= 1, GATE_F32 in {0,1}, NT in {1024, 2048}, CAP in {2,4,9}.
+    const vf_in = [_]catalog.RuntimeInput{
+        .{ .name = "qkv", .dtype = .bfloat16 },
+        .{ .name = "a_in", .dtype = .bfloat16 },
+        .{ .name = "b_in", .dtype = .bfloat16 },
+        .{ .name = "conv_state", .dtype = .bfloat16 },
+        .{ .name = "state_in", .dtype = .float32 },
+        .{ .name = "conv_w", .dtype = .bfloat16 },
+        .{ .name = "A_log", .dtype = .float32 },
+        .{ .name = "dt_bias", .dtype = .bfloat16 },
+        .{ .name = "q_scale", .dtype = .bfloat16, .scalar = true },
+        .{ .name = "k_scale", .dtype = .bfloat16, .scalar = true },
+        .{ .name = "z", .dtype = .bfloat16 },
+        .{ .name = "norm_w", .dtype = .bfloat16 },
+        .{ .name = "eps", .dtype = .float32, .scalar = true },
+    };
+    const vf_out = [_]catalog.Dtype{ .bfloat16, .bfloat16, .float32, .float32, .bfloat16 };
+    try testing.expect(catalog.resolve("sushi_gdn_verify_fold", &vf_in, &vf_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "StT", .value = .{ .dtype = .float32 } },
+        .{ .name = "GATE_F32", .value = .{ .int = 1 } },
+        .{ .name = "HK", .value = .{ .int = 1 } },
+        .{ .name = "HV", .value = .{ .int = 2 } },
+        .{ .name = "DK", .value = .{ .int = 128 } },
+        .{ .name = "DV", .value = .{ .int = 128 } },
+        .{ .name = "C", .value = .{ .int = 512 } },
+        .{ .name = "NT", .value = .{ .int = 1024 } },
+        .{ .name = "SPLIT", .value = .{ .int = 1 } },
+        .{ .name = "CAP", .value = .{ .int = 9 } },
+        .{ .name = "TL", .value = .{ .int = 19 } },
+        .{ .name = "SWISH", .value = .{ .int = 1 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_gdn_verify_fold", &vf_in, &vf_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "StT", .value = .{ .dtype = .float32 } },
+        .{ .name = "GATE_F32", .value = .{ .int = 1 } },
+        .{ .name = "HK", .value = .{ .int = 1 } },
+        .{ .name = "HV", .value = .{ .int = 2 } },
+        .{ .name = "DK", .value = .{ .int = 128 } },
+        .{ .name = "DV", .value = .{ .int = 128 } },
+        .{ .name = "C", .value = .{ .int = 512 } },
+        .{ .name = "NT", .value = .{ .int = 1024 } },
+        .{ .name = "SPLIT", .value = .{ .int = 1 } },
+        .{ .name = "CAP", .value = .{ .int = 9 } },
+        .{ .name = "TL", .value = .{ .int = 0 } },
+        .{ .name = "SWISH", .value = .{ .int = 1 } },
+    }, &res));
+    try testing.expect(!catalog.resolve("sushi_gdn_verify_fold", &vf_in, &vf_out, &.{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "StT", .value = .{ .dtype = .float32 } },
+        .{ .name = "GATE_F32", .value = .{ .int = 2 } },
+        .{ .name = "HK", .value = .{ .int = 1 } },
+        .{ .name = "HV", .value = .{ .int = 2 } },
+        .{ .name = "DK", .value = .{ .int = 128 } },
+        .{ .name = "DV", .value = .{ .int = 128 } },
+        .{ .name = "C", .value = .{ .int = 512 } },
+        .{ .name = "NT", .value = .{ .int = 1024 } },
+        .{ .name = "SPLIT", .value = .{ .int = 1 } },
+        .{ .name = "CAP", .value = .{ .int = 9 } },
+        .{ .name = "TL", .value = .{ .int = 5 } },
+        .{ .name = "SWISH", .value = .{ .int = 1 } },
+    }, &res));
+
+    // gated_delta_pipelined_tb12 accepts InT=float32 (f16 checkpoints promote activations to f32).
+    const gp_in = [_]catalog.RuntimeInput{
+        .{ .name = "q", .dtype = .float32 },
+        .{ .name = "k", .dtype = .float32 },
+        .{ .name = "v", .dtype = .float32 },
+        .{ .name = "g", .dtype = .bfloat16 },
+        .{ .name = "beta", .dtype = .float32 },
+        .{ .name = "state_in", .dtype = .float32 },
+        .{ .name = "T", .dtype = .int32, .scalar = true },
+    };
+    const gp_out = [_]catalog.Dtype{ .bfloat16, .float32 };
+    try testing.expect(catalog.resolve("gated_delta_pipelined_tb12", &gp_in, &gp_out, &.{
+        .{ .name = "InT", .value = .{ .dtype = .float32 } },
+        .{ .name = "StT", .value = .{ .dtype = .float32 } },
+        .{ .name = "OutT", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "Dk", .value = .{ .int = 128 } },
+        .{ .name = "Dv", .value = .{ .int = 128 } },
+        .{ .name = "Hk", .value = .{ .int = 2 } },
+        .{ .name = "Hv", .value = .{ .int = 4 } },
+    }, &res));
+    try testing.expectEqualStrings("sushi_k_gated_delta_pipelined_tb12_f32_f32_bf16_128__f32_f32_f32_bf16_f32_f32_i32s__bf16_f32", res.fnName());
 }

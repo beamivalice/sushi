@@ -53,7 +53,7 @@ pub const RuntimeTarg = struct {
 pub const RuntimeInput = struct {
     name: []const u8,
     dtype: Dtype,
-    scalar: bool,
+    scalar: bool = false,
 };
 
 pub const ParamKind = enum {
@@ -86,7 +86,8 @@ pub const ParamSpec = struct {
     kind: ParamKind,
     /// Explicit function-constant index override (null = auto-assigned sequentially).
     slot: ?u32 = null,
-    /// Allowed values for `ct_int` when `ct_tuples` is null.
+    /// Allowed values for `ct_int` when `ct_tuples` is null; when non-empty on `fc_int`,
+    /// enforces runtime bounds in `resolveSpec` without emitting extra metallib variants.
     ints: []const i32 = &.{},
     /// Allowed values for `ct_bool` when `ct_tuples` is null.
     bools: []const bool = &.{ false, true },
@@ -117,6 +118,7 @@ pub const OutputSlot = struct {
 
 pub const SourceFn = *const fn (std.mem.Allocator, usize) anyerror![]const u8;
 pub const FilterFn = *const fn ([]const CtVal) bool;
+pub const FcFilterFn = *const fn ([]const RuntimeTarg) bool;
 
 pub const KernelSpec = struct {
     /// Runtime kernel name passed to `mlx_fast_metal_kernel_new` / `kernel.Def.create`.
@@ -143,6 +145,8 @@ pub const KernelSpec = struct {
     ct_tuples: ?[]const []const CtVal = null,
     /// Optional filter predicate over variant param tuples.
     filter: ?FilterFn = null,
+    /// Optional runtime predicate over all template/FC args (guards static TG/register bounds).
+    fc_filter: ?FcFilterFn = null,
 };
 
 /// Result of resolving a runtime custom kernel launch to a precompiled `sushi.metallib` function.
@@ -513,6 +517,12 @@ pub fn resolveSpec(
                     .boolean => |b| @intFromBool(b),
                     .dtype => return false,
                 };
+                if (p.ints.len > 0) {
+                    const ok = for (p.ints) |allowed| {
+                        if (allowed == iv) break true;
+                    } else false;
+                    if (!ok) return false;
+                }
                 if (out.n_ints >= max_fc_ints) return false;
                 out.ints[out.n_ints] = .{ .index = fc_slots[pi], .value = iv };
                 out.n_ints += 1;
@@ -578,6 +588,7 @@ pub fn resolveSpec(
 
     for (val_set[0..n_var]) |s| if (!s) return false;
     if (!tupleEmitted(ks, vals[0..n_var])) return false;
+    if (ks.fc_filter) |flt| if (!flt(targs)) return false;
 
     const fname = customFnName(&out.fn_buf, ks, vals[0..n_var], in_dt[0..inputs.len], out_dtypes) catch return false;
     out.fn_len = fname.len;

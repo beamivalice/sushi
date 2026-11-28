@@ -790,13 +790,20 @@ pub const ATTN_QSA256_KERNEL_HEADER = ATTN_PD_KERNEL_HEADER ++
 ;
 
 /// Dequantizes chunk `c8` (8 values) of one packed row into `ev`. 4 and 8 bits fill whole uint32
-/// words; 6 bits packs four values into three bytes (little-endian bitstream, `mlx_quantize`'s
-/// layout), so a chunk is six bytes and the row is read bytewise.
+/// words; 2 bits fills half a uint32 word (16 bits); 3 and 6 bits pack into 3 and 6 bytes
+/// respectively (little-endian bitstream, `mlx_quantize`'s layout) and are read bytewise.
 pub const KV_UNPACK_HEADER =
     \\template <typename T, int BITS>
     \\inline void sushi_kv_unpack8(const device uint32_t* wq, int c8, float sj, float bj, thread T* ev) {
     \\  constexpr uint MASKB = (1u << BITS) - 1u;
-    \\  if constexpr (BITS == 6) {
+    \\  if constexpr (BITS == 2) {
+    \\    const uint w = wq[c8 >> 1] >> ((c8 & 1) * 16);
+    \\    for (int u = 0; u < 8; ++u) ev[u] = T(float((w >> (u * 2)) & MASKB) * sj + bj);
+    \\  } else if constexpr (BITS == 3) {
+    \\    const device uchar* p = ((const device uchar*)wq) + c8 * 3;
+    \\    const uint v = uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16);
+    \\    for (int u = 0; u < 8; ++u) ev[u] = T(float((v >> (u * 3)) & MASKB) * sj + bj);
+    \\  } else if constexpr (BITS == 6) {
     \\    const device uchar* p = ((const device uchar*)wq) + c8 * 6;
     \\    const uint lo = uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16);
     \\    const uint hi = uint(p[3]) | (uint(p[4]) << 8) | (uint(p[5]) << 16);

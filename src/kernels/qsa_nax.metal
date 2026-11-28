@@ -50,7 +50,7 @@ for(int t0=0;t0<L;t0+=BK) {
     if(r<rows) {
       int pos=sushi_qsa_pos(blk,t0+r,sel_len,tail_start,RATIO);
 #if QSA_PACKED
-      value=sushi_qsa_unpack8<T,BITS,GS>(Kp+(long)pos*k_strides[2],Kscp+(long)pos*ksc_strides[2],Kbip+(long)pos*kbi_strides[2],c);
+      value=sushi_qsa_unpack8<T>(Kp+(long)pos*k_strides[2],Kscp+(long)pos*ksc_strides[2],Kbip+(long)pos*kbi_strides[2],c,BITS,GS);
 #else
       value=*((const device uint4*)(Kp+(long)pos*k_strides[2])+c);
 #endif
@@ -103,7 +103,7 @@ for(int t0=0;t0<L;t0+=BK) {
     if(r<rows) {
       int pos=sushi_qsa_pos(blk,t0+r,sel_len,tail_start,RATIO);
 #if QSA_PACKED
-      value=sushi_qsa_unpack8<T,BITS,GS>(Vp+(long)pos*v_strides[2],Vscp+(long)pos*vsc_strides[2],Vbip+(long)pos*vbi_strides[2],c);
+      value=sushi_qsa_unpack8<T>(Vp+(long)pos*v_strides[2],Vscp+(long)pos*vsc_strides[2],Vbip+(long)pos*vbi_strides[2],c,BITS,GS);
 #else
       value=*((const device uint4*)(Vp+(long)pos*v_strides[2])+c);
 #endif

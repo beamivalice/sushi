@@ -3711,6 +3711,78 @@ test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground t
         .{ .B = 1, .T = 68, .Hk = 2, .Hv = 4, .Dv = 128, .tb = 32, .in_dtype = .float16, .state_dtype = .float32 },
     };
     for (cases) |case| try gdnBlockedParityCase(case, s);
+
+    // Verify Cooler precompiled sushi.metallib resolves gated_delta_pipelined_tb12 & blocked_tb16 at InT=float32 with zero MLX calls.
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const al = testing.allocator;
+    const B: c_int = 1;
+    const T: c_int = 68;
+    const Hk: c_int = 1;
+    const Hv: c_int = 2;
+    const Dk: c_int = 128;
+    const Dv: c_int = 64;
+    const qn: usize = @intCast(B * T * Hk * Dk);
+    const vn: usize = @intCast(B * T * Hv * Dv);
+    const gn: usize = @intCast(B * T * Hv);
+    const sn: usize = @intCast(B * Hv * Dv * Dk);
+    var prng = std.Random.DefaultPrng.init(0xF32_C001);
+    const rnd = prng.random();
+    const qd = try al.alloc(f32, qn);
+    defer al.free(qd);
+    const kd = try al.alloc(f32, qn);
+    defer al.free(kd);
+    const vd = try al.alloc(f32, vn);
+    defer al.free(vd);
+    const gd = try al.alloc(f32, gn);
+    defer al.free(gd);
+    const bd = try al.alloc(f32, gn);
+    defer al.free(bd);
+    const sd = try al.alloc(f32, sn);
+    defer al.free(sd);
+    for (qd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (kd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (vd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (gd) |*x| x.* = bf16Trunc(0.5 + 0.4 * rnd.float(f32));
+    for (bd) |*x| x.* = bf16Trunc(rnd.float(f32));
+    for (sd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    const ref = try gdnHostRef(al, qd, kd, vd, gd, bd, sd, @intCast(B), @intCast(T), @intCast(Hk), @intCast(Hv), @intCast(Dk), @intCast(Dv));
+    defer al.free(ref.y);
+    defer al.free(ref.state);
+    const q = try mlx.newData(qd.ptr, &[_]c_int{ B, T, Hk, Dk }, .float32);
+    defer _ = mlx.mlx_array_free(q);
+    const kk = try mlx.newData(kd.ptr, &[_]c_int{ B, T, Hk, Dk }, .float32);
+    defer _ = mlx.mlx_array_free(kk);
+    const v = try mlx.newData(vd.ptr, &[_]c_int{ B, T, Hv, Dv }, .float32);
+    defer _ = mlx.mlx_array_free(v);
+    const g32 = try mlx.newData(gd.ptr, &[_]c_int{ B, T, Hv }, .float32);
+    defer _ = mlx.mlx_array_free(g32);
+    var gbf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gbf);
+    try mlx.check(mlx.mlx_astype(&gbf, g32, .bfloat16, es));
+    const beta = try mlx.newData(bd.ptr, &[_]c_int{ B, T, Hv }, .float32);
+    defer _ = mlx.mlx_array_free(beta);
+    const st = try mlx.newData(sd.ptr, &[_]c_int{ B, Hv, Dv, Dk }, .float32);
+    defer _ = mlx.mlx_array_free(st);
+    const mlx_before = mlx.engine.mlxCalls();
+    for ([_]mlx.mlx_array{ gbf, g32 }) |g_arr| {
+        for ([_]GdnRoute{ .blocked, .pipelined }) |route| {
+            const got = try gdnRunYState(route, 16, q, kk, v, g_arr, beta, st, B, T, Hk, Hv, Dk, Dv, es);
+            defer _ = mlx.mlx_array_free(got.y);
+            defer _ = mlx.mlx_array_free(got.state);
+            const got_y = try evalToF32(al, got.y, vn, es);
+            defer al.free(got_y);
+            const got_st = try evalToF32(al, got.state, sn, es);
+            defer al.free(got_st);
+            try testing.expect(maxAbsDiff(got_y, ref.y) < 0.05);
+            try testing.expect(maxAbsDiff(got_st, ref.state) < 0.05);
+        }
+    }
+    try testing.expectEqual(mlx_before, mlx.engine.mlxCalls());
 }
 
 test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full run)" {

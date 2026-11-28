@@ -77,10 +77,12 @@ pub const K1_SOURCE =
     \\  const T bv = b_in[hv];
     \\  T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\  gb[1] = float(bsig);
-    \\  const GT apd = GT(float(a_in[hv]) + float(dt_bias[hv]));
-    \\  float sp = sushi_log1p(metal::precise::exp(float(apd)));
+    \\  const float apd_raw = float(a_in[hv]) + float(dt_bias[hv]);
+    \\  const float apd = GATE_F32 ? apd_raw : float(T(apd_raw));
+    \\  float sp = sushi_log1p(metal::precise::exp(apd));
     \\  float ea = metal::precise::exp(float(A_log[hv]));
-    \\  gb[0] = float(GT(metal::precise::exp(-(ea * sp))));
+    \\  const float g_raw = metal::precise::exp(-(ea * sp));
+    \\  gb[0] = GATE_F32 ? g_raw : float(T(g_raw));
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\float kk[4], qq[4];
@@ -105,152 +107,221 @@ pub const K1_SOURCE =
 // carries the stored value on, as gated_delta_step_seq does, so state_seq[t]
 // is the state serial decode holds after token t. state_seq[TL-1] is never
 // written (the capture-tail trim).
-const K1S_HEAD =
-    \\constexpr int NSG = NT / 32;
+const K1S_SETUP =
+    \\const int NSG = NT / 32;
     \\constexpr int RB = DV / SPLIT;
-    \\constexpr int R = RB / NSG;
+    \\const int R = RB / NSG;
     \\const int GRP = HV / HK;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint hv = threadgroup_position_in_grid.x / SPLIT;
     \\uint part = threadgroup_position_in_grid.x % SPLIT;
     \\uint hk = hv / GRP;
-    \\threadgroup float qs[TL][DK], ks[TL][DK], vs[TL][DV];
-    \\threadgroup float gb[TL][2];
-    \\uint row0 = part * RB + sg * R;
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int R_CAP = 4;
+    \\float st[R_CAP][4];
+    \\#else
+    \\constexpr int R_CAP = R;
     \\float st[R][4];
-    \\for (int j = 0; j < R; ++j) {
+    \\#endif
+    \\threadgroup float qs[K1S_CAP][DK], ks[K1S_CAP][DK], vs[K1S_CAP][DV];
+    \\threadgroup float gb[K1S_CAP][2];
+    \\uint row0 = part * RB + sg * R;
+    \\#pragma clang loop unroll(full)
+    \\for (int j = 0; j < R_CAP; ++j) if (j < R) {
     \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
     \\  for (int i = 0; i < 4; ++i) st[j][i] = float(state_in[base + i]);
     \\}
-    \\// q, k and v of every token are independent work items: spread them over the simdgroups.
-    \\for (int item = int(sg); item < 3 * TL; item += NSG) {
-    \\  const int kind = item / TL;
-    \\  const int t = item % TL;
-    \\  uint cb = kind == 0 ? hk * DK : (kind == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  T act[4];
-    \\  float sumsq = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    uint ch = cb + lane * 4 + i;
-    \\    float acc = 0.0f;
-    \\    for (int tap = 0; tap < 4; ++tap) {
-    \\      int w = t + tap;
-    \\      const T xv = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
-    \\      acc += float(xv) * float(conv_w[ch * 4 + tap]);
-    \\    }
-    \\    const T conv = T(acc);
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); T sig = conv < T(0) ? sy : T(1) - sy;
-    \\    act[i] = conv * sig;
-    \\    float v = float(act[i]);
-    \\    sumsq += v * v;
-    \\  }
-    \\  if (kind < 2) {
-    \\    sumsq = simd_sum(sumsq);
-    \\    float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
-    \\    const T scale = kind == 0 ? q_scale : k_scale;
-    \\    threadgroup float* dst = kind == 0 ? qs[t] : ks[t];
-    \\    for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = float(scale * T(1) * T(float(act[i]) * inv));
-    \\  } else {
-    \\    for (int i = 0; i < 4; ++i) vs[t][lane * 4 + i] = float(act[i]);
-    \\  }
-    \\}
-    \\if (sg < 3 && part == 0 && (sg == 2 || hv % GRP == 0)) {
-    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    uint ch = cb + lane * 4 + i;
-    \\    for (int j = 0; j < 3; ++j) {
-    \\      int w = TL + j;
-    \\      conv_out[j * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
-    \\    }
-    \\  }
-    \\}
-    \\if (sg == (NSG > 3 ? 3 : 0) && lane < TL) {
-    \\  const int t = int(lane);
-    \\  float ea = metal::precise::exp(float(A_log[hv]));
-    \\  const T bv = b_in[t * HV + hv];
-    \\  T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
-    \\  gb[t][1] = float(bsig);
-    \\  const GT apd = GT(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
-    \\  float sp = sushi_log1p(metal::precise::exp(float(apd)));
-    \\  gb[t][0] = float(GT(metal::precise::exp(-(ea * sp))));
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (int t = 0; t < TL; ++t) {
-    \\  float kk[4], qq[4];
-    \\  for (int i = 0; i < 4; ++i) { kk[i] = ks[t][lane * 4 + i]; qq[i] = qs[t][lane * 4 + i]; }
-    \\  const float g = gb[t][0], beta = gb[t][1];
-    \\  for (int j = 0; j < R; ++j) {
-    \\    uint dv = row0 + j;
-    \\    float kv_mem = 0.0f;
-    \\    for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] * g; kv_mem += st[j][i] * kk[i]; }
-    \\    kv_mem = simd_sum(kv_mem);
-    \\    float delta = (vs[t][dv] - kv_mem) * beta;
-    \\    float out = 0.0f;
-    \\    for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] + kk[i] * delta; out += st[j][i] * qq[i]; }
-    \\    out = simd_sum(out);
 ;
-const K1S_TAIL =
-    \\    if (t + 1 < TL) {
-    \\      uint sbase = t * (HV * DV * DK) + (hv * DV + dv) * DK + lane * 4;
-    \\      for (int i = 0; i < 4; ++i) {
-    \\        state_seq[sbase + i] = static_cast<StT>(st[j][i]);
-    \\        st[j][i] = static_cast<float>(state_seq[sbase + i]);
+
+const K1S_STEP_BODY =
+    \\  // q, k and v of every token in this chunk are independent work items: spread them over the simdgroups.
+    \\  for (int item = int(sg); item < 3 * tc; item += NSG) {
+    \\    const int kind = item / tc;
+    \\    const int lt = item % tc;
+    \\    const int t = t0 + lt;
+    \\    uint cb = kind == 0 ? hk * DK : (kind == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
+    \\    T act[4];
+    \\    float sumsq = 0.0f;
+    \\    for (int i = 0; i < 4; ++i) {
+    \\      uint ch = cb + lane * 4 + i;
+    \\      float acc = 0.0f;
+    \\      for (int tap = 0; tap < 4; ++tap) {
+    \\        int w = t + tap;
+    \\        const T xv = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
+    \\        acc += float(xv) * float(conv_w[ch * 4 + tap]);
+    \\      }
+    \\      const T conv = T(acc);
+    \\      T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); T sig = conv < T(0) ? sy : T(1) - sy;
+    \\      act[i] = conv * sig;
+    \\      float v = float(act[i]);
+    \\      sumsq += v * v;
+    \\    }
+    \\    if (kind < 2) {
+    \\      sumsq = simd_sum(sumsq);
+    \\      float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
+    \\      const T scale = kind == 0 ? q_scale : k_scale;
+    \\      threadgroup float* dst = kind == 0 ? qs[lt] : ks[lt];
+    \\      for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = float(scale * T(1) * T(float(act[i]) * inv));
+    \\    } else {
+    \\      for (int i = 0; i < 4; ++i) vs[lt][lane * 4 + i] = float(act[i]);
+    \\    }
+    \\  }
+    \\  if (t0 == 0 && sg < 3 && part == 0 && (sg == 2 || hv % GRP == 0)) {
+    \\    uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
+    \\    for (int i = 0; i < 4; ++i) {
+    \\      uint ch = cb + lane * 4 + i;
+    \\      for (int j = 0; j < 3; ++j) {
+    \\        int w = TL + j;
+    \\        conv_out[j * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
     \\      }
     \\    }
     \\  }
-    \\}
-    \\for (int j = 0; j < R; ++j) {
+    \\  if (sg == uint(NSG > 3 ? 3 : 0) && lane < uint(tc)) {
+    \\    const int lt = int(lane);
+    \\    const int t = t0 + lt;
+    \\    float ea = metal::precise::exp(float(A_log[hv]));
+    \\    const T bv = b_in[t * HV + hv];
+    \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
+    \\    gb[lt][1] = float(bsig);
+    \\    const float apd_raw = float(a_in[t * HV + hv]) + float(dt_bias[hv]);
+    \\    const float apd = GATE_F32 ? apd_raw : float(T(apd_raw));
+    \\    float sp = sushi_log1p(metal::precise::exp(apd));
+    \\    const float g_raw = metal::precise::exp(-(ea * sp));
+    \\    gb[lt][0] = GATE_F32 ? g_raw : float(T(g_raw));
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (int lt = 0; lt < tc; ++lt) {
+    \\    const int t = t0 + lt;
+    \\    float kk[4], qq[4];
+    \\    for (int i = 0; i < 4; ++i) { kk[i] = ks[lt][lane * 4 + i]; qq[i] = qs[lt][lane * 4 + i]; }
+    \\    const float g = gb[lt][0], beta = gb[lt][1];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int j = 0; j < R_CAP; ++j) if (j < R) {
+    \\      uint dv = row0 + j;
+    \\      float kv_mem = 0.0f;
+    \\      for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] * g; kv_mem += st[j][i] * kk[i]; }
+    \\      kv_mem = simd_sum(kv_mem);
+    \\      float delta = (vs[lt][dv] - kv_mem) * beta;
+    \\      float out = 0.0f;
+    \\      for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] + kk[i] * delta; out += st[j][i] * qq[i]; }
+    \\      out = simd_sum(out);
+;
+
+const K1S_SEQ_CAP =
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int K1S_CAP = 9;
+    \\#else
+    \\constexpr int K1S_CAP = TL < 9 ? TL : 9;
+    \\#endif
+;
+
+const K1S_STATE_STORE =
+    \\#pragma clang loop unroll(full)
+    \\for (int j = 0; j < R_CAP; ++j) if (j < R) {
     \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
     \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
     \\}
 ;
 
-pub const K1S_SOURCE = K1S_HEAD ++ "\n" ++
-    \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
-++ "\n" ++ K1S_TAIL;
-
-// The same recurrence with no per-step state buffer: each step still rounds the carried state to its stored width.
-const K1S_NOCAP_TAIL =
-    \\    if (t + 1 < TL) {
-    \\      for (int i = 0; i < 4; ++i) st[j][i] = static_cast<float>(static_cast<StT>(st[j][i]));
+const K1S_CAP_STORE =
+    \\      if (t + 1 < TL) {
+    \\        uint sbase = uint(t) * uint(HV * DV * DK) + (hv * DV + dv) * DK + lane * 4;
+    \\        for (int i = 0; i < 4; ++i) {
+    \\          state_seq[sbase + i] = static_cast<StT>(st[j][i]);
+    \\          st[j][i] = static_cast<float>(state_seq[sbase + i]);
+    \\        }
+    \\      }
     \\    }
     \\  }
-    \\}
-    \\for (int j = 0; j < R; ++j) {
-    \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
-    \\}
 ;
 
-pub const K1S_NOCAP_SOURCE = K1S_HEAD ++ "\n" ++
-    \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
-++ "\n" ++ K1S_NOCAP_TAIL;
+const K1S_NOCAP_STORE =
+    \\      if (t + 1 < TL) {
+    \\        for (int i = 0; i < 4; ++i) st[j][i] = static_cast<float>(static_cast<StT>(st[j][i]));
+    \\      }
+    \\    }
+    \\  }
+;
+
+fn k1sSeqSource(comptime inner_tail: []const u8) [:0]const u8 {
+    return K1S_SEQ_CAP ++ "\n" ++ K1S_SETUP ++ "\n" ++
+        \\if (TL <= K1S_CAP) {
+        \\  const int t0 = 0;
+        \\  const int tc = TL;
+    ++ "\n" ++ K1S_STEP_BODY ++ "\n" ++
+        \\      if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
+    ++ "\n" ++ inner_tail ++ "\n" ++
+        \\} else {
+        \\  for (int t0 = 0; t0 < TL; t0 += K1S_CAP) {
+        \\    if (t0 > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\    const int tc = metal::min(K1S_CAP, TL - t0);
+    ++ "\n" ++ K1S_STEP_BODY ++ "\n" ++
+        \\      if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
+    ++ "\n" ++ inner_tail ++ "\n" ++
+        \\  }
+        \\}
+    ++ "\n" ++ K1S_STATE_STORE;
+}
+
+pub const K1S_SOURCE = k1sSeqSource(K1S_CAP_STORE);
+
+// The same recurrence with no per-step state buffer: each step still rounds the carried state to its stored width.
+pub const K1S_NOCAP_SOURCE = k1sSeqSource(K1S_NOCAP_STORE);
+
+const K1S_FOLD_CONV_IN =
+    \\  if (sg < 3 && (sg == 2 || hv % GRP == 0)) {
+    \\    uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
+    \\    for (int i = 0; i < 4; ++i) {
+    \\      uint ch = cb + lane * 4 + i;
+    \\      for (int w = 0; w < 3 + TL; ++w) conv_in[w * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
+    \\    }
+    \\  }
+;
+
+const K1S_FOLD_GATE =
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (sg < uint(tc)) {
+    \\    float xs[4];
+    \\    float sumsq = 0.0f;
+    \\    for (int i = 0; i < 4; ++i) { xs[i] = ys[sg][lane * 4 + i]; sumsq += xs[i] * xs[i]; }
+    \\    sumsq = simd_sum(sumsq);
+    \\    float inv = metal::precise::rsqrt(sumsq / float(DV) + eps);
+    \\    uint base = ((uint(t0) + sg) * HV + hv) * DV + lane * 4;
+    \\    for (int i = 0; i < 4; ++i) {
+    \\      const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
+    \\      const T zv = z[base + i];
+    \\      T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); T sig = zv < T(0) ? sy : T(1) - sy;
+    \\      gated[base + i] = SWISH ? (zv * sig) * normed : normed * sig;
+    \\    }
+    \\  }
+;
 
 // One threadgroup owns a head. Its stored-precision y stays in shared memory
 // for the norm-gate reduction; rollback also receives the convolution inputs.
-pub const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
-    \\    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));
-++ "\n" ++ K1S_TAIL ++ "\n" ++
-    \\if (sg < 3 && (sg == 2 || hv % GRP == 0)) {
-    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    uint ch = cb + lane * 4 + i;
-    \\    for (int w = 0; w < 3 + TL; ++w) conv_in[w * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
-    \\  }
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (sg < TL) {
-    \\  float xs[4];
-    \\  float sumsq = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { xs[i] = ys[sg][lane * 4 + i]; sumsq += xs[i] * xs[i]; }
-    \\  sumsq = simd_sum(sumsq);
-    \\  float inv = metal::precise::rsqrt(sumsq / float(DV) + eps);
-    \\  uint base = (sg * HV + hv) * DV + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
-    \\    const T zv = z[base + i];
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); T sig = zv < T(0) ? sy : T(1) - sy;
-    \\    gated[base + i] = SWISH ? (zv * sig) * normed : normed * sig;
+// CAP sizes the threadgroup buffers ({2, 4, 9}) so TL=2 keeps 4 KiB TG SRAM (no wave-overlap loss)
+// while TL stays an fc_int; TL <= CAP runs single-shot, TL > CAP chunks cleanly with zero JIT.
+pub const K1S_FOLD_SOURCE =
+    \\constexpr int K1S_CAP = CAP;
+    \\threadgroup float ys[K1S_CAP][DV];
+++ "\n" ++ K1S_SETUP ++ "\n" ++
+    \\if (TL <= K1S_CAP) {
+    \\  const int t0 = 0;
+    \\  const int tc = TL;
+++ "\n" ++ K1S_STEP_BODY ++ "\n" ++
+    \\      if (lane == 0) ys[lt][dv] = float(static_cast<T>(out));
+++ "\n" ++ K1S_CAP_STORE ++ "\n" ++ K1S_STATE_STORE ++ "\n" ++ K1S_FOLD_CONV_IN ++ "\n" ++ K1S_FOLD_GATE ++ "\n" ++
+    \\} else {
+    \\  for (int t0 = 0; t0 < TL; t0 += K1S_CAP) {
+    \\    if (t0 > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    const int tc = metal::min(K1S_CAP, TL - t0);
+++ "\n" ++ K1S_STEP_BODY ++ "\n" ++
+    \\      if (lane == 0) ys[lt][dv] = float(static_cast<T>(out));
+++ "\n" ++ K1S_CAP_STORE ++ "\n" ++
+    \\    if (t0 + K1S_CAP >= TL) {
+++ "\n" ++ K1S_STATE_STORE ++ "\n" ++ K1S_FOLD_CONV_IN ++ "\n" ++
+    \\    }
+++ "\n" ++ K1S_FOLD_GATE ++ "\n" ++
     \\  }
     \\}
 ;
@@ -322,8 +393,7 @@ fn buildConfig(g: Geometry, t_len: c_int, state: mlx.mlx_dtype, gate: mlx.mlx_dt
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, NT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", state));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gate));
-    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
+    inline for (.{ .{ "GATE_F32", @as(c_int, @intFromBool(gate == .float32)) }, .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     if (t_len > 1) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TL", t_len));
     return cfg;
@@ -546,6 +616,10 @@ pub fn foldDeclined(t_len: c_int) bool {
     return t_len >= 2 and t_len <= MAX_SEQ and fold_ok[@intCast(t_len)] == false;
 }
 
+fn foldCapFor(t_len: c_int) c_int {
+    return if (t_len <= 2) 2 else if (t_len <= 4) 4 else 9;
+}
+
 fn buildFoldConfig(key: FoldKey, t_len: c_int) !mlx.mlx_fast_metal_kernel_config {
     const g = key.g;
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
@@ -558,8 +632,7 @@ fn buildFoldConfig(key: FoldKey, t_len: c_int) !mlx.mlx_fast_metal_kernel_config
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, key.nt, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", key.state));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", key.gate));
-    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", key.nt }, .{ "SPLIT", @as(c_int, 1) }, .{ "TL", t_len }, .{ "SWISH", @as(c_int, @intFromBool(key.swish)) } }) |kv|
+    inline for (.{ .{ "GATE_F32", @as(c_int, @intFromBool(key.gate == .float32)) }, .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", key.nt }, .{ "SPLIT", @as(c_int, 1) }, .{ "CAP", foldCapFor(t_len) }, .{ "TL", t_len }, .{ "SWISH", @as(c_int, @intFromBool(key.swish)) } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     return cfg;
 }
@@ -757,4 +830,348 @@ test "logical capture includes every defined state and the separate final state"
     const d = try logicalSsmCapture(stream, &entries[1]);
     defer _ = mlx.mlx_array_free(d);
     try testing.expect(!try qsaArraysAllEqual(a, d, stream));
+}
+
+test "gdn recur FC: TL > 9 resolves via sushi.metallib and matches serial decode bit-for-bit" {
+    try mlx.requireGpu();
+    try testing.expectEqual(@as(c_int, 2), foldCapFor(0));
+    try testing.expectEqual(@as(c_int, 2), foldCapFor(1));
+    try testing.expectEqual(@as(c_int, 2), foldCapFor(2));
+    try testing.expectEqual(@as(c_int, 4), foldCapFor(3));
+    try testing.expectEqual(@as(c_int, 4), foldCapFor(4));
+    try testing.expectEqual(@as(c_int, 9), foldCapFor(5));
+    try testing.expectEqual(@as(c_int, 9), foldCapFor(9));
+    try testing.expectEqual(@as(c_int, 9), foldCapFor(10));
+    try testing.expectEqual(@as(c_int, 9), foldCapFor(19));
+
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const s = mlx.engine.stream();
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+    const g: Geometry = .{ .hk = 1, .hv = 2, .dk = 128, .dv = 128 };
+    const c: c_int = 2 * g.hk * g.dk + g.hv * g.dv;
+
+    const randArr = struct {
+        fn make(r: std.Random, shape: []const c_int, dtype: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try testing.allocator.alloc(f32, n);
+            defer testing.allocator.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * 0.5;
+            const a32 = try mlx.newData(buf.ptr, shape, .float32);
+            defer _ = mlx.mlx_array_free(a32);
+            if (dtype == .float32) {
+                var copy = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(copy);
+                try mlx.check(mlx.mlx_astype(&copy, a32, .float32, st));
+                return copy;
+            }
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_astype(&out, a32, dtype, st));
+            return out;
+        }
+    }.make;
+
+    // Cover 2-chunk (TL = 10 = 9+1, TL = 18 = 9+9 exact multiple) and 3-chunk (TL = 19 = 9+9+1),
+    // plus both GATE_F32=1/StT=f32 and GATE_F32=0/StT=bf16.
+    const Case = struct { tl: c_int, state: mlx.mlx_dtype, gate: mlx.mlx_dtype, seed: u64 };
+    const cases = [_]Case{
+        .{ .tl = 19, .state = .float32, .gate = .float32, .seed = 0x71_19 },
+        .{ .tl = 19, .state = .bfloat16, .gate = .bfloat16, .seed = 0x71_1A },
+        .{ .tl = 18, .state = .float32, .gate = .bfloat16, .seed = 0x71_18 },
+        .{ .tl = 10, .state = .bfloat16, .gate = .float32, .seed = 0x71_10 },
+    };
+
+    const k_cap = try makeKernel("sushi_gdn_decode_recur_seq", &.{ "y", "conv_out", "state_out", "state_seq" }, K1S_SOURCE);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k_cap);
+    const k_nocap = try makeKernel("sushi_gdn_decode_recur_seq_nocap", &.{ "y", "conv_out", "state_out" }, K1S_NOCAP_SOURCE);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k_nocap);
+    const f_ins_n = [_][*:0]const u8{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps" };
+    const f_outs_n = [_][*:0]const u8{ "gated", "conv_out", "state_out", "state_seq", "conv_in" };
+    const fiv = mlx.mlx_vector_string_new_data(&f_ins_n, f_ins_n.len);
+    defer _ = mlx.mlx_vector_string_free(fiv);
+    const fov = mlx.mlx_vector_string_new_data(&f_outs_n, f_outs_n.len);
+    defer _ = mlx.mlx_vector_string_free(fov);
+    const fk = mlx.mlx_fast_metal_kernel_new("sushi_gdn_verify_fold", fiv, fov, K1S_FOLD_SOURCE, HEADER, true, false);
+    if (fk.ctx == null) return error.MetalKernelCompileFailed;
+    defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+
+    for (cases) |tc| {
+        const tl = tc.tl;
+        const tlu: usize = @intCast(tl);
+        var prng = std.Random.DefaultPrng.init(tc.seed);
+        const rnd = prng.random();
+
+        const qkv = try randArr(rnd, &.{ 1, tl, c }, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(qkv);
+        const a_in = try randArr(rnd, &.{ 1, tl, g.hv }, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(a_in);
+        const b_in = try randArr(rnd, &.{ 1, tl, g.hv }, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(b_in);
+        const conv_state = try randArr(rnd, &.{ 1, 3, c }, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(conv_state);
+        const state_in = try randArr(rnd, &.{ 1, g.hv, g.dv, g.dk }, tc.state, s);
+        defer _ = mlx.mlx_array_free(state_in);
+        const conv_w = try randArr(rnd, &.{ c, 4, 1 }, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(conv_w);
+        const A_log = try randArr(rnd, &.{g.hv}, .float32, s);
+        defer _ = mlx.mlx_array_free(A_log);
+        const dt_bias = try randArr(rnd, &.{g.hv}, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(dt_bias);
+        const q_scale = try randArr(rnd, &.{}, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(q_scale);
+        const k_scale = try randArr(rnd, &.{}, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(k_scale);
+        const z = try randArr(rnd, &.{ 1, tl, g.hv * g.dv }, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(z);
+        const norm_w = try randArr(rnd, &.{g.dv}, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(norm_w);
+        const eps = try mlx.newFloat(1e-6);
+        defer _ = mlx.mlx_array_free(eps);
+
+        // Reference: tl serial single-token steps via step(t_len = 1).
+        var cur_conv = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&cur_conv, conv_state));
+        defer _ = mlx.mlx_array_free(cur_conv);
+        var cur_state = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&cur_state, state_in));
+        defer _ = mlx.mlx_array_free(cur_state);
+        var ys: [19]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (ys) |arr| if (arr.ctx != null) {
+            _ = mlx.mlx_array_free(arr);
+        };
+        var seq_states: [18]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (seq_states) |arr| if (arr.ctx != null) {
+            _ = mlx.mlx_array_free(arr);
+        };
+        for (0..tlu) |ti| {
+            const t_i: c_int = @intCast(ti);
+            const q1 = try rowsOf(qkv, t_i, t_i + 1, s);
+            defer _ = mlx.mlx_array_free(q1);
+            const a1 = try rowsOf(a_in, t_i, t_i + 1, s);
+            defer _ = mlx.mlx_array_free(a1);
+            const b1 = try rowsOf(b_in, t_i, t_i + 1, s);
+            defer _ = mlx.mlx_array_free(b1);
+            var r = (try step(g, 1, .{
+                .qkv = q1,
+                .a = a1,
+                .b = b1,
+                .conv_state = cur_conv,
+                .ssm_state = cur_state,
+                .conv_w = conv_w,
+                .A_log = A_log,
+                .dt_bias = dt_bias,
+                .q_scale = q_scale,
+                .k_scale = k_scale,
+                .gate_dtype = tc.gate,
+            }, false, s)) orelse return error.GdnStepDeclined;
+            defer r.deinit();
+            ys[ti] = r.y;
+            r.y = .{ .ctx = null };
+            _ = mlx.mlx_array_free(cur_conv);
+            cur_conv = r.conv_state;
+            r.conv_state = .{ .ctx = null };
+            _ = mlx.mlx_array_free(cur_state);
+            cur_state = r.ssm_state;
+            r.ssm_state = .{ .ctx = null };
+            if (ti + 1 < tlu) {
+                seq_states[ti] = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&seq_states[ti], cur_state));
+            }
+        }
+        const y_vec = mlx.mlx_vector_array_new_data(&ys, tlu);
+        defer _ = mlx.mlx_vector_array_free(y_vec);
+        var ref_y = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_y);
+        try mlx.check(mlx.mlx_concatenate_axis(&ref_y, y_vec, 1, s));
+
+        // Zero MLX fallback during all Cooler dispatches (proves precompiled sushi.metallib resolution).
+        const mlx_before = mlx.engine.mlxCalls();
+
+        const ins10 = [_]mlx.mlx_array{ qkv, a_in, b_in, conv_state, state_in, conv_w, A_log, dt_bias, q_scale, k_scale };
+        const v10 = mlx.mlx_vector_array_new_data(&ins10, ins10.len);
+        defer _ = mlx.mlx_vector_array_free(v10);
+        for ([_]bool{ true, false }) |cap| {
+            const cfg = try buildConfig(g, tl, tc.state, tc.gate, cap);
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            var ov = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ov);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, if (cap) k_cap else k_nocap, v10, cfg, s));
+            var got_y = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(got_y);
+            var got_conv = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(got_conv);
+            var got_st = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(got_st);
+            try mlx.check(mlx.mlx_vector_array_get(&got_y, ov, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&got_conv, ov, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&got_st, ov, 2));
+            try testing.expect(try qsaArraysAllEqual(got_y, ref_y, s));
+            try testing.expect(try qsaArraysAllEqual(got_conv, cur_conv, s));
+            try testing.expect(try qsaArraysAllEqual(got_st, cur_state, s));
+            if (cap) {
+                var got_seq = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(got_seq);
+                try mlx.check(mlx.mlx_vector_array_get(&got_seq, ov, 3));
+                // Check every chunk boundary and final captured step: 0, 8, 9, tl-2.
+                for ([_]usize{ 0, 8, 9, tlu - 2 }) |chk| {
+                    if (chk + 1 >= tlu) continue;
+                    const ci: c_int = @intCast(chk);
+                    var sl = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(sl);
+                    try mlx.check(mlx.mlx_slice(&sl, got_seq, &[_]c_int{ ci, 0, 0, 0, 0 }, 5, &[_]c_int{ ci + 1, 1, g.hv, g.dv, g.dk }, 5, &[_]c_int{ 1, 1, 1, 1, 1 }, 5, s));
+                    var rsh = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(rsh);
+                    try mlx.check(mlx.mlx_reshape(&rsh, sl, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, s));
+                    try testing.expect(try qsaArraysAllEqual(rsh, seq_states[chk], s));
+                }
+            }
+        }
+
+        // Verify fold at TL (CAP = 9 -> 2 or 3 chunks).
+        const fcfg = try buildFoldConfig(.{ .g = g, .swish = true, .nt = FOLD_NT, .state = tc.state, .gate = tc.gate }, tl);
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(fcfg);
+        const ins13 = [_]mlx.mlx_array{ qkv, a_in, b_in, conv_state, state_in, conv_w, A_log, dt_bias, q_scale, k_scale, z, norm_w, eps };
+        const v13 = mlx.mlx_vector_array_new_data(&ins13, ins13.len);
+        defer _ = mlx.mlx_vector_array_free(v13);
+        var f_out = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(f_out);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&f_out, fk, v13, fcfg, s));
+        var f_gated = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f_gated);
+        var f_conv = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f_conv);
+        var f_st = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f_st);
+        var f_seq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f_seq);
+        var f_cin = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f_cin);
+        try mlx.check(mlx.mlx_vector_array_get(&f_gated, f_out, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&f_conv, f_out, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&f_st, f_out, 2));
+        try mlx.check(mlx.mlx_vector_array_get(&f_seq, f_out, 3));
+        try mlx.check(mlx.mlx_vector_array_get(&f_cin, f_out, 4));
+        try testing.expect(try qsaArraysAllEqual(f_conv, cur_conv, s));
+        try testing.expect(try qsaArraysAllEqual(f_st, cur_state, s));
+        for ([_]usize{ 0, 8, 9, tlu - 2 }) |chk| {
+            if (chk + 1 >= tlu) continue;
+            const ci: c_int = @intCast(chk);
+            var f_sl = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f_sl);
+            try mlx.check(mlx.mlx_slice(&f_sl, f_seq, &[_]c_int{ ci, 0, 0, 0, 0 }, 5, &[_]c_int{ ci + 1, 1, g.hv, g.dv, g.dk }, 5, &[_]c_int{ 1, 1, 1, 1, 1 }, 5, s));
+            var f_rsh = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f_rsh);
+            try mlx.check(mlx.mlx_reshape(&f_rsh, f_sl, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, s));
+            try testing.expect(try qsaArraysAllEqual(f_rsh, seq_states[chk], s));
+        }
+        const cin_parts = [_]mlx.mlx_array{ conv_state, qkv };
+        const cin_vec = mlx.mlx_vector_array_new_data(&cin_parts, cin_parts.len);
+        defer _ = mlx.mlx_vector_array_free(cin_vec);
+        var ref_cin = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_cin);
+        try mlx.check(mlx.mlx_concatenate_axis(&ref_cin, cin_vec, 1, s));
+        try testing.expect(try qsaArraysAllEqual(f_cin, ref_cin, s));
+        // All three GDN FC kernels (recur_seq, recur_seq_nocap, verify_fold) ran strictly on Cooler.
+        try testing.expectEqual(mlx_before, mlx.engine.mlxCalls());
+
+        // Verify gated across all chunk boundaries via gdnNormGateFused on ref_y (serial reference),
+        // chunked in <= 9-row slices so every tl (including 10, 18, 19) hits the decode normgate arm.
+        const qgdn = @import("qwen4_gdn.zig");
+        var g_parts: [3]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (g_parts) |arr| if (arr.ctx != null) {
+            _ = mlx.mlx_array_free(arr);
+        };
+        var n_parts: usize = 0;
+        var r0: c_int = 0;
+        while (r0 < tl) : (r0 += 9) {
+            const r1 = @min(tl, r0 + 9);
+            var ry = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ry);
+            try mlx.check(mlx.mlx_slice(&ry, ref_y, &[_]c_int{ 0, r0, 0, 0 }, 4, &[_]c_int{ 1, r1, g.hv, g.dv }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+            const rz = try rowsOf(z, r0, r1, s);
+            defer _ = mlx.mlx_array_free(rz);
+            g_parts[n_parts] = (try qgdn.gdnNormGateFused(s, ry, rz, 0, g.hv * g.dv, norm_w, eps, true, g.hv, g.dv, 1, r1 - r0)) orelse return error.FusedDeclined;
+            n_parts += 1;
+        }
+        const gp_vec = mlx.mlx_vector_array_new_data(&g_parts, n_parts);
+        defer _ = mlx.mlx_vector_array_free(gp_vec);
+        var ref_gated = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_gated);
+        try mlx.check(mlx.mlx_concatenate_axis(&ref_gated, gp_vec, 1, s));
+        try testing.expect(try qsaArraysAllEqual(f_gated, ref_gated, s));
+    }
+
+    // Verify maxTotalThreadsPerThreadgroup on the specialized FC pipelines (CAP in {2, 4, 9}, NSG in {1, 8}, HC).
+    const catalog = @import("../metallib_catalog.zig");
+    const stock = @import("../tensor/stock.zig");
+    const metal_mod = @import("../metal.zig");
+    const vf_in = [_]catalog.RuntimeInput{
+        .{ .name = "qkv", .dtype = .bfloat16 },
+        .{ .name = "a_in", .dtype = .bfloat16 },
+        .{ .name = "b_in", .dtype = .bfloat16 },
+        .{ .name = "conv_state", .dtype = .bfloat16 },
+        .{ .name = "state_in", .dtype = .float32 },
+        .{ .name = "conv_w", .dtype = .bfloat16 },
+        .{ .name = "A_log", .dtype = .float32 },
+        .{ .name = "dt_bias", .dtype = .bfloat16 },
+        .{ .name = "q_scale", .dtype = .bfloat16, .scalar = true },
+        .{ .name = "k_scale", .dtype = .bfloat16, .scalar = true },
+        .{ .name = "z", .dtype = .bfloat16 },
+        .{ .name = "norm_w", .dtype = .bfloat16 },
+        .{ .name = "eps", .dtype = .float32, .scalar = true },
+    };
+    const vf_out = [_]catalog.Dtype{ .bfloat16, .bfloat16, .float32, .float32, .bfloat16 };
+    for ([_]i32{ 2, 4, 9 }) |cap_v| {
+        var res: catalog.Resolved = .{};
+        try testing.expect(catalog.resolve("sushi_gdn_verify_fold", &vf_in, &vf_out, &.{
+            .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "StT", .value = .{ .dtype = .float32 } },
+            .{ .name = "GATE_F32", .value = .{ .int = 1 } },
+            .{ .name = "HK", .value = .{ .int = 1 } },
+            .{ .name = "HV", .value = .{ .int = 2 } },
+            .{ .name = "DK", .value = .{ .int = 128 } },
+            .{ .name = "DV", .value = .{ .int = 128 } },
+            .{ .name = "C", .value = .{ .int = 512 } },
+            .{ .name = "NT", .value = .{ .int = FOLD_NT } },
+            .{ .name = "SPLIT", .value = .{ .int = 1 } },
+            .{ .name = "CAP", .value = .{ .int = cap_v } },
+            .{ .name = "TL", .value = .{ .int = cap_v } },
+            .{ .name = "SWISH", .value = .{ .int = 1 } },
+        }, &res));
+        var ints_fc: [catalog.max_fc_ints]metal_mod.IntConstant = undefined;
+        for (res.intSlice(), 0..) |ci, i| ints_fc[i] = .{ .index = ci.index, .value = ci.value };
+        const p = try stock.kernelConstants(res.fnName(), res.hashKey(), &.{}, ints_fc[0..res.n_ints]);
+        try testing.expect(p.max_threads >= 640);
+    }
+    const qp_in = [_]catalog.RuntimeInput{
+        .{ .name = "q", .dtype = .bfloat16 },
+        .{ .name = "k", .dtype = .uint32 },
+        .{ .name = "v", .dtype = .uint32 },
+        .{ .name = "scl", .dtype = .float32 },
+        .{ .name = "blocks", .dtype = .int32 },
+        .{ .name = "ksc", .dtype = .bfloat16 },
+        .{ .name = "kbi", .dtype = .bfloat16 },
+        .{ .name = "vsc", .dtype = .bfloat16 },
+        .{ .name = "vbi", .dtype = .bfloat16 },
+    };
+    const qp_out = [_]catalog.Dtype{.bfloat16};
+    for ([_]i32{ 1, 2, 8 }) |nsg_v| {
+        var res: catalog.Resolved = .{};
+        try testing.expect(catalog.resolve("sushi_attn_qsa256_packed", &qp_in, &qp_out, &.{
+            .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "NSG", .value = .{ .int = nsg_v } },
+            .{ .name = "BK", .value = .{ .int = 32 } },
+            .{ .name = "RATIO", .value = .{ .int = 4 } },
+            .{ .name = "BITS", .value = .{ .int = 3 } },
+            .{ .name = "GS", .value = .{ .int = 64 } },
+        }, &res));
+        var ints_fc: [catalog.max_fc_ints]metal_mod.IntConstant = undefined;
+        for (res.intSlice(), 0..) |ci, i| ints_fc[i] = .{ .index = ci.index, .value = ci.value };
+        const p = try stock.kernelConstants(res.fnName(), res.hashKey(), &.{}, ints_fc[0..res.n_ints]);
+        try testing.expect(p.max_threads >= @as(usize, @intCast(nsg_v)) * 32);
+    }
 }
