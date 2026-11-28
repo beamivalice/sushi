@@ -1032,6 +1032,39 @@ test "a Qwen request's growth commit covers the cache it reserves at the width t
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
+test "static bill defaults wired margin to 0 GiB unless overridden across budgetFor, FitReadings, and defaultBudgetLimits" {
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const static_bill = @import("static_bill.zig");
+    const was = (Machine{ .total = 128 * GiB, .wired_mb = 123_000, .margin = null, .avail = 100 * GiB, .gpu_floor = 0 }).pin();
+    defer _ = was.pin();
+    launch_state.setWiredMarginFile(null);
+
+    const before = static_bill.Before.now();
+    const st_default = bills.FitReadings.nowFor(true);
+    const dyn_default = bills.FitReadings.nowFor(false);
+    try testing.expectEqual(@as(u64, 0), st_default.ceiling.margin);
+    try testing.expectEqual(GiB, dyn_default.ceiling.margin);
+    try testing.expectEqual(@as(u64, 512 * MiB), st_default.ceiling.planning() - dyn_default.ceiling.planning());
+
+    const st_limits = bills.defaultBudgetLimitsFor(true);
+    const dyn_limits = bills.defaultBudgetLimitsFor(false);
+    try testing.expectEqual(@as(u64, 512 * MiB), st_limits.margin);
+    try testing.expectEqual(GiB, dyn_limits.margin);
+
+    const budget_default = static_bill.budgetFor(before);
+    const was_one = (Machine{ .total = 128 * GiB, .wired_mb = 123_000, .margin = GiB, .avail = 100 * GiB, .gpu_floor = 0 }).pin();
+    defer _ = was_one.pin();
+    const budget_one_gib = static_bill.budgetFor(before);
+    try testing.expectEqual(@as(u64, 512 * MiB), budget_default - budget_one_gib);
+
+    const was_two = (Machine{ .total = 128 * GiB, .wired_mb = 123_000, .margin = null, .avail = 100 * GiB, .gpu_floor = 0 }).pin();
+    defer _ = was_two.pin();
+    launch_state.setWiredMarginFile(2);
+    defer launch_state.setWiredMarginFile(null);
+    try testing.expectEqual(budget_one_gib - GiB, static_bill.budgetFor(before));
+}
+
 test "a served load whose memory sizes its prefill width below a given min refuses by name, before it serves" {
     const t = std.testing;
     const settings_resolve = @import("settings_resolve.zig");

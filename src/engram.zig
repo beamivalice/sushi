@@ -444,6 +444,22 @@ pub const Table = struct {
         return self.gatherAs(gpa, ids, .float32, s);
     }
 
+    /// Dry recording of `gatherAs` for `n` rows: materializes zeroed host slices of exact byte size without SSD reads.
+    pub fn dequantDryAs(self: *const Table, gpa: std.mem.Allocator, n: usize, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+        const w = try gpa.alignedAlloc(u8, .@"4", n * self.w_row);
+        defer gpa.free(w);
+        @memset(w, 0);
+        const sc = try gpa.alignedAlloc(u8, .@"4", n * self.sdim);
+        defer gpa.free(sc);
+        @memset(sc, 0);
+        return self.dequantAs(.{ .w = w, .s = sc }, n, dt, s);
+    }
+
+    /// Dry recording of `gather` for `n` rows: materializes zeroed host slices of exact byte size without SSD reads.
+    pub fn dequantDry(self: *const Table, gpa: std.mem.Allocator, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+        return self.dequantDryAs(gpa, n, .float32, s);
+    }
+
     /// Asks the kernel to read every `stride`-th of `ids` from `first` into the page cache now
     /// (`F_RDADVISE`: asynchronous, no copy), so the preads behind it find the rows cached or in
     /// flight and a batch of random rows costs about one SSD latency, not one per row. An

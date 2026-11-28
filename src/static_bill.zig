@@ -84,13 +84,14 @@ pub fn onLedger(config: *const ModelConfig, warms: bool) bool {
     return warms and bills.ledgerArch(config);
 }
 
-/// B (part 9): the planning ceiling (`bills.Ceiling.planning`) less what the process held before this load: what MLX
-/// holds, its cache too, and the other resident models (the engine's free buffers among them, each load on the ledger at
-/// its whole budget), and the decoder pools lent out of it.
+/// B (part 9): the static-bill planning ceiling (`bills.ceilingNowStatic`, 0 GiB default wired margin unless
+/// overridden) less what the process held before this load: what MLX holds, its cache too, and the other resident
+/// models (the engine's free buffers among them, each load on the ledger at its whole budget), and the decoder pools
+/// lent out of it.
 pub fn budgetFor(b: Before) u64 {
     const mlx_cache = gpu_mem.cacheBytes() -| gpu_mem.engineFree();
     const others = (bills.promisedActive(gpu_mem.activeBytes(), null) -| b.activeSince()) +| mlx_cache +| b.held.free;
-    return bills.ceilingNow().planning() -| others;
+    return bills.ceilingNowStatic().planning() -| others;
 }
 
 /// The load's ledger opens with its budget, read once here. Returns the room its chunk and context are chosen in: the

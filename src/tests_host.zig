@@ -127,13 +127,7 @@ test {
     _ = @import("fill_marks.zig");
     _ = @import("ledger.zig");
     _ = @import("static_bill.zig");
-    _ = @import("tensor/plan/plan_frame.zig");
     _ = @import("tensor/plan/plan_trace.zig");
-    _ = @import("tensor/plan/plan_shape.zig");
-    _ = @import("tensor/plan/plan_pack.zig");
     _ = @import("tensor/plan/plan_region.zig");
-    _ = @import("tensor/plan/plan_binder.zig");
     _ = @import("tensor/plan/plan_api.zig");
-    _ = @import("tensor/plan/plan_soundness_test.zig");
-    _ = @import("tensor/plan/plan_book.zig");
 }

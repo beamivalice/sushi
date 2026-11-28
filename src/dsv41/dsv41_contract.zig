@@ -71,9 +71,9 @@ pub fn rowStores(xfm: *Trunk) !RowStores {
     return rowStoresOf((try dsv41_model.currentState(m)) orelse return .{});
 }
 
-/// How many appends have had to grow a store, process-wide (`dsv41_model.store_grows`).
+/// How many appends have had to grow a store, process-wide (`dsv41_store.store_grows`).
 pub fn storeGrows() u64 {
-    return dsv41_model.store_grows;
+    return @import("dsv41_store.zig").store_grows;
 }
 
 fn rowStoresOf(st: *const dsv41_model.State) RowStores {
@@ -127,6 +127,40 @@ pub fn unboundChunks(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, chunk:
     }
 }
 
+fn stateFixedRings(st: *const dsv41_model.State) u64 {
+    var rings: u64 = 0;
+    for (st.layers) |*ls| {
+        rings += pool_class.poolBytes(dsv41_model.arrayBytes(ls.win.buf.array));
+        if (ls.pend_kv_buf) |b| rings += pool_class.poolBytes(dsv41_model.arrayBytes(b));
+        if (ls.pend_gate_buf) |b| rings += pool_class.poolBytes(dsv41_model.arrayBytes(b));
+    }
+    for (st.ds) |*r| rings += pool_class.poolBytes(dsv41_model.arrayBytes(r.buf.array));
+    for (st.verify_pend_kv[0..st.layers.len]) |opt| if (opt) |b| {
+        rings += pool_class.poolBytes(dsv41_model.arrayBytes(b));
+    };
+    for (st.verify_pend_gate[0..st.layers.len]) |opt| if (opt) |b| {
+        rings += pool_class.poolBytes(dsv41_model.arrayBytes(b));
+    };
+    if (st.verify_mh) |b| rings += pool_class.poolBytes(dsv41_model.arrayBytes(b));
+    if (st.spec_undo.win.cap > 0) {
+        rings += pool_class.poolBytes(dsv41_model.arrayBytes(st.spec_undo.win.buf.array));
+        for ([_]?mlx.mlx_array{ st.spec_undo.pend_kv_buf, st.spec_undo.pend_gate_buf, st.spec_undo.verify_kv_buf, st.spec_undo.verify_gate_buf }) |opt| if (opt) |b| {
+            rings += pool_class.poolBytes(dsv41_model.arrayBytes(b));
+        };
+    }
+    if (st.points) |pts| {
+        for (pts.slots[0..pts.cap]) |*slot| {
+            for (slot.layers[0..st.layers.len]) |row| for (row) |opt| if (opt) |b| {
+                rings += pool_class.poolBytes(dsv41_model.arrayBytes(b));
+            };
+            for (slot.ds[0..st.ds.len]) |opt| if (opt) |b| {
+                rings += pool_class.poolBytes(dsv41_model.arrayBytes(b));
+            };
+        }
+    }
+    return rings;
+}
+
 /// What a request's bind makes in the pool before its first forward: a fresh request is bound to its last row `end` as
 /// `Generator` binds it, and the pool's in-use bytes it grew by are returned, with the bytes of the window rings the state
 /// holds then (the stores are `Config.stateReservedBytes`).
@@ -149,10 +183,7 @@ pub fn bindMade(xfm: *Trunk, end: usize) !struct { made: u64, rings: u64 } {
     var rings: u64 = 0;
     const lent = dsv41_model.lendOwn(m);
     defer lent.end();
-    if (try dsv41_model.currentState(m)) |st| {
-        for (st.layers) |*ls| rings += pool_class.poolBytes(dsv41_model.arrayBytes(ls.win.buf.array));
-        for (st.ds) |*r| rings += pool_class.poolBytes(dsv41_model.arrayBytes(r.buf.array));
-    }
+    if (try dsv41_model.currentState(m)) |st| rings = stateFixedRings(st);
     return .{ .made = (s1.pool_bytes - s1.pool_free) - (s0.pool_bytes - s0.pool_free), .rings = rings };
 }
 
@@ -179,15 +210,17 @@ pub fn forwardHeld(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, end: usi
     const ids_bytes = pool_class.poolBytes(4 * ids.len);
     _ = mlx.mlx_array_free(try forwardIds(xfm, &ctx, ids));
     const peak = mlx.engine.poolHeldPeak(.process);
+    const peak_in = mlx.engine.poolPeak(.process) -| in0;
+    const in_use = if (m.plans != null) peak_in else peak_in -| ids_bytes;
     // `footprint` is the request's whole hold past the pool at rest: its stores and rings, then its forward.
-    return .{ .in_use = mlx.engine.poolPeak(.process) - in0 - ids_bytes, .held = peak - held0, .footprint = peak - rest };
+    return .{ .in_use = in_use, .held = peak -| held0, .footprint = peak -| rest };
 }
 
 /// What a restored request makes in the pool: `ids[0..at]` are prefilled and captured as a restore point, the state is
 /// dropped, and the point is restored and the request bound to its last row `end` as `Generator` does. The pool's in-use
 /// bytes at their fullest over the restore and the bind, past those in use before them (the point's own arrays among
 /// them), which are the request's stores' and nothing else.
-pub fn restoredPeak(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, at: usize, end: usize) !u64 {
+pub fn restoredPeak(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, at: usize, end: usize) !struct { made: u64, rings: u64 } {
     const trunk_mod = @import("../trunk.zig");
     const prefix = @import("dsv41_prefix.zig");
     const m = dsv41_state.modelOf(xfm).?;
@@ -214,11 +247,18 @@ pub fn restoredPeak(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, at: usi
     {
         const lent = if (m.serves_rows) dsv41_model.lendOwn(m) else null;
         defer if (lent) |l| l.end();
+        if (m.onEngine()) try dsv41_model.reserveNew(m, end);
         try prefix.restore(m, &cp, ids[0..at]);
     }
     try prefix.bindRows(xfm, &ctx, end);
     mlx.engine.close();
-    return mlx.engine.poolPeak(.process) - in0;
+    var rings: u64 = 0;
+    if (m.onEngine()) {
+        const lent = if (m.serves_rows) dsv41_model.lendOwn(m) else null;
+        defer if (lent) |l| l.end();
+        if (try dsv41_model.currentState(m)) |st| rings = stateFixedRings(st);
+    }
+    return .{ .made = mlx.engine.poolPeak(.process) - in0, .rings = rings };
 }
 
 /// The served tiny ends a chat or Responses reply within a few tokens, and holds 128: a long reply is a completion
@@ -337,12 +377,25 @@ pub fn greedyRows(a: std.mem.Allocator, xfm: *Trunk, prompts: []const []const u3
     }
     const segs = try a.alloc(dsv41_model.Seg, k);
     defer a.free(segs);
+    const views = if (m.plans != null) try a.alloc(mlx.mlx_array, k) else null;
+    defer if (views) |vs| a.free(vs);
+    if (views) |vs| @memset(vs, .{ .ctx = null });
+    if (m.plans != null and m.logits_fixed[0] != null) for (reqs) |*r| try m.makeRequestLogits(r);
     var step: u32 = 1;
     while (step < n) : (step += 1) {
         for (segs, reqs, next) |*sg, *r, *t| sg.* = .{ .request = r, .ids = @as(*const [1]u32, t) };
-        const rows = try @import("dsv41_serving.zig").forwardRows(xfm, segs);
-        defer _ = mlx.mlx_array_free(rows);
-        try argmaxRows(xfm, rows, next);
+        if (views) |vs| {
+            try @import("dsv41_serving.zig").forwardRowsViews(xfm, segs, false, vs);
+            defer for (vs) |*v| if (v.ctx != null) {
+                _ = mlx.mlx_array_free(v.*);
+                v.* = .{ .ctx = null };
+            };
+            for (vs, 0..) |v, i| try argmaxRows(xfm, v, next[i .. i + 1]);
+        } else {
+            const rows = try @import("dsv41_serving.zig").forwardRows(xfm, segs);
+            defer _ = mlx.mlx_array_free(rows);
+            try argmaxRows(xfm, rows, next);
+        }
         for (out, next) |*o, t| try o.append(a, t);
     }
     return out;
@@ -382,6 +435,11 @@ fn forwardIds(xfm: *Trunk, ctx: *@import("../trunk.zig").ForwardCtx, p: []const 
     const ids = try std.heap.page_allocator.alloc(i32, p.len);
     defer std.heap.page_allocator.free(ids);
     for (p, ids) |t, *o| o.* = @intCast(t);
+    if (dsv41_state.modelOf(xfm)) |m| if (m.plans != null) {
+        const arr = try m.idsInput(ids);
+        defer _ = mlx.mlx_array_free(arr);
+        return xfm.forwardWith(ctx, arr);
+    };
     const shape = [_]c_int{ 1, @intCast(p.len) };
     const host = mlx.engine.enter(xfm.outStream());
     const arr = mlx.newData(ids.ptr, &shape, .int32) catch |e| {
@@ -395,6 +453,8 @@ fn forwardIds(xfm: *Trunk, ctx: *@import("../trunk.zig").ForwardCtx, p: []const 
 
 /// The greedy token of each of the last `into.len` rows of `logits` into `into`.
 fn argmaxRows(xfm: *Trunk, logits: mlx.mlx_array, into: []u32) !void {
+    const wide = if (dsv41_state.modelOf(xfm)) |m| (if (m.plans != null) @import("../tensor/core.zig").widePhase() else null) else null;
+    defer if (wide) |w| w.end();
     var am = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am);
     try mlx.check(mlx.mlx_argmax_axis(&am, logits, -1, false, xfm.outStream()));

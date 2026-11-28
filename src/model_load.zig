@@ -334,7 +334,7 @@ pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xf
             // A light load still ends with the plans and the seal a served load's warm leaves.
             if (arch_handle.onEngine(null, config)) {
                 const cooler = @import("arch/cooler.zig");
-                try cooler.planLoad(xfm, null);
+                try cooler.planLoad(xfm);
                 cooler.warmEnded(xfm);
             }
             return;
@@ -365,6 +365,16 @@ pub fn beginPipelines(io: std.Io, a: std.mem.Allocator, config: *const ModelConf
 
 /// `warmLoad` over the manifest `pipelines` the load opened (`beginPipelines`).
 pub fn warmLoadWith(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xfm: *Trunk, verify_cap: ?u32, aux_head: ?*anyopaque, kv: trunk.KVQuantConfig, pipelines: ?*@import("arch/cooler_pipelines.zig").Plan) !void {
+    if (comptime @import("builtin").is_test) {
+        if (config.test_skip_warm) {
+            if (arch_handle.onEngine(null, config)) {
+                const cooler = @import("arch/cooler.zig");
+                try cooler.planLoad(xfm);
+                cooler.warmEnded(xfm);
+            }
+            return;
+        }
+    }
     const warmup_start = std.Io.Timestamp.now(io, .awake);
     const on_engine = arch_handle.onEngine(null, config);
     const cooler_pipelines = @import("arch/cooler_pipelines.zig");
@@ -398,7 +408,7 @@ pub fn warmLoadWith(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig
         log.err("[warm] a served request failed ({s}: {s}); a load on Sushi Cooler does not serve without it\n", .{ @errorName(err), latchedCause(&cause) });
         return err;
     };
-    @import("arch/cooler.zig").planLoad(xfm, if (plan) |p| p.shapeCache() else null) catch |err| {
+    @import("arch/cooler.zig").planLoad(xfm) catch |err| {
         var cause: [512]u8 = undefined;
         log.err("[plan] the load's plans were not built ({s}: {s}); a load on the static bill does not serve without them\n", .{ @errorName(err), latchedCause(&cause) });
         return err;
@@ -417,20 +427,20 @@ pub fn ssdHoldStride(config: *const model_mod.ModelConfig, stride: u32) u32 {
 /// A load that warms, of an arch on the ledger (`static_bill.onLedger`): its ledger opens with its budget, read once, its
 /// plans are recorded, its prefill chunk is fixed on the arena they measure (D98), and that arena is made, so its warm
 /// runs what a request runs (D107). The trunk's copy of the config takes the chunk. Any other load is left as it is.
-pub fn openLedger(config: *ModelConfig, xfm: *Trunk, before: static_bill.Before, warms: bool, cache: ?@import("tensor/plan/plan_book.zig").Cache) !void {
+pub fn openLedger(config: *ModelConfig, xfm: *Trunk, before: static_bill.Before, warms: bool, tower: ?*@import("arch/media.zig").Tower) !void {
     const cooler = @import("arch/cooler.zig");
     const room: ?u64 = if (static_bill.onLedger(config, warms)) try static_bill.open(config, before) else null;
     var measured: PlanArena = .{ .xfm = xfm };
     if (room) |r| {
         try bills.refuseStaticChunkBeforePlans(config, r);
-        try cooler.planRecord(xfm, cache);
+        try cooler.planRecord(xfm, tower);
     }
     const chunk = try bills.fixStaticPrefillChunk(config, if (room) |r| .{ .room = r, .arena = measured.arena() } else null);
     if (chunk == 0) return;
     xfm.config.static_prefill_chunk = chunk;
     xfm.config.pinned_prefill_chunk = chunk;
     config.static_ledger.?.terms = bills.ledgerTermsAt(config, bills.defaultKvBits(config), chunk).?;
-    try cooler.planLoad(xfm, cache);
+    try cooler.planLoad(xfm);
 }
 
 /// A load on the ledger whose warm ended is sealed: its model bill is committed and its context fixed
@@ -864,7 +874,7 @@ pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const Mo
     // A streamed plan's requirement does not read `mtp_on`.
     const plan = BudgetPlanner{ .io = io, .allocator = allocator, .config = config, .model_dir = model_dir, .vision = load_vision, .assistant = assistant_bytes, .beside = 0, .mtp_on = false };
     const beside = bills.defaultRequestBill(config) +| encode;
-    const limits = bills.defaultBudgetLimits();
+    const limits = bills.defaultBudgetLimitsFor(bills.ledgerArch(config));
     const unbound = ramDefaultBudget(tier, resident_need, beside, limits, plan);
     const budget = settle orelse return unbound;
     var reader = PreflightReader{ .io = io, .config = config };
@@ -882,7 +892,8 @@ pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const Mo
 }
 
 /// The load preflight's readings, polled by `bills.settleAvailableBytes` while memory still being released comes back:
-/// each read takes `bills.FitReadings.now` and the bound the preflight compares its need with.
+/// each read takes `bills.FitReadings.nowFor` (using 0 GiB default wired margin for static-bill loads) and the bound the
+/// preflight compares its need with.
 const PreflightReader = struct {
     io: std.Io,
     config: *const ModelConfig,
@@ -891,7 +902,7 @@ const PreflightReader = struct {
     last: ?bills.SushiAvailable = null,
 
     pub fn read(r: *PreflightReader) ?u64 {
-        const readings = bills.FitReadings.now();
+        const readings = bills.FitReadings.nowFor(bills.ledgerArch(r.config));
         const got = readings.preflightAvailable();
         // An unread figure keeps the last one read, which the wait returns and a refusal is priced on.
         if (got.bytes == null and r.last != null) return null;
@@ -2552,7 +2563,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     // Launch pipeline preload worker threads BEFORE reading weight shards from SSD so Metal pipeline creation
     // overlaps with disk I/O, then join right before `initTrunk` / first Metal dispatch.
-    var pipelines = if (params.warmup_eager) beginPipelinesAsync(sch.io, sch.allocator, params.config) else null;
+    const skip_warm = comptime @import("builtin").is_test;
+    var pipelines = if (params.warmup_eager and !(skip_warm and params.config.test_skip_warm)) beginPipelinesAsync(sch.io, sch.allocator, params.config) else null;
     defer if (pipelines) |*p| p.deinit();
 
     // Weights — first mlx call. Binds the stream on this thread.
@@ -2990,7 +3002,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     // With its weights and expert cache resident, a load on the ledger reads its budget, once, and fixes its chunk and
     // its arena in it.
-    try openLedger(params.config, xfm_ptr, engine_before, params.warmup_eager, if (pipelines) |*p| p.shapeCache() else null);
+    try openLedger(params.config, xfm_ptr, engine_before, params.warmup_eager, if (vision_ptr) |v| if (v.tower) |*tw| tw else null else null);
 
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request

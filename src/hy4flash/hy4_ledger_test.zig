@@ -395,7 +395,7 @@ test "hy4 ledger: a reading outside a load on the ledger counts its whole budget
             try testing.expectEqual(gpu_mem.activeBytes(), bills.promisedActive(gpu_mem.activeBytes(), &ld.config));
             // A load beside it plans in what the budget leaves, and less the cache MLX holds, which no engine load reuses.
             const next = static_bill.Before.now();
-            const planning = bills.ceilingNow().planning();
+            const planning = bills.ceilingNowStatic().planning();
             try testing.expect(static_bill.budgetFor(next) <= planning -| l.budget());
             defer gpu_mem.cache_bytes_override = null;
             gpu_mem.cache_bytes_override = gpu_mem.engineFree();
@@ -445,7 +445,7 @@ test "hy4 ledger: the arena a load's chunk is chosen on is the arena it then hol
             const chosen_on = try measured.arena().of(chunk);
             ld.xfm.config.static_prefill_chunk = chunk;
             ld.xfm.config.pinned_prefill_chunk = chunk;
-            try cooler.planLoad(ld.xfm, null);
+            try cooler.planLoad(ld.xfm);
             mlx.engine.close();
             const held = @import("../gpu_mem.zig").engineHeld().arena - before.held.arena;
             errdefer std.debug.print("{s}: the chunk of {d} rows was chosen on an arena of {d} B; the load holds {d} B of it\n", .{ dir, chunk, chosen_on, held });
@@ -518,7 +518,7 @@ fn sealedTight(ld: *Load, comptime C: type, dir: []const u8, ctx: u32) !Tight {
     const chunk = try bills.fixStaticPrefillChunk(&ld.config, .{ .room = tight, .arena = measured.arena() });
     ld.xfm.config.static_prefill_chunk = chunk;
     ld.xfm.config.pinned_prefill_chunk = chunk;
-    try cooler.planLoad(ld.xfm, null);
+    try cooler.planLoad(ld.xfm);
     try model_load.warmLoad(std.Io.Threaded.global_single_threaded.io(), ld.a, &ld.config, ld.xfm, verify_cap, null, kv_cfg);
     const sealed = model_load.sealLedger(&ld.config, ld.xfm, ld.before);
     return .{ .chunk = chunk, .tokens = ctx, .sealed = sealed, .arena = measured.arena() };

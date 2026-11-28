@@ -93,7 +93,7 @@ pub const Gather = struct {
         // The ids decide how many blocks: a dry recording plans the most they can name (`plan.bound`), its ids' own
         // blocks and the lowest others beside them, ascending, so each id finds its block.
         const most_blocks = @min(ids.len, (vocab + block - 1) / block);
-        const planned = try plan.bound(nb_all, most_blocks);
+        const planned = plan.bound(nb_all, most_blocks);
         if (planned != nb_all) {
             var other: u32 = 0;
             var k = nb_all;
@@ -183,7 +183,7 @@ pub const Gather = struct {
             const t0 = starts[gi];
             const tn = starts[gi + 1] - t0;
             // How many of the ids fall in the group follows the ids: a dry recording plans every id there.
-            const launched = try plan.bound(tn, ids.len);
+            const launched = plan.bound(tn, ids.len);
             // A landing group asks every id's row, as its recording does, and computes its own.
             const out_rows = if (landed != null) ids.len else launched;
             const pairs = try o.contiguous(try o.slice(pairs_all, 0, ci(2 * t0), ci(2 * (t0 + tn))));

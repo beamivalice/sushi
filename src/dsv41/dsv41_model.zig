@@ -23,6 +23,8 @@ const model_mod = @import("../model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("../expert_usage.zig");
 const transient_peak = @import("../transient_peak.zig");
+const store_mod = @import("dsv41_store.zig");
+const plan_api = @import("../tensor/plan/plan_api.zig");
 
 const A = sc_mod.A;
 const S = sc_mod.S;
@@ -234,8 +236,14 @@ pub const Experts = union(enum) {
         /// The layer's pick-score penalty (`--expert-cache-bias`), f32 `[experts]`, added to the router's bias at decode
         /// widths. Null leaves the pick exact.
         penalty: ?*const fn (ctx: *anyopaque, layer: usize) anyerror!?A = null,
+        /// Cooler host-ring cache penalty (`[experts]` f32 written into caller's host slice); false when inactive.
+        penalty_host: ?*const fn (ctx: *anyopaque, layer: usize, out: []f32) anyerror!bool = null,
+        /// Pure predicate: whether `penalty_host` will apply a penalty on `layer` (checked in dry recordings too).
+        has_penalty: ?*const fn (ctx: *anyopaque, layer: usize) bool = null,
         /// Host copy of the layer's `--expert-cache-bias` penalty (`[experts]`) for prefetch ranking; false when off or busy.
         prefetch_penalty: ?*const fn (ctx: *anyopaque, layer: usize, out: []f32) bool = null,
+        /// Fixes GPU cache maps in place at load before dry plan recording.
+        fix_spec: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     };
 
     pub const Spec = struct {
@@ -330,320 +338,16 @@ const Rope = struct { freqs: A };
 
 // ── state ────────────────────────────────────────────────────────────────
 
-/// Appends that had to grow a store: none while a request that bound its stores (`bindRequest`) runs.
-pub var store_grows: u64 = 0;
-
-/// Rows appended one chunk at a time, in a buffer made at the rows its request ends at, or for a store no request has
-/// bound, grown by `rows_grow_div`'s fraction.
-pub const Rows = struct {
-    /// The rows `[cap, width]` in `dtype`, or packed: E2M1 codes `[cap, width/2]` u8.
-    buf: mlx_pages.InPlace = .none,
-    /// Packed: the scale bytes `[cap, width/group]`.
-    sbuf: mlx_pages.InPlace = .none,
-    used: usize = 0,
-    cap: usize = 0,
-    /// The rows the request that holds this store ends at (`bindRequest`); 0 = no request has bound it, and it grows by
-    /// `rows_grow_div`'s fraction.
-    goal: usize = 0,
-    width: usize,
-    dtype: mlx.mlx_dtype,
-    /// The rows are an FP4 round trip's output, stored in its own format (`qat_mod.packFp4`).
-    pack: ?Pack = null,
-
-    const Pack = struct { mode: qat_mod.Qat, group: usize };
-
-    pub fn deinit(self: *Rows) void {
-        self.buf.deinit();
-        self.sbuf.deinit();
-    }
-
-    /// A new buffer of `cap` rows of `cols` (`cap` from `pagedCap`) holding `buf`'s first `used` rows; `buf` is left as it
-    /// was, so `growTo` builds every part before it frees any old one.
-    fn grown(buf: mlx_pages.InPlace, used: usize, cap: usize, cols: usize, dt: mlx.mlx_dtype, s: S) !mlx_pages.InPlace {
-        var z = try mlx_pages.inPlaceBuffer(&.{ ci(cap), ci(cols) }, dt, s);
-        errdefer z.deinit();
-        if (used > 0) {
-            var old = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(old);
-            try mlx.check(mlx.mlx_slice(&old, buf.array, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(used), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            var up = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(up);
-            const next = try z.write(&up, old, &.{ 0, 0 }, &.{ ci(used), ci(cols) }, s);
-            z.deinit();
-            z = next;
-        }
-        return z;
-    }
-
-    /// Every part made `cap` rows long with the rows held kept, all or none: each part's new buffer is built (and, with
-    /// `written`, evaluated) before any old one is freed, so a failure at any part frees what was built and leaves every
-    /// part and `cap` as they were, never a part and `cap` that disagree.
-    fn growTo(self: *Rows, cap: usize, s: S, written: bool) !void {
-        const Shape = struct { cols: usize, dtype: mlx.mlx_dtype };
-        const olds = [2]*mlx_pages.InPlace{ &self.buf, &self.sbuf };
-        var shapes: [2]Shape = undefined;
-        var n: usize = 1;
-        shapes[0] = .{ .cols = self.width, .dtype = self.dtype };
-        if (self.pack) |pk| {
-            n = 2;
-            shapes = .{ .{ .cols = self.width / 2, .dtype = .uint8 }, .{ .cols = self.width / pk.group, .dtype = .uint8 } };
-        }
-        var next: [2]mlx_pages.InPlace = @splat(.none);
-        errdefer for (&next) |*b| b.deinit();
-        for (olds[0..n], shapes[0..n], next[0..n]) |old, sh, *dst| dst.* = try grown(old.*, self.used, cap, sh.cols, sh.dtype, s);
-        if (written) {
-            // A grow left pending would take its buffer inside the forward that first reads it.
-            var i = n;
-            while (i > 0) : (i -= 1) try mlx.check(mlx.mlx_array_eval(next[i - 1].array));
-        }
-        for (olds[0..n], next[0..n]) |old, *z| {
-            old.deinit();
-            old.* = z.*;
-            z.* = .none;
-        }
-        self.cap = cap;
-    }
-
-    fn put(buf: *mlx_pages.InPlace, x: A, at: usize, s: S) !void {
-        const n = dim(x, 0);
-        const cols = dim(x, 1);
-        var up = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(up);
-        const next = try buf.write(&up, x, &.{ ci(at), 0 }, &.{ ci(at + n), ci(cols) }, s);
-        _ = mlx.mlx_array_free(buf.array);
-        buf.* = next;
-    }
-
-    /// `count` rows on MLX's page grid for every buffer that grows with these rows (`mlx_pages`), so each append writes in
-    /// place; the engine of our own appends in place at any size.
-    fn pagedCap(self: *const Rows, count: usize, s: S) usize {
-        if (mlx.engine.isStream(s)) return count;
-        const item: u64 = @import("../tensor/core.zig").itemSize(self.dtype);
-        const parts: []const u64 = if (self.pack) |pk| &.{ self.width / 2, self.width / pk.group } else &.{self.width * item};
-        return @intCast(mlx_pages.pagedCountAll(count, parts));
-    }
-
-    /// Whether this store is no larger than a request billed `billed` rows pays for: the bill on MLX's page grid, which
-    /// `Config.mlxForwardCap` adds (`rowsGridBytes`) and `pagedCap` sizes every store by.
-    fn fitsBill(self: *const Rows, billed: usize, s: S) bool {
-        return self.cap <= self.pagedCap(billed, s);
-    }
-
-    /// The grow the next append would make, made now: a buffer of this state's own with that append's slack.
-    fn reserve(self: *Rows, s: S) !void {
-        if (self.used == 0) return;
-        try self.regrow(self.pagedCap(cfg_mod.reservedRows(self.used), s), s);
-    }
-
-    /// The store of a request that ends at `goal` rows: its buffers made that long now with the rows it holds kept (none
-    /// yet, when it holds none), so no append makes or grows one.
-    fn bind(self: *Rows, goal: usize, s: S) !void {
-        self.goal = goal;
-        const cap = self.pagedCap(@max(goal, self.used), s);
-        if (cap != self.cap) try self.regrow(cap, s);
-    }
-
-    /// The buffers made `cap` rows long with the rows held kept, written now.
-    fn regrow(self: *Rows, cap: usize, s: S) !void {
-        try self.growTo(cap, s, true);
-    }
-
-    /// The buffer cut back to the rows it holds with `reserve`'s slack, or gone when it holds none.
-    fn trim(self: *Rows, s: S) !void {
-        if (self.used > 0) return self.reserve(s);
-        self.deinit();
-        self.cap = 0;
-    }
-
-    pub fn append(self: *Rows, sc: *Scope, x: A) !void {
-        const n = dim(x, 0);
-        if (n == 0) return;
-        const s = sc.s;
-        if (self.used + n > self.cap) {
-            store_grows += 1;
-            const cap = self.pagedCap(cfg_mod.grownRows(self.cap, self.used, n, self.goal), s);
-            try self.growTo(cap, s, false);
-        }
-        if (self.pack) |pk| {
-            const p = try qat_mod.packFp4(sc, try sc.astype(x, self.dtype), pk.mode, pk.group);
-            try put(&self.buf, p.codes, self.used, s);
-            try put(&self.sbuf, p.scales, self.used, s);
-        } else try put(&self.buf, try sc.astype(x, self.dtype), self.used, s);
-        self.used += n;
-    }
-
-    /// Rows [0, n) as values.
-    pub fn rows(self: *const Rows, sc: *Scope, n: usize) !A {
-        return self.rowsIn(sc, 0, n);
-    }
-
-    /// Rows [lo, hi) as values.
-    fn rowsIn(self: *const Rows, sc: *Scope, lo: usize, hi: usize) !A {
-        const head = try sc.slice(self.buf.array, 0, lo, hi);
-        const pk = self.pack orelse return head;
-        return qat_mod.unpackFp4(sc, .{ .codes = head, .scales = try sc.slice(self.sbuf.array, 0, lo, hi) }, pk.mode, pk.group, self.dtype);
-    }
-
-    /// Rows `idx` (flat ids below `used`) as values.
-    fn gather(self: *const Rows, sc: *Scope, idx: A) !A {
-        const pk = self.pack orelse return sc.take(self.buf.array, idx, 0);
-        return qat_mod.unpackFp4(sc, .{ .codes = try sc.take(self.buf.array, idx, 0), .scales = try sc.take(self.sbuf.array, idx, 0) }, pk.mode, pk.group, self.dtype);
-    }
-};
-
-/// The window's rows by absolute position, in a ring of `cap` rows.
-const Ring = struct {
-    buf: mlx_pages.InPlace,
-    cap: usize,
-    width: usize,
-    /// The buffer's dtype, so a launch that takes the ring reads nothing off it.
-    dt: mlx.mlx_dtype,
-
-    fn init(cap: usize, width: usize, dt: mlx.mlx_dtype, s: S) !Ring {
-        var z = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(z);
-        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ ci(cap), ci(width) }, 2, dt, s));
-        return .{ .buf = mlx_pages.InPlace.adopt(z, .ring), .cap = cap, .width = width, .dt = dt };
-    }
-
-    fn deinit(self: *Ring) void {
-        self.buf.deinit();
-    }
-
-    /// Rows for positions [p0, p0 + n); only the last `cap` survive.
-    fn write(self: *Ring, x: A, p0: usize, s: S) !void {
-        const n = dim(x, 0);
-        const keep_n = @min(n, self.cap);
-        const first = p0 + n - keep_n;
-        var done: usize = 0;
-        while (done < keep_n) {
-            const slot = (first + done) % self.cap;
-            const run = @min(keep_n - done, self.cap - slot);
-            var part = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(part);
-            try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ ci(n - keep_n + done), 0 }, 2, &[_]c_int{ ci(n - keep_n + done + run), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            var cast = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(cast);
-            try mlx.check(mlx.mlx_astype(&cast, part, mlx.mlx_array_dtype(self.buf.array), s));
-            var up = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(up);
-            const next = try self.buf.write(&up, cast, &.{ ci(slot), 0 }, &.{ ci(slot + run), ci(self.width) }, s);
-            _ = mlx.mlx_array_free(self.buf.array);
-            self.buf = next;
-            done += run;
-        }
-    }
-
-    /// The ring as `write` of rows `x` at `p0` would leave it, made by another launch: `next` replaces the buffer.
-    fn replace(self: *Ring, next: A) void {
-        const kept = self.buf.replaced(next);
-        _ = mlx.mlx_array_free(self.buf.array);
-        self.buf = kept;
-    }
-
-    /// Rows for positions [lo, hi) in order; `hi - lo <= cap`.
-    fn read(self: *const Ring, sc: *Scope, lo: usize, hi: usize) !A {
-        std.debug.assert(hi - lo <= self.cap);
-        var idx: [512]i32 = undefined;
-        for (lo..hi, 0..) |p, k| idx[k] = @intCast(p % self.cap);
-        return sc.take(self.buf.array, try sc.ints(idx[0 .. hi - lo], &.{ci(hi - lo)}), 0);
-    }
-};
-
-const LState = struct {
-    win: Ring,
-    comp: ?Rows = null,
-    idx_k: ?Rows = null,
-    /// Ratio > 1 compressors: the open group's kv and gate rows, f32.
-    pend_kv: A = none,
-    pend_gate: A = none,
-
-    fn deinit(self: *LState) void {
-        self.win.deinit();
-        if (self.comp) |*r| r.deinit();
-        if (self.idx_k) |*r| r.deinit();
-        if (self.pend_kv.ctx != null) _ = mlx.mlx_array_free(self.pend_kv);
-        if (self.pend_gate.ctx != null) _ = mlx.mlx_array_free(self.pend_gate);
-    }
-};
-
-/// What a verify chunk keeps to give back its rejected rows: each compressor's row counts and open pooling group
-/// as the chunk began, and the main rows the stages' windows take only for the rows that stay.
-const Verify = struct {
-    n0: usize,
-    rows: usize,
-    comp_used: []usize,
-    idx_used: []usize,
-    /// A pooling compressor's rows from its open group's first token on, as the chunk left them before it cut a new group.
-    pend_kv: []A,
-    pend_gate: []A,
-    mh: A = none,
-};
-
-pub const State = struct {
-    gpa: std.mem.Allocator,
-    /// Which state this is, for a record of it (`dsv41_prefix.Live`): a made state takes a new one, and the state keeps
-    /// it as it rolls back or moves between its model and a request.
-    id: u64 = 0,
-    /// The KV cache of the request whose forward last moved this state; 0 once a rollback hands it to the next one.
-    /// Only that request publishes a record of it (`ownedBy`).
-    owner: usize = 0,
-    n: usize = 0,
-    layers: []LState,
-    /// The request's compressed token ids (Engram look-back).
-    hist: std.ArrayList(u32) = .empty,
-    /// Per DSpark stage: the window of the main stream's keys for the committed positions.
-    ds: []Ring = &.{},
-    /// The stage rings hold a commit no pass has submitted yet (`commitMain` lazy); `flushMain` submits it.
-    main_lazy: bool = false,
-    verify: ?Verify = null,
-    /// `bindRequest` made this state for a request that has not run yet: its first forward keeps it, where it would
-    /// reset a state left by another (`takeBoundState`).
-    bound_fresh: bool = false,
-
-    pub fn deinit(self: *State) void {
-        for (self.layers) |*l| l.deinit();
-        self.gpa.free(self.layers);
-        for (self.ds) |*r| r.deinit();
-        self.gpa.free(self.ds);
-        self.hist.deinit(self.gpa);
-        self.dropVerify();
-    }
-
-    fn dropVerify(self: *State) void {
-        const v = self.verify orelse return;
-        for (v.pend_kv) |x| if (x.ctx != null) {
-            _ = mlx.mlx_array_free(x);
-        };
-        for (v.pend_gate) |x| if (x.ctx != null) {
-            _ = mlx.mlx_array_free(x);
-        };
-        if (v.mh.ctx != null) _ = mlx.mlx_array_free(v.mh);
-        self.gpa.free(v.comp_used);
-        self.gpa.free(v.idx_used);
-        self.gpa.free(v.pend_kv);
-        self.gpa.free(v.pend_gate);
-        self.verify = null;
-    }
-};
-
-pub fn arrayBytes(a: A) u64 {
-    if (a.ctx == null) return 0;
-    return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
-}
-
-/// The state's resident bytes as allocated: every layer's window ring, compressed and index rows
-/// (their capacity) and open pooling group.
-pub fn stateBytes(st: *const State) u64 {
-    var bytes: u64 = 0;
-    for (st.layers) |*l| {
-        bytes += arrayBytes(l.win.buf.array) + arrayBytes(l.pend_kv) + arrayBytes(l.pend_gate);
-        if (l.comp) |r| bytes += arrayBytes(r.buf.array) + arrayBytes(r.sbuf.array);
-        if (l.idx_k) |r| bytes += arrayBytes(r.buf.array) + arrayBytes(r.sbuf.array);
-    }
-    for (st.ds) |r| bytes += arrayBytes(r.buf.array);
-    return bytes;
-}
+pub const Rows = store_mod.Rows;
+pub const Ring = store_mod.Ring;
+pub const LState = store_mod.LState;
+pub const Verify = store_mod.Verify;
+pub const State = store_mod.State;
+pub const Points = store_mod.Points;
+pub const arrayBytes = store_mod.arrayBytes;
+pub const stateBytes = store_mod.stateBytes;
+pub const writeFixed = store_mod.writeFixed;
+pub const writeGroupBlock = store_mod.writeGroupBlock;
 
 // ── the model ────────────────────────────────────────────────────────────
 
@@ -923,6 +627,15 @@ pub const Model = struct {
     ced_split: ?usize = null,
     /// Diagnostic (`SUSHI_DSV41_PREFILL_PROFILE`): a wide chunk evaluates after every stage and logs where its time went.
     profile: ?*Profile = null,
+    /// Fixed Cooler blocks for logits, input ids, and the empty-slot placeholder (zero pool asks in forwards/captures).
+    logits_fixed: [2]?A = .{ null, null },
+    logits_turn: u1 = 0,
+    logits_rows: c_int = cfg_mod.ring_slack,
+    ids_fixed: ?A = null,
+    placeholder: ?A = null,
+    pass_fixed: ?*store_mod.PassFixed = null,
+    plans: ?*@import("dsv41_plan.zig").Plans = null,
+    recorded: ?*@import("dsv41_plan.zig").Plans = null,
 
     /// What a forward is for: it alone picks the arm the trellis linears launch on (`rowsOf`).
     pub const Forward = enum {
@@ -1000,6 +713,84 @@ pub const Model = struct {
         return .{ .a = self.gpa, .s = self.s, .rows = self.rows };
     }
 
+    /// An STQ layer's structural key at `(li, p0, L)` for `plan.frame` and plan position pruning.
+    pub const LayerKey = struct {
+        layer: usize,
+        rows: usize,
+        exact_rows: bool,
+        wide_rows: bool,
+        first: bool,
+        win_full: bool,
+        win_edge: bool,
+        win_wrap: bool,
+        pooled: bool,
+        open: bool,
+        tail_open: bool,
+        closes: usize,
+        arm: enum { none, dense, straddle, selected },
+        cand_active: bool,
+        cand_pad: bool,
+        index_nax: bool,
+        topk_split: bool,
+        packed_scan: bool,
+        attn_split: bool,
+        attn_straddle: bool,
+        has_img: bool,
+        has_tail: bool,
+        has_verify: bool,
+        has_dspark: bool,
+        attn_apart: bool,
+        route_spec: bool,
+    };
+
+    pub fn layerKey(self: *const Model, li: usize, p0: usize, L: usize, has_img: bool, has_tail: bool, has_verify: bool, has_dspark: bool) LayerKey {
+        const c = &self.cfg;
+        const r = self.layers[li].ratio;
+        const w: usize = c.window;
+        const ring_cap = w + cfg_mod.ring_slack;
+        const nb = if (r > 0) (p0 + L) / r else 0;
+        const has_idx = self.layers[li].idx != null;
+        const cs = c.cand_source;
+        const cand_active = cs >= 0 and blk: {
+            const csu: usize = @intCast(cs);
+            const r_cs = self.layers[csu].ratio;
+            const nb_cs = if (r_cs > 0) (p0 + L) / r_cs else 0;
+            break :blk (nb_cs + c.cand_block_size - 1) / @max(c.cand_block_size, 1) > c.cand_blocks;
+        };
+        const kk = @min(c.index_topk, nb);
+        const topk_cols = if (cand_active and cs >= 0 and li > @as(usize, @intCast(cs))) c.cand_blocks * c.cand_block_size else nb;
+        const s0 = kernels.attnSplits(w + (if (r > 0) @min(c.index_topk, (p0 + 1) / r) else 0));
+        const s_last = kernels.attnSplits(w + (if (r > 0) @min(c.index_topk, (p0 + L) / r) else 0));
+        return .{
+            .layer = li,
+            .rows = L,
+            .exact_rows = self.rows.exact,
+            .wide_rows = self.rows.wide,
+            .first = p0 == 0,
+            .win_full = p0 + L > w,
+            .win_edge = p0 < w and p0 + L > w,
+            .win_wrap = (p0 % ring_cap) + L > ring_cap,
+            .pooled = r > 0 and p0 >= r,
+            .open = r > 0 and (p0 % r) != 0,
+            .tail_open = r > 1 and ((p0 + L) % r) != 0,
+            .closes = if (r > 0) (p0 + L) / r - p0 / r else 0,
+            .arm = if (r == 0 or nb == 0) .none else if (nb <= c.index_topk) .dense else if (p0 / r < c.index_topk) .straddle else .selected,
+            .cand_active = cand_active,
+            .cand_pad = cs >= 0 and li == @as(usize, @intCast(cs)) and cand_active and c.cand_block_size > 1 and (nb % c.cand_block_size) != 0,
+            .index_nax = has_idx and nb > 0 and self.index_nax and self.qat_on and (L > 1 or nb >= self.index_nax_keys),
+            .topk_split = has_idx and nb > 0 and kernels.topkSplits(@intCast(L), @intCast(topk_cols), @intCast(kk)) > 1,
+            .packed_scan = has_idx and nb > 0 and self.layers[li].comp == null and nb <= self.index_stream_tile,
+            .attn_split = s0 > 1,
+            .attn_straddle = s0 != s_last or (self.attn_apart and r > 0 and nb > 0 and L > 1),
+            .has_img = has_img,
+            .has_tail = has_tail,
+            .has_verify = has_verify,
+            .has_dspark = has_dspark,
+            .attn_apart = self.attn_apart,
+            .route_spec = self.route_spec,
+        };
+    }
+
     pub fn deinit(self: *Model) void {
         pipeDrain(self) catch {};
         if (self.profile) |pf| self.gpa.destroy(pf);
@@ -1023,10 +814,103 @@ pub const Model = struct {
             for (ds.stq) |*rb| rb.deinit();
             self.gpa.free(ds.stq);
         }
+        self.freeLogitsBlocks();
+        if (self.ids_fixed) |a| _ = mlx.mlx_array_free(a);
+        if (self.placeholder) |a| _ = mlx.mlx_array_free(a);
+        self.freePassFixed();
+        if (self.recorded) |p| {
+            p.deinit();
+            self.gpa.destroy(p);
+            self.recorded = null;
+        }
+        if (self.plans) |p| {
+            p.deinit();
+            self.gpa.destroy(p);
+            self.plans = null;
+        }
         for (self.owned.items) |x| _ = mlx.mlx_array_free(x);
         self.owned.deinit(self.gpa);
         self.gpa.free(self.layers);
         self.gpa.destroy(self);
+    }
+
+    fn activePassFixed(self: *const Model) ?*store_mod.PassFixed {
+        if (plan_api.session.mode == .wide) return null;
+        return self.pass_fixed;
+    }
+
+    pub fn makeLogitsBlocks(self: *Model) !void {
+        self.freeLogitsBlocks();
+        const owned = mlx.engine.widePhase();
+        defer owned.end();
+        for (&self.logits_fixed) |*b| b.* = (try mlx_pages.ringBuffer(&.{ self.logits_rows, @intCast(self.cfg.vocab) }, .float32, stateStream(self))).array;
+        self.logits_turn = 0;
+    }
+
+    pub fn freeLogitsBlocks(self: *Model) void {
+        for (&self.logits_fixed) |*b| if (b.*) |a| {
+            _ = mlx.mlx_array_free(a);
+            b.* = null;
+        };
+    }
+
+    pub fn makeRequestLogits(self: *Model, r: *Request) !void {
+        const owned = mlx.engine.widePhase();
+        defer owned.end();
+        for (&r.logits_fixed) |*b| if (b.* == null) {
+            b.* = (try mlx_pages.ringBuffer(&.{ self.logits_rows, @intCast(self.cfg.vocab) }, .float32, stateStream(self))).array;
+        };
+    }
+
+    pub const ids_rows: c_int = @import("../bills.zig").PREFILL_CHUNK_LADDER[0];
+
+    pub fn makeIdsBlock(self: *Model) !void {
+        if (self.ids_fixed == null) {
+            const owned = mlx.engine.widePhase();
+            defer owned.end();
+            self.ids_fixed = (try mlx_pages.ringBuffer(&.{ 1, ids_rows }, .uint32, stateStream(self))).array;
+        }
+    }
+
+    pub fn makePassFixed(self: *Model, reach: usize) !void {
+        self.freePassFixed();
+        const has_spec = self.cfg.expert_dec != null and switch (self.experts) {
+            .hook => |hk| hk.spec != null,
+            .resident => false,
+        };
+        const engram_cols = if (self.hash) |*hs| hs.cols() else 0;
+        const pf = try self.gpa.create(store_mod.PassFixed);
+        errdefer self.gpa.destroy(pf);
+        pf.* = try store_mod.PassFixed.init(&self.cfg, self.act, self.dspark != null, has_spec, self.hash != null, engram_cols, self.serves_rows, reach, stateStream(self));
+        self.pass_fixed = pf;
+    }
+
+    pub fn freePassFixed(self: *Model) void {
+        if (self.pass_fixed) |pf| {
+            pf.deinit();
+            self.gpa.destroy(pf);
+            self.pass_fixed = null;
+        }
+    }
+
+    pub fn idsInput(self: *Model, ids: []const i32) !A {
+        if (ids.len > ids_rows) return error.Dsv41IdsPastBlock;
+        const dst = self.ids_fixed orelse return error.Dsv41IdsBlockMissing;
+        const host = std.mem.bytesAsSlice(u32, try mlx.engine.hostWritable(dst));
+        for (host[0..ids.len], ids) |*d, v| d.* = @bitCast(v);
+        var view = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, dst, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 1, @intCast(ids.len) }, 2, &[_]c_int{ 1, 1 }, 2, stateStream(self)));
+        return view;
+    }
+
+    pub fn ensurePlaceholder(self: *Model) !A {
+        if (self.placeholder) |p| return p;
+        const owned = mlx.engine.widePhase();
+        defer owned.end();
+        const made = (try mlx_pages.ringBuffer(&.{1}, .uint8, stateStream(self))).array;
+        self.placeholder = made;
+        return made;
     }
 
     fn dropAhead(self: *Model) void {
@@ -1539,6 +1423,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     if (mlx.streamIsGpu(s)) try kernels.probeTopk(gpa, s);
     setWideArms(m);
     m.ced_split = c.cedSplit();
+    if (opts.on_engine) _ = try m.ensurePlaceholder();
     return m;
 }
 
@@ -1634,6 +1519,8 @@ pub fn newState(m: *const Model) !State {
     // The rings are made where the forwards write them: a ring of MLX's would be copied or written in place by the
     // engine's first step, by whether MLX had finished making it.
     const s = stateStream(m);
+    const owned = mlx.engine.widePhase();
+    defer owned.end();
     for (layers, 0..) |*l, li| {
         l.* = .{ .win = try Ring.init(c.window + slack, c.head_dim, m.act, s) };
         made += 1;
@@ -1797,24 +1684,56 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
         const full = groups * r;
         // Both slices before either leaves the scope: a failed second one leaves the first to the scope.
         const tail: [2]mlx.mlx_array = if (full < total) .{ try sc.slice(kv, 0, full, total), try sc.slice(gate, 0, full, total) } else .{ none, none };
-        // A wide forward copies its pending rows out: a slice would keep its whole projections in use until the next
-        // forward. A narrow one's projections are a few rows, and a decode step makes no copy.
-        const wide = rows > cfg_mod.verify_rows;
-        const new_kv = if (full == total) none else if (wide) try ownedRows(tail[0], total - full, sc.s) else sc.out(tail[0]);
-        const new_gate = if (full == total) none else if (wide) ownedRows(tail[1], total - full, sc.s) catch |e| {
-            _ = mlx.mlx_array_free(new_kv);
-            return e;
-        } else sc.out(tail[1]);
-        if (st.verify) |*v| {
-            if (v.pend_kv[li].ctx != null) _ = mlx.mlx_array_free(v.pend_kv[li]);
-            if (v.pend_gate[li].ctx != null) _ = mlx.mlx_array_free(v.pend_gate[li]);
-            v.pend_kv[li] = sc.out(kv);
-            v.pend_gate[li] = sc.out(gate);
+        if (m.onEngine()) {
+            // Free open views first so fixed owners stay sole (`refs == 1`) before in-place write.
+            if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+            if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+            ls.pend_kv = none;
+            ls.pend_gate = none;
+            if (full < total) {
+                try store_mod.writeFixed(&ls.pend_kv_buf, tail[0], &.{ ci(r - 1), ci(hd) }, sc.s);
+                try store_mod.writeFixed(&ls.pend_gate_buf, tail[1], &.{ ci(r - 1), ci(hd) }, sc.s);
+                ls.pend_kv = try store_mod.headRows(ls.pend_kv_buf.?, total - full, sc.s);
+                ls.pend_gate = store_mod.headRows(ls.pend_gate_buf.?, total - full, sc.s) catch |e| {
+                    _ = mlx.mlx_array_free(ls.pend_kv);
+                    ls.pend_kv = none;
+                    return e;
+                };
+            }
+            if (st.verify) |*v| {
+                if (v.pend_kv[li].ctx != null) _ = mlx.mlx_array_free(v.pend_kv[li]);
+                if (v.pend_gate[li].ctx != null) _ = mlx.mlx_array_free(v.pend_gate[li]);
+                v.pend_kv[li] = none;
+                v.pend_gate[li] = none;
+                try store_mod.writeFixed(&st.verify_pend_kv[li], kv, &.{ ci(r - 1 + cfg_mod.ring_slack), ci(hd) }, sc.s);
+                try store_mod.writeFixed(&st.verify_pend_gate[li], gate, &.{ ci(r - 1 + cfg_mod.ring_slack), ci(hd) }, sc.s);
+                v.pend_kv[li] = try store_mod.headRows(st.verify_pend_kv[li].?, total, sc.s);
+                v.pend_gate[li] = store_mod.headRows(st.verify_pend_gate[li].?, total, sc.s) catch |e| {
+                    _ = mlx.mlx_array_free(v.pend_kv[li]);
+                    v.pend_kv[li] = none;
+                    return e;
+                };
+            }
+        } else {
+            // A wide forward copies its pending rows out: a slice would keep its whole projections in use until the next
+            // forward. A narrow one's projections are a few rows, and a decode step makes no copy.
+            const wide = rows > cfg_mod.verify_rows;
+            const new_kv = if (full == total) none else if (wide) try store_mod.ownedRows(tail[0], total - full, sc.s) else sc.out(tail[0]);
+            const new_gate = if (full == total) none else if (wide) store_mod.ownedRows(tail[1], total - full, sc.s) catch |e| {
+                _ = mlx.mlx_array_free(new_kv);
+                return e;
+            } else sc.out(tail[1]);
+            if (st.verify) |*v| {
+                if (v.pend_kv[li].ctx != null) _ = mlx.mlx_array_free(v.pend_kv[li]);
+                if (v.pend_gate[li].ctx != null) _ = mlx.mlx_array_free(v.pend_gate[li]);
+                v.pend_kv[li] = sc.out(kv);
+                v.pend_gate[li] = sc.out(gate);
+            }
+            if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+            if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+            ls.pend_kv = new_kv;
+            ls.pend_gate = new_gate;
         }
-        if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
-        if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
-        ls.pend_kv = new_kv;
-        ls.pend_gate = new_gate;
         if (groups == 0) return;
         g0 = (p0 - pend_rows) / r;
         const kg = try sc.reshape(try sc.slice(kv, 0, 0, full), &.{ ci(groups), ci(r), ci(hd) });
@@ -2090,8 +2009,18 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
                 try candidateBlockIds(sc, m, li, scores, lens, bs, c.cand_blocks)
             else
                 try candidateBlocks(sc, m, li, scores, lens, bs, c.cand_blocks);
-            if (cand.ctx != null) _ = mlx.mlx_array_free(cand.*);
-            cand.* = if (picks.ctx != null) sc.out(picks) else none;
+            if (cand.ctx != null) {
+                _ = mlx.mlx_array_free(cand.*);
+                cand.* = none;
+            }
+            if (picks.ctx != null) {
+                cand.* = if (m.activePassFixed()) |pf| if (Ls <= NARROW_ROWS and sh.cand.len == 1 and pf.cand_i32[sh.slot] != null) blk: {
+                    const dt = mlx.mlx_array_dtype(picks);
+                    const cap = if (dt == .int32) pf.cand_i32_cap else pf.cand_bool_cap;
+                    const buf = if (dt == .int32) &pf.cand_i32[sh.slot] else &pf.cand_bool[sh.slot];
+                    break :blk try store_mod.storeFixed(buf, picks, cap, sc.s);
+                } else sc.out(picks) else sc.out(picks);
+            }
         } else if (masked) {
             var o = mlx.mlx_array_new();
             const rep = try sc.res(mlx.mlx_repeat_axis(&o, cand.*, ci(bs), -1, sc.s), &o);
@@ -2177,9 +2106,11 @@ const Shared = struct {
     index_keys: [8]IndexKey = undefined,
     index_arrays: [8]A = @splat(none),
     index_len: usize = 0,
+    slot: u8 = 0,
 
     /// `indexArray` once per distinct `spec` in the pass; the array is the pass's, not the scope's.
     fn index(self: *Shared, sc: *Scope, spec: IndexKey) !A {
+        if (plan_api.planned()) return indexArray(sc, spec);
         for (self.index_keys[0..self.index_len], self.index_arrays[0..self.index_len]) |k, a| {
             if (std.meta.eql(k, spec)) return a;
         }
@@ -2298,15 +2229,21 @@ fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr:
     const clen = (p0 + b) / r;
     if (ly.idx != null and clen > 0) {
         const sp = try indexer(sc, m, st, li, try sc.slice(h, 0, a, b), try sc.slice(qr, 0, a, b), p0 + a, &sh.cand[si], sh, pre_idx);
-        if (sh.topk[si].ctx != null) _ = mlx.mlx_array_free(sh.topk[si]);
-        sh.topk[si] = sc.out(sp);
+        if (sh.topk[si].ctx != null) {
+            _ = mlx.mlx_array_free(sh.topk[si]);
+            sh.topk[si] = none;
+        }
+        sh.topk[si] = if (m.activePassFixed()) |pf| if (si == 0 and b - a <= NARROW_ROWS and pf.topk[sh.slot] != null)
+            try store_mod.storeFixed(&pf.topk[sh.slot], sp, pf.topk_cap, sc.s)
+        else
+            sc.out(sp) else sc.out(sp);
         sh.topk_ratio[si] = ly.ratio;
         sh.clearUnpacked(si);
     }
     if (clen == 0 or sh.topk[si].ctx == null) return .{};
     const src = c.latest(li, Config.isKvSource);
     const comp = &st.layers[src].comp.?;
-    const cache_unpacked = b - a <= NARROW_ROWS;
+    const cache_unpacked = b - a <= NARROW_ROWS and (m.activePassFixed() == null or sh.slot == 0 or b - a == 1);
     var picks: Picks = if (comp.pack == null)
         .{ .topk = sh.topk[si], .comp_rows = try comp.rows(sc, clen) }
     else if (raw)
@@ -2315,7 +2252,20 @@ fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr:
         .{ .topk = sh.uids[si], .comp_rows = sh.urows[si] }
     else blk: {
         const p = try packedPicks(sc, comp, sh.topk[si], false);
-        if (cache_unpacked) sh.setUnpacked(si, src, clen, sc.out(p.comp_rows), sc.out(p.topk));
+        if (cache_unpacked) {
+            sh.clearUnpacked(si);
+            if (m.activePassFixed()) |pf| if (si == 0 and pf.urows[sh.slot] != null and pf.uids[sh.slot] != null) {
+                const ur = try store_mod.storeFixed(&pf.urows[sh.slot], p.comp_rows, pf.urows_cap[sh.slot], sc.s);
+                errdefer _ = mlx.mlx_array_free(ur);
+                const ui = try store_mod.storeFixed(&pf.uids[sh.slot], p.topk, pf.topk_cap, sc.s);
+                sh.setUnpacked(si, src, clen, ur, ui);
+                break :blk .{ .topk = ui, .comp_rows = ur };
+            } else {
+                sh.setUnpacked(si, src, clen, sc.out(p.comp_rows), sc.out(p.topk));
+            } else {
+                sh.setUnpacked(si, src, clen, sc.out(p.comp_rows), sc.out(p.topk));
+            }
+        }
         break :blk p;
     };
     picks.ratio = sh.topk_ratio[si];
@@ -2501,6 +2451,15 @@ fn attentionDecodeFused(sc: *Scope, m: *const Model, st: *State, li: usize, h: A
     const eps = try kernels.hcEps(sc, c.eps, c.hc_eps);
     const norm: exl3.project_rows.Norm = .{ .w = ly.q_norm, .eps = eps, .cols = sh_in.cols[1] };
     const use_ip = mlx.engine.isStream(sc.s) and mlx.engine.isOurs(ls.win.buf.array);
+    if (use_ip) {
+        try ls.win.buf.landed(sc.s);
+        if (!try mlx.engine.sole(ls.win.buf.array)) {
+            var copy = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(copy);
+            try mlx.check(mlx.engine.copyOwned(&copy, ls.win.buf.array));
+            ls.win.replace(copy);
+        }
+    }
     const qout_ip: A = if (use_ip) blk: {
         const core = @import("../tensor/core.zig");
         const qt = try core.freshOut(mlx.mlx_array_dtype(h), &.{ ci(L), sh_in.cols[1] });
@@ -2769,14 +2728,6 @@ fn attentionRowsJoined(sc: *Scope, m: *const Model, li: usize, h: A, segs: []con
         }
     };
 
-    // Hoist indexer query & head-weight projections across all joined rows when any segment scores compressed keys.
-    var idx_all: ?PreIdx = null;
-    if (ly.idx) |*iw| if (any_clen and L <= NARROW_ROWS and iw.wq_b.stq != null and (iw.weights_proj.stq != null or denseNarrow(fus, &iw.weights_proj, h))) {
-        const iq = try ropeQ(sc, m, try sc.reshape(try iw.wq_b.apply(sc, in[0]), &.{ ci(L), ci(c.index_heads), ci(c.index_head_dim) }), m.rope_yarn.freqs, pos_all, false, .fp4_ue8m0, .float32);
-        const iwts = try indexWeights(sc, fus, &iw.weights_proj, h);
-        idx_all = .{ .q = iq, .wts = iwts };
-    };
-
     // Split hyper-connection mixes once for all rows (replaces N per-request riding splits and 3 N-way concats).
     const split_all: ?kernels.HcSplit = if (ride) |rs|
         try kernels.hcSplitZ(sc, rs.z, c.hc_mult, c.hc_iters, try kernels.hcEps(sc, c.eps, c.hc_eps))
@@ -2788,39 +2739,65 @@ fn attentionRowsJoined(sc: *Scope, m: *const Model, li: usize, h: A, segs: []con
     const seg_grouped = try sc.a.alloc(bool, n);
     defer sc.a.free(seg_grouped);
     var any_grouped = false;
+
+    var attn_sc = m.scope();
+    defer attn_sc.deinit();
+
+    // Hoist indexer query & head-weight projections across all joined rows when any segment scores compressed keys.
+    var idx_all: ?PreIdx = null;
+    if (ly.idx) |*iw| if (L <= NARROW_ROWS and iw.wq_b.stq != null and (iw.weights_proj.stq != null or denseNarrow(fus, &iw.weights_proj, h))) {
+        if (any_clen) {
+            const iq = try ropeQ(&attn_sc, m, try attn_sc.reshape(try iw.wq_b.apply(&attn_sc, in[0]), &.{ ci(L), ci(c.index_heads), ci(c.index_head_dim) }), m.rope_yarn.freqs, pos_all, false, .fp4_ue8m0, .float32);
+            const iwts = try indexWeights(&attn_sc, fus, &iw.weights_proj, h);
+            idx_all = .{ .q = iq, .wts = iwts };
+        }
+    };
+
     for (segs, 0..) |sg, i| {
+        const clen_sg = if (ly.ratio > 0) (sg.p0 + sg.rows) / ly.ratio else 0;
+        // `c.latest(..., isKvSource)` is unreachable when `ly.ratio == 0` (e.g. layers 0..1 before the first KV source).
+        const urows_hit = clen_sg > 0 and sg.sh.urows[0].ctx != null and sg.sh.usrc[0] == c.latest(li, Config.isKvSource) and sg.sh.uclen[0] == clen_sg;
+        _ = urows_hit;
+        var sg_sc = m.scope();
+        defer sg_sc.deinit();
         const r0 = sg.row;
         const r1 = sg.row + sg.rows;
         var mine: [3]A = .{ none, none, none };
         for (in, &mine) |a, *o| if (a.ctx != null) {
-            o.* = try sc.slice(a, 0, r0, r1);
+            o.* = try sg_sc.slice(a, 0, r0, r1);
         };
         const pre: PreJoined = .{
-            .q_roped = try sc.slice(q_all, 0, r0, r1),
-            .comp_proj = if (comp_proj_all) |cp| .{ try sc.slice(cp[0], 0, r0, r1), try sc.slice(cp[1], 0, r0, r1) } else null,
+            .q_roped = try sg_sc.slice(q_all, 0, r0, r1),
+            .comp_proj = if (comp_proj_all) |cp| .{ try sg_sc.slice(cp[0], 0, r0, r1), try sg_sc.slice(cp[1], 0, r0, r1) } else null,
             .comp_done = comp_done_all,
-            .idx = if (idx_all) |ia| .{ .q = try sc.slice(ia.q, 0, r0, r1), .wts = try sc.slice(ia.wts, 0, r0, r1) } else null,
+            .idx = if (idx_all) |ia| .{ .q = try sg_sc.slice(ia.q, 0, r0, r1), .wts = try sg_sc.slice(ia.wts, 0, r0, r1) } else null,
         };
-        const dh = try decodeHeads(sc, m, sg.st, li, try sc.slice(h, 0, r0, r1), r1 - r0, mine, none, sg.p0, sg.sh, null, pre);
+        const dh = try decodeHeads(&sg_sc, m, sg.st, li, try sg_sc.slice(h, 0, r0, r1), r1 - r0, mine, none, sg.p0, sg.sh, null, pre);
         seg_grouped[i] = dh.grouped;
         any_grouped = any_grouped or dh.grouped;
-        os[i] = dh.o;
+        os[i] = try attn_sc.keep(sg_sc.out(dh.o));
     }
-    // If a multi-row verify segment crossed an attention split count and returned ungrouped `[Ls, H, hd]` while
-    // peer segments returned grouped `[og, Ls, H/og*hd]`, transpose the ungrouped slice to match the grouped banks.
-    if (any_grouped) {
-        const og = c.o_groups;
-        const gin = c.heads * c.head_dim / og;
-        for (segs, 0..) |sg, i| if (!seg_grouped[i]) {
-            os[i] = try sc.transpose(try sc.reshape(os[i], &.{ ci(sg.rows), ci(og), ci(gin) }), &.{ 1, 0, 2 });
+    const res = blk: {
+        var post_sc = m.scope();
+        defer post_sc.deinit();
+        // If a multi-row verify segment crossed an attention split count and returned ungrouped `[Ls, H, hd]` while
+        // peer segments returned grouped `[og, Ls, H/og*hd]`, transpose the ungrouped slice to match the grouped banks.
+        if (any_grouped) {
+            const og = c.o_groups;
+            const gin = c.heads * c.head_dim / og;
+            for (segs, 0..) |sg, i| if (!seg_grouped[i]) {
+                os[i] = try post_sc.transpose(try post_sc.reshape(os[i], &.{ ci(sg.rows), ci(og), ci(gin) }), &.{ 1, 0, 2 });
+            };
+        }
+        const joined: DecodeHeads = .{
+            .o = try post_sc.concat(os, if (any_grouped) 1 else 0),
+            .grouped = any_grouped,
+            .split = split_all,
         };
-    }
-    const joined: DecodeHeads = .{
-        .o = try sc.concat(os, if (any_grouped) 1 else 0),
-        .grouped = any_grouped,
-        .split = split_all,
+        const out = try decodeOut(&post_sc, m, li, joined, ride);
+        break :blk try sc.keep(post_sc.out(out));
     };
-    return try decodeOut(sc, m, li, joined, ride);
+    return res;
 }
 
 /// `kernels.attnFused` over a span's `picks`: a packed store is decoded inside the kernel when `q` is the store's dtype.
@@ -3014,7 +2991,24 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix, qu
     var bias = if (img.ctx != null and ly.gate_bias_vl.ctx != null) try bsc.where(try bsc.expand(img, -1), ly.gate_bias_vl, ly.gate_bias) else ly.gate_bias;
     // An expert the layer's cache lacks scores lower in a decode-width text pick; the weights stay unbiased.
     if (img.ctx == null and li < c.layers and rows <= exl3.kernels.DECODE_ROWS_MAX) switch (m.experts) {
-        .hook => |hk| if (hk.penalty) |pen_fn| {
+        .hook => |hk| if (mlx.engine.isStream(sc.s)) {
+            if (hk.penalty_host) |pen_host| {
+                const want = if (plan_api.session.mode == .dry) (if (hk.has_penalty) |f| f(hk.ctx, li) else false) else true;
+                if (want) {
+                    const pen_buf = try sc.a.alloc(f32, c.experts);
+                    defer sc.a.free(pen_buf);
+                    const applied = if (plan_api.session.mode == .dry) blk: {
+                        @memset(pen_buf, 0);
+                        break :blk true;
+                    } else try pen_host(hk.ctx, li, pen_buf);
+                    if (applied) bias = try bsc.add(bias, try bsc.floats(pen_buf, &.{ci(c.experts)}));
+                }
+            } else if (hk.penalty) |pen_fn| {
+                if (plan_api.session.mode != .dry) if (try pen_fn(hk.ctx, li)) |pen| {
+                    bias = try bsc.add(bias, pen);
+                };
+            }
+        } else if (hk.penalty) |pen_fn| {
             if (try pen_fn(hk.ctx, li)) |pen| bias = try bsc.add(bias, pen);
         },
         .resident => {},
@@ -3775,6 +3769,8 @@ pub const Request = struct {
     /// With joined rows, the position its restore took from a stored entry: the rows below it are that entry's, so the
     /// SSD tier links them (at one row the live record keeps it, `dsv41_prefix.Live.base`).
     rows_base: usize = 0,
+    logits_fixed: [2]?A = .{ null, null },
+    logits_turn: u1 = 0,
 
     pub fn init(_: std.mem.Allocator, _: usize) !Request {
         return .{};
@@ -3785,6 +3781,11 @@ pub const Request = struct {
         self.park();
         if (self.state) |*st| st.deinit();
         self.state = null;
+        for (&self.logits_fixed) |*b| if (b.*) |a| {
+            _ = mlx.mlx_array_free(a);
+            b.* = null;
+        };
+        self.logits_turn = 0;
     }
 
     /// The request ended: its state is the model's again. With joined rows it stays the request's until the slot goes
@@ -3792,6 +3793,7 @@ pub const Request = struct {
     pub fn reset(self: *Request) void {
         self.endLease();
         self.trimReserve();
+        self.logits_turn = 0;
         if (self.model) |m| if (m.serves_rows) {
             if (m.bound == self) m.bound = null;
             return;
@@ -3822,6 +3824,9 @@ pub const Request = struct {
         pipeDrain(m) catch |e| log.warn("[dsv41] a pipelined layer failed as its request ended: {s}\n", .{@errorName(e)});
         const cap = mlx.engine.uncapped();
         defer mlx.engine.capped(cap);
+        const owned = mlx.engine.widePhase();
+        defer owned.end();
+        st.reach = 0;
         for (st.layers) |*ls| for ([_]*?Rows{ &ls.comp, &ls.idx_k }) |slot| if (slot.*) |*rows| {
             rows.goal = 0;
             rows.trim(stateStream(m)) catch |e| log.warn("[dsv41] a row store was not trimmed as its request ended: {s}\n", .{@errorName(e)});
@@ -3928,9 +3933,43 @@ pub fn checkLent(m: *const Model) !void {
 }
 
 /// Where the state the model runs is kept: the bound request's, else the model's own.
-fn liveSlot(m: *Model) !*?State {
+pub fn liveSlot(m: *Model) !*?State {
     try checkLent(m);
     return if (m.bound) |r| &r.state else &m.dec_state;
+}
+
+/// Sizes the running/parked state for a request reaching `reach` tokens (pre-allocating row stores and fixed owners
+/// between requests so forwards make zero state allocations).
+pub fn reserveFor(m: *Model, reach: usize) !void {
+    const st = try ensureState(m);
+    try store_mod.reserveState(st, &m.cfg, m.act, m.dspark != null, m.onEngine(), m.serves_rows, reach, stateStream(m));
+    if (m.bound) |r| if (m.logits_fixed[0] != null) try m.makeRequestLogits(r);
+}
+
+/// Ensures a state exists and reserves it to `reach` tokens before a lookup.
+pub fn reserveNew(m: *Model, reach: usize) !void {
+    _ = try ensureState(m);
+    try reserveFor(m, reach);
+}
+
+/// Ensures persistent fixed owners exist and rows fit `st.n + n` for an unbound forward outside `beginWide`.
+pub fn prepareUnboundForward(m: *Model, n: usize) !void {
+    const st = try ensureState(m);
+    const s = stateStream(m);
+    if (m.onEngine()) try store_mod.ensureFixedOwners(st, &m.cfg, m.act, m.dspark != null, m.serves_rows, s);
+    for (st.layers, 0..) |*ls, li| {
+        const r = m.layers[li].ratio;
+        if (r == 0) continue;
+        const add = (st.n + n) / r - st.n / r;
+        if (add == 0) continue;
+        inline for (.{ &ls.comp, &ls.idx_k }) |opt| if (opt.*) |*rows| {
+            if (rows.used + add > rows.cap) {
+                store_mod.store_grows += 1;
+                const cap = rows.pagedCap(cfg_mod.grownRows(rows.cap, rows.used, add, rows.goal), s);
+                try rows.growTo(cap, s, true);
+            }
+        };
+    }
 }
 
 /// Binds the request that ends at token `end` to the state the model runs: every row store is made the rows it holds at
@@ -3943,6 +3982,11 @@ pub fn bindRequest(m: *Model, end: usize, fresh: bool) !void {
     if (fresh) resetState(m);
     const st = try ensureState(m);
     st.bound_fresh = fresh;
+    if (m.onEngine()) {
+        try store_mod.reserveState(st, &m.cfg, m.act, m.dspark != null, true, m.serves_rows, end, stateStream(m));
+        if (m.bound) |r| if (m.logits_fixed[0] != null) try m.makeRequestLogits(r);
+        return;
+    }
     for (st.layers, 0..) |*ls, li| {
         const goal: usize = @intCast(m.cfg.storeRows(li, end));
         if (ls.comp) |*rows| try rows.bind(goal, stateStream(m));
@@ -4395,104 +4439,16 @@ fn warmRun(logits: A) !void {
 
 // ── restore points ───────────────────────────────────────────────────────
 
-/// The arrays one slot of a restore point keeps; the prefix cache stores them in an SSM snapshot's four fields.
-pub const Slot = [4]A;
-pub const nil_slot: Slot = @splat(none);
+pub const Slot = store_mod.Slot;
+pub const nil_slot = store_mod.nil_slot;
+pub const slotCountFor = store_mod.slotCountFor;
+pub const rowRatios = store_mod.rowRatios;
+pub const present = store_mod.present;
 
 /// Slots a restore point holds: per layer the window ring with the open pooling group, then the compressed and
 /// index rows; then one per DSpark stage window.
 pub fn slotCount(m: *const Model) usize {
     return slotCountFor(&m.cfg, m.dspark != null);
-}
-
-/// Tokens per row of layer `li`'s compressed rows and of its index keys; 0 where the layer keeps none. A restore
-/// point at position `n` holds `n / ratio` rows of each.
-pub fn rowRatios(c: *const cfg_mod.Config, li: usize) [2]u32 {
-    const r: u32 = c.ratios[li];
-    return .{ if (c.isKvSource(li)) r else 0, if (c.isOwner(li)) r else 0 };
-}
-
-/// `slotCount` for a config.
-pub fn slotCountFor(c: *const cfg_mod.Config, dspark: bool) usize {
-    return 2 * c.layers + (if (dspark) c.n_mtp else 0);
-}
-
-/// The first `n` rows of `x` as a view.
-fn headRows(x: A, n: usize, s: S) !A {
-    if (x.ctx == null or n == 0) return none;
-    const sh = mlx.getShape(x);
-    var head = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(head);
-    try mlx.check(mlx.mlx_slice(&head, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(n), sh[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
-    return head;
-}
-
-fn rowsOf(x: A) usize {
-    return if (x.ctx != null) dim(x, 0) else 0;
-}
-
-/// The bytes of rows [0, n) of `x`.
-fn rowBytes(x: A, n: usize) usize {
-    if (x.ctx == null or n == 0) return 0;
-    return n * (mlx.mlx_array_size(x) / dim(x, 0)) * mlx.mlx_array_itemsize(x);
-}
-
-/// An owned copy of rows [0, n) that keeps every bit (a float add of zero would turn -0.0 into +0.0).
-fn ownedRows(x: A, n: usize, s: S) !A {
-    if (x.ctx == null or n == 0) return none;
-    const head = try headRows(x, n, s);
-    defer _ = mlx.mlx_array_free(head);
-    const dt = mlx.mlx_array_dtype(x);
-    const raw_dt: mlx.mlx_dtype = switch (dt) {
-        .bfloat16, .float16 => .uint16,
-        .float32 => .uint32,
-        else => dt,
-    };
-    var raw = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(raw);
-    try mlx.check(mlx.mlx_view(&raw, head, raw_dt, s));
-    var copy = mlx.mlx_array_new();
-    {
-        errdefer _ = mlx.mlx_array_free(copy);
-        if (mlx.engine.isStream(s)) {
-            // The engine copies into one buffer of the pool; MLX's own copy shares, so there an add of zero makes one.
-            try mlx.check(mlx.engine.copyOwned(&copy, raw));
-        } else {
-            var zero = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(zero);
-            try mlx.check(mlx.mlx_zeros(&zero, &[_]c_int{1}, 1, raw_dt, s));
-            try mlx.check(mlx.mlx_add(&copy, raw, zero, s));
-        }
-    }
-    if (raw_dt == dt) return copy;
-    defer _ = mlx.mlx_array_free(copy);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_view(&out, copy, dt, s));
-    return out;
-}
-
-/// A slot array the checkpoint holds; every real one is 2-D, and an absent one is stored as a one-byte placeholder.
-pub fn present(a: A) bool {
-    return a.ctx != null and mlx.mlx_array_ndim(a) == 2 and mlx.mlx_array_size(a) > 0;
-}
-
-/// `shareInto` for a buffer later rows are written into: its record is read off `src`, a restore's own exact copy.
-fn shareBuf(dst: *mlx_pages.InPlace, src: A, grid: mlx_pages.Grid) !void {
-    dst.deinit();
-    if (!present(src)) return;
-    var copy = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(copy);
-    try mlx.check(mlx.mlx_array_set(&copy, src));
-    dst.* = mlx_pages.InPlace.adopt(copy, grid);
-}
-
-fn shareInto(dst: *A, src: A) !void {
-    if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
-    dst.* = none;
-    if (!present(src)) return;
-    dst.* = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(dst, src));
 }
 
 /// The request's state at `st.n` as owned copies in `out` (`slotCount` nil slots); frees them on a failure.
@@ -4516,42 +4472,57 @@ fn captureInto(m: *Model, out: []Slot, share: bool) !void {
     const s = stateStream(m);
     const host = mlx.engine.enter(s);
     defer host.end();
-    if (mlx.engine.isStream(s)) {
+    const copy_small = !(mlx.engine.isStream(s) and share);
+    const owned = if (mlx.engine.isStream(s)) mlx.engine.widePhase() else null;
+    defer if (owned) |o| o.end();
+    if (mlx.engine.isStream(s) and !share) {
         // The copies are the pool's and outlive the last forward's cap: the pool is told of each first.
         const lens = try m.gpa.alloc(usize, 7 * st.layers.len + st.ds.len);
         defer m.gpa.free(lens);
         @memset(lens, 0);
         for (st.layers, 0..) |*ls, li| {
             const of = lens[7 * li ..][0..7];
-            of[0] = rowBytes(ls.win.buf.array, ls.win.cap);
-            of[1] = rowBytes(ls.pend_kv, rowsOf(ls.pend_kv));
-            of[2] = rowBytes(ls.pend_gate, rowsOf(ls.pend_gate));
-            if (!share) for ([_]?Rows{ ls.comp, ls.idx_k }, 0..) |rows, k| if (rows) |r| {
-                of[3 + 2 * k] = rowBytes(r.buf.array, r.used);
-                of[4 + 2 * k] = rowBytes(r.sbuf.array, r.used);
+            of[0] = store_mod.rowBytes(ls.win.buf.array, ls.win.cap);
+            of[1] = store_mod.rowBytes(ls.pend_kv, store_mod.rowsOf(ls.pend_kv));
+            of[2] = store_mod.rowBytes(ls.pend_gate, store_mod.rowsOf(ls.pend_gate));
+            for ([_]?Rows{ ls.comp, ls.idx_k }, 0..) |rows, k| if (rows) |r| {
+                of[3 + 2 * k] = store_mod.rowBytes(r.buf.array, r.used);
+                of[4 + 2 * k] = store_mod.rowBytes(r.sbuf.array, r.used);
             };
         }
-        for (st.ds, 0..) |r, si| lens[7 * st.layers.len + si] = rowBytes(r.buf.array, r.cap);
+        for (st.ds, 0..) |r, si| lens[7 * st.layers.len + si] = store_mod.rowBytes(r.buf.array, r.cap);
         mlx.engine.room(lens);
     }
     const evals = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(evals);
     for (st.layers, 0..) |*ls, li| {
         const a = &out[2 * li];
-        a[0] = try ownedRows(ls.win.buf.array, ls.win.cap, s);
-        a[1] = try ownedRows(ls.pend_kv, if (ls.pend_kv.ctx != null) dim(ls.pend_kv, 0) else 0, s);
-        a[2] = try ownedRows(ls.pend_gate, if (ls.pend_gate.ctx != null) dim(ls.pend_gate, 0) else 0, s);
+        if (copy_small) {
+            a[0] = try store_mod.ownedRows(ls.win.buf.array, ls.win.cap, s);
+            a[1] = try store_mod.ownedRows(ls.pend_kv, store_mod.rowsOf(ls.pend_kv), s);
+            a[2] = try store_mod.ownedRows(ls.pend_gate, store_mod.rowsOf(ls.pend_gate), s);
+        } else {
+            try store_mod.shareInto(&a[0], ls.win.buf.array);
+            try store_mod.shareInto(&a[1], ls.pend_kv);
+            try store_mod.shareInto(&a[2], ls.pend_gate);
+        }
         const b = &out[2 * li + 1];
         if (ls.comp) |r| {
-            b[0] = try if (share) headRows(r.buf.array, r.used, s) else ownedRows(r.buf.array, r.used, s);
-            b[1] = try if (share) headRows(r.sbuf.array, r.used, s) else ownedRows(r.sbuf.array, r.used, s);
+            b[0] = try if (share) store_mod.headRows(r.buf.array, r.used, s) else store_mod.ownedRows(r.buf.array, r.used, s);
+            b[1] = try if (share) store_mod.headRows(r.sbuf.array, r.used, s) else store_mod.ownedRows(r.sbuf.array, r.used, s);
         }
         if (ls.idx_k) |r| {
-            b[2] = try if (share) headRows(r.buf.array, r.used, s) else ownedRows(r.buf.array, r.used, s);
-            b[3] = try if (share) headRows(r.sbuf.array, r.used, s) else ownedRows(r.sbuf.array, r.used, s);
+            b[2] = try if (share) store_mod.headRows(r.buf.array, r.used, s) else store_mod.ownedRows(r.buf.array, r.used, s);
+            b[3] = try if (share) store_mod.headRows(r.sbuf.array, r.used, s) else store_mod.ownedRows(r.sbuf.array, r.used, s);
         }
     }
-    for (st.ds, 0..) |r, si| out[2 * st.layers.len + si][0] = try ownedRows(r.buf.array, r.cap, s);
+    for (st.ds, 0..) |r, si| {
+        if (copy_small) {
+            out[2 * st.layers.len + si][0] = try store_mod.ownedRows(r.buf.array, r.cap, s);
+        } else {
+            try store_mod.shareInto(&out[2 * st.layers.len + si][0], r.buf.array);
+        }
+    }
     for (out) |sl| for (sl) |x| if (x.ctx != null) try mlx.check(mlx.mlx_vector_array_append_value(evals, x));
     try mlx.check(mlx.mlx_eval(evals));
 }
@@ -4563,41 +4534,92 @@ pub fn freeSlot(sl: *Slot) void {
     }
 }
 
-fn restoreRows(r: *Rows, buf: A, sbuf: A, want: usize) !void {
+fn restoreRows(r: *Rows, buf: A, sbuf: A, want: usize, s: S, on_engine: bool) !void {
     const used: usize = if (present(buf)) dim(buf, 0) else 0;
     if (used != want or (r.pack != null and used > 0 and !present(sbuf))) return error.Dsv41CheckpointMismatch;
     if (used == 0) return;
-    try shareBuf(&r.buf, buf, .paged);
-    try shareBuf(&r.sbuf, sbuf, .paged);
+    if (on_engine) {
+        try r.reserveFor(@max(r.goal, used), s);
+        const next0 = blk: {
+            var up0 = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(up0);
+            break :blk try r.buf.write(&up0, buf, &.{ 0, 0 }, &.{ ci(used), ci(dim(buf, 1)) }, s);
+        };
+        _ = mlx.mlx_array_free(r.buf.array);
+        r.buf = next0;
+        try next0.landed(s);
+        if (r.pack != null) {
+            const next1 = blk: {
+                var up1 = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(up1);
+                break :blk try r.sbuf.write(&up1, sbuf, &.{ 0, 0 }, &.{ ci(used), ci(dim(sbuf, 1)) }, s);
+            };
+            _ = mlx.mlx_array_free(r.sbuf.array);
+            r.sbuf = next1;
+            try next1.landed(s);
+        }
+        r.used = used;
+        return;
+    }
+    try store_mod.shareBuf(&r.buf, buf, .paged);
+    try store_mod.shareBuf(&r.sbuf, sbuf, .paged);
     r.used = used;
     r.cap = used;
 }
 
 /// Makes the request's state the restore point `slots` at position `n`, over the first `n` of the request's
-/// token ids (the Engram history); the arrays are shared, never written. The rows stay the point's own: the request's
-/// bind (`bindRequest`) makes its stores at its last row from them, one copy and none beside it. A failure leaves the
-/// state reset.
+/// token ids (the Engram history). A failure leaves the state reset.
 pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) !void {
     if (slots.len != slotCount(m) or ids.len < n) return error.Dsv41CheckpointMismatch;
-    resetState(m);
+    const s = stateStream(m);
+    const owned = if (m.onEngine()) mlx.engine.widePhase() else null;
+    defer if (owned) |o| o.end();
     errdefer resetState(m);
-    const st = try ensureState(m);
+    const st = if (m.onEngine()) blk: {
+        const cur = try ensureState(m);
+        try store_mod.emptyForRestore(cur, &m.cfg, m.act, m.dspark != null, true, m.serves_rows, @max(n, cur.reach), s);
+        break :blk cur;
+    } else blk: {
+        resetState(m);
+        break :blk try ensureState(m);
+    };
+    if (m.bound) |r| if (m.logits_fixed[0] != null) try m.makeRequestLogits(r);
     for (st.layers, 0..) |*ls, li| {
         const a = slots[2 * li];
         const b = slots[2 * li + 1];
         if (!present(a[0]) or dim(a[0], 0) != ls.win.cap) return error.Dsv41CheckpointMismatch;
-        try shareBuf(&ls.win.buf, a[0], .ring);
-        ls.win.dt = mlx.mlx_array_dtype(a[0]);
-        try shareInto(&ls.pend_kv, a[1]);
-        try shareInto(&ls.pend_gate, a[2]);
+        if (m.onEngine()) {
+            try ls.win.writeAll(a[0], s);
+            ls.win.dt = mlx.mlx_array_dtype(a[0]);
+            const r = m.ratio(li);
+            if (r > 1) {
+                if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+                if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+                ls.pend_kv = none;
+                ls.pend_gate = none;
+                if (present(a[1])) {
+                    try store_mod.writeFixed(&ls.pend_kv_buf, a[1], &.{ ci(r - 1), ci(m.cfg.head_dim) }, s);
+                    ls.pend_kv = try store_mod.headRows(ls.pend_kv_buf.?, store_mod.rowsOf(a[1]), s);
+                }
+                if (present(a[2])) {
+                    try store_mod.writeFixed(&ls.pend_gate_buf, a[2], &.{ ci(r - 1), ci(m.cfg.head_dim) }, s);
+                    ls.pend_gate = try store_mod.headRows(ls.pend_gate_buf.?, store_mod.rowsOf(a[2]), s);
+                }
+            }
+        } else {
+            try store_mod.shareBuf(&ls.win.buf, a[0], .ring);
+            ls.win.dt = mlx.mlx_array_dtype(a[0]);
+            try store_mod.shareInto(&ls.pend_kv, a[1]);
+            try store_mod.shareInto(&ls.pend_gate, a[2]);
+        }
         const r = m.ratio(li);
-        if (ls.comp) |*rows| try restoreRows(rows, b[0], b[1], n / r);
-        if (ls.idx_k) |*rows| try restoreRows(rows, b[2], b[3], n / r);
+        if (ls.comp) |*rows| try restoreRows(rows, b[0], b[1], n / r, s, m.onEngine());
+        if (ls.idx_k) |*rows| try restoreRows(rows, b[2], b[3], n / r, s, m.onEngine());
     }
     for (st.ds, 0..) |*ring, si| {
         const a = slots[2 * st.layers.len + si][0];
         if (!present(a) or dim(a, 0) != ring.cap) return error.Dsv41CheckpointMismatch;
-        try shareBuf(&ring.buf, a, .ring);
+        if (m.onEngine()) try ring.writeAll(a, s) else try store_mod.shareBuf(&ring.buf, a, .ring);
     }
     st.n = n;
     if (m.hash != null) {
@@ -4606,12 +4628,38 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
     }
 }
 
+/// Readies the request's state for `DiskTier.restorePointInto` at `pos` tokens (`dsv41_store.emptyForRestore`), zero pool asks.
+pub fn restoreBegin(m: *Model, pos: usize) !void {
+    if (!m.onEngine()) return error.Dsv41RestoreOffEngine;
+    const st = try ensureState(m);
+    try store_mod.emptyForRestore(st, &m.cfg, m.act, m.dspark != null, true, m.serves_rows, pos, stateStream(m));
+    if (m.bound) |r| if (m.logits_fixed[0] != null) try m.makeRequestLogits(r);
+}
+
+pub fn restoreDest(m: *Model, snap_li: usize, field: u1, row: usize, dtype: mlx.mlx_dtype, shape: []const c_int) ![]u8 {
+    const st = try ensureState(m);
+    return store_mod.restoreDest(st, &m.cfg, snap_li, field, row, dtype, shape);
+}
+
+pub fn restoreEnd(m: *Model, pos: usize, ids: []const u32, counts: []const [2]usize) !void {
+    const st = try ensureState(m);
+    errdefer resetState(m);
+    const Ctx = struct {
+        m: *const Model,
+        fn map(ctx: @This(), t: u32) u32 {
+            return ctx.m.compressedId(t);
+        }
+    };
+    try store_mod.restoreEnd(st, &m.cfg, m.hash != null, Ctx{ .m = m }, Ctx.map, pos, ids, counts, stateStream(m));
+}
+
 /// Whether no row buffer of the live state is larger than a `prompt_len`-token request's own would be, with the
 /// quarter its bill adds (`server.prefillNeededAtChunk`): only then is it paid for (`rollbackState` trims one that is not).
 pub fn liveRowsFit(m: *const Model, prompt_len: usize) !bool {
     const st = (try currentState(m)) orelse return false;
+    const keep = @max(prompt_len, st.reach);
     for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |r| {
-        if (!r.fitsBill(billedRows(m.ratio(li), prompt_len), stateStream(m))) return false;
+        if (!r.fitsBill(billedRows(m.ratio(li), keep), stateStream(m))) return false;
     };
     return true;
 }
@@ -4624,8 +4672,8 @@ fn billedRows(ratio: usize, prompt_len: usize) usize {
 
 /// Makes the live state its own earlier self at `n`: `slots` are the fixed arrays a restore point of the same
 /// request held there (`captureState`'s rows are not needed), and the compressed and index rows keep their first
-/// `n / ratio`, because rows are append-only. The arrays are shared, never written. Checked whole before anything
-/// changes; the caller guarantees the first `n` of `ids` are the tokens the state was built from.
+/// `n / ratio`, because rows are append-only. Checked whole before anything changes; the caller guarantees the first `n`
+/// of `ids` are the tokens the state was built from.
 pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) !void {
     const st = if ((try liveSlot(m)).*) |*st| st else return error.Dsv41NoLiveState;
     if (st.verify != null or slots.len != slotCount(m) or ids.len < n or st.n < n) return error.Dsv41CheckpointMismatch;
@@ -4641,16 +4689,40 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
     }
     errdefer resetState(m);
     st.owner = 0;
+    const s = stateStream(m);
     for (st.layers, 0..) |*ls, li| {
         const a = slots[2 * li];
-        try shareBuf(&ls.win.buf, a[0], .ring);
-        ls.win.dt = mlx.mlx_array_dtype(a[0]);
-        try shareInto(&ls.pend_kv, a[1]);
-        try shareInto(&ls.pend_gate, a[2]);
+        if (m.onEngine()) {
+            try ls.win.writeAll(a[0], s);
+            ls.win.dt = mlx.mlx_array_dtype(a[0]);
+            const r = m.ratio(li);
+            if (r > 1) {
+                if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+                if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+                ls.pend_kv = none;
+                ls.pend_gate = none;
+                if (present(a[1])) {
+                    try store_mod.writeFixed(&ls.pend_kv_buf, a[1], &.{ ci(r - 1), ci(m.cfg.head_dim) }, s);
+                    ls.pend_kv = try store_mod.headRows(ls.pend_kv_buf.?, store_mod.rowsOf(a[1]), s);
+                }
+                if (present(a[2])) {
+                    try store_mod.writeFixed(&ls.pend_gate_buf, a[2], &.{ ci(r - 1), ci(m.cfg.head_dim) }, s);
+                    ls.pend_gate = try store_mod.headRows(ls.pend_gate_buf.?, store_mod.rowsOf(a[2]), s);
+                }
+            }
+        } else {
+            try store_mod.shareBuf(&ls.win.buf, a[0], .ring);
+            ls.win.dt = mlx.mlx_array_dtype(a[0]);
+            try store_mod.shareInto(&ls.pend_kv, a[1]);
+            try store_mod.shareInto(&ls.pend_gate, a[2]);
+        }
         if (ls.comp) |*rows| rows.used = n / m.ratio(li);
         if (ls.idx_k) |*rows| rows.used = n / m.ratio(li);
     }
-    for (st.ds, 0..) |*ring, si| try shareBuf(&ring.buf, slots[2 * st.layers.len + si][0], .ring);
+    for (st.ds, 0..) |*ring, si| {
+        const src = slots[2 * st.layers.len + si][0];
+        if (m.onEngine()) try ring.writeAll(src, s) else try store_mod.shareBuf(&ring.buf, src, .ring);
+    }
     st.n = n;
     st.main_lazy = false;
     if (m.hash != null) st.hist.shrinkRetainingCapacity(n);
@@ -4659,8 +4731,11 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
     if (try liveRowsFit(m, ids.len)) return;
     const cap = mlx.engine.uncapped();
     defer mlx.engine.capped(cap);
+    const owned = mlx.engine.widePhase();
+    defer owned.end();
+    const keep = @max(ids.len, st.reach);
     for (st.layers, 0..) |*ls, li| for ([_]*?Rows{ &ls.comp, &ls.idx_k }) |rows_| if (rows_.*) |*rows| {
-        if (!rows.fitsBill(billedRows(m.ratio(li), ids.len), stateStream(m))) try rows.trim(stateStream(m));
+        if (!rows.fitsBill(billedRows(m.ratio(li), keep), s)) try rows.trim(s);
     };
 }
 
@@ -4675,20 +4750,20 @@ pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) 
     const s = stateStream(m);
     for (st.layers, 0..) |*ls, li| {
         const a = &out[2 * li];
-        for (0..3) |k| try shareInto(&a[k], fixed[2 * li][k]);
+        for (0..3) |k| try store_mod.shareInto(&a[k], fixed[2 * li][k]);
         if (ls.comp == null and ls.idx_k == null) continue;
         const r = n / m.ratio(li);
         const b = &out[2 * li + 1];
         if (ls.comp) |rows| {
-            b[0] = try headRows(rows.buf.array, r, s);
-            b[1] = try headRows(rows.sbuf.array, r, s);
+            b[0] = try store_mod.headRows(rows.buf.array, r, s);
+            b[1] = try store_mod.headRows(rows.sbuf.array, r, s);
         }
         if (ls.idx_k) |rows| {
-            b[2] = try headRows(rows.buf.array, r, s);
-            b[3] = try headRows(rows.sbuf.array, r, s);
+            b[2] = try store_mod.headRows(rows.buf.array, r, s);
+            b[3] = try store_mod.headRows(rows.sbuf.array, r, s);
         }
     }
-    for (st.ds, 0..) |_, si| try shareInto(&out[2 * st.layers.len + si][0], fixed[2 * st.layers.len + si][0]);
+    for (st.ds, 0..) |_, si| try store_mod.shareInto(&out[2 * st.layers.len + si][0], fixed[2 * st.layers.len + si][0]);
 }
 
 fn setWideArms(m: *Model) void {
@@ -4772,6 +4847,10 @@ pub const Pass = struct {
     engram_rows: [cfg_mod.max_engram]A = @splat(none),
     /// Layers this pass rebuilt after a pick missed the map: past `Model.route_spec_rebuilds` it waits for every layer's picks.
     rollbacks: u32 = 0,
+    x_turn: u1 = 0,
+    cpre_turn: u1 = 0,
+    unres_turn: u1 = 0,
+    targets_fixed: bool = true,
 
     pub fn deinit(self: *Pass, gpa: std.mem.Allocator) void {
         if (self.unresolved) |*u| u.deinit();
@@ -4977,20 +5056,64 @@ fn handle(x: A) A {
 const Undo = struct {
     st: *State,
     li: usize,
-    ring: mlx_pages.InPlace,
+    fixed: bool,
+    win_saved: bool = false,
+    ring: mlx_pages.InPlace = .none,
     comp_used: usize,
     idx_used: usize,
-    pend_kv: A,
-    pend_gate: A,
-    verify_kv: A,
-    verify_gate: A,
+    pend_kv: A = none,
+    pend_gate: A = none,
+    verify_kv: A = none,
+    verify_gate: A = none,
+    pend_kv_rows: usize = 0,
+    pend_gate_rows: usize = 0,
+    verify_kv_rows: usize = 0,
+    verify_gate_rows: usize = 0,
+    s: S,
+    ratio: usize,
+    head_dim: usize,
 
-    fn take(st: *State, li: usize, rows: usize) Undo {
+    fn take(c: *const Config, st: *State, li: usize, rows: usize, s: S) !Undo {
         const ls = &st.layers[li];
         const v = if (st.verify) |*vv| vv else null;
+        if (st.spec_undo.win.cap > 0) {
+            var su = &st.spec_undo;
+            const win_saved = rows > 1;
+            if (win_saved) try su.win.writeAll(ls.win.buf.array, s);
+            const r = c.ratios[li];
+            const hd = c.head_dim;
+            const kv_rows = store_mod.rowsOf(ls.pend_kv);
+            const gate_rows = store_mod.rowsOf(ls.pend_gate);
+            if (kv_rows > 0 and su.pend_kv_buf != null) try store_mod.writeFixed(&su.pend_kv_buf, ls.pend_kv, &.{ ci(su.max_ratio - 1), ci(hd) }, s);
+            if (gate_rows > 0 and su.pend_gate_buf != null) try store_mod.writeFixed(&su.pend_gate_buf, ls.pend_gate, &.{ ci(su.max_ratio - 1), ci(hd) }, s);
+            var v_kv_rows: usize = 0;
+            var v_gate_rows: usize = 0;
+            if (v) |vv| {
+                v_kv_rows = store_mod.rowsOf(vv.pend_kv[li]);
+                v_gate_rows = store_mod.rowsOf(vv.pend_gate[li]);
+                if (v_kv_rows > 0 and su.verify_kv_buf != null) try store_mod.writeFixed(&su.verify_kv_buf, vv.pend_kv[li], &.{ ci(su.max_ratio - 1 + cfg_mod.ring_slack), ci(hd) }, s);
+                if (v_gate_rows > 0 and su.verify_gate_buf != null) try store_mod.writeFixed(&su.verify_gate_buf, vv.pend_gate[li], &.{ ci(su.max_ratio - 1 + cfg_mod.ring_slack), ci(hd) }, s);
+            }
+            return .{
+                .st = st,
+                .li = li,
+                .fixed = true,
+                .win_saved = win_saved,
+                .comp_used = if (ls.comp) |rc| rc.used else 0,
+                .idx_used = if (ls.idx_k) |rc| rc.used else 0,
+                .pend_kv_rows = kv_rows,
+                .pend_gate_rows = gate_rows,
+                .verify_kv_rows = v_kv_rows,
+                .verify_gate_rows = v_gate_rows,
+                .s = s,
+                .ratio = r,
+                .head_dim = hd,
+            };
+        }
         return .{
             .st = st,
             .li = li,
+            .fixed = false,
             .ring = if (rows > 1) ls.win.buf.share() else .none,
             .comp_used = if (ls.comp) |r| r.used else 0,
             .idx_used = if (ls.idx_k) |r| r.used else 0,
@@ -4998,6 +5121,9 @@ const Undo = struct {
             .pend_gate = handle(ls.pend_gate),
             .verify_kv = if (v) |vv| handle(vv.pend_kv[li]) else none,
             .verify_gate = if (v) |vv| handle(vv.pend_gate[li]) else none,
+            .s = s,
+            .ratio = c.ratios[li],
+            .head_dim = c.head_dim,
         };
     }
 
@@ -5007,15 +5133,38 @@ const Undo = struct {
         saved.* = none;
     }
 
-    fn restore(self: *Undo) void {
+    fn restoreFixedView(dst_view: *A, dst_buf: *?A, src_buf: A, rows_n: usize, cap_rows: usize, hd: usize, s: S) !void {
+        if (dst_view.ctx != null) _ = mlx.mlx_array_free(dst_view.*);
+        dst_view.* = none;
+        if (rows_n == 0) return;
+        const head = try store_mod.headRows(src_buf, rows_n, s);
+        defer _ = mlx.mlx_array_free(head);
+        try store_mod.writeFixed(dst_buf, head, &.{ ci(cap_rows), ci(hd) }, s);
+        dst_view.* = try store_mod.headRows(dst_buf.*.?, rows_n, s);
+    }
+
+    fn restore(self: *Undo) !void {
         const ls = &self.st.layers[self.li];
+        if (ls.comp) |*r| r.used = self.comp_used;
+        if (ls.idx_k) |*r| r.used = self.idx_used;
+        if (self.fixed) {
+            const su = &self.st.spec_undo;
+            if (self.win_saved) try ls.win.writeAll(su.win.buf.array, self.s);
+            if (self.ratio > 1) {
+                try restoreFixedView(&ls.pend_kv, &ls.pend_kv_buf, su.pend_kv_buf.?, self.pend_kv_rows, self.ratio - 1, self.head_dim, self.s);
+                try restoreFixedView(&ls.pend_gate, &ls.pend_gate_buf, su.pend_gate_buf.?, self.pend_gate_rows, self.ratio - 1, self.head_dim, self.s);
+                if (self.st.verify) |*v| {
+                    try restoreFixedView(&v.pend_kv[self.li], &self.st.verify_pend_kv[self.li], su.verify_kv_buf.?, self.verify_kv_rows, self.ratio - 1 + cfg_mod.ring_slack, self.head_dim, self.s);
+                    try restoreFixedView(&v.pend_gate[self.li], &self.st.verify_pend_gate[self.li], su.verify_gate_buf.?, self.verify_gate_rows, self.ratio - 1 + cfg_mod.ring_slack, self.head_dim, self.s);
+                }
+            }
+            return;
+        }
         if (self.ring.array.ctx != null) {
             ls.win.buf.deinit();
             ls.win.buf = self.ring;
             self.ring = .none;
         }
-        if (ls.comp) |*r| r.used = self.comp_used;
-        if (ls.idx_k) |*r| r.used = self.idx_used;
         give(&ls.pend_kv, &self.pend_kv);
         give(&ls.pend_gate, &self.pend_gate);
         if (self.st.verify) |*v| {
@@ -5032,9 +5181,15 @@ const Undo = struct {
     }
 };
 
+fn specCapReached(rollbacks: usize, limit: usize, li: usize) bool {
+    const cap = limit + li / 3;
+    if (plan_api.session.mode == .dry) return false;
+    return rollbacks >= cap;
+}
+
 /// Whether layer `li` of the pass queues its routed chain from the stream's cache map.
 fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
-    if (!m.route_spec or m.sync_layers or p.ids.len > cfg_mod.route_spec_rows or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
+    if (!m.route_spec or m.sync_layers or p.ids.len > cfg_mod.route_spec_rows or specCapReached(p.rollbacks, m.route_spec_rebuilds, li)) return false;
     if (m.trace != null or m.profile != null or p.tail != null or p.img.ctx != null) return false;
     const hk = switch (m.experts) {
         .resident => return false,
@@ -5087,9 +5242,10 @@ fn rankPicks(logits: []const f32, bias: []const f32, penalty: ?[]const f32, out:
 
 /// Hands the stream the experts the prefetch layer's router is expected to pick, ranked from `u.pred`.
 fn issuePrefetch(m: *const Model, u: *const Unresolved) !void {
+    if (plan_api.session.mode == .dry) return;
     const hk = m.experts.hook;
     const prefetch = hk.prefetch orelse return;
-    const logits = try sc_mod.hostF32(u.pred);
+    const logits = try sc_mod.hostResultF32(u.pred);
     const bias = try sc_mod.hostF32(m.layers[u.pred_layer].gate_bias);
     const rows = dim(u.pred, 0);
     const E = bias.len;
@@ -5113,20 +5269,100 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
     const t0 = readStart();
     const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, .{ .layer = .{ .m = m, .li = u.li } }, u.map, u.kept);
     readDone(settle_site, t0);
-    if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
-    if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map ({d} of those {d} picks recomputed)\n", .{ spec_kept, spec_rebuilt, spec_redo_picks, spec_rebuilt_picks });
+    if (plan_api.session.mode != .dry) {
+        if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
+        if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map ({d} of those {d} picks recomputed)\n", .{ spec_kept, spec_rebuilt, spec_redo_picks, spec_rebuilt_picks });
+    }
     if (sum == null) return null;
-    return sc.out(try hcExpand(&sc, m, u.x1, try sc.astype(sum.?, m.act), u.post, u.comb));
+    var esc = sc.child();
+    defer esc.deinit();
+    return esc.out(try hcExpand(&esc, m, u.x1, try esc.astype(sum.?, m.act), u.post, u.comb));
+}
+
+fn freeHandle(a: *A) void {
+    if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a.*);
+        a.* = none;
+    }
+}
+
+fn replaceWithFixed(dst: *A, buf: *?A, cap: c_int, s: S) !void {
+    // Store before freeing `dst.*`: callers pass the live handle in `dst` as the source to copy.
+    const out = try store_mod.storeFixed(buf, dst.*, cap, s);
+    freeHandle(dst);
+    dst.* = out;
+}
+
+fn adoptFixedStream(m: *const Model, x_turn: *u1, cpre_turn: *u1, x: *A, cpre: *A, new_x: A, new_cpre: A, s: S) !void {
+    const pf = m.pass_fixed.?;
+    const nx_slot = x_turn.* ^ 1;
+    const nc_slot = cpre_turn.* ^ 1;
+    const fx = try store_mod.storeFixed(&pf.x[nx_slot], new_x, pf.x_cap, s);
+    errdefer _ = mlx.mlx_array_free(fx);
+    const fc = try store_mod.storeFixed(&pf.cpre[nc_slot], new_cpre, pf.cpre_cap, s);
+    freeHandle(x);
+    freeHandle(cpre);
+    _ = mlx.mlx_array_free(new_x);
+    _ = mlx.mlx_array_free(new_cpre);
+    x.* = fx;
+    cpre.* = fc;
+    x_turn.* = nx_slot;
+    cpre_turn.* = nc_slot;
+}
+
+fn adoptInitialPassFixed(m: *const Model, p: *Pass) !void {
+    const pf = m.activePassFixed() orelse return;
+    if (p.ids.len > NARROW_ROWS) return;
+    const fx = try store_mod.storeFixed(&pf.x[0], p.x, pf.x_cap, stateStream(m));
+    errdefer _ = mlx.mlx_array_free(fx);
+    const fc = try store_mod.storeFixed(&pf.cpre[0], p.cpre, pf.cpre_cap, stateStream(m));
+    freeHandle(&p.x);
+    freeHandle(&p.cpre);
+    p.x = fx;
+    p.cpre = fc;
+    p.x_turn = 0;
+    p.cpre_turn = 0;
+}
+
+fn adoptFixedUnresolved(m: *const Model, turn: *u1, u: *Unresolved, s: S) !void {
+    const pf = m.pass_fixed orelse return;
+    const slot = &pf.unres[turn.*];
+    turn.* +%= 1;
+    if (u.h.ctx != null and slot.h != null) try replaceWithFixed(&u.h, &slot.h, pf.unres_h_cap, s);
+    if (u.idx.ctx != null and slot.idx != null) try replaceWithFixed(&u.idx, &slot.idx, pf.unres_idx_cap, s);
+    if (u.wts.ctx != null and slot.wts != null) try replaceWithFixed(&u.wts, &slot.wts, pf.unres_wts_cap, s);
+    if (u.x1.ctx != null and slot.x1 != null) try replaceWithFixed(&u.x1, &slot.x1, pf.unres_x1_cap, s);
+    if (u.post.ctx != null and slot.post != null) try replaceWithFixed(&u.post, &slot.post, pf.unres_post_cap, s);
+    if (u.comb.ctx != null and slot.comb != null) try replaceWithFixed(&u.comb, &slot.comb, pf.unres_comb_cap, s);
+    if (u.pre.ctx != null and slot.pre != null) try replaceWithFixed(&u.pre, &slot.pre, pf.unres_pre_cap, s);
+    if (u.pred.ctx != null and slot.pred != null) try replaceWithFixed(&u.pred, &slot.pred, pf.unres_pred_cap, s);
+    if (u.kept.down.ctx != null and slot.kept_down != null) try replaceWithFixed(&u.kept.down, &slot.kept_down, pf.unres_kept_down_cap, s);
+    if (u.kept.shared.ctx != null) {
+        if (mlx.mlx_array_dtype(u.kept.shared) == .float32 and slot.kept_shared_f32 != null) {
+            try replaceWithFixed(&u.kept.shared, &slot.kept_shared_f32, pf.unres_kept_shared_f32_cap, s);
+        } else if (slot.kept_shared != null) {
+            try replaceWithFixed(&u.kept.shared, &slot.kept_shared, pf.unres_kept_shared_cap, s);
+        }
+    }
 }
 
 /// Checks the pass's unresolved layer, if any, and takes its exact output where the queued chain missed.
-fn settleLast(m: *const Model, p: *Pass) !bool {
+fn settleLast(m: *Model, p: *Pass) !bool {
     var u = p.unresolved orelse return false;
     p.unresolved = null;
     defer u.deinit();
     settle_site = .settle_last;
     defer settle_site = .settle;
     const exact = try settleRecord(m, &u) orelse return false;
+    if (m.activePassFixed()) |pf| if (p.ids.len <= NARROW_ROWS) {
+        const nxt = p.x_turn ^ 1;
+        const fx = try store_mod.storeFixed(&pf.x[nxt], exact, pf.x_cap, stateStream(m));
+        freeHandle(&p.x);
+        _ = mlx.mlx_array_free(exact);
+        p.x = fx;
+        p.x_turn = nxt;
+        return true;
+    };
     _ = mlx.mlx_array_free(p.x);
     p.x = exact;
     return true;
@@ -5136,30 +5372,43 @@ fn settleLast(m: *const Model, p: *Pass) !bool {
 /// queued from the stream's cache map and the previous layer's is checked after this one is submitted, so the host
 /// never waits on a layer's own picks; a miss in the previous layer rebuilds this one from its exact output.
 pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
-    const on = specOn(m, p, li);
+    var on = specOn(m, p, li);
     // A layer that cannot queue from the map starts from its predecessor's exact output.
     if (p.unresolved != null and !on) _ = try settleLast(m, p);
     var prior = p.unresolved;
     p.unresolved = null;
     defer if (prior) |*u| u.deinit();
-    var undo: ?Undo = if (prior != null) Undo.take(p.st, li, p.ids.len) else null;
+    var undo: ?Undo = null;
     defer if (undo) |*u| u.deinit();
+    if (prior != null) undo = try Undo.take(&m.cfg, p.st, li, p.ids.len, m.s);
     p.sh.spec_on = on;
     try buildLayer(m, p, li);
     if (prior == null) return;
     const u = &prior.?;
-    const exact = try settleRecord(m, u) orelse return;
+    const exact = try settleRecord(m, u);
+    if (exact == null) return;
     if (p.unresolved) |*next| next.deinit();
     p.unresolved = null;
-    undo.?.restore();
+    try undo.?.restore();
     p.sh.clearUnpackedAll();
     _ = mlx.mlx_array_free(p.x);
     _ = mlx.mlx_array_free(p.cpre);
-    p.x = exact;
-    p.cpre = handle(u.pre);
+    if (m.activePassFixed() != null and p.ids.len <= NARROW_ROWS) {
+        p.x = none;
+        p.cpre = none;
+        try adoptFixedStream(m, &p.x_turn, &p.cpre_turn, &p.x, &p.cpre, exact.?, handle(u.pre), stateStream(m));
+    } else {
+        p.x = exact.?;
+        p.cpre = handle(u.pre);
+    }
+    // Release the prior layer's unresolved views before rebuilding `li` so both `pf.unres` slots stay sole.
+    u.deinit();
+    prior = null;
     p.rollbacks += 1;
     try submit(p.x);
-    return passLayer(m, p, li);
+    on = specOn(m, p, li);
+    p.sh.spec_on = on;
+    try buildLayer(m, p, li);
 }
 
 /// What a request's own rows take before layer `li`'s block: its Engram write and the DSpark targets its state keeps.
@@ -5176,37 +5425,69 @@ fn layerInput(m: *Model, p: *Pass, li: usize, sc: *Scope, ev: *std.ArrayList(A),
         if (p.engram_rows[ei].ctx == null) {
             const rt = readStart();
             defer readDone(.engram, rt);
-            p.engram_rows[ei] = if (p.engram_pf) |pf| blk: {
+            const raw_eng = if (plan_api.session.mode == .dry)
+                try e.table.dequantDryAs(gpa, L * nc, m.act, m.s)
+            else if (p.engram_pf) |pf| blk: {
                 const raw = try pf.take(p.p0, ei, 0);
                 defer raw.deinit(gpa);
-                break :blk sc.out(try sc.keep(try e.table.dequantAs(raw, L * nc, m.act, m.s)));
+                break :blk try e.table.dequantAs(raw, L * nc, m.act, m.s);
             } else blk: {
                 const mine = try gpa.alloc(u32, L * nc);
                 defer gpa.free(mine);
                 for (0..L) |t| @memcpy(mine[t * nc ..][0..nc], p.rows[(t * hs.n_layers + ei) * nc ..][0..nc]);
                 if (try e.table.tryReadCached(gpa, mine)) |raw| {
                     defer raw.deinit(gpa);
-                    break :blk sc.out(try sc.keep(try e.table.dequantAs(raw, mine.len, m.act, m.s)));
+                    break :blk try e.table.dequantAs(raw, mine.len, m.act, m.s);
                 }
-                break :blk sc.out(try sc.keep(try e.table.gatherAs(gpa, mine, m.act, m.s))); // [L * cols, head_dim]
+                break :blk try e.table.gatherAs(gpa, mine, m.act, m.s); // [L * cols, head_dim]
             };
+            if (m.activePassFixed()) |pf| if (L <= NARROW_ROWS and pf.engram_rows[ei] != null) {
+                defer _ = mlx.mlx_array_free(raw_eng);
+                p.engram_rows[ei] = try store_mod.storeFixed(&pf.engram_rows[ei], raw_eng, pf.engram_cap, m.s);
+            } else {
+                p.engram_rows[ei] = sc.out(try sc.keep(raw_eng));
+            } else {
+                p.engram_rows[ei] = sc.out(try sc.keep(raw_eng));
+            }
         }
         const table_rows = p.engram_rows[ei];
-        const nx = sc.out(try engramWrite(sc, m, e, p.x, table_rows, p.img));
-        _ = mlx.mlx_array_free(p.x);
-        p.x = nx;
-        if (prof(m, L)) |pf| try pf.mark(.engram, &.{nx});
+        const nx = try engramWrite(sc, m, e, p.x, table_rows, p.img);
+        if (m.activePassFixed()) |pf| if (L <= NARROW_ROWS and p.targets_fixed) {
+            const nxt = p.x_turn ^ 1;
+            const fx = try store_mod.storeFixed(&pf.x[nxt], nx, pf.x_cap, sc.s);
+            freeHandle(&p.x);
+            p.x = fx;
+            p.x_turn = nxt;
+        } else {
+            _ = mlx.mlx_array_free(p.x);
+            p.x = sc.out(nx);
+        } else {
+            _ = mlx.mlx_array_free(p.x);
+            p.x = sc.out(nx);
+        }
+        if (prof(m, L)) |pf| try pf.mark(.engram, &.{p.x});
     }
     if (m.tap != null and m.cfg.isDsparkTarget(li)) {
         const mean = try sc.mean(p.x, 1, false);
         try tapInput(m, li, .dspark_in, try sc.astype(mean, m.act));
     }
-    if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len) aheadEngram(m, p) catch {};
+    if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len and plan_api.session.mode != .dry) aheadEngram(m, p) catch {};
     const c = &m.cfg;
     if (p.st.ds.len > 0) for (c.dspark.targets[0..c.dspark.n_targets], 0..) |tl, t| if (tl == li) {
-        if (p.targets[t].ctx != null) _ = mlx.mlx_array_free(p.targets[t]);
-        p.targets[t] = sc.out(try sc.astype(try sc.mean(try sc.astype(p.x, .float32), 1, false), m.act));
-        try if (wait) mlx.check(mlx.mlx_array_eval(p.targets[t])) else ev.append(gpa, p.targets[t]);
+        if (p.targets[t].ctx != null) {
+            _ = mlx.mlx_array_free(p.targets[t]);
+            p.targets[t] = none;
+        }
+        const tgt = try sc.astype(try sc.mean(try sc.astype(p.x, .float32), 1, false), m.act);
+        if (m.activePassFixed()) |pf| if (L <= NARROW_ROWS and p.targets_fixed and pf.targets[t] != null) {
+            p.targets[t] = try store_mod.storeFixed(&pf.targets[t], tgt, pf.target_cap, sc.s);
+        } else {
+            p.targets[t] = sc.out(tgt);
+            try if (wait) mlx.check(mlx.mlx_array_eval(p.targets[t])) else ev.append(gpa, p.targets[t]);
+        } else {
+            p.targets[t] = sc.out(tgt);
+            try if (wait) mlx.check(mlx.mlx_array_eval(p.targets[t])) else ev.append(gpa, p.targets[t]);
+        }
     };
 }
 
@@ -5217,8 +5498,6 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
         p.tail = null;
     };
     const L = p.ids.len;
-    var sc = m.scope();
-    defer sc.deinit();
     if (prof(m, L)) |pf| {
         pf.restart();
         pf.decoder = if (m.ced_split) |split| li >= split else false;
@@ -5228,16 +5507,27 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     const wait = (m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX) and !piped;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
-    try layerInput(m, p, li, &sc, &ev, wait);
-    p.sh.img = p.img;
-    if (width_probe) |t| try t.put("x_in_{d}", .{li}, p.x);
-    const out = try block(&sc, m, p.st, li, p.x, p.cpre, p.p0, &p.sh, p.span, null, &.{});
-    _ = mlx.mlx_array_free(p.x);
-    _ = mlx.mlx_array_free(p.cpre);
-    p.x = out.x;
-    p.cpre = out.pre;
-    p.unresolved = p.sh.spec;
-    p.sh.spec = null;
+    {
+        var sc = m.scope();
+        defer sc.deinit();
+        try layerInput(m, p, li, &sc, &ev, wait);
+        p.sh.img = p.img;
+        if (width_probe) |t| try t.put("x_in_{d}", .{li}, p.x);
+        const out = try block(&sc, m, p.st, li, p.x, p.cpre, p.p0, &p.sh, p.span, null, &.{});
+        if (m.activePassFixed() != null and L <= NARROW_ROWS) {
+            try adoptFixedStream(m, &p.x_turn, &p.cpre_turn, &p.x, &p.cpre, out.x, out.pre, sc.s);
+            p.unresolved = p.sh.spec;
+            p.sh.spec = null;
+            if (p.unresolved) |*u| try adoptFixedUnresolved(m, &p.unres_turn, u, sc.s);
+        } else {
+            _ = mlx.mlx_array_free(p.x);
+            _ = mlx.mlx_array_free(p.cpre);
+            p.x = out.x;
+            p.cpre = out.pre;
+            p.unresolved = p.sh.spec;
+            p.sh.spec = null;
+        }
+    }
     if (p.unresolved) |u| try ev.append(gpa, u.idx);
     try ev.append(gpa, p.x);
     try ev.append(gpa, p.cpre);
@@ -5266,7 +5556,8 @@ fn preparePassHead(m: *Model, p: *Pass, want: Want) !A {
     // The head is queued before the host checks the last layer, so the GPU goes from that layer to the logits; a miss
     // there builds the head again from the exact stream.
     const queued = p.unresolved != null and prof(m, L) == null;
-    var res = if (queued) try queuedHead(m, p, want) else none;
+    var res = none;
+    res = if (queued) try queuedHead(m, p, want) else none;
     errdefer if (res.ctx != null) {
         _ = mlx.mlx_array_free(res);
     };
@@ -5290,7 +5581,13 @@ fn advancePass(m: *Model, p: *Pass) !void {
         if (p.st.verify) |*v| {
             // Read only by `finishVerify`'s lazy commit, from targets the layers already evaluated.
             if (v.mh.ctx != null) _ = mlx.mlx_array_free(v.mh);
-            v.mh = msc.out(main_rows);
+            v.mh = none;
+            if (m.onEngine()) {
+                try store_mod.writeFixed(&p.st.verify_mh, main_rows, &.{ ci(cfg_mod.ring_slack), ci(c.dspark.n_targets * c.dim) }, msc.s);
+                v.mh = try store_mod.headRows(p.st.verify_mh.?, L, msc.s);
+            } else {
+                v.mh = msc.out(main_rows);
+            }
         } else try commitMain(&msc, m, p.st, main_rows, p.p0, if (L > exl3.kernels.DECODE_ROWS_MAX) .wait else .lazy);
     }
 }
@@ -5339,7 +5636,21 @@ fn headLogits(m: *Model, p: *const Pass, want: Want) !A {
     defer sc.deinit();
     const xs = if (want == .last) try sc.slice(p.x, 0, L - 1, L) else p.x;
     const ps = if (want == .last) try sc.slice(p.cpre, 0, L - 1, L) else p.cpre;
-    return sc.out(try projectHead(&sc, m, xs, ps));
+    const raw = sc.out(try projectHead(&sc, m, xs, ps));
+    const rows: usize = if (want == .last) 1 else L;
+    if (m.logits_fixed[0] != null and rows <= @as(usize, @intCast(m.logits_rows))) {
+        defer _ = mlx.mlx_array_free(raw);
+        const blocks: *[2]?A = if (m.bound) |r| &r.logits_fixed else &m.logits_fixed;
+        const turn_ptr: *u1 = if (m.bound) |r| &r.logits_turn else &m.logits_turn;
+        const turn = try store_mod.pickSolePair(blocks, turn_ptr, sc.s);
+        const out_blk = &blocks[turn];
+        try store_mod.writeFixed(out_blk, raw, &.{ m.logits_rows, @intCast(m.cfg.vocab) }, sc.s);
+        var view = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, out_blk.*.?, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(rows), @intCast(m.cfg.vocab) }, 2, &[_]c_int{ 1, 1 }, 2, sc.s));
+        return view;
+    }
+    return raw;
 }
 
 fn projectHead(sc: *Scope, m: *Model, xs: A, ps: A) !A {
@@ -5375,6 +5686,7 @@ pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision:
     defer transient_peak.end(if (st.verify != null) .verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len, null);
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
+    try adoptInitialPassFixed(m, &pass);
     pass.ahead = ahead;
     planCed(m, &pass, want);
     try prefetchEngram(m, &pass);
@@ -5409,9 +5721,11 @@ pub fn extendRows(m: *Model, segs: []const Seg) !A {
     defer gpa.free(passes);
     var begun: usize = 0;
     defer for (passes[0..begun]) |*p| p.deinit(gpa);
-    for (segs, passes) |sg, *p| {
+    for (segs, passes, 0..) |sg, *p, i| {
         const st = &sg.request.state.?;
         p.* = try beginPassWith(m, st, sg.ids, st.n, SPAN, null);
+        p.sh.slot = @intCast(i);
+        p.targets_fixed = false;
         begun += 1;
     }
     var joined = try Shared.init(gpa, 1);
@@ -5482,6 +5796,21 @@ fn captureJoinedTargets(sc: *Scope, m: *const Model, ps: []Pass, segs: []const A
     };
     if (!any) return;
     const mean_all = try sc.astype(try sc.mean(try sc.astype(x, .float32), 1, false), m.act);
+    if (m.activePassFixed()) |pf| if (dim(mean_all, 0) <= NARROW_ROWS and pf.targets[ti] != null) {
+        // Free prior per-pass views first so `pf.targets[ti]` keeps refcount 1 during `storeFixed` (including arm1 rollback),
+        // keeping all returned slices external instead of exporting `mean_all` out of `arm0`/`retry_f`.
+        for (ps) |*p| if (p.targets[ti].ctx != null) {
+            _ = mlx.mlx_array_free(p.targets[ti]);
+            p.targets[ti] = none;
+        };
+        const fixed_all = try store_mod.storeFixed(&pf.targets[ti], mean_all, pf.target_cap, sc.s);
+        defer _ = mlx.mlx_array_free(fixed_all);
+        for (ps, segs) |*p, sg| if (p.st.ds.len > 0) {
+            p.targets[ti] = sc.out(try sc.slice(fixed_all, 0, sg.row, sg.row + sg.rows));
+            if (!mlx.engine.isStream(m.s)) try ev.append(m.gpa, p.targets[ti]);
+        };
+        return;
+    };
     for (ps, segs) |*p, sg| if (p.st.ds.len > 0) {
         if (p.targets[ti].ctx != null) _ = mlx.mlx_array_free(p.targets[ti]);
         p.targets[ti] = sc.out(try sc.slice(mean_all, 0, sg.row, sg.row + sg.rows));
@@ -5496,6 +5825,9 @@ const JoinedRows = struct {
     pre: A = none,
     unresolved: ?Unresolved = null,
     rollbacks: usize = 0,
+    x_turn: u1 = 0,
+    cpre_turn: u1 = 0,
+    unres_turn: u1 = 0,
     engram_pf: ?*engram.Prefetch = null,
     engram_rows: [cfg_mod.max_engram]A = @splat(none),
 
@@ -5588,10 +5920,12 @@ fn joinedEngram(sc: *Scope, m: *Model, ps: []const Pass, rows: *JoinedRows, li: 
         defer m.engram_wait_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
         const rt = readStart();
         defer readDone(.engram, rt);
-        rows.engram_rows[ei] = if (rows.engram_pf) |pf| blk: {
+        const raw_eng = if (plan_api.session.mode == .dry)
+            try e.table.dequantDryAs(sc.a, total_tokens * cols, m.act, m.s)
+        else if (rows.engram_pf) |pf| blk: {
             const raw = try pf.take(0, ei, 0);
             defer raw.deinit(m.gpa);
-            break :blk sc.out(try sc.keep(try e.table.dequantAs(raw, total_tokens * cols, m.act, m.s)));
+            break :blk try e.table.dequantAs(raw, total_tokens * cols, m.act, m.s);
         } else blk: {
             const ids = try sc.a.alloc(u32, total_tokens * cols);
             defer sc.a.free(ids);
@@ -5605,19 +5939,27 @@ fn joinedEngram(sc: *Scope, m: *Model, ps: []const Pass, rows: *JoinedRows, li: 
             }
             if (try e.table.tryReadCached(sc.a, ids)) |raw| {
                 defer raw.deinit(sc.a);
-                break :blk sc.out(try sc.keep(try e.table.dequantAs(raw, ids.len, m.act, m.s)));
+                break :blk try e.table.dequantAs(raw, ids.len, m.act, m.s);
             }
             // Hand off the open GPU pass before reading Engram table rows from SSD so GPU work overlaps disk I/O.
             if (mlx.engine.isStream(m.s)) try mlx.engine.submit();
-            break :blk sc.out(try sc.keep(try e.table.gatherAs(sc.a, ids, m.act, m.s)));
+            break :blk try e.table.gatherAs(sc.a, ids, m.act, m.s);
         };
+        if (m.pass_fixed) |pf| if (total_tokens <= NARROW_ROWS and pf.engram_rows[ei] != null) {
+            defer _ = mlx.mlx_array_free(raw_eng);
+            rows.engram_rows[ei] = try store_mod.storeFixed(&pf.engram_rows[ei], raw_eng, pf.engram_cap, m.s);
+        } else {
+            rows.engram_rows[ei] = sc.out(try sc.keep(raw_eng));
+        } else {
+            rows.engram_rows[ei] = sc.out(try sc.keep(raw_eng));
+        }
     }
     return try engramApply(sc, m, e, x, rows.engram_rows[ei]);
 }
 
 /// Whether layer `li` of a joined forward queues its routed chain speculatively from the stream's cache map.
 fn specOnRows(m: *const Model, total_rows: usize, rollbacks: usize, li: usize) bool {
-    if (!m.route_spec or m.sync_layers or total_rows > exl3.kernels.DECODE_ROWS_MAX or rollbacks >= m.route_spec_rebuilds + li / 3) return false;
+    if (!m.route_spec or m.sync_layers or total_rows > exl3.kernels.DECODE_ROWS_MAX or specCapReached(rollbacks, m.route_spec_rebuilds, li)) return false;
     if (m.trace != null or m.profile != null or m.tap != null) return false;
     const hk = switch (m.experts) {
         .resident => return false,
@@ -5635,6 +5977,15 @@ fn settleLastRows(m: *Model, rows: *JoinedRows) !bool {
     settle_site = .settle_last;
     defer settle_site = .settle;
     const exact = try settleRecord(m, &u) orelse return false;
+    if (m.pass_fixed) |pf| {
+        const nxt = rows.x_turn ^ 1;
+        const fx = try store_mod.storeFixed(&pf.x[nxt], exact, pf.x_cap, stateStream(m));
+        freeHandle(&rows.x);
+        _ = mlx.mlx_array_free(exact);
+        rows.x = fx;
+        rows.x_turn = nxt;
+        return true;
+    }
     if (rows.x.ctx != null) _ = mlx.mlx_array_free(rows.x);
     rows.x = exact;
     return true;
@@ -5643,32 +5994,45 @@ fn settleLastRows(m: *Model, rows: *JoinedRows) !bool {
 /// Layer `li` of a joined forward with overlapped route speculation (`passLayer` over all joined requests): submits
 /// layer `li` before settling layer `li - 1`'s streamed cache map, rolling back every pass's layer-`li` state on miss.
 fn passLayerRows(m: *Model, ps: []Pass, joined: *Shared, li: usize, rows: *JoinedRows, total_rows: usize) !void {
-    const on = specOnRows(m, total_rows, rows.rollbacks, li);
+    var on = specOnRows(m, total_rows, rows.rollbacks, li);
     if (rows.unresolved != null and !on) _ = try settleLastRows(m, rows);
     var prior = rows.unresolved;
     rows.unresolved = null;
     defer if (prior) |*u| u.deinit();
     var undos: [16]Undo = undefined;
-    const n_undo: usize = if (prior != null) ps.len else 0;
-    if (prior != null) {
-        for (ps, undos[0..n_undo]) |*p, *u| u.* = Undo.take(p.st, li, p.ids.len);
-    }
+    var n_undo: usize = 0;
     defer for (undos[0..n_undo]) |*u| u.deinit();
+    if (prior != null) {
+        for (ps) |*p| {
+            undos[n_undo] = try Undo.take(&m.cfg, p.st, li, p.ids.len, m.s);
+            n_undo += 1;
+        }
+    }
     joined.spec_on = on;
     try buildLayerRows(m, ps, joined, li, rows);
     if (prior == null) return;
     const u = &prior.?;
-    const exact = try settleRecord(m, u) orelse return;
+    const exact = try settleRecord(m, u);
+    if (exact == null) return;
     if (rows.unresolved) |*next| next.deinit();
     rows.unresolved = null;
-    for (undos[0..n_undo]) |*un| un.restore();
+    for (undos[0..n_undo]) |*un| try un.restore();
     for (ps) |*p| p.sh.clearUnpackedAll();
     rows.deinitArrays();
-    rows.x = exact;
-    rows.pre = handle(u.pre);
+    if (m.pass_fixed != null and total_rows <= NARROW_ROWS) {
+        try adoptFixedStream(m, &rows.x_turn, &rows.cpre_turn, &rows.x, &rows.pre, exact.?, handle(u.pre), stateStream(m));
+    } else {
+        rows.x = exact.?;
+        rows.pre = handle(u.pre);
+    }
+    // Release the prior layer's unresolved views before rebuilding `li` so both `pf.unres` slots stay sole.
+    u.deinit();
+    prior = null;
     rows.rollbacks += 1;
     try submit(rows.x);
-    return passLayerRows(m, ps, joined, li, rows, total_rows);
+    on = specOnRows(m, total_rows, rows.rollbacks, li);
+    joined.spec_on = on;
+    try buildLayerRows(m, ps, joined, li, rows);
 }
 
 /// Layer `li` of a joined forward: each request's own input, then one block over all rows.
@@ -5713,11 +6077,18 @@ fn buildLayerRows(m: *Model, ps: []Pass, joined: *Shared, li: usize, rows: *Join
         try captureJoinedTargets(&sc, m, ps, segs, li, x, &ev);
     }
     const out = try block(&sc, m, ps[0].st, li, x, pre, 0, joined, SPAN, null, segs);
-    rows.deinitArrays();
-    rows.x = out.x;
-    rows.pre = out.pre;
-    rows.unresolved = joined.spec;
-    joined.spec = null;
+    if (m.pass_fixed != null and dim(out.x, 0) <= NARROW_ROWS) {
+        try adoptFixedStream(m, &rows.x_turn, &rows.cpre_turn, &rows.x, &rows.pre, out.x, out.pre, sc.s);
+        rows.unresolved = joined.spec;
+        joined.spec = null;
+        if (rows.unresolved) |*u| try adoptFixedUnresolved(m, &rows.unres_turn, u, sc.s);
+    } else {
+        rows.deinitArrays();
+        rows.x = out.x;
+        rows.pre = out.pre;
+        rows.unresolved = joined.spec;
+        joined.spec = null;
+    }
     if (rows.unresolved) |u| try ev.append(gpa, u.idx);
     if (li > 0 and (li & 3) != 3 and mlx.engine.isStream(m.s) and residentLayer(m, li) and rows.unresolved == null) return;
     try ev.append(gpa, rows.x);
@@ -5904,13 +6275,16 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     defer transient_peak.end(.prefill_chunk, ids.len, null);
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
+    try adoptInitialPassFixed(m, &pass);
     pass.ahead = ahead;
     try prefetchEngram(m, &pass);
     for (0..split) |li| try passLayer(m, &pass, li);
     _ = try settleLast(m, &pass);
-    var sc = m.scope();
-    defer sc.deinit();
-    try cedCompress(&sc, m, &pass, split);
+    {
+        var sc = m.scope();
+        defer sc.deinit();
+        try cedCompress(&sc, m, &pass, split);
+    }
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(m.gpa);
     try appendStateArrays(m.gpa, &ev, &st.layers[split]);
@@ -5945,17 +6319,26 @@ fn cedCompress(sc: *Scope, m: *Model, p: *Pass, li: usize) !void {
 fn cedReplay(m: *Model, p: *Pass, li: usize, t: usize) !void {
     const gpa = m.gpa;
     const L = p.ids.len;
-    var sc = m.scope();
-    defer sc.deinit();
-    try cedCompress(&sc, m, p, li);
-    const x = sc.out(try sc.slice(p.x, 0, L - t, L));
-    errdefer _ = mlx.mlx_array_free(x);
-    const pre = sc.out(try sc.slice(p.cpre, 0, L - t, L));
-    errdefer _ = mlx.mlx_array_free(pre);
-    const img = if (p.img.ctx != null) sc.out(try sc.slice(p.img, 0, L - t, L)) else none;
+    var x = none;
+    errdefer if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    var pre = none;
+    errdefer if (pre.ctx != null) {
+        _ = mlx.mlx_array_free(pre);
+    };
+    var img = none;
     errdefer if (img.ctx != null) {
         _ = mlx.mlx_array_free(img);
     };
+    {
+        var sc = m.scope();
+        defer sc.deinit();
+        try cedCompress(&sc, m, p, li);
+        x = sc.out(try sc.slice(p.x, 0, L - t, L));
+        pre = sc.out(try sc.slice(p.cpre, 0, L - t, L));
+        if (p.img.ctx != null) img = sc.out(try sc.slice(p.img, 0, L - t, L));
+    }
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.appendSlice(gpa, &.{ x, pre });
@@ -6046,7 +6429,13 @@ fn commitMainJoined(sc: *Scope, m: *Model, passes: []Pass) !bool {
         const main_rows = try sc.concat(p.targets[0..c.dspark.n_targets], -1);
         if (p.st.verify) |*v| {
             if (v.mh.ctx != null) _ = mlx.mlx_array_free(v.mh);
-            v.mh = sc.out(main_rows);
+            v.mh = none;
+            if (m.onEngine()) {
+                try store_mod.writeFixed(&p.st.verify_mh, main_rows, &.{ ci(cfg_mod.ring_slack), ci(c.dspark.n_targets * c.dim) }, sc.s);
+                v.mh = try store_mod.headRows(p.st.verify_mh.?, p.ids.len, sc.s);
+            } else {
+                v.mh = sc.out(main_rows);
+            }
         } else {
             parts[pi] = main_rows;
             pi += 1;
@@ -6138,10 +6527,10 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, B: u32, meter: ?*@import("
     const with_heads = heads_wanted == .full;
     const c = &m.cfg;
     const st = try ensureState(m);
+    const n = st.n;
     const ds = &(m.dspark orelse return error.Dsv41NoDspark);
     var sc = m.scope();
     defer sc.deinit();
-    const n = st.n;
     const hc = c.hc_mult;
     var in: [cfg_mod.max_block]i32 = undefined;
     for (in[0..B], 0..) |*v, k| v.* = @intCast(if (k == 0) t1 else c.dspark.noise_id);
@@ -6200,11 +6589,11 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, B: u32, meter: ?*@import("
     errdefer out.deinit();
     out.ids = try gpa.alloc(u32, B + 1);
     out.ids[0] = t1;
-    for (try sc_mod.hostI32(all), out.ids[1..]) |v, *o| o.* = @intCast(v);
+    for (try sc_mod.hostResultI32(all, @intCast(c.vocab)), out.ids[1..]) |v, *o| o.* = @intCast(v);
     out.logits = try gpa.alloc(f32, if (with_heads) B * c.vocab else 0);
     out.conf = try gpa.alloc(f32, if (with_conf) B else 0);
-    if (with_heads) @memcpy(out.logits, try sc_mod.hostF32(heads));
-    if (with_conf) @memcpy(out.conf, try sc_mod.hostF32(conf));
+    if (with_heads) @memcpy(out.logits, try sc_mod.hostResultF32(heads));
+    if (with_conf) @memcpy(out.conf, try sc_mod.hostResultF32(conf));
     return out;
 }
 
@@ -6326,9 +6715,9 @@ pub fn draftBatch(
     const all_c = if (with_conf) try sc.reshape(try sc.concat(confs_all[0..total_b], 0), &.{ci(total_b)}) else all_p;
     try evalAll(&.{ all_p, all_h, all_c });
 
-    const p_host = try sc_mod.hostI32(all_p);
-    const h_host = if (with_heads) try sc_mod.hostF32(all_h) else &[_]f32{};
-    const c_host = if (with_conf) try sc_mod.hostF32(all_c) else &[_]f32{};
+    const p_host = try sc_mod.hostResultI32(all_p, @intCast(c.vocab));
+    const h_host = if (with_heads) try sc_mod.hostResultF32(all_h) else &[_]f32{};
+    const c_host = if (with_conf) try sc_mod.hostResultF32(all_c) else &[_]f32{};
 
     var filled: usize = 0;
     errdefer for (out_drafts[0..filled]) |*d| d.deinit();
@@ -6417,8 +6806,23 @@ pub fn finishVerifyJoined(m: *Model, reqs: []const *Request, accepteds: []const 
                     const tail: [2]mlx.mlx_array = if (hi > lo) .{ try sc.slice(v.pend_kv[li], 0, lo, hi), try sc.slice(v.pend_gate[li], 0, lo, hi) } else .{ none, none };
                     if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
                     if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
-                    ls.pend_kv = if (hi > lo) sc.out(tail[0]) else none;
-                    ls.pend_gate = if (hi > lo) sc.out(tail[1]) else none;
+                    ls.pend_kv = none;
+                    ls.pend_gate = none;
+                    if (hi > lo) {
+                        if (m.onEngine()) {
+                            try store_mod.writeFixed(&ls.pend_kv_buf, tail[0], &.{ ci(r - 1), ci(c.head_dim) }, sc.s);
+                            try store_mod.writeFixed(&ls.pend_gate_buf, tail[1], &.{ ci(r - 1), ci(c.head_dim) }, sc.s);
+                            ls.pend_kv = try store_mod.headRows(ls.pend_kv_buf.?, hi - lo, sc.s);
+                            ls.pend_gate = store_mod.headRows(ls.pend_gate_buf.?, hi - lo, sc.s) catch |e| {
+                                _ = mlx.mlx_array_free(ls.pend_kv);
+                                ls.pend_kv = none;
+                                return e;
+                            };
+                        } else {
+                            ls.pend_kv = sc.out(tail[0]);
+                            ls.pend_gate = sc.out(tail[1]);
+                        }
+                    }
                 }
             }
             st.n = end;
@@ -6576,13 +6980,27 @@ pub fn finishVerify(m: *Model, accepted: usize) !void {
                 const first = v.n0 - v.n0 % r; // the position of row 0 of the saved open group
                 const lo = end - end % r - first;
                 const hi = end - first;
-                // Slices of the round's evaluated rows, left lazy: the next pass's layer evaluation takes them as inputs.
-                // Both are made before the old pair goes, so a failed slice leaves the layer its old pair, not freed handles.
+                // Slices of the round's evaluated rows, left lazy on MLX or landed into fixed blocks on Cooler.
                 const tail: [2]mlx.mlx_array = if (hi > lo) .{ try sc.slice(v.pend_kv[li], 0, lo, hi), try sc.slice(v.pend_gate[li], 0, lo, hi) } else .{ none, none };
                 if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
                 if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
-                ls.pend_kv = if (hi > lo) sc.out(tail[0]) else none;
-                ls.pend_gate = if (hi > lo) sc.out(tail[1]) else none;
+                ls.pend_kv = none;
+                ls.pend_gate = none;
+                if (hi > lo) {
+                    if (m.onEngine()) {
+                        try store_mod.writeFixed(&ls.pend_kv_buf, tail[0], &.{ ci(r - 1), ci(m.cfg.head_dim) }, sc.s);
+                        try store_mod.writeFixed(&ls.pend_gate_buf, tail[1], &.{ ci(r - 1), ci(m.cfg.head_dim) }, sc.s);
+                        ls.pend_kv = try store_mod.headRows(ls.pend_kv_buf.?, hi - lo, sc.s);
+                        ls.pend_gate = store_mod.headRows(ls.pend_gate_buf.?, hi - lo, sc.s) catch |e| {
+                            _ = mlx.mlx_array_free(ls.pend_kv);
+                            ls.pend_kv = none;
+                            return e;
+                        };
+                    } else {
+                        ls.pend_kv = sc.out(tail[0]);
+                        ls.pend_gate = sc.out(tail[1]);
+                    }
+                }
             }
         }
         st.n = end;

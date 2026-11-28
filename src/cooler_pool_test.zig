@@ -1181,6 +1181,7 @@ test "cooler contract: a DeepSeek prefill that releases decoder pools keeps them
     var ld: Load = undefined;
     try ld.openLight(D, dir, true);
     defer _ = ld.close();
+    try contract.requirePoolCap(&ld.config);
     if ((arch_sched.rowCap(&ld.config) orelse 1) < 2) return error.SkipZigTest;
     const borrow = @import("dsv41/dsv41_borrow.zig");
     const xfm = arch_handle.trunk(ld.h);
@@ -1225,7 +1226,18 @@ test "cooler contract: a DeepSeek decoder pool left released with no lessee, on 
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    for ([_]bool{ true, false }) |cooler| try lentHeldOff(dir, cooler);
+    var ran = false;
+    for ([_]bool{ true, false }) |cooler| {
+        {
+            var cfg = try contract.prepareConfig(D, dir, cooler);
+            const on_ledger = @import("bills.zig").ledgerArch(&cfg);
+            cfg.deinit(testing.allocator);
+            if (on_ledger) continue;
+        }
+        try lentHeldOff(dir, cooler);
+        ran = true;
+    }
+    if (!ran) return error.SkipZigTest;
 }
 
 fn lentHeldOff(dir: []const u8, cooler: bool) !void {
@@ -1473,7 +1485,18 @@ test "cooler contract: every exit of a DeepSeek pool's release, read-back and he
     defer mlx.engine.fault.disarm();
     defer mlx.fault.disarm();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    for ([_]bool{ true, false }) |cooler| try lentSweep(dir, cooler);
+    var ran = false;
+    for ([_]bool{ true, false }) |cooler| {
+        {
+            var cfg = try contract.prepareConfig(D, dir, cooler);
+            const on_ledger = @import("bills.zig").ledgerArch(&cfg);
+            cfg.deinit(testing.allocator);
+            if (on_ledger) continue;
+        }
+        try lentSweep(dir, cooler);
+        ran = true;
+    }
+    if (!ran) return error.SkipZigTest;
 }
 
 fn lentSweep(dir: []const u8, cooler: bool) !void {
@@ -1531,7 +1554,18 @@ test "cooler contract: a DeepSeek read-back holds the union workspace beside the
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    for ([_]bool{ true, false }) |cooler| try readBackHoldsUnion(dir, cooler);
+    var ran = false;
+    for ([_]bool{ true, false }) |cooler| {
+        {
+            var cfg = try contract.prepareConfig(D, dir, cooler);
+            const on_ledger = @import("bills.zig").ledgerArch(&cfg);
+            cfg.deinit(testing.allocator);
+            if (on_ledger) continue;
+        }
+        try readBackHoldsUnion(dir, cooler);
+        ran = true;
+    }
+    if (!ran) return error.SkipZigTest;
 }
 
 fn readBackHoldsUnion(dir: []const u8, cooler: bool) !void {
@@ -1569,11 +1603,22 @@ test "cooler contract: a second DeepSeek model's own lessee reading counts only 
     const dir2 = std.mem.span(std.c.getenv("DSV41_STQ_TINY_PM") orelse return error.SkipZigTest);
     // Each engine is read whatever the other said.
     var failed: ?anyerror = null;
-    for ([_]bool{ true, false }) |cooler| twoLessees(dir, dir2, cooler) catch |e| {
-        if (e == error.SkipZigTest) return e;
-        failed = failed orelse e;
-    };
+    var ran = false;
+    for ([_]bool{ true, false }) |cooler| {
+        {
+            var cfg = try contract.prepareConfig(D, dir, cooler);
+            const on_ledger = @import("bills.zig").ledgerArch(&cfg);
+            cfg.deinit(testing.allocator);
+            if (on_ledger) continue;
+        }
+        ran = true;
+        twoLessees(dir, dir2, cooler) catch |e| {
+            if (e == error.SkipZigTest) return e;
+            failed = failed orelse e;
+        };
+    }
     if (failed) |e| return e;
+    if (!ran) return error.SkipZigTest;
 }
 
 fn twoLessees(dir: []const u8, dir2: []const u8, cooler: bool) !void {
@@ -1654,6 +1699,7 @@ test "cooler contract: a DeepSeek decode whose read-back of a released pool is r
     var ld: Load = undefined;
     try ld.openLight(D, dir, true);
     defer _ = ld.close();
+    try contract.requirePoolCap(&ld.config);
     const borrow = @import("dsv41/dsv41_borrow.zig");
     const xfm = arch_handle.trunk(ld.h);
     const engine = xfm.expert_stream.?;
@@ -1774,6 +1820,7 @@ test "cooler contract: a DeepSeek layer left released with no union workspace is
     var ld: Load = undefined;
     try ld.openLight(D, dir, true);
     defer _ = ld.close();
+    try contract.requirePoolCap(&ld.config);
     const borrow = @import("dsv41/dsv41_borrow.zig");
     const engine = arch_handle.trunk(ld.h).expert_stream.?;
     var sv: Served = undefined;
@@ -1849,6 +1896,7 @@ test "cooler contract: a DeepSeek decode forward reads back every pool its prefi
     var ld: Load = undefined;
     try ld.openLight(D, dir, true);
     defer _ = ld.close();
+    try contract.requirePoolCap(&ld.config);
     const borrow = @import("dsv41/dsv41_borrow.zig");
     const pool_class = @import("tensor/pool_class.zig");
     const xfm = arch_handle.trunk(ld.h);
@@ -1909,6 +1957,7 @@ test "cooler contract: a DeepSeek request admitted while an earlier borrower's p
     var lease: LentLease = undefined;
     try lease.open(dir, true);
     defer lease.close();
+    try contract.requirePoolCap(&lease.ld.config);
     const engine = lease.engine;
     const config = &lease.ld.config;
     const m = @import("dsv41/dsv41_state.zig").modelOf(arch_handle.trunk(lease.ld.h)).?;
@@ -2003,6 +2052,7 @@ test "cooler contract: a DeepSeek prefill's chunk width holds where it held befo
     var lease: LentLease = undefined;
     try lease.open(dir, true);
     defer lease.close();
+    try contract.requirePoolCap(&lease.ld.config);
     const engine = lease.engine;
     const config = &lease.ld.config;
     // The working set is the ceiling the width reads, whatever wired limit the box declares.
@@ -2202,9 +2252,9 @@ test "cooler contract: a DeepSeek request restored from a point makes its stores
             const end: usize = 1300 + 64;
             const made = try D.restoredPeak(a, ld.xfm, prompt, 1200, end);
             const reserved = ld.config.dsv41.?.stateReservedBytes(true, end);
-            errdefer std.debug.print("cooler contract: the restore and the bind took {d} B of the pool at their fullest, the stores at the request's last row are {d} B\n", .{ made, reserved });
+            errdefer std.debug.print("cooler contract: the restore and the bind took {d} B of the pool at their fullest, the stores at the request's last row are {d} B and the fixed rings {d} B\n", .{ made.made, reserved, made.rings });
             // Each store is made once, at its last row: no copy of the restored rows waits beside it.
-            try testing.expectEqual(reserved, made);
+            try testing.expectEqual(reserved + made.rings, made.made);
         }
     }.run);
 }
@@ -2258,6 +2308,7 @@ test "cooler contract: a DeepSeek prefill holds no more than the needed and the 
             var ld: Load = undefined;
             try ld.openLight(D, dir, true);
             defer _ = ld.close();
+            try contract.requirePoolCap(&ld.config);
             // Wide enough that the prefill's cap, not the decode forward's, is the term the bill nets the lendable from.
             const rows: usize = 8192;
             const prompt = try a.alloc(u32, rows);

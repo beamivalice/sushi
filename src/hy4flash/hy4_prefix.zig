@@ -768,7 +768,7 @@ test "hy4 prefix: the held bytes count each store once, two stores a dry recordi
     defer @import("../test_support.zig").restoreEngine(was);
     const scope = mlx.engine.enter(mlx.engine.stream());
     defer scope.end();
-    var rec = try plan.Recorder.begin(std.testing.allocator, .{ .site = 1 });
+    var rec = plan.Recorder.begin(std.testing.allocator);
     defer rec.deinit();
     var driver: plan.Driver = .{ .gpa = std.testing.allocator };
     defer driver.deinit();

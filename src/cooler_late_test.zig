@@ -310,6 +310,24 @@ fn lendingPrefill(ld: *Load, dir: []const u8, ids: []const u32) !?struct { relea
     const xfm = arch_handle.trunk(ld.h);
     const engine = xfm.expert_stream orelse return null;
     if (engine.borrow_from >= engine.layers.len) return null;
+    if (@import("bills.zig").ledgerArch(&ld.config)) {
+        var aliased: usize = 0;
+        for (engine.borrow_from..engine.layers.len) |li| aliased += @intFromBool(engine.layers[li].aliased);
+        // Static-bill loads alias the decoder pools on every wide chunk (from chunk 1) and plan tiny fixtures to
+        // 2 * chunk + 128 (4224) tokens; two chunks plus the held-back span (4129 + 4 reply tokens) stays within reach.
+        const prompt = try testing.allocator.alloc(u32, 2 * 2048 + @import("prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1);
+        defer testing.allocator.free(prompt);
+        for (prompt, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+        var sv: Served = undefined;
+        try sv.init(ld, dir);
+        defer sv.deinit();
+        const late = mlx.engine.latePipelines();
+        mlx.engine.late_names.clear();
+        var from: u32 = 0;
+        var got = try sv.requestWith(prompt, 4, .{ .temperature = 0 }, false, &from);
+        got.deinit(testing.allocator);
+        return .{ .released = aliased, .late = mlx.engine.latePipelines() - late };
+    }
     const m = @import("dsv41/dsv41_state.zig").modelOf(xfm).?;
     ld.config.pinned_prefill_chunk = 2048;
     const need = borrow.prefillNeed(&m.cfg, @import("cooler_side.zig").onEngine(&ld.config), 2048, 4096);

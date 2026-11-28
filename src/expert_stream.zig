@@ -3,6 +3,7 @@ const test_note = @import("test_note.zig");
 const expert_stats = @import("expert_stats.zig");
 const fill_marks = @import("fill_marks.zig");
 const mlx = @import("mlx.zig");
+const core = @import("tensor/core.zig");
 const gpu_mem = @import("gpu_mem.zig");
 const log = @import("log.zig");
 const io_mod = @import("expert_io.zig");
@@ -1246,9 +1247,20 @@ const SlabOperand = struct {
 
     /// One flat axis of `elems` elements: a rate-grouped layer's trellis storage, pools back to back.
     fn createFlat(allocator: std.mem.Allocator, elems: usize, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
+        return createFlatWithSlab(allocator, elems, dtype, elem_bytes, s, null);
+    }
+
+    pub fn createFlatAliased(allocator: std.mem.Allocator, elems: usize, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream, backing: []align(io_mod.align_bytes) u8) !SlabOperand {
+        return createFlatWithSlab(allocator, elems, dtype, elem_bytes, s, backing);
+    }
+
+    fn createFlatWithSlab(allocator: std.mem.Allocator, elems: usize, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream, backing: ?[]align(io_mod.align_bytes) u8) !SlabOperand {
         if (elems == 0 or elems > std.math.maxInt(c_int) or elem_bytes == 0) return error.InvalidExpertGeometry;
         const stride = elems * elem_bytes;
-        const slab = try io_mod.PageSlab.create(allocator, stride);
+        const slab = if (backing) |buf| blk: {
+            if (buf.len < io_mod.pageRoundUp(stride)) return error.InvalidExpertGeometry;
+            break :blk try io_mod.PageSlab.createAliased(allocator, buf);
+        } else try io_mod.PageSlab.create(allocator, stride);
         errdefer slab.destroy();
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
@@ -1262,6 +1274,14 @@ const SlabOperand = struct {
     }
 
     fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
+        return createShapedWithSlab(allocator, count, inner, dtype, elem_bytes, s, null);
+    }
+
+    pub fn createShapedAliased(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream, backing: []align(io_mod.align_bytes) u8) !SlabOperand {
+        return createShapedWithSlab(allocator, count, inner, dtype, elem_bytes, s, backing);
+    }
+
+    fn createShapedWithSlab(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream, backing: ?[]align(io_mod.align_bytes) u8) !SlabOperand {
         if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
         var stride: usize = elem_bytes;
         var shape: [4]c_int = undefined;
@@ -1271,7 +1291,11 @@ const SlabOperand = struct {
             stride = try std.math.mul(usize, stride, @intCast(d));
             shape[j + 1] = d;
         }
-        const slab = try io_mod.PageSlab.create(allocator, stride * count);
+        const total = try std.math.mul(usize, stride, count);
+        const slab = if (backing) |buf| blk: {
+            if (buf.len < io_mod.pageRoundUp(total)) return error.InvalidExpertGeometry;
+            break :blk try io_mod.PageSlab.createAliased(allocator, buf);
+        } else try io_mod.PageSlab.create(allocator, total);
         errdefer slab.destroy();
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
@@ -1591,6 +1615,17 @@ const GroupedLayer = struct {
         self.caches_made = 0;
     }
 
+    fn resetCaches(self: *GroupedLayer) void {
+        for (self.caches[0..self.caches_made]) |*cache| {
+            cache.tick = 0;
+            @memset(cache.expert_to_slot, -1);
+            @memset(cache.slot_to_expert, std.math.maxInt(u16));
+            @memset(cache.ages, 0);
+            @memset(cache.ready, false);
+            @memset(cache.swap_starved, 0);
+        }
+    }
+
     fn deinitBanks(self: *GroupedLayer) void {
         self.cache_ragged.deinit();
         self.union_ragged.deinit();
@@ -1694,6 +1729,10 @@ const LayerState = struct {
     active: bool = false,
     /// Released for a prefill's working set (`Engine.borrowLayer`): no pool, every route reads into the union workspace.
     borrowed: bool = false,
+    /// True while this layer's pool slabs alias sub-slices of the shared static arena tail.
+    aliased: bool = false,
+    /// Sub-slices of the shared arena tail assigned to each component slab while `aliased` is true.
+    alias_slices: [][]align(io_mod.align_bytes) u8 = &.{},
     /// The experts the pool held when it was released (global ids), read back by `Engine.restoreLayer`, and the bytes the
     /// release gave back.
     saved: []u16 = &.{},
@@ -1711,6 +1750,9 @@ const LayerState = struct {
     spec_raw: mlx.mlx_array = .{ .ctx = null },
     /// f32 `[experts]` pick-score penalty of `spec_host` (`biasPenalty`); null context while the engine's bias is off.
     spec_pen: mlx.mlx_array = .{ .ctx = null },
+    /// True once pre-allocated on Cooler so subsequent updates overwrite in place (`hostWritable`) with zero allocs.
+    spec_fixed: bool = false,
+    spec_dirty: bool = false,
 
     /// Brings the host map and its GPU copy up to the cache. The pair only ever
     /// changes together: a failure leaves no GPU map and a host map that forces
@@ -1718,6 +1760,21 @@ const LayerState = struct {
     /// `cache_bias` > 0 also builds the map's pick-score penalty (`spec_pen`).
     fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator, s: mlx.mlx_stream, cache_bias: f32) !void {
         try self.refreshSpecHost(allocator);
+        if (self.spec_fixed and self.spec_slots.ctx != null) {
+            if (!self.spec_dirty) return;
+            const slots_dst = std.mem.bytesAsSlice(i32, @as([]align(4) u8, @alignCast(try mlx.engine.hostWritable(self.spec_slots))));
+            for (slots_dst, self.spec_host) |*dst, host| dst.* = @max(host, 0);
+            if (self.spec_raw.ctx != null) {
+                const raw_dst = std.mem.bytesAsSlice(i32, @as([]align(4) u8, @alignCast(try mlx.engine.hostWritable(self.spec_raw))));
+                @memcpy(raw_dst, self.spec_host);
+            }
+            if (cache_bias > 0 and self.spec_pen.ctx != null) {
+                const pen_dst = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(try mlx.engine.hostWritable(self.spec_pen))));
+                biasPenalty(self.spec_host, cache_bias, pen_dst);
+            }
+            self.spec_dirty = false;
+            return;
+        }
         if (self.spec_slots.ctx != null) return;
         const experts = self.spec_host.len;
         errdefer {
@@ -1759,6 +1816,8 @@ const LayerState = struct {
         self.spec_raw = raw;
         if (self.spec_pen.ctx != null) _ = mlx.mlx_array_free(self.spec_pen);
         self.spec_pen = pen;
+        // Freshly allocated `spec_slots`/`spec_raw`/`spec_pen` already match `spec_host`.
+        self.spec_dirty = false;
     }
 
     /// Brings the host map up to the cache; a GPU copy it no longer matches goes, for `refreshSpec` to make again.
@@ -1772,6 +1831,10 @@ const LayerState = struct {
         }
         const changed = if (self.grouped) |gl| refreshGroupedSpecMap(gl, self.spec_host) else refreshSpecMap(self.cache.expert_to_slot, self.cache.ready, self.spec_host);
         if (!changed) return;
+        if (self.spec_fixed) {
+            self.spec_dirty = true;
+            return;
+        }
         for ([_]*mlx.mlx_array{ &self.spec_slots, &self.spec_raw, &self.spec_pen }) |a| {
             if (a.ctx != null) _ = mlx.mlx_array_free(a.*);
             a.* = .{ .ctx = null };
@@ -1852,20 +1915,62 @@ fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, laye
 /// The nine slabs of a rate-grouped layer's cache (`slots` per group) or, with `slots` null, of the union workspace
 /// (`elems` trellis elements per projection): trellis flat per projection, `rows` scale rows. Scale widths and
 /// dtypes come from `layer`.
-fn createGroupedSlabs(allocator: std.mem.Allocator, layer: *const GroupedLayer, slots: ?[]const u32, rows: u32, s: mlx.mlx_stream, elems: ?[3]usize) ![]SlabOperand {
+fn groupedSlabBytes(layer: *const GroupedLayer, slots: ?[]const u32, rows: u32, elems: ?[3]usize, made: usize) usize {
+    const pi = made / 3;
+    const raw: usize = if (made % 3 == 0)
+        (if (slots) |per_group| layer.trellisElems(pi, per_group) else elems.?[pi]) * 2
+    else
+        @as(usize, rows) * @as(usize, @intCast(layer.pieceBytes(0, made)));
+    return io_mod.pageRoundUp(raw);
+}
+
+/// Page-rounded total backing bytes required to alias all rate-grouped cache slabs for `layer`.
+pub fn layerSlabBytes(layer: *const GroupedLayer) u64 {
+    const per_group = layer.slots[0..layer.groups.count];
+    var total: u64 = 0;
+    for (0..quant.component_count) |ci| total += groupedSlabBytes(layer, per_group, layer.cache_slots, null, ci);
+    return total;
+}
+
+fn createGroupedSlabsWith(
+    allocator: std.mem.Allocator,
+    layer: *const GroupedLayer,
+    slots: ?[]const u32,
+    rows: u32,
+    s: mlx.mlx_stream,
+    elems: ?[3]usize,
+    slices: ?[]const []align(io_mod.align_bytes) u8,
+) ![]SlabOperand {
     const n = quant.component_count;
+    if (slices) |sl| if (sl.len != n) return error.InvalidExpertGeometry;
     const slabs = try allocator.alloc(SlabOperand, n);
     errdefer allocator.free(slabs);
     var made: usize = 0;
     errdefer for (slabs[0..made]) |*operand| operand.destroy(allocator, s);
     while (made < n) : (made += 1) {
         const pi = made / 3;
+        const backing: ?[]align(io_mod.align_bytes) u8 = if (slices) |sl| sl[made] else null;
         slabs[made] = if (made % 3 == 0)
-            try SlabOperand.createFlat(allocator, if (slots) |per_group| layer.trellisElems(pi, per_group) else elems.?[pi], .uint16, 2, s)
+            try SlabOperand.createFlatWithSlab(allocator, if (slots) |per_group| layer.trellisElems(pi, per_group) else elems.?[pi], .uint16, 2, s, backing)
         else
-            try SlabOperand.createShaped(allocator, rows, &.{@intCast(layer.pieceBytes(0, made) / 2)}, .float16, 2, s);
+            try SlabOperand.createShapedWithSlab(allocator, rows, &.{@intCast(layer.pieceBytes(0, made) / 2)}, .float16, 2, s, backing);
     }
     return slabs;
+}
+
+fn createGroupedSlabs(allocator: std.mem.Allocator, layer: *const GroupedLayer, slots: ?[]const u32, rows: u32, s: mlx.mlx_stream, elems: ?[3]usize) ![]SlabOperand {
+    return createGroupedSlabsWith(allocator, layer, slots, rows, s, elems, null);
+}
+
+fn createGroupedSlabsAliased(
+    allocator: std.mem.Allocator,
+    layer: *const GroupedLayer,
+    slots: []const u32,
+    rows: u32,
+    s: mlx.mlx_stream,
+    slices: []const []align(io_mod.align_bytes) u8,
+) ![]SlabOperand {
+    return createGroupedSlabsWith(allocator, layer, slots, rows, s, null, slices);
 }
 
 fn presentSlabCount(slabs: []const SlabOperand) u64 {
@@ -2328,6 +2433,9 @@ pub const Engine = struct {
             for (layer.slabs) |*operand| operand.destroy(self.allocator, self.s);
             if (layer.slabs.len != 0) self.allocator.free(layer.slabs);
             layer.slabs = &.{};
+            if (layer.alias_slices.len != 0) self.allocator.free(layer.alias_slices);
+            layer.alias_slices = &.{};
+            layer.aliased = false;
             if (layer.saved.len != 0) self.allocator.free(layer.saved);
             layer.saved = &.{};
         }
@@ -2662,6 +2770,20 @@ pub const Engine = struct {
         return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &layer.grouped.?.cache_ragged };
     }
 
+    /// Pre-allocates and fixes every active layer's GPU cache map at load so planned decode executions overwrite it in
+    /// place (`hostWritable`) without touching the arena or pool.
+    pub fn fixSpecMaps(self: *Engine) !void {
+        if (!mlx.engine.isStream(self.s)) return;
+        const owned = mlx.engine.widePhase();
+        defer owned.end();
+        for (self.layers, 0..) |*layer, li| {
+            const target = self.groupedLayer(@intCast(li)) orelse self.routeLayer(@intCast(li)) orelse continue;
+            target.spec_fixed = true;
+            try target.refreshSpec(self.allocator, self.s, self.cache_bias);
+            _ = layer;
+        }
+    }
+
     /// The layer `specRoute` maps: an active layer of a quantized store, not rate-grouped, its slabs all there.
     fn routeLayer(self: *Engine, layer_index: u16) ?*LayerState {
         if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
@@ -2743,14 +2865,39 @@ pub const Engine = struct {
         const layer = &self.layers[layer_index];
         if (!layer.active) return error.ExpertLayerAbsent;
         if (layer.borrowed) return error.ExpertDryBorrowed;
-        if (workspace and (layer.grouped == null or self.grouped_union.len != layer.slabs.len)) return error.ExpertDryNoWorkspace;
         const remapped = try self.allocator.alloc(u16, occurrences.len);
         errdefer self.allocator.free(remapped);
         if (layer.grouped) |gl| {
+            if (workspace and self.grouped_union.len != layer.slabs.len) return error.ExpertDryNoWorkspace;
             for (occurrences, remapped) |expert, *d| d.* = @intCast(gl.slot_base[gl.groups.groupOf(expert)]);
             return .{ .allocator = self.allocator, .remapped = remapped, .quantized = true, .workspace = workspace, .ragged = if (workspace) &gl.union_ragged else &gl.cache_ragged };
         }
-        if (self.store.quantized != null or layer.slabs.len < 2) return error.ExpertDryUnsupported;
+        if (self.store.quantized != null) {
+            if (self.store.layout() == .bf16_individual) return error.ExpertDryUnsupported;
+            const n = self.store.componentCount();
+            if (workspace and self.union_slabs.len != n) return error.ExpertDryNoWorkspace;
+            const read_set = if (workspace) self.union_slabs else layer.slabs;
+            if (read_set.len < n or layer.slabs.len < n) return error.ExpertDryUnsupported;
+            @memset(remapped, 0);
+            var quant_raw: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
+            errdefer if (workspace) for (quant_raw) |arr| if (arr.ctx != null) {
+                _ = mlx.mlx_array_free(arr);
+            };
+            for (0..n) |ci| {
+                if (!read_set[ci].present) continue;
+                quant_raw[ci] = if (workspace) try read_set[ci].viewAs(layer.slabs[ci].array, self.s) else read_set[ci].array;
+            }
+            return .{
+                .allocator = self.allocator,
+                .remapped = remapped,
+                .quant_raw = quant_raw,
+                .quantized = true,
+                .owns_quant_views = workspace,
+                .workspace = workspace,
+            };
+        }
+        if (workspace) return error.ExpertDryNoWorkspace;
+        if (layer.slabs.len < 2) return error.ExpertDryUnsupported;
         @memset(remapped, 0);
         const gate_up = try layer.slabs[0].borrow();
         errdefer _ = mlx.mlx_array_free(gate_up);
@@ -3862,6 +4009,152 @@ pub const Engine = struct {
         try gl.buildCacheBank(self.s, layer.slabs);
         errdefer gl.cache_ragged.deinit();
         try gl.initCaches(self.allocator);
+    }
+
+    pub const AliasPlan = struct {
+        borrow_from: u16,
+        layer_count: u16,
+        total_bytes: u64,
+    };
+
+    /// Computes how many active rate-grouped layers from `borrow_from` upward fit within `budget` (or all if null).
+    pub fn aliasPlan(self: *const Engine, borrow_from: u16, budget: ?u64) AliasPlan {
+        var total: u64 = 0;
+        var count: u16 = 0;
+        for (self.layers, 0..) |*layer, li| {
+            if (li < borrow_from or !layer.active) continue;
+            const gl = layer.grouped orelse continue;
+            const need = layerSlabBytes(gl);
+            if (budget) |cap| if (total + need > cap) break;
+            total += need;
+            count += 1;
+        }
+        return .{ .borrow_from = borrow_from, .layer_count = count, .total_bytes = total };
+    }
+
+    /// Replaces pool slabs for active grouped layers `[borrow_from..)` that fit in `tail` with aliases over `tail`,
+    /// preserving any already-warm slab contents and caches while keeping Metal wrappers fixed for zero-churn leasing.
+    pub fn installAliasedLayers(self: *Engine, borrow_from: u16, tail: []align(io_mod.align_bytes) u8) !usize {
+        try self.ensureUnion();
+        self.drainPendingReaders();
+        _ = mlx.mlx_synchronize(self.s);
+        var offset: usize = 0;
+        var installed: usize = 0;
+        for (self.layers, 0..) |*layer, li| {
+            if (li < borrow_from or !layer.active or layer.borrowed or layer.aliased) continue;
+            const gl = layer.grouped orelse continue;
+            const need: usize = @intCast(layerSlabBytes(gl));
+            if (offset + need > tail.len) break;
+            self.prefetchWait(@intCast(li));
+
+            const slices = try self.allocator.alloc([]align(io_mod.align_bytes) u8, quant.component_count);
+            errdefer self.allocator.free(slices);
+            var cursor = offset;
+            const per_group = gl.slots[0..gl.groups.count];
+            for (slices, 0..) |*dst_slice, ci| {
+                const sz = groupedSlabBytes(gl, per_group, gl.cache_slots, null, ci);
+                dst_slice.* = @alignCast(tail[cursor..][0..sz]);
+                cursor += sz;
+            }
+            const new_slabs = try createGroupedSlabsAliased(self.allocator, gl, per_group, gl.cache_slots, self.s, slices);
+            errdefer {
+                for (new_slabs) |*operand| operand.destroy(self.allocator, self.s);
+                self.allocator.free(new_slabs);
+            }
+            if (layer.slabs.len == quant.component_count) {
+                for (layer.slabs, new_slabs) |old, new| {
+                    if (!old.present or !new.present) continue;
+                    const ob = (old.slab orelse continue).bytes;
+                    const nb = (new.slab orelse continue).bytes;
+                    const copy_len = @min(ob.len, nb.len);
+                    @memcpy(nb[0..copy_len], ob[0..copy_len]);
+                }
+            }
+            gl.cache_ragged.deinit();
+            for (layer.slabs) |*operand| operand.destroy(self.allocator, self.s);
+            if (layer.slabs.len != 0) self.allocator.free(layer.slabs);
+            layer.slabs = new_slabs;
+            layer.alias_slices = slices;
+            layer.aliased = true;
+            try gl.buildCacheBank(self.s, layer.slabs);
+            offset = cursor;
+            installed += 1;
+        }
+        return installed;
+    }
+
+    /// Saves cached experts, clears aliased group caches in CPU memory without freeing Metal buffers, marks them
+    /// borrowed (routing wide calls to `grouped_union`), and hands the arena tail lease to the GPU.
+    pub fn acquireAliasLease(self: *Engine) !void {
+        if (core.arenaLeaseHeld()) return;
+        self.drainPendingReaders();
+        _ = mlx.mlx_synchronize(self.s);
+        for (self.layers, 0..) |*layer, li| {
+            if (!layer.aliased or !layer.active or layer.borrowed) continue;
+            const gl = layer.grouped orelse continue;
+            self.prefetchWait(@intCast(li));
+            var saved: std.ArrayList(u16) = .empty;
+            errdefer saved.deinit(self.allocator);
+            for (gl.caches[0..gl.caches_made], 0..) |*cache, g| {
+                for (cache.slot_to_expert, cache.ready) |expert, ready| {
+                    if (ready and expert != std.math.maxInt(u16))
+                        try saved.append(self.allocator, @intCast(gl.groups.base[g] + expert));
+                }
+            }
+            if (layer.saved.len != 0) self.allocator.free(layer.saved);
+            layer.saved = try saved.toOwnedSlice(self.allocator);
+            gl.resetCaches();
+            layer.borrowed = true;
+            layer.spec_dirty = true;
+        }
+        try core.arenaTakeLease();
+    }
+
+    /// Waits for GPU passes touching the arena tail, returns the tail lease, and refills aliased layers in-place
+    /// via `prepareHost` without Metal buffer allocations (safe under `closePool(.refuse)`).
+    pub fn releaseAliasLease(self: *Engine) !void {
+        var any_borrowed = false;
+        for (self.layers) |*layer| if (layer.aliased and layer.borrowed) {
+            any_borrowed = true;
+            break;
+        };
+        if (!any_borrowed and !core.arenaLeaseHeld()) return;
+        try core.arenaReturnLease();
+        for (self.layers, 0..) |*layer, li| {
+            if (!layer.aliased or !layer.active or !layer.borrowed) continue;
+            self.prefetchWait(@intCast(li));
+            layer.borrowed = false;
+            errdefer layer.borrowed = true;
+            if (layer.saved.len != 0) {
+                const stats = layer.stats;
+                defer layer.stats = stats;
+                var prepared = try self.prepareHost(@intCast(li), layer.saved);
+                prepared.deinit();
+                self.allocator.free(layer.saved);
+                layer.saved = &.{};
+            }
+            layer.spec_dirty = true;
+        }
+    }
+
+    /// Tears down all aliased slabs and tail lease references before `core.arenaRelease()` unmaps the arena.
+    pub fn releaseAliasedLayers(self: *Engine) void {
+        core.arenaReturnLease() catch {};
+        self.drainPendingReaders();
+        _ = mlx.mlx_synchronize(self.s);
+        for (self.layers, 0..) |*layer, li| {
+            if (!layer.aliased) continue;
+            self.prefetchWait(@intCast(li));
+            if (layer.grouped) |gl| _ = self.dropPool(layer, gl);
+            if (layer.alias_slices.len != 0) self.allocator.free(layer.alias_slices);
+            layer.alias_slices = &.{};
+            if (layer.saved.len != 0) {
+                self.allocator.free(layer.saved);
+                layer.saved = &.{};
+            }
+            layer.aliased = false;
+            layer.borrowed = true;
+        }
     }
 
     /// A released layer's route: each distinct pick is read into the union workspace at its group position and the
@@ -6804,4 +7097,43 @@ test "expert stream bulkFillGrouped: resident and async warm fill byte-identical
     try t.expect(streamed.fill_experts_total > 0);
     try t.expect(streamed.kept.?.read > 0);
     try t.expectEqual(@as(u64, 0), streamed.fillStats().bytes_bounced);
+}
+
+test "expert stream prepareDry: quantized uniform MXFP4 supports cache and workspace slabs with zero fills" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const raw = try quant.writeTinyMxfp4IndividualCheckpoint(t.allocator, tmp.dir, 2, 32, 32);
+    defer t.allocator.free(raw);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(t.io, &path_buf);
+    const geometry = Geometry{ .layers = 2, .experts = 2, .hidden = 32, .intermediate = 32, .first_moe_layer = 1 };
+    const per_expert = try mxfp4ExpertBytes(32, 32);
+    var engine = try Engine.initWithOptions(t.allocator, path_buf[0..n], geometry, per_expert, mlx.gpuStream(), .{
+        .io_workers = 1,
+        .bounce_size = 1 << 20,
+        .layout = .mxfp4_individual,
+    });
+    defer engine.deinit();
+
+    var cache_route = try engine.prepareDry(1, &.{ 0, 1 }, false);
+    defer cache_route.deinit();
+    try t.expect(cache_route.quantized);
+    try t.expect(!cache_route.workspace);
+    try t.expect(!cache_route.owns_quant_views);
+    try t.expectEqual(@as(u64, 0), engine.fill_bytes_total);
+    for ([_]quant.Component{ .gate_w, .gate_s, .up_w, .up_s, .down_w, .down_s }) |c| {
+        try t.expect(cache_route.quantOperand(c).ctx != null);
+    }
+
+    var union_route = try engine.prepareDry(1, &.{ 0, 1 }, true);
+    defer union_route.deinit();
+    try t.expect(union_route.quantized);
+    try t.expect(union_route.workspace);
+    try t.expect(union_route.owns_quant_views);
+    try t.expectEqual(@as(u64, 0), engine.fill_bytes_total);
+    for ([_]quant.Component{ .gate_w, .gate_s, .up_w, .up_s, .down_w, .down_s }) |c| {
+        try t.expect(union_route.quantOperand(c).ctx != null);
+    }
 }

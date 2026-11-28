@@ -704,6 +704,7 @@ test "cooler contract: test_skip_warm skips the warm on a light load and never r
 
 /// `e`, after naming the fixture it came from.
 pub fn named(env: []const u8, dir: []const u8, e: anyerror) anyerror {
+    if (e == error.SkipZigTest) return e;
     var msg: [512]u8 = undefined;
     std.debug.print("cooler contract: fixture {s} ({s}): {s}: {s}\n", .{ env, dir, @errorName(e), mlx.takeError(&msg) orelse "no MLX or engine error latched" });
     return e;

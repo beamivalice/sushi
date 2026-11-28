@@ -357,9 +357,14 @@ pub fn linearSharedNormed(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: 
     return true;
 }
 
-/// `linearSharedNormed` for a 2-segment `[q_lora, kv_row]` attention input that writes normed `q_lora` `[rows, norm.cols]`
-/// and the updated KV ring `[cap, kv_dim]` in one finish dispatch, eliminating `ropeKvRing`.
-pub fn linearSharedNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, opts: Opts, norm: project_rows.Norm, kr: project_rows.KvRing) !?project_rows.NormedRingOut {
+const NormedRingPlan = struct {
+    l: project_rows.RowsLaunch,
+    g: project_rows.RowsGeom,
+    bounds: [3]c_int,
+    pin: ?project_rows.PinnedCfg,
+};
+
+fn prepareNormedRing(x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, opts: Opts, norm: project_rows.Norm, kr: project_rows.KvRing) !?NormedRingPlan {
     if (sh.count != 2) return null;
     const xs = mlx.getShape(x);
     const ts = mlx.getShape(sh.p.trellis);
@@ -376,7 +381,14 @@ pub fn linearSharedNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, d
     try dec.requireTable();
     kernels.setDecodeParams(dec);
     const pin: ?project_rows.PinnedCfg = if (sh.geo) |geo| (if (l.out_dt == .bfloat16 and opts.rows.exact == geo.key.exact) (if (geo.row(rows)) |r| (if (std.meta.eql(r.g, g)) r.pin else null) else null) else null) else null;
-    return try project_rows.launchRowsNormedRing(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, l, g, try project_rows.rowsKernel(g), bounds, pin, norm, kr);
+    return .{ .l = l, .g = g, .bounds = bounds, .pin = pin };
+}
+
+/// `linearSharedNormed` for a 2-segment `[q_lora, kv_row]` attention input that writes normed `q_lora` `[rows, norm.cols]`
+/// and the updated KV ring `[cap, kv_dim]` in one finish dispatch, eliminating `ropeKvRing`.
+pub fn linearSharedNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, opts: Opts, norm: project_rows.Norm, kr: project_rows.KvRing) !?project_rows.NormedRingOut {
+    const plan = try prepareNormedRing(x, sh, dec, opts, norm, kr) orelse return null;
+    return try project_rows.launchRowsNormedRing(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, plan.l, plan.g, try project_rows.rowsKernel(plan.g), plan.bounds, plan.pin, norm, kr);
 }
 
 /// `linearWith` for a one-bank query projection whose `rp.hd`-channel heads leave tail-rotated by `rp.rd` in-register,
@@ -1676,6 +1688,113 @@ test "exl3 Ultra pins the K5 query projection geometry at every decode width" {
             const g = slot.?.g;
             try std.testing.expectEqual(@as(c_int, if (n == 80) 2 else 4), g.kph);
             try std.testing.expectEqual(@as(c_int, 1), g.nsplit);
+        }
+    }
+}
+
+test "exl3 linear: linearSharedNormedRing in-place matches out-of-place bit-for-bit and mutates ring in place" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const was = mlx.engine.enabled;
+    defer mlx.engine.enabled = was;
+    mlx.engine.enabled = true;
+    defer kernels.setDecodeParams(.mul1);
+
+    const s = mlx.engine.stream();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x9a41);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+
+    const in_dim: usize = 1024;
+    const q_cols: usize = 1536;
+    const kv_dim: usize = 512;
+    const out_dim: usize = q_cols + kv_dim;
+    const rd: usize = 64;
+    const cap: usize = 16;
+
+    var h = try Host.init(alloc, rnd, 1, in_dim, out_dim, 64);
+    defer h.deinit();
+    const sh: Shared = .{ .p = h.p, .cols = .{ 0, @intCast(q_cols), @intCast(out_dim), 0, 0 }, .count = 2 };
+
+    const qw_bits = try alloc.alloc(u16, q_cols);
+    for (qw_bits) |*b| b.* = bf16Bits(0.5 + rnd.float(f32));
+    const q_w = try host_side.made(mlx.mlx_array_new_data(qw_bits.ptr, &[_]c_int{@intCast(q_cols)}, 1, .bfloat16));
+    defer _ = mlx.mlx_array_free(q_w);
+
+    const kw_bits = try alloc.alloc(u16, kv_dim);
+    for (kw_bits) |*b| b.* = bf16Bits(0.5 + rnd.float(f32));
+    const kw = try host_side.made(mlx.mlx_array_new_data(kw_bits.ptr, &[_]c_int{@intCast(kv_dim)}, 1, .bfloat16));
+    defer _ = mlx.mlx_array_free(kw);
+
+    const freqs_v = try alloc.alloc(f32, rd / 2);
+    for (freqs_v, 0..) |*f, i| f.* = 1.0 / std.math.pow(f32, 10000.0, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(rd)));
+    const freqs = try host_side.made(mlx.mlx_array_new_data(freqs_v.ptr, &[_]c_int{@intCast(rd / 2)}, 1, .float32));
+    defer _ = mlx.mlx_array_free(freqs);
+
+    const eps_v = [_]f32{1e-6};
+    const eps = try host_side.made(mlx.mlx_array_new_data(&eps_v, &[_]c_int{1}, 1, .float32));
+    defer _ = mlx.mlx_array_free(eps);
+
+    const init_ring = try alloc.alloc(u16, cap * kv_dim);
+    for (init_ring) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 2.0);
+
+    for ([_]usize{ 1, 6 }) |rows| {
+        const xb = try alloc.alloc(u16, rows * in_dim);
+        for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4.0);
+        const x = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(rows), @intCast(in_dim) }, 2, .bfloat16));
+        defer _ = mlx.mlx_array_free(x);
+
+        const pos_v = try alloc.alloc(i32, rows);
+        for (pos_v, 0..) |*p, i| p.* = @intCast(13 + i);
+        const pos = try host_side.made(mlx.mlx_array_new_data(pos_v.ptr, &[_]c_int{@intCast(rows)}, 1, .int32));
+        defer _ = mlx.mlx_array_free(pos);
+
+        for ([_]bool{ false, true }) |qat| {
+            const ring_ref = try host_side.made(mlx.mlx_array_new_data(init_ring.ptr, &[_]c_int{ @intCast(cap), @intCast(kv_dim) }, 2, .bfloat16));
+            defer _ = mlx.mlx_array_free(ring_ref);
+            var ring_ip = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ring_ip);
+            try mlx.check(mlx.engine.copyOwned(&ring_ip, ring_ref));
+            try t.expect(try mlx.engine.sole(ring_ip));
+            const ring_store_before = mlx.engine.storePointer(ring_ip);
+            var qout_ip_arr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&qout_ip_arr, &[_]c_int{ @intCast(rows), @intCast(q_cols) }, 2, .bfloat16, s));
+            const qout_ip = try host_side.made(qout_ip_arr);
+            defer _ = mlx.mlx_array_free(qout_ip);
+            try t.expect(try mlx.engine.sole(qout_ip));
+            const qout_store_before = mlx.engine.storePointer(qout_ip);
+
+            const norm: project_rows.Norm = .{ .w = q_w, .eps = eps, .cols = @intCast(q_cols) };
+            const kr_ref: project_rows.KvRing = .{ .kw = kw, .freqs = freqs, .pos = pos, .ring = ring_ref, .cap = @intCast(cap), .kv_dim = @intCast(kv_dim), .rd = @intCast(rd), .qat = qat };
+            const kr_ip: project_rows.KvRing = .{ .kw = kw, .freqs = freqs, .pos = pos, .ring = ring_ip, .cap = @intCast(cap), .kv_dim = @intCast(kv_dim), .rd = @intCast(rd), .qat = qat, .qout_in_place = qout_ip };
+
+            const ref = (try linearSharedNormedRing(s, x, sh, dec, .{ .rows = .{ .exact = true } }, norm, kr_ref)) orelse return error.NormedRingSkipped;
+            defer _ = mlx.mlx_array_free(ref.q);
+            defer _ = mlx.mlx_array_free(ref.ring);
+
+            const got = (try linearSharedNormedRing(s, x, sh, dec, .{ .rows = .{ .exact = true } }, norm, kr_ip)) orelse return error.NormedRingSkipped;
+            try t.expect(got.in_place);
+            try t.expectEqual(ring_store_before, mlx.engine.storePointer(ring_ip));
+            try t.expectEqual(qout_store_before, mlx.engine.storePointer(qout_ip));
+
+            var cq_ref = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cq_ref);
+            var cq_ip = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cq_ip);
+            const want_q = try alloc.dupe(f32, try hostF32(s, ref.q, &cq_ref));
+            const got_q = try alloc.dupe(f32, try hostF32(s, qout_ip, &cq_ip));
+            try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want_q), std.mem.sliceAsBytes(got_q));
+
+            var cr_ref = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cr_ref);
+            var cr_ip = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cr_ip);
+            const want_r = try alloc.dupe(f32, try hostF32(s, ref.ring, &cr_ref));
+            const got_r = try alloc.dupe(f32, try hostF32(s, ring_ip, &cr_ip));
+            try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want_r), std.mem.sliceAsBytes(got_r));
         }
     }
 }

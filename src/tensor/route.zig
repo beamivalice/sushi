@@ -5871,7 +5871,7 @@ test "engine f16 matmul on the NAX tiles: a dtype's first product before the sea
     core.sealed = false;
     {
         const plan_api = @import("plan/plan_api.zig");
-        var recorder = try plan_api.Recorder.begin(t_std.allocator, .{ .site = 1 });
+        var recorder = plan_api.Recorder.begin(t_std.allocator);
         defer recorder.deinit();
         var driver: plan_api.Driver = .{ .gpa = t_std.allocator };
         defer driver.deinit();
@@ -8196,7 +8196,7 @@ test "matmul: under a plan, split-K asks its partials at their most partitions w
     const q = try o.zeros(&.{ 64, 512 }, .float32);
     for ([_]c_int{ 96, 512 }) |keys| {
         const c = try o.zeros(&.{ 512, keys }, .float32);
-        var rec = try plan.Recorder.begin(al, .{ .site = plan.siteOf(@src()) });
+        var rec = plan.Recorder.begin(al);
         defer rec.deinit();
         var driver: plan.Driver = .{ .gpa = al };
         defer driver.deinit();
@@ -8208,9 +8208,9 @@ test "matmul: under a plan, split-K asks its partials at their most partitions w
             _ = mlx.mlx_array_free(y);
         }
         var most: u64 = 0;
-        for (rec.instances.items) |inst| for (inst.asks.items) |as| {
+        for (rec.asks.items) |as| {
             most = @max(most, as.bytes);
-        };
+        }
         try std.testing.expectEqual(32 * 64 * @as(u64, @intCast(keys)) * 4, most);
     }
 }
@@ -8239,7 +8239,7 @@ test "matmul: under a plan, NAX split-K asks its partials at no fewer partitions
         const case = .{ .k = k, .parts = parts };
         const q = try o.zeros(&.{ 64, case.k }, .bfloat16);
         const c = try o.zeros(&.{ case.k, 96 }, .bfloat16);
-        var rec = try plan.Recorder.begin(al, .{ .site = plan.siteOf(@src()) });
+        var rec = plan.Recorder.begin(al);
         defer rec.deinit();
         var driver: plan.Driver = .{ .gpa = al };
         defer driver.deinit();
@@ -8251,9 +8251,9 @@ test "matmul: under a plan, NAX split-K asks its partials at no fewer partitions
             _ = mlx.mlx_array_free(y);
         }
         var most: u64 = 0;
-        for (rec.instances.items) |inst| for (inst.asks.items) |as| {
+        for (rec.asks.items) |as| {
             most = @max(most, as.bytes);
-        };
+        }
         try std.testing.expectEqual(case.parts * 64 * 96 * 4, most);
     }
 }

@@ -5,6 +5,10 @@ const log = @import("../log.zig");
 const trunk = @import("../trunk.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
+const dsv41_plan = @import("dsv41_plan.zig");
+const dsv41_sample_plan = @import("dsv41_sample_plan.zig");
+const dsv41_vision = @import("dsv41_vision.zig");
+const bills = @import("../bills.zig");
 const cooler_side = @import("../cooler_side.zig");
 const serving = @import("dsv41_serving.zig");
 const admission = @import("../arch/admission.zig");
@@ -28,12 +32,6 @@ pub const flags = @import("dsv41_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("dsv41_drafter.zig");
 
-/// Its forwards install their own caps beside the expert pools they release (`dsv41_borrow`), and a request's end leaves
-/// the engine the decode pool the ledger parks (`arch/cooler.zig`).
-pub const cooler_own_caps = true;
-pub fn coolerRestCap(config: *const Config) u64 {
-    return config.expertPoolBytes();
-}
 pub const sched = @import("dsv41_sched.zig"); // slot:sched (S2b)
 
 pub const prefix = @import("dsv41_prefix.zig"); // slot:prefix (S2c)
@@ -75,6 +73,8 @@ pub const config_facts: arch_config.Facts = .{
     .ssd_tables = &.{".engram.embed."},
     .reads_pair_major = true,
     .prefill_start_width_of = config_file.prefillWidthFor,
+    .static_chunk_max = config_file.widest_chunk,
+    .static_chunk_default = config_file.default_chunk,
     .expert_pool_bytes = config_file.dsv41_pool_bytes,
     .streams_experts = true,
     .renders_own_chat_template = true,
@@ -197,9 +197,108 @@ pub fn resetCache(xfm: Model) !void {
 }
 
 pub fn warmup(xfm: Model) !void {
+    const ds = &xfm.arch_state.dsv41;
+    if (ds.warm_deferred) {
+        ds.warm_deferred = false;
+        defer if (ds.warm_plan) |*p| {
+            p.deinit();
+            ds.warm_plan = null;
+        };
+        const load_clock = @import("../load_clock.zig");
+        const warm_t0 = load_clock.now();
+        const made_before = mlx.engine.pipelinesMade();
+        const plan_made_ns: u64 = if (ds.warm_plan) |*p| p.made_ns else 0;
+        const plan_made_count: u64 = if (ds.warm_plan) |*p| p.made_count else 0;
+        const w: usize = if (xfm.config.static_prefill_chunk > 0) @intCast(xfm.config.static_prefill_chunk) else config_file.warm_width;
+        try serving.warmAllAt(xfm, ds.model.?, ds.stq_experts, ds.warm_scope, w);
+        if (ds.warm_scope == .all) if (ds.warm_plan) |*p| p.storeManifestOnly();
+        const made = mlx.engine.pipelinesMade();
+        const count_before = @import("dsv41_load.zig").takePipelinesBefore() orelse made_before.count;
+        load_clock.warmDone(warm_t0, made.ns - made_before.ns + plan_made_ns, made.count - count_before + plan_made_count);
+        mlx.engine.trim();
+    }
     // Runs on a warm manifest too: its first forward takes the expert routes' first cost, which a skip moves into the
     // first request.
     return xfm.warmupTrunk();
+}
+
+/// Records narrow worst-case plans and sample draws before the warm (`planRecord`) so candidate prefill chunks price against them.
+pub fn planRecord(xfm: Model, loaded_tower: ?*@import("../arch/media.zig").Tower) !void {
+    const m = xfm.arch_state.dsv41.model orelse return error.Dsv41NoModel;
+    if (!m.onEngine() or m.plans != null or m.recorded != null) return;
+    const chunk_cap: usize = @intCast(bills.chunkBoundsOf(&xfm.config).max);
+    const warm_reach: usize = @intCast(bills.warmLongestPrompt(&xfm.config, chunk_cap) +| bills.WARM_REPLY_TOKENS);
+    const reach: usize = @max(@as(usize, bills.planReach(&xfm.config)), @max(warm_reach, 2 * chunk_cap + 128));
+    const joined: usize = if (m.serves_rows) m.servedJoinedRows() else 0;
+    const masks: dsv41_sample_plan.Masks = .{ .suppress = xfm.suppress_mask };
+
+    const p = try dsv41_plan.record(m, xfm.allocator, reach, 0, joined);
+    errdefer {
+        p.deinit();
+        xfm.allocator.destroy(p);
+    }
+    try dsv41_sample_plan.record(m, p, masks);
+    if (m.cfg.vision != null and xfm.config.keeps_tower) {
+        const max_patches = @import("../arch/media.zig").maxImagePatches(media.preproc(&xfm.config));
+        if (loaded_tower) |t| switch (t.arch) {
+            .dsv41 => |*dv| try dsv41_plan.recordEncode(p, .{ .tower = dv, .max_patches = max_patches }),
+            else => {},
+        } else if (xfm.arch_state.dsv41.loader_weights) |w| if (w.get("vision.patch_embed.proj.weight") != null) {
+            var tower = try dsv41_vision.Dsv41Vision.initForPlan(xfm.allocator, xfm.config, w);
+            defer tower.deinit();
+            try dsv41_plan.recordEncode(p, .{ .tower = &tower, .max_patches = max_patches });
+        };
+    }
+    m.recorded = p;
+}
+
+/// Arena bytes held with prefill chunks of `chunk` rows; null on MLX or when no plans are recorded/built.
+pub fn planArena(xfm: Model, chunk: u32) !?u64 {
+    const m = xfm.arch_state.dsv41.model orelse return null;
+    const p = m.recorded orelse m.plans orelse return null;
+    const need = try dsv41_plan.regionAt(m, p, @min(@as(usize, chunk), p.reach));
+    return p.layoutWith(need).arenaBytes();
+}
+
+/// Finalizes recorded plans at the widest chosen prefill chunk and allocates the shared static arena + tail alias.
+pub fn planBuild(xfm: Model) !void {
+    const m = xfm.arch_state.dsv41.model orelse return error.Dsv41NoModel;
+    if (!m.onEngine() or m.plans != null) return;
+    try planRecord(xfm, null);
+    const p = m.recorded.?;
+    const chunk = @min(@import("../prefill_plan.zig").widestPrefillWidth(&xfm.config), p.reach);
+    _ = try dsv41_plan.regionAt(m, p, chunk);
+    try dsv41_plan.makeArenaWithBorrowBudget(m, p, xfm.expert_stream, .within_wide);
+    m.recorded = null;
+    m.plans = p;
+}
+
+pub fn sampleBegin(xfm: Model, mix: @import("../sampler.zig").Mix) !bool {
+    const m = xfm.arch_state.dsv41.model orelse return false;
+    return dsv41_sample_plan.begin(m, mix);
+}
+
+pub fn sampleToken(xfm: Model, lazy: mlx.mlx_array) !mlx.mlx_array {
+    return dsv41_sample_plan.token(xfm.arch_state.dsv41.model.?, lazy);
+}
+
+pub fn sampleForced(xfm: Model, id: u32) !?mlx.mlx_array {
+    const m = xfm.arch_state.dsv41.model orelse return null;
+    return dsv41_sample_plan.forced(m, id);
+}
+
+pub fn sampleEnd(xfm: Model) !void {
+    return dsv41_sample_plan.end(xfm.arch_state.dsv41.model.?);
+}
+
+pub fn sampleFail(xfm: Model) void {
+    dsv41_sample_plan.fail(xfm.arch_state.dsv41.model.?);
+}
+
+pub fn forwardIds(xfm: Model, ids: []const i32) !?mlx.mlx_array {
+    const m = xfm.arch_state.dsv41.model orelse return null;
+    if (m.plans == null) return null;
+    return try m.idsInput(ids);
 }
 
 pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {

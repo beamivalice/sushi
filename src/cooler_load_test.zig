@@ -317,13 +317,19 @@ test "cooler contract: the first served DeepSeek request after a Cooler load's w
             // decoder holds expert-cache pools a prefill can borrow: a resident one never takes the borrow path.
             const state = &arch_handle.trunk(sv.entry.handle.?).arch_state;
             // A build without DeepSeek (`-Darchs`) has no streamed decoder that lends.
-            const lends = if (comptime @hasField(@TypeOf(state.*), "dsv41")) (if (state.dsv41.stq_experts) |x| x.engine.borrow_from < x.engine.layers.len else false) else false;
+            const is_ledger = @import("bills.zig").ledgerArch(&ld.config);
+            const lends = if (comptime @hasField(@TypeOf(state.*), "dsv41")) (!is_ledger and if (state.dsv41.stq_experts) |x| x.engine.borrow_from < x.engine.layers.len else false) else false;
             try testing.expectEqual(lends, LateUnwireHeadroom.borrowed);
             // A headroom read counts MLX's cache and the pool's free buffers as free: the first request starts as the second.
             try testing.expectEqual(starts[1].mlx_cache, starts[0].mlx_cache);
             // The warm leaves no more of the pool in use than a finished request does.
             try testing.expect(in_use[0] <= in_use[1]);
-            try testing.expect(@max(grew[0], grew[1]) - @min(grew[0], grew[1]) <= rest);
+            if (is_ledger) {
+                const peak = [2]u64{ in_use[0] + grew[0], in_use[1] + grew[1] };
+                try testing.expect(@max(peak[0], peak[1]) - @min(peak[0], peak[1]) <= rest);
+            } else {
+                try testing.expect(@max(grew[0], grew[1]) - @min(grew[0], grew[1]) <= rest);
+            }
         }
     }.run);
 }

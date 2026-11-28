@@ -919,7 +919,7 @@ fn sharedPairNsplit(in_dim: c_int) c_int {
     return 1;
 }
 
-fn sharedDownNsplit(in_dim: c_int) c_int {
+pub fn sharedDownNsplit(in_dim: c_int) c_int {
     if (@rem(in_dim, 4 * 16) == 0) return 4;
     if (@rem(in_dim, 2 * 16) == 0) return 2;
     return 1;
@@ -1285,6 +1285,15 @@ fn unitScore(s: mlx.mlx_stream) !mlx.mlx_array {
     defer scope.end();
     const one: f32 = 1;
     return unit_score.put(side, {}, mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32));
+}
+
+/// Populates the per-side constant caches (`unit_score`, `zero_slot_rows`) outside dry recording
+/// (`docs/bill_redesign.md#caches`).
+pub fn prepareSharedCaches(s: mlx.mlx_stream) !void {
+    _ = try unitScore(s);
+    const scope = host_side.enter(s);
+    defer scope.end();
+    for (1..kernels.DECODE_ROWS_MAX + 1) |rows| _ = try zeroSlots(rows);
 }
 
 /// A settle's recomputed picks: their planes, and for each slot its row of `part` or -1.

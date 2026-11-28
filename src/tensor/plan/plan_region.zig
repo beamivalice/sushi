@@ -1,16 +1,35 @@
-//! The wide phases' region (D97, docs/bill_redesign.md): an execution of a prefill chunk or an image's encode places
-//! each ask at the lowest gap that holds it (address-ordered first fit; a dead ask's bytes join their neighbours'), and
-//! its host-filled asks one after another in the host ring's replica, which comes back down at each eval to the end of
-//! the highest host ask still alive: the GPU has read every one dead by then. `Need` runs those rules over a dry
-//! recording's trace: the region a load holds is the most of each over its probes, and `core`'s wide execution places
-//! by the same rules. Pure: the host tier builds it.
+//! D97 address-ordered first-fit region sizing and placement (used uniformly for both narrow and wide executions).
+//! Each scratch ask takes the lowest gap that holds it (adjacent dead asks coalesce); each host-filled ask bumps a
+//! linear host-ring replica cursor, which drops back at each eval wait to the highest live host ask. Pure: host tier.
 const std = @import("std");
+const builtin = @import("builtin");
 const trace_mod = @import("plan_trace.zig");
 const Trace = trace_mod.Trace;
 
 pub const Error = error{OutOfMemory};
 
-/// What an execution asks of the region at most: its scratch's highest top, and its host ring's.
+pub const default_alignment: u64 = 256;
+pub const test_guard: u64 = if (builtin.is_test) default_alignment else 0;
+
+/// Shape of the shared Metal arena `[host ring x replicas | scratch]`.
+pub const Layout = struct {
+    /// Scratch pool bytes.
+    g: u64 = 0,
+    /// Host-ring bytes per replica.
+    h: u64 = 0,
+    replicas: u32 = 2,
+    alignment: u64 = default_alignment,
+    /// Non-null when `core.arenaFor` mmaps `[host | scratch]` with tail `[keep..]` leased from a borrower.
+    keep: ?u64 = null,
+    /// Extra canary tail bytes appended to each scratch arena allocation when enabled (`test_guard`).
+    guard: u64 = 0,
+
+    pub fn arenaBytes(l: Layout) u64 {
+        return l.h * l.replicas + l.g;
+    }
+};
+
+/// Peak scratch and host-ring bytes an execution trace requires.
 pub const Need = struct {
     scratch: u64 = 0,
     host: u64 = 0,
@@ -20,24 +39,49 @@ pub const Need = struct {
     }
 };
 
-/// Free bytes below the top, each with the mark of the dispatches that last bound them (`core` takes it as the floor
-/// of their next tenant; `need` ignores it).
+fn addHeadroom(bytes: u64, pct: u64, min_div: u64, floor_cap: u64, alignment: u64) u64 {
+    if (bytes == 0) return 0;
+    const by_pct = bytes + (bytes * pct + 99) / 100;
+    const min_floor = bytes + @min(bytes / min_div, floor_cap);
+    return std.mem.alignForward(u64, @max(by_pct, min_floor), alignment);
+}
+
+/// Explicit fragmentation headroom for narrow execution (`Layout.keep`).
+pub fn withNarrowHeadroom(n: Need, alignment: u64) Need {
+    return .{
+        .scratch = addHeadroom(n.scratch, 15, 2, 32 << 20, alignment),
+        .host = addHeadroom(n.host, 15, 2, 4 << 20, alignment),
+    };
+}
+
+/// Explicit fragmentation headroom for wide execution (`Layout.g` / `Layout.h`).
+pub fn withWideHeadroom(n: Need, alignment: u64) Need {
+    return .{
+        .scratch = addHeadroom(n.scratch, 5, 4, 16 << 20, alignment),
+        .host = addHeadroom(n.host, 10, 4, 4 << 20, alignment),
+    };
+}
+
+/// Free bytes below the top, each with the dispatch mark of the tenant that last held them.
 pub const Gap = struct { lo: u64, hi: u64, mark: u64 = 0 };
 
-/// The scratch's placement: gaps sorted by offset, none touching another or the top.
+/// Scratch placement: gaps sorted by offset, none touching another or the top.
 pub const Fit = struct {
     gaps: std.ArrayList(Gap) = .empty,
     top: u64 = 0,
-    /// The highest mark of bytes the top came down over: a place from the top lies on them.
+    /// Highest mark of bytes the top came down over: any allocation from the top below `top_mark_hi` lies on them.
     top_mark: u64 = 0,
+    top_mark_hi: u64 = 0,
     high: u64 = 0,
+
+    pub const Taken = struct { at: u64, mark: u64 };
 
     pub fn deinit(f: *Fit, gpa: std.mem.Allocator) void {
         f.gaps.deinit(gpa);
     }
 
-    /// The lowest gap that holds `len` (already aligned), or the top; the place and the mark its bytes carry.
-    pub fn take(f: *Fit, len: u64) struct { at: u64, mark: u64 } {
+    /// Lowest gap that holds `len` (already aligned), or the top; returns placement offset and carried mark.
+    pub fn take(f: *Fit, len: u64) Taken {
         for (f.gaps.items, 0..) |*g, i| if (g.hi - g.lo >= len) {
             const at = g.lo;
             const mark = g.mark;
@@ -45,17 +89,62 @@ pub const Fit = struct {
             return .{ .at = at, .mark = mark };
         };
         const at = f.top;
+        const mark = if (at < f.top_mark_hi) f.top_mark else 0;
         f.top += len;
         f.high = @max(f.high, f.top);
-        return .{ .at = at, .mark = f.top_mark };
+        return .{ .at = at, .mark = mark };
     }
 
-    /// The place `[lo, hi)` is dead, its bytes last bound at `mark`.
+    /// Narrow placement preferring cold bytes (`mark < hot_mark`) to avoid spurious intra-pass GPU barriers when
+    /// headroom allows, falling back to coolest fitting gap or `top` if bumping past `top_mark_hi` would exceed `cap`.
+    pub fn takePreferCold(f: *Fit, gpa: std.mem.Allocator, len: u64, hot_mark: u64, cap: u64, cold_limit: u64) Error!Taken {
+        for (f.gaps.items, 0..) |*g, i| if (g.hi - g.lo >= len and g.mark < hot_mark) {
+            const at = g.lo;
+            const mark = g.mark;
+            if (g.hi - g.lo == len) _ = f.gaps.orderedRemove(i) else g.lo += len;
+            return .{ .at = at, .mark = mark };
+        };
+        if (len <= cold_limit) {
+            if ((f.top >= f.top_mark_hi or f.top_mark < hot_mark) and f.top + len <= cap) {
+                const at = f.top;
+                const mark = if (at < f.top_mark_hi) f.top_mark else 0;
+                f.top += len;
+                f.high = @max(f.high, f.top);
+                return .{ .at = at, .mark = mark };
+            } else if (f.top < f.top_mark_hi and f.top_mark >= hot_mark and f.top_mark_hi + len <= cap) {
+                try f.gaps.append(gpa, .{ .lo = f.top, .hi = f.top_mark_hi, .mark = f.top_mark });
+                f.top = f.top_mark_hi;
+                f.top_mark = 0;
+                const at = f.top;
+                f.top += len;
+                f.high = @max(f.high, f.top);
+                return .{ .at = at, .mark = 0 };
+            }
+        }
+        var best_i: ?usize = null;
+        for (f.gaps.items, 0..) |g, i| {
+            if (g.hi - g.lo < len) continue;
+            if (best_i == null or g.mark < f.gaps.items[best_i.?].mark) best_i = i;
+        }
+        if (best_i) |bi| {
+            const g = &f.gaps.items[bi];
+            const at = g.lo;
+            const mark = g.mark;
+            if (g.hi - g.lo == len) _ = f.gaps.orderedRemove(bi) else g.lo += len;
+            return .{ .at = at, .mark = mark };
+        }
+        const at = f.top;
+        const mark = if (at < f.top_mark_hi) f.top_mark else 0;
+        f.top += len;
+        f.high = @max(f.high, f.top);
+        return .{ .at = at, .mark = mark };
+    }
+
+    /// Releases `[lo, hi)` back to `Fit`, recording `mark` as the highest dispatch mark over these bytes.
     pub fn give(f: *Fit, gpa: std.mem.Allocator, lo_in: u64, hi_in: u64, mark_in: u64) Error!void {
         var lo = lo_in;
         var hi = hi_in;
         var mark = mark_in;
-        // The gaps either side, which it joins.
         var i: usize = 0;
         while (i < f.gaps.items.len and f.gaps.items[i].hi <= lo) i += 1;
         if (i > 0 and f.gaps.items[i - 1].hi == lo) {
@@ -71,228 +160,93 @@ pub const Fit = struct {
         }
         if (hi == f.top) {
             f.top = lo;
-            f.top_mark = @max(f.top_mark, mark);
+            if (mark > 0 or f.top_mark > 0) {
+                f.top_mark = @max(f.top_mark, mark);
+                f.top_mark_hi = @max(f.top_mark_hi, hi);
+            }
             return;
         }
         try f.gaps.insert(gpa, i, .{ .lo = lo, .hi = hi, .mark = mark });
     }
 };
 
-/// The place of each scratch ask of `t` in the order an execution makes them, each rounded up to `alignment`: what
-/// `core.beginWidePadded` pads an execution of the same structure to. The caller frees it.
-pub fn padOf(gpa: std.mem.Allocator, t: *const Trace, alignment: u64) Error![]u64 {
-    var out: std.ArrayList(u64) = .empty;
-    errdefer out.deinit(gpa);
-    try padInstance(gpa, t, 0, alignment, &out);
-    return out.toOwnedSlice(gpa);
-}
-
-fn padInstance(gpa: std.mem.Allocator, t: *const Trace, i: u32, alignment: u64, out: *std.ArrayList(u64)) Error!void {
-    const inst = &t.instances[i];
-    for (inst.events.items) |e| switch (e) {
-        .ask => |o| {
-            const a = inst.asks.items[o];
-            if (!a.host and !a.external) try out.append(gpa, std.mem.alignForward(u64, @max(a.bytes, 1), alignment));
-        },
-        .child => |c| try padInstance(gpa, t, c, alignment, out),
-    };
-}
-
-/// Whether a padded execution may follow its own choices from one of `traces`' passes to another: every pass meets
-/// the same sites in the same order, and leaves first fit in one state at each, the frees before its next scratch ask
-/// taken. Then each stretch between two choices places as the pass it follows did, from the state that pass had.
-pub fn choicesAgree(gpa: std.mem.Allocator, traces: []const Trace, alignment: u64) Error!bool {
-    for (traces) |*tr| if (!choicesKeepTheirAsks(tr)) return false;
-    if (traces.len < 2) return true;
-    const first = try statesAt(gpa, &traces[0], alignment);
-    defer gpa.free(first);
-    for (traces[1..]) |*tr| {
-        if (tr.choices.len != traces[0].choices.len) return false;
-        for (tr.choices, traces[0].choices) |a, b| if (a.site != b.site) return false;
-        const got = try statesAt(gpa, tr, alignment);
-        defer gpa.free(got);
-        if (!std.mem.eql(u64, first, got)) return false;
-    }
-    return true;
-}
-
-/// Whether every scratch ask `t` made after a choice, in the instance the choice was made in or below it, died inside
-/// that instance. One that outlives it lands where its own arm left room, so the arms' passes part wherever first fit
-/// happens to place it apart: an arm hands up only what was made before it.
-fn choicesKeepTheirAsks(t: *const Trace) bool {
-    for (t.choices) |c| {
-        if (c.frame == 0) continue;
-        for (t.instances, 0..) |inst, h| {
-            // The instance's way into the choice's: its own events when it is the choice's, else the child it is under.
-            var below: u32 = 0;
-            var c_inst: u32 = @intCast(h);
-            while (c_inst != c.frame) : (below += 1) {
-                const up = t.instances[c_inst].parent;
-                if (up == trace_mod.none) break;
-                if (up == c.frame) {
-                    if (t.instances[c_inst].at < c.event) break;
-                    below += 1;
-                    c_inst = up;
-                    break;
-                }
-                c_inst = up;
-            }
-            if (c_inst != c.frame) continue;
-            for (inst.events.items, 0..) |e, k| switch (e) {
-                .ask => |o| {
-                    const a = inst.asks.items[o];
-                    if (a.host or a.external) continue;
-                    if (h == c.frame and k < c.event) continue;
-                    if (a.death == trace_mod.none or a.lift > below) return false;
-                },
-                .child => {},
-            };
-        }
-    }
-    return true;
-}
-
-/// A hash of first fit's state at each of `t`'s choices: before its next scratch ask, or at the end.
-fn statesAt(gpa: std.mem.Allocator, t: *const Trace, alignment: u64) Error![]u64 {
-    var w: Walk = .{ .gpa = gpa, .t = t, .alignment = alignment };
-    defer w.deinit();
-    w.states = try gpa.alloc(u64, t.choices.len);
-    errdefer gpa.free(w.states);
-    try w.run();
-    while (w.next_state < t.choices.len) : (w.next_state += 1) w.states[w.next_state] = w.fitHash();
-    return w.states;
-}
-
-/// The region `t` asks, each place rounded up to `alignment`. An ask `plan.into` named is its owner's bytes, never the
-/// region's.
+/// Region demand for `t` without canary guards.
 pub fn need(gpa: std.mem.Allocator, t: *const Trace, alignment: u64) Error!Need {
-    var w: Walk = .{ .gpa = gpa, .t = t, .alignment = alignment };
+    return needWithGuard(gpa, t, alignment, 0);
+}
+
+/// Region demand for `t`, adding `guard` bytes to each scratch allocation to match `core` test canary sizing.
+pub fn needWithGuard(gpa: std.mem.Allocator, t: *const Trace, alignment: u64, guard: u64) Error!Need {
+    var w: Walk = .{ .gpa = gpa, .t = t, .alignment = alignment, .guard = guard };
     defer w.deinit();
     try w.run();
     return .{ .scratch = w.fit.high, .host = w.host_high };
 }
 
+const HostEntry = struct { end: u64, death: u32 };
+
 const Walk = struct {
     gpa: std.mem.Allocator,
     t: *const Trace,
     alignment: u64,
-    dying: []std.AutoHashMapUnmanaged(u32, std.ArrayList(trace_mod.Ref)) = &.{},
-    places: std.AutoHashMapUnmanaged(u64, [2]u64) = .empty,
+    guard: u64,
+    places: std.AutoHashMapUnmanaged(trace_mod.Ref, [2]u64) = .empty,
     fit: Fit = .{},
-    /// The live host asks' ends, by ask.
-    host_live: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    host_live: std.AutoHashMapUnmanaged(trace_mod.Ref, HostEntry) = .empty,
     host_top: u64 = 0,
     host_high: u64 = 0,
-    waits: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    /// `statesAt`: first fit's state as each choice is met, and the scratch asks placed so far.
-    states: []u64 = &.{},
-    next_state: usize = 0,
-    scratch: u32 = 0,
-
-    fn run(w: *Walk) Error!void {
-        const gpa = w.gpa;
-        const t = w.t;
-        // Each instance's asks by the index of the owner's event they die before.
-        w.dying = try gpa.alloc(std.AutoHashMapUnmanaged(u32, std.ArrayList(trace_mod.Ref)), t.instances.len);
-        for (w.dying) |*d| d.* = .empty;
-        for (t.instances, 0..) |inst, i| for (inst.asks.items, 0..) |a, o| {
-            if (a.death == trace_mod.none) continue;
-            var owner: u32 = @intCast(i);
-            for (0..a.lift) |_| owner = t.instances[owner].parent;
-            const got = try w.dying[owner].getOrPut(gpa, a.death);
-            if (!got.found_existing) got.value_ptr.* = .empty;
-            try got.value_ptr.append(gpa, .{ .instance = @intCast(i), .ordinal = @intCast(o) });
-        };
-        for (t.waits) |x| try w.waits.put(gpa, @as(u64, x.instance) << 32 | x.at, x.deaths);
-        try w.instance(0);
-    }
-
-    fn fitHash(w: *const Walk) u64 {
-        var h = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&h, w.fit.top);
-        for (w.fit.gaps.items) |g| {
-            std.hash.autoHash(&h, g.lo);
-            std.hash.autoHash(&h, g.hi);
-        }
-        return h.final();
-    }
 
     fn deinit(w: *Walk) void {
-        for (w.dying) |*d| {
-            var it = d.valueIterator();
-            while (it.next()) |l| l.deinit(w.gpa);
-            d.deinit(w.gpa);
-        }
-        w.gpa.free(w.dying);
         w.places.deinit(w.gpa);
         w.fit.deinit(w.gpa);
         w.host_live.deinit(w.gpa);
-        w.waits.deinit(w.gpa);
     }
 
-    fn key(r: trace_mod.Ref) u64 {
-        return @as(u64, r.instance) << 32 | r.ordinal;
+    fn run(w: *Walk) Error!void {
+        for (w.t.events) |ev| switch (ev) {
+            .ask => |ref| try w.ask(ref),
+            .free => |ref| try w.free(ref),
+            .wait => |deaths| w.wait(deaths),
+        };
     }
 
-    fn instance(w: *Walk, i: u32) Error!void {
-        const inst = &w.t.instances[i];
-        for (inst.events.items, 0..) |e, k| {
-            // A wait comes before the deaths placed with it, which may have come after it: each ask's `died` says.
-            w.wait(i, @intCast(k));
-            try w.kill(i, @intCast(k));
-            switch (e) {
-                .ask => |o| try w.ask(.{ .instance = i, .ordinal = o }),
-                .child => |c| try w.instance(c),
-            }
-        }
-        w.wait(i, @intCast(inst.events.items.len));
-        try w.kill(i, @intCast(inst.events.items.len));
-    }
-
-    fn wait(w: *Walk, i: u32, at: u32) void {
-        const deaths = w.waits.get(@as(u64, i) << 32 | at) orelse return;
+    fn wait(w: *Walk, deaths: u32) void {
         var top: u64 = 0;
-        var it = w.host_live.iterator();
+        var it = w.host_live.valueIterator();
         while (it.next()) |e| {
-            const k = e.key_ptr.*;
-            const died = w.t.instances[@intCast(k >> 32)].asks.items[@intCast(k & 0xFFFF_FFFF)].died;
-            if (died >= deaths) top = @max(top, e.value_ptr.*);
+            // `death == none` (maxInt(u32)) is naturally `>= deaths`, as are asks dying at or after this wait.
+            if (e.death >= deaths) top = @max(top, e.end);
         }
         w.host_top = top;
     }
 
     fn ask(w: *Walk, ref: trace_mod.Ref) Error!void {
-        const a = w.t.instances[ref.instance].asks.items[ref.ordinal];
+        const a = w.t.asks[ref];
         if (a.external) return;
-        const len = std.mem.alignForward(u64, @max(a.bytes, 1), w.alignment);
+        const aligned = std.mem.alignForward(u64, @max(a.bytes, 1), w.alignment);
         if (a.host) {
-            w.host_top += len;
+            w.host_top += aligned;
             w.host_high = @max(w.host_high, w.host_top);
-            try w.host_live.put(w.gpa, key(ref), w.host_top);
+            try w.host_live.put(w.gpa, ref, .{ .end = w.host_top, .death = a.death });
             return;
         }
-        while (w.next_state < w.states.len and w.t.choices[w.next_state].at == w.scratch) : (w.next_state += 1) w.states[w.next_state] = w.fitHash();
-        w.scratch += 1;
+        const len = aligned + w.guard;
         const got = w.fit.take(len);
-        try w.places.put(w.gpa, key(ref), .{ got.at, got.at + len });
+        try w.places.put(w.gpa, ref, .{ got.at, got.at + len });
     }
 
-    fn kill(w: *Walk, owner: u32, at: u32) Error!void {
-        const refs = w.dying[owner].get(at) orelse return;
-        for (refs.items) |r| {
-            if (w.host_live.remove(key(r))) continue;
-            const p = w.places.fetchRemove(key(r)) orelse continue;
-            try w.fit.give(w.gpa, p.value[0], p.value[1], 0);
-        }
+    fn free(w: *Walk, ref: trace_mod.Ref) Error!void {
+        if (w.host_live.remove(ref)) return;
+        const p = w.places.fetchRemove(ref) orelse return;
+        try w.fit.give(w.gpa, p.value[0], p.value[1], 0);
     }
 };
 
 const testing = std.testing;
 
-/// A recording of `script`: 'a'..'z' asks an ask of that many pages, 'A'..'Z' kills the ask of that letter, '(' and
-/// ')' open and close a frame, '!' makes the next ask host-filled, '|' waits for the GPU.
+/// Builds a trace from `script`: 'a'..'z' asks `n` pages, 'A'..'Z' frees it, '!' marks next ask host-filled, '|' waits.
 fn record(script: []const u8) !Trace {
-    var r = try trace_mod.Recorder.begin(testing.allocator, .{ .site = 1 });
+    var r = trace_mod.Recorder.begin(testing.allocator);
     defer r.deinit();
     var refs: [26]?trace_mod.Ref = @splat(null);
     var host = false;
@@ -302,8 +256,6 @@ fn record(script: []const u8) !Trace {
             host = false;
         },
         'A'...'Z' => r.free(refs[ch - 'A'].?),
-        '(' => try r.enter(.{ .site = 2 }, .exact),
-        ')' => r.exit(),
         '!' => host = true,
         '|' => try r.wait(),
         else => unreachable,
@@ -311,15 +263,13 @@ fn record(script: []const u8) !Trace {
     return r.end();
 }
 
-test "region: an ask takes the lowest gap that holds it, a dead ask's bytes join their neighbours', and host asks add up apart" {
+test "region: first-fit takes lowest gap, coalesces neighbours, and reclaims host ring across waits" {
     const page: u64 = 4096;
     const cases = [_]struct { script: []const u8, scratch: u64, host: u64 = 0 }{
         // a (1 page), b (2) above it; b dies, then c (3) takes the top: 1 + 3 pages.
         .{ .script = "abBcAC", .scratch = 4 },
         // b (2) dies under a live d (4): c (3) does not fit b's gap and goes on top; then a (1) takes b's gap.
         .{ .script = "bdBcaDCA", .scratch = 2 + 4 + 3 },
-        // A result a frame hands up stays where it is; the scratch below it is a gap the next ask fits.
-        .{ .script = "e(bc)BaCAE", .scratch = 5 + 2 + 3 },
         // Two dead neighbours join: c (3) fits where a (1) and b (2) were.
         .{ .script = "abdABcCD", .scratch = 1 + 2 + 4 },
         // Host asks never take scratch: they add up.
@@ -328,10 +278,8 @@ test "region: an ask takes the lowest gap that holds it, a dead ask's bytes join
         .{ .script = "!a!bAB|!cC", .scratch = 0, .host = 3 },
         // A host ask alive at the wait keeps its bytes: c lands past a.
         .{ .script = "!a!bB|!cAC", .scratch = 0, .host = 1 + 3 },
-        // An ask that dies after the wait, in the same place of the trace, was alive at it.
+        // An ask that dies after the wait was still alive at it.
         .{ .script = "!a|A!bB", .scratch = 0, .host = 1 + 2 },
-        // A wait inside a frame gives back an ask dead in its parent before it.
-        .{ .script = "!aA(|!c)C", .scratch = 0, .host = 3 },
     };
     for (cases) |c| {
         var t = try record(c.script);
@@ -343,7 +291,7 @@ test "region: an ask takes the lowest gap that holds it, a dead ask's bytes join
     }
 }
 
-test "region: a gap's mark is the highest of the bytes it joined, and the top keeps the mark of what it came down over" {
+test "region: gap marks and headroom helpers respect tiny fixtures and caps" {
     var f: Fit = .{};
     defer f.deinit(testing.allocator);
     const a = f.take(4096);
@@ -358,4 +306,62 @@ test "region: a gap's mark is the highest of the bytes it joined, and the top ke
     try f.give(testing.allocator, 8192, 12288, 2);
     try testing.expectEqual(@as(u64, 0), f.top);
     try testing.expectEqual(@as(u64, 9), f.take(4096).mark);
+
+    const tiny = withNarrowHeadroom(.{ .scratch = 4096, .host = 4096 }, 256);
+    try testing.expectEqual(@as(u64, 6144), tiny.scratch);
+    try testing.expectEqual(@as(u64, 6144), tiny.host);
+
+    const real_narrow = withNarrowHeadroom(.{ .scratch = 200 << 20, .host = 10 << 20 }, 256);
+    // 200 MiB: max(+15% = 230 MiB, +32 MiB = 232 MiB) = 232 MiB.
+    try testing.expectEqual(@as(u64, 232 << 20), real_narrow.scratch);
+    // 10 MiB host: max(+15% = 11.5 MiB, +min(5,4)=14 MiB) = 14 MiB.
+    try testing.expectEqual(@as(u64, 14 << 20), real_narrow.host);
+
+    const real_wide = withWideHeadroom(.{ .scratch = 2000 << 20, .host = 20 << 20 }, 256);
+    try testing.expectEqual(@as(u64, 2100 << 20), real_wide.scratch);
+    try testing.expectEqual(@as(u64, 24 << 20), real_wide.host);
+}
+
+test "region: takePreferCold avoids hot gap when headroom allows, falls back on tight cap, and coalesces" {
+    var f: Fit = .{};
+    defer f.deinit(testing.allocator);
+    const page: u64 = 4096;
+    const hot: u64 = 10;
+    const p0 = try f.takePreferCold(testing.allocator, page, hot, 4 * page, 2 * page);
+    const p1 = try f.takePreferCold(testing.allocator, page, hot, 4 * page, 2 * page);
+    try f.give(testing.allocator, p0.at, p0.at + page, hot);
+    // Avoids hot gap [0, 4096) at offset 2*page with mark 0.
+    const cold = try f.takePreferCold(testing.allocator, page, hot, 4 * page, 2 * page);
+    try testing.expectEqual(2 * page, cold.at);
+    try testing.expectEqual(@as(u64, 0), cold.mark);
+
+    // Free cold and p1 so top drops down over hot bytes; bumping top past top_mark_hi still picks cold when cap allows.
+    try f.give(testing.allocator, cold.at, cold.at + page, 0);
+    try f.give(testing.allocator, p1.at, p1.at + page, hot);
+    try testing.expectEqual(@as(u64, 0), f.top);
+    try testing.expectEqual(@as(u64, 0), f.gaps.items.len);
+    const cold_bump = try f.takePreferCold(testing.allocator, page, hot, 4 * page, 2 * page);
+    try testing.expectEqual(2 * page, cold_bump.at);
+    try testing.expectEqual(@as(u64, 0), cold_bump.mark);
+
+    // When cap leaves no room to bump past top_mark_hi, fall back to the coolest fitting gap.
+    try f.give(testing.allocator, cold_bump.at, cold_bump.at + page, hot + 1);
+    try testing.expectEqual(@as(u64, 0), f.top);
+    const tight = try f.takePreferCold(testing.allocator, page, hot, 3 * page, 2 * page);
+    try testing.expectEqual(@as(u64, 0), tight.at);
+    try testing.expectEqual(hot + 1, tight.mark);
+
+    // Distinct gaps behind live allocations: tight fallback picks the gap with the smallest mark.
+    var f2: Fit = .{};
+    defer f2.deinit(testing.allocator);
+    const g0 = f2.take(page);
+    const d0 = f2.take(page);
+    const g1 = f2.take(page);
+    const d1 = f2.take(page);
+    _ = .{ d0, d1 };
+    try f2.give(testing.allocator, g0.at, g0.at + page, hot + 5);
+    try f2.give(testing.allocator, g1.at, g1.at + page, hot + 1);
+    const coolest = try f2.takePreferCold(testing.allocator, page, hot, 4 * page, 2 * page);
+    try testing.expectEqual(g1.at, coolest.at);
+    try testing.expectEqual(hot + 1, coolest.mark);
 }

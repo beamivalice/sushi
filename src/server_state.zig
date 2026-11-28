@@ -304,6 +304,7 @@ pub fn maxConcurrentFile() ?u32 {
 /// How far under the enforced wired limit a plan may reach: past the limit Metal returns
 /// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
 pub const WIRED_LIMIT_MARGIN_BYTES: u64 = @as(u64, model_settings.default_wired_margin_gib) << 30;
+pub const STATIC_WIRED_LIMIT_MARGIN_BYTES: u64 = @as(u64, model_settings.default_static_wired_margin_gib) << 30;
 
 /// `--wired-margin-gib` in bytes; null = not given. It outranks the saved `server.wired_margin_gib`.
 pub var wired_margin_flag_bytes: ?u64 = null;
@@ -317,11 +318,22 @@ pub fn setWiredMarginFile(gib: ?u32) void {
     wired_margin_file_gib.store(gib orelse no_wired_margin_file, .monotonic);
 }
 
+fn wiredMarginBytesWithDefault(default_bytes: u64) u64 {
+    const file = wired_margin_file_gib.load(.monotonic);
+    return settings_resolve.resolve(u64, wired_margin_flag_bytes, if (file != no_wired_margin_file) @as(u64, file) << 30 else null, default_bytes).value;
+}
+
 /// What stays unplanned under a raised wired limit: flag, else the saved value, else the default. Every reader asks at
 /// the moment it plans, so a save reaches the next request and the next load.
 pub fn wiredMarginBytes() u64 {
-    const file = wired_margin_file_gib.load(.monotonic);
-    return settings_resolve.resolve(u64, wired_margin_flag_bytes, if (file != no_wired_margin_file) @as(u64, file) << 30 else null, WIRED_LIMIT_MARGIN_BYTES).value;
+    return wiredMarginBytesWithDefault(WIRED_LIMIT_MARGIN_BYTES);
+}
+
+/// Default wired margin for static-bill loads (`0 GiB`): static loads measure their weights, slabs, static pool,
+/// pipelines, and arena on the ledger and add `BILL_MARGIN_BYTES`, leaving `GPU_FLOOR_SLACK_BYTES` + `gpu_floor` under
+/// the declared limit unless `--wired-margin-gib` or `server.wired_margin_gib` overrides.
+pub fn staticWiredMarginBytes() u64 {
+    return wiredMarginBytesWithDefault(STATIC_WIRED_LIMIT_MARGIN_BYTES);
 }
 
 // Numeric slot diagnostics cross to error mapping only on this connection's thread.

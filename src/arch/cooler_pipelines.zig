@@ -213,14 +213,6 @@ pub const Plan = struct {
         return p.await();
     }
 
-    /// Where a planned load keeps the shapes its misses record: this key's directory, beside its manifest. Null with no
-    /// manifest root, as a load with none keeps no manifest.
-    pub fn shapeCache(p: *const Plan) ?@import("../tensor/plan/plan_book.zig").Cache {
-        const root = p.root orelse return null;
-        var buf: [manifest.Key.dir_len]u8 = undefined;
-        return .init(p.io, if (p.from_path) .{ .path = reopenRoot } else .{ .handle = root }, p.key.dirName(&buf));
-    }
-
     /// After a complete warm: the recipes the process made, written for this key, and the older builds of the scope
     /// removed. A failure is a warning, not a failed load.
     pub fn store(p: *Plan) void {
@@ -281,7 +273,9 @@ fn writeArchiveForKey(io: std.Io, key: manifest.Key, dir: []const u8) ?usize {
     }
 }
 
-fn reopenRoot(io: std.Io) ?@import("../tensor/plan/plan_book.zig").Cache.Opened {
+const OpenedRoot = struct { dir: std.Io.Dir, owned: bool };
+
+fn reopenRoot(io: std.Io) ?OpenedRoot {
     var reason: []const u8 = "";
     const dir = openRoot(io, &reason) orelse return null;
     return .{ .dir = dir, .owned = root_hook == null };
@@ -369,7 +363,7 @@ fn rewriteLateImpl(with_archive: bool) void {
     const archive_needed = with_archive and l.from_path and (!l.archive_loaded or total > l.archive_recipes);
     const manifest_needed = registry.generation != l.written_gen;
     if (with_archive and !manifest_needed and !archive_needed) return;
-    const opened: ?@import("../tensor/plan/plan_book.zig").Cache.Opened = if (l.from_path) reopenRoot(l.io) else .{ .dir = l.root, .owned = false };
+    const opened: ?OpenedRoot = if (l.from_path) reopenRoot(l.io) else .{ .dir = l.root, .owned = false };
     const root = opened orelse {
         log.warn("[pipelines] manifest not written: the manifest root did not open\n", .{});
         return;

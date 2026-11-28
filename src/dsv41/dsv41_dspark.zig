@@ -70,9 +70,11 @@ pub const DrafterResume = R.DrafterResume;
 pub const drafterResumeAfterForced = R.drafterResumeAfterForced;
 pub const roundRows = R.roundRows;
 pub const Verdict = R.Verdict;
+pub const VerdictIn = R.VerdictIn;
 pub const LazyVerdict = R.LazyVerdict;
 pub const verdictBegin = R.verdictBegin;
 pub const verdictInFor = R.verdictInFor;
+pub const verdictOf = R.verdictOf;
 pub const commitVerdict = R.commitVerdict;
 pub const settleDrafted = R.settleDrafted;
 

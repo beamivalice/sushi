@@ -141,7 +141,7 @@ pub fn plan(gpa: std.mem.Allocator, bank_rows: []const u32, order: []const u32, 
         pairs[2 * i + 1] = dest[i];
     }
     // The groups follow the picks, a readback: a dry recording plans one a pick, the most there can be.
-    const n_groups = try @import("../tensor/plan/plan_api.zig").bound(groups.items.len / 3, order.len);
+    const n_groups = @import("../tensor/plan/plan_api.zig").bound(groups.items.len / 3, order.len);
     try groups.appendNTimes(gpa, 0, 3 * n_groups - groups.items.len);
     return .{
         .groups = mlx.mlx_array_new_data(groups.items.ptr, &[_]c_int{@intCast(groups.items.len)}, 1, .uint32),

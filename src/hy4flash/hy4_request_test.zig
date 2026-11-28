@@ -582,12 +582,11 @@ test "hy4 request: three drafting requests in company verify their drafts as gro
     try testing.expect(rounds < 64);
     try testing.expect(hy4_state.joined_ticks_for_test > 0);
     const after = core.stats();
-    errdefer std.debug.print("group ticks {d}: exec {d} wide {d} miss {any} refused {d}\n", .{ hy4_sched_knobs.group_ticks_for_test, after.executions - before.executions, after.wide_executions - before.wide_executions, core.executionMiss(), hy4_sched_knobs.groups_refused_for_test });
+    errdefer std.debug.print("group ticks {d}: exec {d} wide {d} refused {d}\n", .{ hy4_sched_knobs.group_ticks_for_test, after.executions - before.executions, after.wide_executions - before.wide_executions, hy4_sched_knobs.groups_refused_for_test });
     try testing.expect(hy4_sched_knobs.group_ticks_for_test > 0);
     try testing.expectEqual(@as(u64, 0), hy4_sched_knobs.groups_refused_for_test);
     try testing.expect(after.executions - before.executions > 0);
     try testing.expectEqual(@as(u64, 0), after.wide_executions - before.wide_executions);
-    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
     for (0..3) |i| {
         const gen = &slots[i].legacy_gen.?;
         errdefer std.debug.print("slot {d}: error {?s}, {d} tokens, {} accepted over {d} rounds, hist {any}\n", .{ i, slots[i].error_code, gen.generated_ids.items.len, gen.drafter_stats.accepted, gen.drafter_stats.rounds, gen.drafter_stats.rows_hist[1..9] });
@@ -676,10 +675,8 @@ test "hy4 request: a request's logits blocks keep one shape across a group tick,
     hy4_sched_knobs.groups_on_for_test = false;
     try scheduler.runDecodeTick(&sv.sch, slots[0..3]);
     try expectBlockShapes(m, &slots);
-    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
     try scheduler.runDecodeTick(&sv.sch, slots[0..1]);
     try expectBlockShapes(m, &slots);
-    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
     // Group rounds through the scheduler's own tick, inside the sealed turn: no wide phase, no ask past the plan.
     hy4_sched_knobs.groups_on_for_test = true;
     const wide_before = core.stats().wide_executions;
@@ -694,7 +691,6 @@ test "hy4 request: a request's logits blocks keep one shape across a group tick,
         try testing.expectEqual(was_stats.closed_asks, now.closed_asks);
         try testing.expectEqual(was_stats.wide_asks, now.wide_asks);
         try expectBlockShapes(m, &slots);
-        try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
     }
     try testing.expect(hy4_sched_knobs.group_ticks_for_test > 1);
     try testing.expectEqual(wide_before, core.stats().wide_executions);
@@ -711,7 +707,6 @@ test "hy4 request: a request's logits blocks keep one shape across a group tick,
         try scheduler.runDecodeTick(&sv.sch, act[0..k]);
         scheduler.cullDecoding(&sv.sch);
     }
-    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
     for (0..3) |i| {
         try testing.expectEqual(@as(?[]const u8, null), slots[i].error_code);
         try testing.expectEqualSlices(u32, solos[i].tokens.items, slots[i].legacy_gen.?.generated_ids.items);
@@ -873,7 +868,6 @@ test "hy4 request: a joined tick draws each row through its own planned sample r
     try scheduler.runPrefill(&sv.sch, slot_b);
     try sv.sch.decoding.append(a, slot_b);
     const draws = p.sample.draws;
-    const misses = p.sample.misses;
     const joined = hy4_state.joined_ticks_for_test;
     var total_draws: u64 = 0;
     while (slot_a.joinsTick() or slot_b.joinsTick()) {
@@ -895,7 +889,6 @@ test "hy4 request: a joined tick draws each row through its own planned sample r
     try testing.expect(ticks > 0);
     // Every joined row's draw is an execution of its own mix's root.
     try testing.expectEqual(2 * ticks, total_draws);
-    try testing.expectEqual(misses, p.sample.misses);
     try testing.expect(slot_a.error_code == null and slot_b.error_code == null);
     try testing.expectEqualSlices(u32, solo_a.tokens.items, slot_a.legacy_gen.?.generated_ids.items);
     try testing.expectEqualSlices(u32, solo_b.tokens.items, slot_b.legacy_gen.?.generated_ids.items);
@@ -1190,7 +1183,6 @@ test "hy4 request: batched DFly2 draftBatch + grouped verify at N=2, 4, 8 across
     try testing.expectEqual(st_before.closed_asks, st_after.closed_asks);
     try testing.expectEqual(st_before.wide_asks, st_after.wide_asks);
     try testing.expectEqual(st_before.wide_executions, st_after.wide_executions);
-    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
 
     // Now drive all `max_n` slots to completion under grouped DFly2: every slot matches solo tokens bit-for-bit!
     hy4_sched_knobs.groups_on_for_test = true;
@@ -1210,7 +1202,6 @@ test "hy4 request: batched DFly2 draftBatch + grouped verify at N=2, 4, 8 across
     }
     try testing.expect(hy4_sched_knobs.group_ticks_for_test > 0);
     try testing.expectEqual(late_before, mlx.engine.latePipelines());
-    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
     for (0..max_n) |i| {
         try testing.expectEqual(@as(?[]const u8, null), slots[i].error_code);
         try testing.expectEqualSlices(u32, solos[i].tokens.items, slots[i].legacy_gen.?.generated_ids.items);
@@ -1231,7 +1222,6 @@ test "hy4 request: a slot without handover past the sparse threshold joins group
     const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
     const m = xfm.arch_state.hy4flash.model.?;
     if (xfm.arch_state.hy4flash.drafter == null) return error.SkipZigTest;
-    const core = @import("../tensor/core.zig");
 
     const thr: usize = @as(usize, m.config.indexer.group_topk) * m.config.indexer.group;
     const prompt_len: usize = @max(thr + 6, 16);
@@ -1275,7 +1265,6 @@ test "hy4 request: a slot without handover past the sparse threshold joins group
     try testing.expect(!m.hasHandover(req0));
     try testing.expect(m.hasHandover(req1));
 
-    const misses_before = m.plans.?.misses;
     const late_before = mlx.engine.latePipelines();
     hy4_sched_knobs.groups_on_for_test = true;
     defer hy4_sched_knobs.groups_on_for_test = false;
@@ -1285,8 +1274,6 @@ test "hy4 request: a slot without handover past the sparse threshold joins group
     var pair = [_]*scheduler.Slot{ slot0, slot1 };
     try scheduler.runDecodeTick(&sv.sch, &pair);
     scheduler.cullDecoding(&sv.sch);
-    try testing.expectEqual(misses_before, m.plans.?.misses);
-    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
     try testing.expect(m.hasHandover(req0));
     try testing.expect(hy4_sched_knobs.group_ticks_for_test >= 1);
 
@@ -1303,7 +1290,6 @@ test "hy4 request: a slot without handover past the sparse threshold joins group
         try scheduler.runDecodeTick(&sv.sch, act[0..k]);
         scheduler.cullDecoding(&sv.sch);
     }
-    try testing.expectEqual(misses_before, m.plans.?.misses);
     try testing.expectEqual(late_before, mlx.engine.latePipelines());
     try testing.expectEqual(@as(?[]const u8, null), slot0.error_code);
     try testing.expectEqual(@as(?[]const u8, null), slot1.error_code);
@@ -1371,7 +1357,6 @@ test "hy4 request: a streamed Cooler load with >= 2 * top_k slots/layer joins co
         solos_made = i + 1;
     }
 
-    const misses_before = m.plans.?.misses;
     const late_before = mlx.engine.latePipelines();
     const fills_before = eng.fill_experts_total;
     hy4_state.joined_ticks_for_test = 0;
@@ -1406,7 +1391,6 @@ test "hy4 request: a streamed Cooler load with >= 2 * top_k slots/layer joins co
     }
     try testing.expect(hy4_state.joined_ticks_for_test > 0);
     try testing.expect(eng.fill_experts_total > fills_before);
-    try testing.expectEqual(misses_before, m.plans.?.misses);
     try testing.expectEqual(late_before, mlx.engine.latePipelines());
 
     // Exact ledger balance after all streamed concurrent requests close.

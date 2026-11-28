@@ -198,7 +198,7 @@ fn record(t: *const Tower, gpa: std.mem.Allocator, grid: Grid, fill: core.Fill, 
         defer _ = mlx.mlx_array_free(media);
         {
             // The media is the request's, made beside the encode: a recording of its own, dropped.
-            var rec = try plan.Recorder.begin(gpa, .{ .site = plan.siteOf(@src()) });
+            var rec = plan.Recorder.begin(gpa);
             defer rec.deinit();
             var state_driver: plan.Driver = .{ .gpa = gpa };
             defer state_driver.deinit();
@@ -206,7 +206,7 @@ fn record(t: *const Tower, gpa: std.mem.Allocator, grid: Grid, fill: core.Fill, 
             defer core.endRecording() catch {};
             try mlx.check(mlx.engine.freshArray(&media, &[_]c_int{ 1, @intCast(t.rowsOf(grid.h, grid.w)), @intCast(t.v.out_hidden) }, .float32));
         }
-        var rec = try plan.Recorder.begin(gpa, .{ .site = plan.siteOf(@src()) });
+        var rec = plan.Recorder.begin(gpa);
         defer rec.deinit();
         {
             try core.beginRecording(.{ .dry = .{ .driver = &driver, .fill = fill } }, &rec);
@@ -236,12 +236,8 @@ pub fn recordChecked(t: *const Tower, gpa: std.mem.Allocator, grid: Grid) ![]pla
     const other = try record(t, gpa, grid, .ramp, true);
     defer freeTraces(gpa, other);
     if (zeros.len != other.len) return error.Hy4PlanDataSteers;
-    for (zeros, other) |z, r| if (plan_trace.firstDifferenceOf(z.instances, r.instances, false)) |d| {
-        log.err("[plan] an encode of {d} x {d} patches records two shapes over two inputs ({t} at {d}, frame {d}/{d}): its data steers a size no `plan.bound` declares\n", .{ grid.h, grid.w, d.what, d.at, z.instances[d.instance].id.site, z.instances[d.instance].id.key });
-        return error.Hy4PlanDataSteers;
-    };
-    for (zeros, other) |z, r| if (!plan_trace.sameWaits(z.waits, r.waits)) {
-        log.err("[plan] an encode of {d} x {d} patches waits for the GPU at other places over two inputs: its data steers an eval\n", .{ grid.h, grid.w });
+    for (zeros, other) |z, r| if (plan_trace.firstDifference(z.view(), r.view())) |d| {
+        log.err("[plan] an encode of {d} x {d} patches records two shapes over two inputs ({t} at {d}): its data steers a size no `plan.bound` declares\n", .{ grid.h, grid.w, d.what, d.at });
         return error.Hy4PlanDataSteers;
     };
     return zeros;
@@ -254,14 +250,14 @@ fn freeTraces(gpa: std.mem.Allocator, traces: []plan_trace.Trace) void {
 
 /// The region an encode of an image the load accepts asks at most (D97), each place rounded to `alignment`: the most of
 /// each probe grid's checked recording (`recordChecked`).
-pub fn need(t: *const Tower, gpa: std.mem.Allocator, max_patches: u64, alignment: u64) !plan.region.Need {
+pub fn need(t: *const Tower, gpa: std.mem.Allocator, max_patches: u64, alignment: u64, guard: u64) !plan.region.Need {
     const grids = try probeGrids(gpa, t, max_patches);
     defer gpa.free(grids);
     var most: plan.region.Need = .{};
     for (grids) |g| {
         const traces = try recordChecked(t, gpa, g);
         defer freeTraces(gpa, traces);
-        for (traces) |*tr| most = most.max(try plan.region.need(gpa, tr, alignment));
+        for (traces) |*tr| most = most.max(try plan.region.needWithGuard(gpa, tr, alignment, guard));
     }
     return most;
 }

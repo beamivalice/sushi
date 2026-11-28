@@ -21,6 +21,7 @@ const kv_quant = @import("../kv_quant.zig");
 const prefix_arch = @import("../arch/prefix.zig");
 const restore_dump = @import("../restore_dump.zig");
 const dsv41_state = @import("dsv41_state.zig");
+const store = @import("dsv41_store.zig");
 const cfg_mod = @import("dsv41_config.zig");
 const live_points = @import("../live_points.zig");
 
@@ -98,9 +99,16 @@ fn placeholder() mlx.HostArrayRefused!mlx.mlx_array {
 }
 
 /// `a`, or for an absent slot the checkpoint's one placeholder, shared: `first` is the handle that made it.
-fn orPlaceholder(a: mlx.mlx_array, first: *mlx.mlx_array) !mlx.mlx_array {
+fn orPlaceholder(a: mlx.mlx_array, first: *mlx.mlx_array, placeholder_src: ?mlx.mlx_array) !mlx.mlx_array {
     if (a.ctx != null) return a;
     if (first.ctx == null) {
+        if (placeholder_src) |ph| {
+            var copy = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(copy);
+            try mlx.check(mlx.mlx_array_set(&copy, ph));
+            first.* = copy;
+            return copy;
+        }
         first.* = placeholder() catch return error.Dsv41CheckpointPlaceholder;
         return first.*;
     }
@@ -127,15 +135,19 @@ fn captureWith(allocator: std.mem.Allocator, m: *model.Model, pos: usize, share:
     defer allocator.free(slots);
     @memset(slots, model.nil_slot);
     try if (share) model.captureStateShared(m, slots) else model.captureState(m, slots);
+    if (m.onEngine()) {
+        const ph = m.placeholder orelse try m.ensurePlaceholder();
+        return fromSlots(allocator, slots, pos, ph);
+    }
     // The placeholder of the absent slots is made where the state is, and the pool is told of it like a copy.
     const host = mlx.engine.enter(model.stateStream(m));
     defer host.end();
     mlx.engine.room(&.{1});
-    return fromSlots(allocator, slots, pos);
+    return fromSlots(allocator, slots, pos, null);
 }
 
 /// The checkpoint that takes ownership of the arrays in `slots`, which are freed on a failure.
-fn fromSlots(allocator: std.mem.Allocator, slots: []model.Slot, pos: usize) !transformer.SSMCheckpoint {
+fn fromSlots(allocator: std.mem.Allocator, slots: []model.Slot, pos: usize, placeholder_src: ?mlx.mlx_array) !transformer.SSMCheckpoint {
     const layers = allocator.alloc(transformer.SSMCacheEntrySnapshot, 2 * slots.len) catch |err| {
         for (slots) |*sl| model.freeSlot(sl);
         return err;
@@ -153,10 +165,10 @@ fn fromSlots(allocator: std.mem.Allocator, slots: []model.Slot, pos: usize) !tra
             for (slots[at / 2 ..]) |*rest| model.freeSlot(rest);
             allocator.free(layers);
         }
-        const conv = try orPlaceholder(sl[2 * h], &first);
+        const conv = try orPlaceholder(sl[2 * h], &first, placeholder_src);
         sl[2 * h] = .{ .ctx = null };
         errdefer _ = mlx.mlx_array_free(conv);
-        const ssm = try orPlaceholder(sl[2 * h + 1], &first);
+        const ssm = try orPlaceholder(sl[2 * h + 1], &first, placeholder_src);
         sl[2 * h + 1] = .{ .ctx = null };
         layers[at] = .{ .conv_state = conv, .ssm_state = ssm, .initialized = true };
     }
@@ -169,10 +181,14 @@ fn captureLive(allocator: std.mem.Allocator, m: *model.Model, p: *const LivePoin
     defer allocator.free(slots);
     @memset(slots, model.nil_slot);
     try model.captureLiveShared(m, p.slots, p.pos, slots);
+    if (m.onEngine()) {
+        const ph = m.placeholder orelse try m.ensurePlaceholder();
+        return fromSlots(allocator, slots, p.pos, ph);
+    }
     const host = mlx.engine.enter(model.stateStream(m));
     defer host.end();
     mlx.engine.room(&.{1});
-    return fromSlots(allocator, slots, p.pos);
+    return fromSlots(allocator, slots, p.pos, null);
 }
 
 /// Makes the request's state `cp` over the first `cp.pos` of `ids`; the checkpoint's arrays are shared.
@@ -254,12 +270,9 @@ pub const Live = struct {
         return n;
     }
 
-    /// Keeps the fixed arrays of `cp`, a point of the request now running, and drops the shallowest past the cap.
-    pub fn keep(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, disk_id: ?u64) !void {
+    fn preparePointSlot(self: *Live, allocator: std.mem.Allocator, n_slots: usize, pos: usize) ![]model.Slot {
         if (self.ready and !self.open) self.clear(allocator);
-        const n_slots = model.slotCount(m);
-        if (cp.layers.len != 2 * n_slots) return error.Dsv41CheckpointMismatch;
-        while (self.points.items.len > 0 and self.points.items[self.points.items.len - 1].pos >= cp.pos) {
+        while (self.points.items.len > 0 and self.points.items[self.points.items.len - 1].pos >= pos) {
             var p = self.points.pop().?;
             freePoint(allocator, &p);
         }
@@ -269,10 +282,36 @@ pub const Live = struct {
         }
         const slots = try allocator.alloc(model.Slot, n_slots);
         @memset(slots, model.nil_slot);
+        return slots;
+    }
+
+    /// Keeps the fixed arrays of `cp`, a point of the request now running, and drops the shallowest past the cap.
+    /// On Cooler with pre-allocated `Points` slots, copies into a free slot instead of retaining references to live
+    /// state arrays or allocating from the pool.
+    pub fn keep(self: *Live, allocator: std.mem.Allocator, m: *model.Model, cp: *const transformer.SSMCheckpoint, disk_id: ?u64) !void {
+        const n_slots = model.slotCount(m);
+        if (cp.layers.len != 2 * n_slots) return error.Dsv41CheckpointMismatch;
+        const slots = try self.preparePointSlot(allocator, n_slots, cp.pos);
         errdefer {
             for (slots) |*sl| model.freeSlot(sl);
             allocator.free(slots);
         }
+        if (m.onEngine()) if ((try model.liveSlot(m)).*) |*st| if (st.points != null) {
+            const src_slots = try allocator.alloc(model.Slot, n_slots);
+            defer allocator.free(src_slots);
+            @memset(src_slots, model.nil_slot);
+            for (src_slots, 0..) |*sl, j| {
+                if (j < 2 * m.cfg.layers and j % 2 == 1) continue;
+                const lo = cp.layers[2 * j];
+                const hi = cp.layers[2 * j + 1];
+                for ([4]mlx.mlx_array{ lo.conv_state, lo.ssm_state, hi.conv_state, hi.ssm_state }, 0..) |a, k| {
+                    if (model.present(a)) sl[k] = a;
+                }
+            }
+            try store.copyCheckpointIntoFixedSlot(st, &m.cfg, src_slots, model.stateStream(m), slots);
+            try self.points.append(allocator, .{ .pos = cp.pos, .slots = slots, .disk_id = disk_id });
+            return;
+        };
         for (slots, 0..) |*sl, j| {
             if (j < 2 * m.cfg.layers and j % 2 == 1) continue;
             const lo = cp.layers[2 * j];
@@ -286,8 +325,23 @@ pub const Live = struct {
         try self.points.append(allocator, .{ .pos = cp.pos, .slots = slots, .disk_id = disk_id });
     }
 
+    /// Captures a restored state (`restoreDiskInto`) directly into a pre-allocated `Points` slot, zero pool asks.
+    pub fn keepRestoredFromState(self: *Live, allocator: std.mem.Allocator, m: *model.Model, pos: usize, disk_id: ?u64) !void {
+        const st = try model.ensureState(m);
+        if (st.n != pos) return error.Dsv41CachePositionMismatch;
+        const slots = try self.preparePointSlot(allocator, model.slotCount(m), pos);
+        errdefer {
+            for (slots) |*sl| model.freeSlot(sl);
+            allocator.free(slots);
+        }
+        try store.captureFixedSlot(st, &m.cfg, model.stateStream(m), slots);
+        try self.points.append(allocator, .{ .pos = pos, .slots = slots, .disk_id = disk_id });
+        self.base = pos;
+        self.restored_disk = if (disk_id) |id| .{ .id = id, .rows = @intCast(pos) } else null;
+    }
+
     /// `keep` for the point a request restored from: its rows below it came from a stored entry.
-    pub fn keepRestored(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, disk_id: ?u64) !void {
+    pub fn keepRestored(self: *Live, allocator: std.mem.Allocator, m: *model.Model, cp: *const transformer.SSMCheckpoint, disk_id: ?u64) !void {
         try self.keep(allocator, m, cp, disk_id);
         self.base = cp.pos;
         self.restored_disk = if (disk_id) |id| .{ .id = id, .rows = @intCast(cp.pos) } else null;
@@ -436,11 +490,21 @@ pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *transformer.Trunk, 
 }
 
 /// Gives the SSD tier this model's split of its restore points.
+/// On Cooler, marks `points_hold_state = true` so commits persist without allocating `[1, 1, n, 1]` row marker arrays.
 pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, disk: *kv_disk_cache.DiskTier) !void {
+    if (@import("../cooler_side.zig").onEngine(config)) disk.points_hold_state = true;
     const c = config.dsv41 orelse return;
     const divs = try rowDivisors(allocator, &c, config.drafterOn());
     defer allocator.free(divs);
     try disk.setGrownSpec(row_span, divs, c.stateBytesPerToken());
+}
+
+/// Reserves `m`'s state for a request of `prompt` tokens and `max_tokens` (`past_end` speculative rows past reply)
+/// before lookup, so a Cooler restore into it asks the pool for nothing.
+pub fn reserveRequest(m: State, prompt: usize, max_tokens: u64, past_end: u64) !void {
+    const end: usize = @intCast(transformer.KVCache.requestEnd(prompt, max_tokens, prompt +| max_tokens, past_end));
+    const cur = (try model.currentState(m)) orelse return try model.reserveNew(m, end);
+    if (end >= cur.n) try model.reserveFor(m, end);
 }
 
 /// SSD bytes one cached token adds to an entry: its rows once, and its share of the fixed arrays of the restore
@@ -576,6 +640,36 @@ fn rollbackLiveInPlace(
     return .{ .matched = pos, .full_match = false, .slot_owned = true };
 }
 
+/// Zero-pool Cooler SSD restore: streams entry `idx`'s point at `pos` straight into `m`'s pre-reserved buffers
+/// (`restoreBegin`/`restoreDest`/`restoreEnd`) via `DiskTier.restorePointInto`.
+pub fn restoreDiskInto(d: *kv_disk_cache.DiskTier, m: State, target_cache: *KVCache, idx: usize, pos: u32, ids: []const u32) !void {
+    const s = model.stateStream(m);
+    const n_snap = snapshotLayers(m);
+    try model.restoreBegin(m, pos);
+    const Into = struct {
+        m: State,
+        counts: [2 * (2 * cfg_mod.max_layers + cfg_mod.max_targets)][2]usize = @splat(.{ 0, 0 }),
+        failed: ?anyerror = null,
+
+        fn dest(ctx: *anyopaque, li: usize, field: u1, row: usize, t: @import("../prefix_vfs_tensors.zig").Named) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (t.dtype == .uint8 and t.shape.len == 1 and t.shape[0] == 1) return null;
+            if (li >= self.counts.len) return self.fail(error.Dsv41CheckpointMismatch);
+            const out = model.restoreDest(self.m, li, field, row, t.dtype, t.shape) catch |e| return self.fail(e);
+            self.counts[li][field] += @intCast(t.shape[0]);
+            return out;
+        }
+
+        fn fail(self: *@This(), e: anyerror) anyerror {
+            self.failed = e;
+            return e;
+        }
+    };
+    var into: Into = .{ .m = m };
+    d.restorePointInto(target_cache, idx, pos, n_snap, .{ .ctx = &into, .dest = Into.dest }, s) catch |e| return into.failed orelse e;
+    try model.restoreEnd(m, pos, ids, into.counts[0..n_snap]);
+}
+
 /// DeepSeek's SSD arm: the stored point under the match that beats the RAM match restores into the model.
 pub fn restoreDisk(
     self: *pc.HotPrefixCache,
@@ -599,25 +693,39 @@ pub fn restoreDisk(
     defer mlx.engine.capped(cap);
     const handled = Handled.begin();
     const refusals = mlx.memoryRefusals();
-    var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, snapshotLayers(m), s) catch |err| {
-        log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-        pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err, refusals);
-        target_cache.truncate(0, s) catch {};
-        handled.drop();
-        return null;
-    };
-    defer cp.deinit(d.allocator);
-    restore(m, &cp, prompt_ids) catch |err| {
-        log.warn("  [disk-cache] DeepSeek state not installed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-        target_cache.truncate(0, s) catch {};
-        reset(m);
-        handled.drop();
-        return null;
-    };
     const entry_id = d.entries.items[hm.idx].id;
-    self.last_restored_disk_id = entry_id;
-    restoredAt(m, cp.pos);
-    if (!m.serves_rows) liveOf(self).keepRestored(self.allocator, m, &cp, entry_id) catch handled.drop();
+    if (m.onEngine()) {
+        restoreDiskInto(d, m, target_cache, hm.idx, hm.cp, prompt_ids) catch |err| {
+            log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+            pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err, refusals);
+            target_cache.truncate(0, s) catch {};
+            reset(m);
+            handled.drop();
+            return null;
+        };
+        self.last_restored_disk_id = entry_id;
+        restoredAt(m, hm.cp);
+        if (!m.serves_rows) liveOf(self).keepRestoredFromState(self.allocator, m, hm.cp, entry_id) catch handled.drop();
+    } else {
+        var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, snapshotLayers(m), s) catch |err| {
+            log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+            pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err, refusals);
+            target_cache.truncate(0, s) catch {};
+            handled.drop();
+            return null;
+        };
+        defer cp.deinit(d.allocator);
+        restore(m, &cp, prompt_ids) catch |err| {
+            log.warn("  [disk-cache] DeepSeek state not installed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+            target_cache.truncate(0, s) catch {};
+            reset(m);
+            handled.drop();
+            return null;
+        };
+        self.last_restored_disk_id = entry_id;
+        restoredAt(m, cp.pos);
+        if (!m.serves_rows) liveOf(self).keepRestored(self.allocator, m, &cp, entry_id) catch handled.drop();
+    }
     log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
     return .{ .matched = hm.cp, .full_match = false, .slot_owned = true, .disk_restore = .{ .id = entry_id, .rows = hm.cp } };
 }
@@ -651,11 +759,11 @@ const Handled = struct {
 /// commit returns. A point off the grid is kept live only (`Live`), whatever the tier does. Below the tier's floor nothing
 /// is written: the points stay for the commit and are kept live, so the next turn rolls back to them as above it.
 /// `held` names the phase that waited on the writer, for the log.
-pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, held: []const u8) void {
+pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, held: []const u8) void {
     writeThroughChain(self, m, cache, prompt, has_tools, media, self.takeMediaChain(), cps, held);
 }
 
-fn writeThroughChain(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, chain: []const pc.MediaSpan, cps: []SSMCheckpoint, held: []const u8) void {
+fn writeThroughChain(self: *pc.HotPrefixCache, m: *dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, chain: []const pc.MediaSpan, cps: []SSMCheckpoint, held: []const u8) void {
     const s = dsv41_model.stateStream(m);
     if (self.disk == null) return;
     const handled = Handled.begin();
@@ -666,10 +774,12 @@ fn writeThroughChain(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cach
     if (prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return if (!m.serves_rows) keepLive(self, m, cps);
     // The points share the request's rows: one that outlived this call would make the next forward copy the store.
     defer for (cps) |*cp| cp.release();
-    markRows(cache, s) catch |err| {
-        log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
-        return;
-    };
+    if (!self.disk.?.points_hold_state) {
+        markRows(cache, s) catch |err| {
+            log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
+            return;
+        };
+    }
     // Joined rows keep no live record: every point goes to the tier, one off the row-segment grid with the rows past
     // the last segment in its own file. At one row such a point stays live, and reaches the tier at the handover.
     if (!m.serves_rows) {
@@ -699,7 +809,7 @@ fn restoredAt(m: *dsv41_model.Model, pos: usize) void {
     };
 }
 
-fn keepLive(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cps: []SSMCheckpoint) void {
+fn keepLive(self: *pc.HotPrefixCache, m: *model.Model, cps: []SSMCheckpoint) void {
     for (cps) |*cp| if (!cp.isReleased()) liveOf(self).keep(self.allocator, m, cp, null) catch |err| {
         log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
     };
@@ -776,7 +886,7 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []co
     defer handled.drop();
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     const rec: live_points.Record = .{ .tokens = live.tokens, .has_tools = live.has_tools, .vision_key = live.vision_key, .media_start = if (live.media_start) |v| @as(usize, v) else null, .media_chain = live.media_chain, .restored = live.restored_disk, .base = live.base };
-    const f = live_points.flush(FlushCtx{ .m = m, .s = s }, self, live.points.items, rec, @min(live.tokens.len, st.n), m.cfg.layers, live.quant, s, "[dsv41-prefix]");
+    const f = live_points.flush(FlushCtx{ .m = m, .s = s, .points_hold_state = self.disk.?.points_hold_state }, self, live.points.items, rec, @min(live.tokens.len, st.n), m.cfg.layers, live.quant, s, "[dsv41-prefix]");
     if (f.points == 0) return;
     log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, f.points, f.top, @as(f64, @floatFromInt(f.bytes)) / 1e9, sw.read() / std.time.ns_per_ms });
 }
@@ -785,13 +895,14 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []co
 const FlushCtx = struct {
     m: *dsv41_model.Model,
     s: mlx.mlx_stream,
+    points_hold_state: bool,
 
     pub fn capture(self: FlushCtx, allocator: std.mem.Allocator, p: *const LivePoint) !SSMCheckpoint {
         return captureLive(allocator, self.m, p);
     }
 
     pub fn prepare(self: FlushCtx, cache: *KVCache) !void {
-        try markRows(cache, self.s);
+        if (!self.points_hold_state) try markRows(cache, self.s);
     }
 };
 

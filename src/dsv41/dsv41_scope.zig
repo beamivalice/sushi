@@ -278,6 +278,18 @@ pub fn hostI32(a: A) ![]const i32 {
     return p[0..mlx.mlx_array_size(a)];
 }
 
+/// Evaluates `a` and reads via `mlx.hostResult` so dry recordings receive fill-patterned slices without reading GPU memory.
+pub fn hostResultF32(a: A) ![]const f32 {
+    try mlx.check(mlx.mlx_array_eval(a));
+    return mlx.hostResult(f32, a, null);
+}
+
+/// Evaluates `a` and reads via `mlx.hostResult`, bounding `.ramp` fill values below `below` when non-null.
+pub fn hostResultI32(a: A, below: ?u32) ![]const i32 {
+    try mlx.check(mlx.mlx_array_eval(a));
+    return mlx.hostResult(i32, a, below);
+}
+
 test "a scope's concat of one part and astype to the same dtype give a handle of the scope's own: the input freed and its box reused, the result keeps its bytes" {
     try mlx.requireGpu();
     const was = mlx.engine.enabled;

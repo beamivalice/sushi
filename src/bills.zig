@@ -110,7 +110,7 @@ pub fn planReach(config: *const model_mod.ModelConfig) u32 {
     const cap = config.contextCap();
     const manual = manualContext(config);
     if (manual == 0 or manual >= cap) return cap;
-    const warm = warmReach(config, arch_config.staticChunkMax(config)) + @import("mtp_policy.zig").mtpVerifyDraftsMax(config) + 1;
+    const warm = warmReach(config, if (ledgerArch(config)) arch_config.staticChunkMax(config) else 0) + @import("mtp_policy.zig").mtpVerifyDraftsMax(config) + 1;
     return @intCast(@min(cap, @max(manual, warm)));
 }
 
@@ -547,6 +547,14 @@ pub fn ceilingNow() Ceiling {
     return c;
 }
 
+/// The ceiling for a static-bill load (defaults wired margin to 0 GiB when no launch flag or saved setting overrides).
+pub fn ceilingNowStatic() Ceiling {
+    var c = ceilingNow();
+    c.margin = launch_state.staticWiredMarginBytes();
+    c.unplanned = wiredUnplannedBytes(c.margin, c.gpu_floor);
+    return c;
+}
+
 /// Bytes MLX wires beside the owned weights and slabs: the decode buffer pool (`dsv41_pool_bytes`), the one
 /// ledger term the owned-bytes count lacks.
 pub const USER_WIRE_MARGIN_BYTES: u64 = 1 << 30;
@@ -637,10 +645,10 @@ pub fn warnUserWireLimit() void {
 
 /// The limits a default `--ssd-budget-gb` must fit: the residency limit (the declared wired limit, else Metal's working
 /// set) and the lower user-wire sysctl, each less what stays unplanned under it.
-pub fn defaultBudgetLimits() model_load.BudgetLimits {
+pub fn defaultBudgetLimitsFor(static_bill: bool) model_load.BudgetLimits {
     const wire = [2]u64{ readSysctlU64("vm.global_user_wire_limit"), readSysctlU64("vm.user_wire_limit") };
     const wire_bind: usize = if (wire[0] == 0 or (wire[1] != 0 and wire[1] < wire[0])) 1 else 0;
-    const c = ceilingNow();
+    const c = if (static_bill) ceilingNowStatic() else ceilingNow();
     // Under a declared limit the ceiling less its margin is the Ceiling's floor.
     return .{
         .wired_limit = c.declared orelse 0,
@@ -651,6 +659,10 @@ pub fn defaultBudgetLimits() model_load.BudgetLimits {
         .user_wire_name = if (wire_bind == 0) "vm.global_user_wire_limit" else "vm.user_wire_limit",
         .user_wire_margin = USER_WIRE_MARGIN_BYTES,
     };
+}
+
+pub fn defaultBudgetLimits() model_load.BudgetLimits {
+    return defaultBudgetLimitsFor(false);
 }
 
 /// What a request at the model's default context bills beside the ssd budget with its prefill borrowed from the decoder
@@ -761,12 +773,16 @@ pub const FitReadings = struct {
     proc_free: u64 = 0,
 
     pub fn now() FitReadings {
+        return nowFor(false);
+    }
+
+    pub fn nowFor(static_bill: bool) FitReadings {
         // The lent decoder pools are in use for a load (`promisedActive`), and not the free RAM their pages show as; nor
         // is what the loads on the ledger hold of their budgets unallocated (D90).
         const held = gpu_mem.lentBytes() +| ledger_mod.unseenBeside(null);
         const active: u64 = promisedActive(gpu_mem.activeBytes(), null);
         return .{
-            .ceiling = ceilingNow(),
+            .ceiling = if (static_bill) ceilingNowStatic() else ceilingNow(),
             .active = active,
             .cache = gpu_mem.cacheBytes(),
             .free = metrics.getAvailableMemBytes() -| held,
@@ -828,7 +844,7 @@ pub fn expertCacheRefusal(config: *const model_mod.ModelConfig, resident_bytes: 
 
 /// The live check a streamed load runs once its plan is applied (`model_load`'s fit resolver).
 pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_bytes: u64) ?ExpertCacheRefusal {
-    return expertCacheRefusal(config, resident_bytes, FitReadings.now());
+    return expertCacheRefusal(config, resident_bytes, FitReadings.nowFor(ledgerArch(config)));
 }
 
 /// What the streamed load's fit check holds under its ceiling: `active` and the load's resident, cache, workspace,
@@ -1535,18 +1551,20 @@ pub const StaticChunkChoice = union(enum) {
     pub const Refusal = struct { min: u32, needed: u64, free: u64, context: ContextSource };
 };
 
-/// Whether `config`'s arch bills only on its ledger (its bill answers `ledgerTerms`: Hy4). A load of it that warms is on
-/// the ledger (`static_bill.onLedger`), whose arena its forwards run in under no pool cap; before its load a request is
-/// priced by the closed-form terms (D105); a load of it that serves no request (`sushi kld`) runs uncapped.
+/// Whether `config`'s arch bills only on its ledger (its bill answers `ledgerTerms`, and on dual-engine archs it is
+/// running on Sushi Cooler). A load of it that warms is on the ledger (`static_bill.onLedger`), whose arena its forwards
+/// run in under no pool cap; before its load a request is priced by the closed-form terms (D105); a load of it that
+/// serves no request (`sushi kld`) runs uncapped.
 pub fn ledgerArch(config: *const model_mod.ModelConfig) bool {
     const claimed = arch_spec.of(config) orelse return false;
     switch (claimed) {
-        inline else => |_, tag| return comptime @hasDecl(arch_registry.Mod(tag).bill, "ledgerTerms"),
+        inline else => |_, tag| return (comptime @hasDecl(arch_registry.Mod(tag).bill, "ledgerTerms")) and @import("cooler_side.zig").onEngine(config),
     }
 }
 
 /// A load on the ledger: what its requests hold at `chunk` (the arch's `ledgerTerms`); null for any other.
 pub fn ledgerTermsAt(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) ?ledger_mod.RequestTerms {
+    if (!ledgerArch(config)) return null;
     return archHook("ledgerTerms", ledger_mod.RequestTerms, config, .{ kv_bits, chunk });
 }
 
@@ -1645,7 +1663,7 @@ pub fn refuseStaticChunkBeforePlans(config: *const model_mod.ModelConfig, room: 
 /// nothing re-sizes it. `ledger` is the load's (`static_bill.open`): the chunk is chosen on it, and a static-bill load
 /// with none (it does not warm) is refused by name. 0 for a load off the static bill.
 pub fn fixStaticPrefillChunk(config: *model_mod.ModelConfig, ledger: ?LedgerChoice) anyerror!u32 {
-    if (arch_config.staticChunkMax(config) == 0) return 0;
+    if (!ledgerArch(config) or arch_config.staticChunkMax(config) == 0) return 0;
     var buf: [256]u8 = undefined;
     const b = switch (prefillChunkBounds(&buf, config)) {
         .refused => |line| {
@@ -4214,6 +4232,49 @@ test "the declared ceiling reads the safety margin at call time: the saved value
     try t.expectEqual(@as(u64, 0), launch_state.wiredMarginBytes());
     launch_state.wired_margin_flag_bytes = 4 * gib;
     try t.expectEqual(limit - 4 * gib, ceilingNow().floor().?);
+}
+
+test "static bill defaults wired margin to 0 GiB while dynamic bill defaults to 1 GiB, unless overridden" {
+    const t = std.testing;
+    const gib: u64 = 1 << 30;
+    const limit_was = wired_limit_mb_override;
+    const floor_was = gpu_floor_bytes.load(.monotonic);
+    const logged_was = wired_floor_logged.load(.monotonic);
+    const flag_was = launch_state.wired_margin_flag_bytes;
+    defer {
+        wired_limit_mb_override = limit_was;
+        gpu_floor_bytes.store(floor_was, .monotonic);
+        wired_floor_logged.store(logged_was, .monotonic);
+        launch_state.wired_margin_flag_bytes = flag_was;
+        launch_state.setWiredMarginFile(null);
+    }
+    wired_limit_mb_override = 123_000;
+    gpu_floor_bytes.store(0, .monotonic);
+    wired_floor_logged.store(true, .monotonic);
+    launch_state.wired_margin_flag_bytes = null;
+    launch_state.setWiredMarginFile(null);
+    const status = @import("status.zig");
+    const total_was = status.total_mem_override;
+    const static_was = static_ceiling_override;
+    defer {
+        status.total_mem_override = total_was;
+        static_ceiling_override = static_was;
+    }
+    status.total_mem_override = 128 * gib;
+    static_ceiling_override = 123_000 << 20;
+    const limit = wiredLimitBytes();
+
+    const dyn = ceilingNow();
+    const st = ceilingNowStatic();
+    try t.expectEqual(gib, dyn.margin);
+    try t.expectEqual(@as(u64, 0), st.margin);
+    try t.expectEqual(limit - gib, dyn.planning());
+    try t.expectEqual(limit - GPU_FLOOR_SLACK_BYTES, st.planning());
+
+    // Explicit flag overrides both.
+    launch_state.wired_margin_flag_bytes = 2 * gib;
+    try t.expectEqual(limit - 2 * gib, ceilingNow().planning());
+    try t.expectEqual(limit - 2 * gib, ceilingNowStatic().planning());
 }
 
 test "a margin of 0 plans to the declared limit less the floor and the 512 MB slack" {

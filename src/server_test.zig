@@ -141,6 +141,8 @@ const Needs = struct {
     one_arch: bool = false,
     /// Only archs whose admission evicts hot cache (`qwen4`).
     evicts_hot_cache: bool = false,
+    /// Only arches that can hold two models resident at once (not static-ledger arches, D90).
+    co_loads: bool = false,
     /// Reuse one persistent resident server per arch for steady-state tests (`max_concurrent = 4`).
     shared: bool = false,
     /// A second copy of the fixture, served as `tiny2`.
@@ -453,7 +455,7 @@ fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void)
     defer for (&archs) |*a| if (a.*) |*x| x.tmp.cleanup();
     inline for (comptime std.meta.tags(registry.Tag), 0..) |t, i| {
         const M = registry.Mod(t);
-        if (comptime @hasDecl(M, "cooler_contract") and @hasDecl(M.cooler_contract, "serverDir")) if (!needs.long_replies or M.cooler_contract.server_long_replies) if (!needs.evicts_hot_cache or t == .qwen4) {
+        if (comptime @hasDecl(M, "cooler_contract") and @hasDecl(M.cooler_contract, "serverDir")) if (!needs.long_replies or M.cooler_contract.server_long_replies) if (!needs.evicts_hot_cache or t == .qwen4) if (!needs.co_loads or comptime !(@hasDecl(M, "bill") and @hasDecl(M.bill, "ledgerTerms"))) {
             const reuse_shared = needs.shared and SharedServer.matches(@tagName(t), needs);
             var tmp = testing.tmpDir(.{});
             var ok = true;
@@ -1260,7 +1262,7 @@ test "server: a model loaded beside the current one with no hot cache of its own
     const Scenario = struct {
         var seen: u32 = 0;
     };
-    try eachArch(4, .{ .tiny2 = true, .max_resident = 2 }, struct {
+    try eachArch(4, .{ .tiny2 = true, .max_resident = 2, .co_loads = true }, struct {
         fn run() !void {
             var b: [512]u8 = undefined;
             gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "the river runs to the sea and on and on", 8, false)));
@@ -1553,10 +1555,15 @@ test "server: a Responses WebSocket turn refused before it runs ends in the erro
             const fd = try wsConnect();
             defer _ = std.c.close(fd);
             defer clearWiredFloor();
+            const tiny_ledger = if (server_state.global_registry) |r| (if (r.entries.get("tiny")) |e| (if (e.config) |c| c.static_ledger else null) else null) else null;
+            const ledger_budget_was = if (tiny_ledger) |l| l.budget() else 0;
+            defer if (tiny_ledger) |l| l.setBudget(ledger_budget_was);
             const ctx_was = server_state.server_config.max_context_size;
             defer server_state.server_config.max_context_size = ctx_was;
             for (cases) |c| {
-                if (std.mem.eql(u8, c.name, "memory admission")) try setWiredFloor(1 << 20);
+                if (std.mem.eql(u8, c.name, "memory admission")) {
+                    if (tiny_ledger) |l| l.setBudget(0) else try setWiredFloor(1 << 20);
+                }
                 server_state.server_config.max_context_size = if (std.mem.eql(u8, c.name, "context overflow")) 64 else ctx_was;
                 try wsSend(fd, c.frame);
                 const frame = try wsReadFrame(fd);
@@ -1567,6 +1574,7 @@ test "server: a Responses WebSocket turn refused before it runs ends in the erro
                 }
             }
             clearWiredFloor();
+            if (tiny_ledger) |l| l.setBudget(ledger_budget_was);
             // The connection serves the next turn.
             try wsSend(fd, "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
             while (true) {
@@ -1774,7 +1782,7 @@ test "server: a reply whose turn ends inside its thought is continued once after
 test "server: a completions stream that fails mid-reply ends in a completions chunk, not a chat delta" {
     try eachArch(4, .{ .shared = true }, struct {
         fn run() !void {
-            defer mlx.engine.fault.disarm();
+            defer mlx.armLatchingFaultForTest(0);
             var b: [512]u8 = undefined;
             gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, false)));
             const fd = try connect();
@@ -1782,7 +1790,7 @@ test "server: a completions stream that fails mid-reply ends in a completions ch
             try send(fd, "POST", "/v1/completions", try completionBody(&b, "a long tale of the sea", 64, true));
             const head = try readUntil(fd, "\"choices\"");
             defer gpa.free(head);
-            mlx.engine.fault.arm(1);
+            mlx.armLatchingFaultForTest(1);
             const rest = try readUntil(fd, null);
             defer gpa.free(rest);
             const at = std.mem.lastIndexOf(u8, rest, "\"finish_reason\":\"error\"") orelse {
@@ -2934,7 +2942,7 @@ fn rawExchange(bytes: []const u8) ![]u8 {
 }
 
 test "server: an unload whose Content-Length has no space after its colon unloads the model it names, or is refused, never another" {
-    try eachArch(4, .{ .tiny2 = true, .one_arch = true }, struct {
+    try eachArch(4, .{ .tiny2 = true, .one_arch = true, .co_loads = true }, struct {
         fn run() !void {
             gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
             gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
@@ -2955,7 +2963,7 @@ test "server: an unload whose Content-Length has no space after its colon unload
 test "server: an unload whose Content-Length has whitespace before its colon, is folded or follows a bare LF unloads the model it names, or is refused" {
     // RFC 9112 §5.1 (whitespace before the colon: MUST 400), §5.2 (obs-fold: 400 or SP), §2.2 (bare LF: a line end or
     // refused). The contract of h15-1's served test: unloads the model it names, or a 400, never another.
-    try eachArch(4, .{ .tiny2 = true, .one_arch = true }, struct {
+    try eachArch(4, .{ .tiny2 = true, .one_arch = true, .co_loads = true }, struct {
         fn run() !void {
             var bad: usize = 0;
             gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));

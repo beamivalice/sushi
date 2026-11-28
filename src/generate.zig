@@ -2588,7 +2588,7 @@ pub const Generator = struct {
     fn sampleSync(self: *Generator, logits: mlx.mlx_array) !sampler.SampleResult {
         const run = try arch_cooler.beginSample(self.xfm, sampler.syncMix(self.sampling, self.generated_ids.items));
         const r = sampler.sampleToken(logits, self.sampling, self.generated_ids.items, self.xfm.outStream()) catch |e| {
-            try run.fail();
+            run.fail();
             return e;
         };
         try run.end();
@@ -3795,7 +3795,7 @@ pub const Generator = struct {
 fn sampleRun(xfm: *Trunk, step: sampler.Step) !mlx.mlx_array {
     const run = try arch_cooler.beginSample(xfm, step.mix());
     const lazy = sampler.sampleStep(std.heap.page_allocator, step, xfm.outStream()) catch |e| {
-        try run.fail();
+        run.fail();
         return e;
     };
     return run.token(lazy);

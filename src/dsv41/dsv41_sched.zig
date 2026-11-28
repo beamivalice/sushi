@@ -64,6 +64,53 @@ pub fn batches(config: *const ModelConfig) bool {
     return joinedRows(config) > 1;
 }
 
+pub fn sampleJoinedRows(
+    xfm: *Trunk,
+    gens: []const *Generator,
+    rows: []const mlx.mlx_array,
+    params: []@import("../sampler.zig").SamplingParams,
+    out: []i32,
+) !bool {
+    const m = xfm.arch_state.dsv41.model orelse return false;
+    const p = m.plans orelse return false;
+    if (!p.sample.planned) return false;
+    std.debug.assert(gens.len == rows.len and rows.len == params.len and out.len == rows.len);
+    const chunk_max = @import("dsv41_sample_plan.zig").token_slots / 2;
+    var base: usize = 0;
+    while (base < rows.len) {
+        const count = @min(chunk_max, rows.len - base);
+        var kept: [chunk_max]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        defer for (kept[0..made]) |k| {
+            _ = mlx.mlx_array_free(k);
+        };
+        for (0..count) |j| {
+            const i = base + j;
+            const gen = gens[i];
+            const step = gen.stepFor(rows[i]);
+            const run = try @import("../arch/cooler.zig").beginSample(xfm, step.mix());
+            const lazy = @import("../sampler.zig").sampleStep(std.heap.page_allocator, step, xfm.outStream()) catch |e| {
+                run.fail();
+                return e;
+            };
+            kept[j] = try run.token(lazy);
+            made = j + 1;
+        }
+        const vec = mlx.mlx_vector_array_new_data(&kept, made);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        for (0..count) |j| {
+            const i = base + j;
+            var token: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&token, kept[j]));
+            out[i] = token;
+            params[i].draw +%= 1;
+        }
+        base += count;
+    }
+    return true;
+}
+
 pub fn rowCap(config: *const ModelConfig) ?usize {
     const n = joinedRows(config);
     return if (n > 1) n else null;
@@ -244,6 +291,9 @@ fn groupForward(
     const m = xfm.arch_state.dsv41.model orelse return error.Dsv41NoModel;
     const n = ctxs.len;
     const cap = m.servedJoinedRows();
+    const wide_opt: ?@import("../tensor/core.zig").Wide = if (m.plans != null) @import("../tensor/core.zig").widePhase() else null;
+    defer if (wide_opt) |w| w.end();
+    if (m.plans) |p| try p.releaseAliasLease();
 
     // When a new set of requests enters concurrency `n`, clear any stale `.plain` cooldown inherited from an earlier
     // low-acceptance batch while keeping the calibrated `serial_ms` baseline.
@@ -535,6 +585,36 @@ fn plainBatchedForward(
         log.info("[dsv41-rows] joined decode tick engaged: {d} rows\n", .{ctxs.len});
     }
     var timer = if (observe_gate) io_util.Stopwatch.init(sch.io) else undefined;
+    const m = xfm.arch_state.dsv41.model orelse return error.Dsv41NoModel;
+    if (m.plans != null) {
+        if (m.logits_fixed[0] != null) for (segs[0..ctxs.len]) |sg| try m.makeRequestLogits(sg.request);
+        var raw_views: [max_rows]mlx.mlx_array = @splat(.{ .ctx = null });
+        var views_made: usize = 0;
+        errdefer for (raw_views[0..ctxs.len]) |v| if (v.ctx != null) {
+            _ = mlx.mlx_array_free(v);
+        };
+        try dsv41_serving.forwardRowsViews(xfm, segs[0..ctxs.len], true, raw_views[0..ctxs.len]);
+        if (observe_gate) {
+            try mlx.check(mlx.mlx_array_eval(raw_views[0]));
+            if (comptime !@import("builtin").is_test) {
+                const ms: f64 = @as(f64, @floatFromInt(timer.read())) / 1e6;
+                group_cost.observePlain(ctxs.len, ms);
+                group_gates[ctxs.len].observePlain(ms / @as(f64, @floatFromInt(ctxs.len)));
+            }
+        }
+        const out = try allocator.alloc(mlx.mlx_array, ctxs.len);
+        errdefer {
+            for (out[0..views_made]) |o| _ = mlx.mlx_array_free(o);
+            allocator.free(out);
+        }
+        for (ctxs, segs[0..ctxs.len], raw_views[0..ctxs.len], 0..) |ctx, sg, v, i| {
+            ctx.cache.step = sg.request.state.?.n;
+            out[i] = v;
+            raw_views[i] = .{ .ctx = null };
+            views_made = i + 1;
+        }
+        return out;
+    }
     const joined = try dsv41_serving.forwardRowsDeferred(xfm, segs[0..ctxs.len]);
     defer _ = mlx.mlx_array_free(joined);
     if (observe_gate) {
@@ -634,6 +714,16 @@ pub fn parkedStateBytes(entry: *model_registry.LoadedModel) u64 {
     return thought_point.dsv41ModelStateBytes(entry);
 }
 
+/// Drops the parked state and unreleased live prefix points when admission reclaims them.
+pub fn releaseParked(entry: *model_registry.LoadedModel) void {
+    const xfm = arch_handle.trunk(entry.handle orelse return);
+    const m = xfm.arch_state.dsv41.model orelse return;
+    if (m.serves_rows) return;
+    if (entry.prefix_cache) |*hc| dsv41_prefix.releaseLive(hc, m, "admission");
+    dsv41_model.resetState(m);
+    mlx.engine.trim();
+}
+
 /// The next exclusive request is admitted as soon as the slot leaves `decoding` and takes the record over, so a
 /// commit at the cleanup drain would publish onto its state.
 pub fn commitsAtCull(slot: *const Slot) bool {
@@ -644,10 +734,11 @@ pub fn commitsAtCull(slot: *const Slot) bool {
 pub const prepare_commit_label = "DeepSeek row marker";
 pub const cancelled_entry_label = "a DeepSeek entry";
 
-/// The cache holds a one-byte-a-token row marker for the model's rows.
+/// The cache holds a one-byte-a-token row marker for the model's rows when off Cooler (`!points_hold_state`).
 pub fn prepareCommit(slot: *Slot) !void {
     const xfm = arch_handle.trunk(slot.model.handle orelse return);
     const dsv = xfm.arch_state.dsv41.model orelse return;
+    if (dsv.onEngine()) return;
     try dsv41_prefix.markRows(&slot.cache, @import("dsv41_model.zig").stateStream(dsv));
 }
 
@@ -661,12 +752,18 @@ pub fn cancelledNeedsCheckpoints() bool {
 }
 
 /// With joined rows the restore installs into the slot's own request, lent until `restoreEnd`.
+/// On Cooler, reserves the state to the request's end before lookup so a restore asks the pool for nothing.
 pub fn restoreTarget(slot: *Slot, xfm: *Trunk) ?sched.RestoreTarget {
     const dsv = xfm.arch_state.dsv41.model orelse return null;
     if (dsv.serves_rows) {
         // Nothing is lent at a lookup, so `restoreEnd` ends this lend by clearing it.
         std.debug.assert(dsv.bound == null);
         _ = dsv41_model.lendFor(dsv, slotRequest(slot));
+    }
+    if (dsv.onEngine()) {
+        const past_end = @import("../bills.zig").speculativeRowsPastEnd(&xfm.config, .{ .mtp_on = slot.enable_mtp and slot.mtp != null });
+        dsv41_prefix.reserveRequest(dsv, slot.prompt_ids.len, slot.max_tokens, past_end) catch |e|
+            log.warn("[dsv41-prefix] the request's state was not reserved before its lookup ({t}): its restore reserves it\n", .{e});
     }
     return .{ .rec = prefix_arch.recurrent("dsv41", dsv), .log_tag = "[dsv41-prefix]" };
 }
@@ -720,7 +817,7 @@ pub fn afterSpecBlock(slot: *Slot, gen: *Generator, block: []const u32) void {
 }
 
 pub fn endRequest(config: *const ModelConfig) void {
-    dsv41_borrow.endRequestMlx(config);
+    if (!@import("../bills.zig").ledgerArch(config)) dsv41_borrow.endRequestMlx(config);
 }
 
 pub fn flushResident(entry: *model_registry.LoadedModel, why: []const u8) void {

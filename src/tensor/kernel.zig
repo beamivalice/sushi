@@ -456,10 +456,10 @@ fn launchWith(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tens
     var made: usize = 0;
     errdefer for (outputs[0..made]) |t| core.release(t);
     for (0..cfg.n_out) |i| {
-        outputs[i] = if (how == .into) blk: {
+        outputs[i] = if (how == .into and i == 0) blk: {
             const t = how.into;
             const shape = cfg.out_shapes[i][0..cfg.out_ndims[i]];
-            if (cfg.n_out != 1 or t.dtype != cfg.out_dtypes[i] or t.ndim != shape.len or !t.rowContiguous()) return error.TensorShape;
+            if (t.dtype != cfg.out_dtypes[i] or t.ndim != shape.len or !t.rowContiguous()) return error.TensorShape;
             for (t.shape[0..t.ndim], shape) |a, b| if (a != b) return error.TensorShape;
             break :blk try core.share(t);
         } else if (how == .counted and i + 1 == cfg.n_out) blk: {
@@ -492,8 +492,8 @@ fn launchWith(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tens
             index += 1;
         }
     }
-    for (outputs) |out| {
-        if (how == .into or how == .disjoint) core.bindOutDisjoint(p, out, index) else core.bindOut(p, out, index);
+    for (outputs, 0..) |out, i| {
+        if ((how == .into and i == 0) or how == .disjoint) core.bindOutDisjoint(p, out, index) else core.bindOut(p, out, index);
         index += 1;
     }
     const grid: metal.Size = .{ .x = @intCast(cfg.grid[0]), .y = @intCast(cfg.grid[1]), .z = @intCast(cfg.grid[2]) };
@@ -701,7 +701,7 @@ test "kernel: a launch's output is the tensor `core.into` names, recorded state-
     var cfg: Config = .{};
     try oneOutput(&cfg, 4);
     try cfg.addTemplate("SCALE", .{ .int = 2 });
-    var rec = try plan.Recorder.begin(testing.allocator, .{ .site = 1 });
+    var rec = plan.Recorder.begin(testing.allocator);
     defer rec.deinit();
     {
         try core.beginRecording(.real, &rec);
@@ -714,7 +714,7 @@ test "kernel: a launch's output is the tensor `core.into` names, recorded state-
         try g.taken(out[0]);
         try testing.expect(out[0].store == dst.store);
     }
-    try testing.expect(rec.instances.items[0].asks.items[0].external);
+    try testing.expect(rec.asks.items[0].external);
     try testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, @alignCast(std.mem.bytesAsSlice(f32, try core.hostBytes(dst))));
     {
         const g = try core.into(dst);

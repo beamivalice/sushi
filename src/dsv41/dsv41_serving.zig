@@ -51,11 +51,12 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const engine = engine_mine.?;
     if (dsv41_borrow.keepsScales(&config) and !engine.plan.resident) try engine.keepScales();
     const skip_warm = if (comptime @import("builtin").is_test) config.test_skip_warm else false;
-    var plan = if (skip_warm)
+    var plan_opt: ?cooler_pipelines.Plan = if (skip_warm)
         cooler_pipelines.begin(allocator, std.Io.Threaded.global_single_threaded.io(), null, "test_skip_warm", .{ .scope = @splat('0'), .build = @splat('0') }, 0)
     else
         beginPipelines(allocator, &config, engine, own_decode);
-    defer plan.deinit();
+    defer if (plan_opt) |*p| p.deinit();
+    const plan = &plan_opt.?;
     // On a warm manifest load with streamed experts and no prefetch rate probe, start bulk cache preloading in the
     // background so SSD reads overlap with `plan.settle()` and `dsv41_model.init()`.
     if (!skip_warm and !engine.plan.resident and plan.case == .same and config.ssdPrefetchPct() == 0) {
@@ -65,7 +66,10 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const settled = if (skip_warm) false else plan.settle();
     if (own_decode) {
         const dsv41 = &config.dsv41.?;
-        if (dsv41.expert_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack, model_stream);
+        if (dsv41.expert_dec) |dec| {
+            try expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack, model_stream);
+            try @import("sushi_exl3").rate_groups.prepareSharedCaches(model_stream);
+        }
         if (dsv41.trunk_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, .pack, model_stream);
     }
     // The pools a route makes follow the plan this load runs under, whatever the config said before it.
@@ -118,6 +122,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         mdl.experts = .{ .hook = experts.hook() };
         if (prefetchIgnoredLine(&config)) |line| log.info("{s}\n", .{line});
     }
+    shell.arch_state.dsv41.loader_weights = weights;
     shell.arch_state.dsv41.model = mdl;
     mdl_mine = null;
     shell.expert_stream = engine;
@@ -133,6 +138,13 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const scope = warmScopeOf(settled);
     // The background cache fill ends before any forward routes experts, on every path that loads a model.
     try engine.awaitAsyncWarmCache();
+    if (own_decode and @import("../bills.zig").ledgerArch(&config)) {
+        shell.arch_state.dsv41.warm_scope = scope;
+        shell.arch_state.dsv41.warm_deferred = true;
+        shell.arch_state.dsv41.warm_plan = plan_opt;
+        plan_opt = null;
+        return shell;
+    }
     if (warmAll(&shell, mdl, shell.arch_state.dsv41.stq_experts, scope)) {
         log.info("[dsv41] kernels warmed for 1..{d} rows{s}{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", if (scope == .mlx) " (the engine's from the manifest)" else "", clock.lap() / std.time.ns_per_ms });
         if (scope == .all and own_decode) plan.storeManifestOnly();
@@ -169,8 +181,9 @@ pub fn warmAll(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStr
 /// `warmAll` with the widest wide chunk it runs.
 pub fn warmAllAt(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope, width: usize) !void {
     if (@import("builtin").is_test) @import("../cooler_warm.zig").arch_warm_runs_for_test += 1;
-    dsv41_borrow.warm_budget = true;
-    defer dsv41_borrow.endWarmMlx();
+    const on_ledger = mdl.plans != null or self.config.static_ledger != null;
+    if (!on_ledger) dsv41_borrow.warm_budget = true;
+    defer if (!on_ledger) dsv41_borrow.endWarmMlx();
     warmForwards(self, mdl, stq, scope, width) catch |e| {
         if (e == error.PoolOverBudget or mlx.takeErrorIf("PoolOverBudget")) {
             const r = mlx.engine.refusedBudget();
@@ -185,14 +198,19 @@ fn warmForwards(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqSt
     // A warm runs throwaway forwards on the model's own state, whichever request is lent around it.
     const own = dsv41_model.lendOwn(mdl);
     defer own.end();
+    const on_ledger = mdl.plans != null or self.config.static_ledger != null;
     try dsv41_model.warmKernelsFor(mdl, scope);
     const after = warmAfter(scope, mdl.onEngine());
     if (after.sampled_verdict) {
-        try dsv41_model.warmBudget(mdl, dsv41_config.verify_rows);
+        if (!on_ledger) try dsv41_model.warmBudget(mdl, dsv41_config.verify_rows);
         try warmSampledVerdict(mdl);
         try warmSerialSampler(mdl);
     }
     if (after.split) if (stq) |st| try st.warmSplit(mdl, dsv41_config.warm_width, false);
+    if (scope == .all and mdl.onEngine()) if (stq) |st| {
+        if (!on_ledger) dsv41_borrow.enterWarmMlx(3, 3, &mdl.cfg, true);
+        try st.warmDecodeFallback(mdl);
+    };
     if (after.wide) {
         var clock = expert_stream_mod.Clock.init();
         try warmWide(self, mdl, stq, width);
@@ -253,27 +271,35 @@ pub fn widePlans(gpa: std.mem.Allocator, width: usize, k: usize, ratios: []const
 pub fn warmWide(self: *Trunk, m: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, width: usize) !void {
     // The split chain is a wide chunk's work but no forward: it takes the budget such a chunk has, not the one the
     // decode-width forward before it left.
-    dsv41_borrow.enterWarmMlx(width, width, &m.cfg, m.onEngine());
-    if (stq) |st| try st.warmSplit(m, width, true);
-    const plans = try widePlans(m.gpa, width, m.layers[0].top_k, m.cfg.ratios[0..m.cfg.layers]);
+    const on_ledger = m.plans != null or self.config.static_ledger != null;
+    const eff_width = if (m.plans) |p| @min(width, p.reach) else width;
+    if (!on_ledger) dsv41_borrow.enterWarmMlx(eff_width, eff_width, &m.cfg, m.onEngine());
+    if (stq) |st| try st.warmSplit(m, eff_width, true);
+    const plans = try widePlans(m.gpa, eff_width, m.layers[0].top_k, m.cfg.ratios[0..m.cfg.layers]);
     defer m.gpa.free(plans);
-    const ids = try m.gpa.alloc(i32, width);
+    const ids = try m.gpa.alloc(i32, eff_width);
     defer m.gpa.free(ids);
     for (ids, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % m.cfg.vocab);
     for (plans) |plan| {
         const chunks = if (plan[1] == 0) plan[0..1] else plan[0..2];
-        if (!planFits(chunks, width)) continue;
+        if (!planFits(chunks, eff_width)) continue;
         var plan_clock = expert_stream_mod.Clock.init();
         try self.resetCache();
         const reset_ms = plan_clock.lap() / std.time.ns_per_ms;
         defer log.debug("[dsv41] wide warm {any}: reset {d} ms, forwards {d} ms\n", .{ chunks, reset_ms, plan_clock.lap() / std.time.ns_per_ms });
         var ctx = self.defaultCtx();
+        var total_rows: usize = 0;
+        for (chunks) |w| total_rows += w;
+        ctx.cache.end_tokens = total_rows;
         for (chunks, 0..) |w, i| {
             ctx.ahead_min_rows = if (i + 1 < chunks.len) chunks[i + 1] else 0;
             // The chunk's token ids, on the side the forward runs on as a request's are.
-            const host = mlx.engine.enter(self.outStream());
-            const arr = try mlx.newData(ids.ptr, &[_]c_int{ 1, @intCast(w) }, .int32);
-            host.end();
+            const arr = if (m.plans != null) try m.idsInput(ids[0..w]) else blk: {
+                const host = mlx.engine.enter(self.outStream());
+                const raw = try mlx.newData(ids.ptr, &[_]c_int{ 1, @intCast(w) }, .int32);
+                host.end();
+                break :blk raw;
+            };
             defer _ = mlx.mlx_array_free(arr);
             const out = try forwardDsv41With(self, &ctx, arr, m);
             defer _ = mlx.mlx_array_free(out);
@@ -494,6 +520,64 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const rows = mlx.getShape(ids);
     if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;
     const n: usize = @intCast(rows[1]);
+    if (m.plans != null) {
+        const dsv41_plan = @import("dsv41_plan.zig");
+        if (ctx.cache.end_tokens > 0) {
+            const goal = @max(ctx.cache.end_tokens, st.n + n);
+            if (st.reach < goal) try dsv41_model.reserveNew(m, goal);
+        } else {
+            try dsv41_model.prepareUnboundForward(m, n);
+        }
+        if (m.bound) |r| if (m.logits_fixed[0] != null) try m.makeRequestLogits(r);
+        try mlx.check(mlx.mlx_array_eval(ids));
+        var stack_ids: [256]u32 = undefined;
+        var heap_ids: ?[]u32 = null;
+        defer if (heap_ids) |h| m.gpa.free(h);
+        const host: []const u32 = switch (mlx.mlx_array_dtype(ids)) {
+            .uint32 => (mlx.mlx_array_data_uint32(ids) orelse return error.InvalidDsv41Input)[0..n],
+            .int32 => blk: {
+                const src = (mlx.mlx_array_data_int32(ids) orelse return error.InvalidDsv41Input)[0..n];
+                const dst = if (n <= stack_ids.len) stack_ids[0..n] else blk_alloc: {
+                    const h = try m.gpa.alloc(u32, n);
+                    heap_ids = h;
+                    break :blk_alloc h;
+                };
+                for (src, dst) |v, *d| d.* = @intCast(v);
+                break :blk dst;
+            },
+            else => return error.InvalidDsv41Input,
+        };
+        if (self.expert_stream) |engine| engine.beginForward();
+        defer if (self.expert_stream) |engine| engine.finishForward(n);
+        const vision: ?dsv41_model.VisionRows = if (ctx.vision_embeddings) |ve| .{ .rows = ve, .offset = ctx.vision_splice_offset } else null;
+        const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
+        defer m.gpa.free(ahead);
+        for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
+        const armed = m.arm(if (n == 1) .step else .prefill);
+        defer armed.end();
+        if (m.ced_split != null and tailUnread(m.cfg.window, n, ctx.ahead_min_rows, ctx.holds_point) and st.verify == null) {
+            _ = dsv41_model.ownBegin(m);
+            const state_only = dsv41_plan.wideState(m, host, vision, ahead);
+            dsv41_model.ownEnd(m, self.s);
+            try state_only;
+            ctx.cache.step = st.n;
+            return mlx.mlx_array_new();
+        }
+        armed.lazyHead(ctx.lazy_logits and n == 1);
+        _ = dsv41_model.ownBegin(m);
+        const forwarded = if (host.len > expert_exl3_kernels.DECODE_ROWS_MAX or ahead.len > 0)
+            dsv41_plan.wideAhead(m, host, .last, vision, ahead)
+        else
+            dsv41_plan.run(m, host, .last, vision);
+        dsv41_model.ownEnd(m, self.s);
+        const last = try forwarded;
+        defer _ = mlx.mlx_array_free(last);
+        ctx.cache.step = st.n;
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(m.cfg.vocab) }, 3, mlx.engine.stream()));
+        return out;
+    }
     const armed = m.arm(if (n == 1) .step else .prefill);
     defer armed.end();
     // Where decode runs on the engine every forward does, at a decode width or a prefill's, with image rows or without.
@@ -508,7 +592,8 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     var one: [1]u32 = undefined;
     const host: []const u32 = if (lazy) &one else (mlx.mlx_array_data_uint32(flat) orelse return error.InvalidDsv41Input)[0..n];
     if (self.expert_stream) |engine| {
-        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n, ctx.prefill_rest, .{ .model = m, .request = dsv41_state.requestOf(ctx) });
+        if (self.config.static_ledger == null)
+            try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n, ctx.prefill_rest, .{ .model = m, .request = dsv41_state.requestOf(ctx) });
         engine.beginForward();
     }
     defer if (self.expert_stream) |engine| engine.finishForward(n);
@@ -583,6 +668,21 @@ pub fn forwardRowsDeferred(self: *Trunk, segs: []const dsv41_model.Seg) !mlx.mlx
     return forwardRowsWith(self, segs, true);
 }
 
+/// `forwardRows` into caller-provided per-request `[1, vocab]` views on the static arena (zero pool asks).
+pub fn forwardRowsViews(self: *Trunk, segs: []const dsv41_model.Seg, lazy_head: bool, out_views: []mlx.mlx_array) !void {
+    const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoModel;
+    if (!m.serves_rows) return error.Dsv41RowsStreamed;
+    m.s = self.s;
+    var total_rows: usize = 0;
+    for (segs) |sg| total_rows += sg.ids.len;
+    if (self.expert_stream) |engine| engine.beginForward();
+    defer if (self.expert_stream) |engine| engine.finishForward(total_rows);
+    const own = m.onEngine();
+    if (own) _ = dsv41_model.ownBegin(m);
+    defer if (own) dsv41_model.ownEnd(m, self.s);
+    try @import("dsv41_plan.zig").runJoined(m, segs, lazy_head, out_views);
+}
+
 fn forwardRowsWith(self: *Trunk, segs: []const dsv41_model.Seg, lazy_head: bool) !mlx.mlx_array {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoModel;
     if (!m.serves_rows) return error.Dsv41RowsStreamed;
@@ -603,10 +703,12 @@ fn forwardRowsWith(self: *Trunk, segs: []const dsv41_model.Seg, lazy_head: bool)
     defer armed.end();
     armed.lazyHead(lazy_head);
     if (self.expert_stream) |engine| {
-        if (multi_row)
-            try dsv41_borrow.beforeGroupRowsForward(engine, &self.config, &m.cfg, row_counts[0..segs.len], seqs[0..segs.len], .{ .model = m, .rows = segs })
-        else
-            try dsv41_borrow.beforeRowsForward(engine, &self.config, &m.cfg, seqs[0..segs.len], .{ .model = m, .rows = segs });
+        if (m.plans == null and self.config.static_ledger == null) {
+            if (multi_row)
+                try dsv41_borrow.beforeGroupRowsForward(engine, &self.config, &m.cfg, row_counts[0..segs.len], seqs[0..segs.len], .{ .model = m, .rows = segs })
+            else
+                try dsv41_borrow.beforeRowsForward(engine, &self.config, &m.cfg, seqs[0..segs.len], .{ .model = m, .rows = segs });
+        }
         engine.beginForward();
     }
     defer if (self.expert_stream) |engine| engine.finishForward(total_rows);
@@ -670,6 +772,7 @@ pub fn dsv41DraftMeasured(self: *Trunk, ctx: *ForwardCtx, t1: u32, limit: ?u32, 
     defer if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
     mlx.engine.phase(2);
     defer mlx.engine.phase(0);
+    if (m.plans != null) return @import("dsv41_plan.zig").runDraft(m, t1, .conf, limit, meter);
     return dsv41_model.draftMeasured(m, t1, .conf, limit, meter);
 }
 
@@ -682,15 +785,17 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
     m.s = self.s;
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
+    if (st.reach < st.n + ids.len) try dsv41_model.reserveNew(m, st.n + ids.len);
     if (self.expert_stream) |engine| {
-        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len, 0, .{ .model = m, .request = dsv41_state.requestOf(ctx) });
+        if (m.plans == null and self.config.static_ledger == null)
+            try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len, 0, .{ .model = m, .request = dsv41_state.requestOf(ctx) });
         engine.beginForward();
     }
     defer if (self.expert_stream) |engine| engine.finishForward(ids.len);
     if (m.onEngine()) _ = dsv41_model.ownBegin(m);
     mlx.engine.phase(3);
     defer mlx.engine.phase(0);
-    const verified = dsv41_model.verify(m, ids);
+    const verified = if (m.plans != null) @import("dsv41_plan.zig").runVerify(m, ids) else dsv41_model.verify(m, ids);
     if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
     const all = try verified;
     defer _ = mlx.mlx_array_free(all);
@@ -719,7 +824,10 @@ pub fn dsv41FinishImpl(self: *Trunk, ctx: *ForwardCtx, accepted: usize) !void {
         defer if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
         mlx.engine.phase(4);
         defer mlx.engine.phase(0);
-        try dsv41_model.finishVerify(m, accepted);
+        if (m.plans != null)
+            try @import("dsv41_plan.zig").runFinishVerify(m, accepted)
+        else
+            try dsv41_model.finishVerify(m, accepted);
     }
     ctx.cache.step = (try dsv41_model.ensureState(m)).n;
 }

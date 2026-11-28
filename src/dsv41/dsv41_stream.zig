@@ -16,6 +16,7 @@ const Config = cfg_mod.Config;
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("../expert_usage.zig");
 const PrefetchCredit = @import("../prefetch_plan.zig").PrefetchCredit;
+const plan_api = @import("../tensor/plan/plan_api.zig");
 
 pub fn geometry(cfg: *const Config) stream.Geometry {
     return .{
@@ -86,7 +87,8 @@ pub const Stream = struct {
         if (!mlx.streamIsGpu(sc.s)) return error.Dsv41StreamRequiresGpu;
         std.debug.assert(self.held == null);
         const gpa = self.engine.allocator;
-        const ids = try sc_mod.hostI32(try sc.astype(idx, .int32));
+        const idx32 = try sc.astype(idx, .int32);
+        const ids = try sc_mod.hostResultI32(idx32, @intCast(self.cfg.experts));
         const host = try gpa.alloc(u16, ids.len);
         defer gpa.free(host);
         for (host, ids) |*h, id| {
@@ -94,7 +96,16 @@ pub const Stream = struct {
             h.* = @intCast(id);
         }
         const pin_hit = if (self.pinned) |*p| p.layer == layer else false;
-        var fresh: ?stream.Prepared = if (pin_hit) null else try self.engine.prepareHost(@intCast(layer), host);
+        var fresh: ?stream.Prepared = null;
+        if (!pin_hit) {
+            if (plan_api.session.mode == .dry) {
+                const may_ws = !self.engine.plan.resident and self.engine.layers[layer].slabs.len > 0 and self.engine.layers[layer].slabs[0].count < host.len and self.engine.union_slabs.len == self.engine.store.componentCount();
+                const use_ws = may_ws and plan_api.choose(@src(), bool, false);
+                fresh = try self.engine.prepareDry(@intCast(layer), host, use_ws);
+            } else {
+                fresh = try self.engine.prepareHost(@intCast(layer), host);
+            }
+        }
         errdefer if (fresh) |*p| {
             _ = mlx.mlx_synchronize(sc.s);
             p.deinit();
@@ -207,12 +218,57 @@ pub const StqStream = struct {
         try sc_mod.evalAll(&.{out});
     }
 
+    /// Warms `settleOpaque`'s non-expanded fused shared reduce (`sushi_exl3_down_reduce_fused_shared`) at decode widths
+    /// (both non-NAX `rows=1` and NAX `rows=3` shared paths) so a full speculative miss never compiles inside a request.
+    pub fn warmDecodeFallback(self: *StqStream, m: *const model.Model) !void {
+        if (!m.onEngine() or m.act != .bfloat16) return;
+        const engine = self.engine;
+        const li = for (engine.layers, 0..) |*layer, i| {
+            if (layer.active and layer.grouped != null) break i;
+        } else return;
+        const rb = &engine.layers[li].grouped.?.cache_ragged;
+        if (rb.experts == 0) return;
+        var sc = Scope.plain(engine.allocator, mlx.engine.stream());
+        defer sc.deinit();
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
+        const k: usize = self.cfg.top_k;
+        for ([_]usize{ 1, 3 }) |rows| {
+            if (rows > exl3.kernels.DECODE_ROWS_MAX) continue;
+            const ids = try engine.allocator.alloc(i32, rows * k);
+            defer engine.allocator.free(ids);
+            for (ids, 0..) |*id, i| id.* = @intCast(i % rb.experts);
+            const x = try sc.zeros(&.{ @intCast(rows), @intCast(self.cfg.dim) }, .bfloat16);
+            const slots = try sc.ints(ids, &.{ @intCast(rows), @intCast(k) });
+            const wts = try sc.zeros(&.{ @intCast(rows), @intCast(k) }, .float32);
+            const out = try model.stqRouted(&sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, slots, wts, .{ .layer = .{ .m = m, .li = li } });
+            try sc_mod.evalAll(&.{out});
+        }
+    }
+
     pub fn hook(self: *StqStream) model.Experts.Hook {
         return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque, .host_ns = hostNsOpaque, .slot_map = slotMapOpaque, .prefetch = prefetchOpaque, .can_prefetch = canPrefetchOpaque, .spec = .{
             .can = canQueue,
             .queue = queueOpaque,
             .settle = settleOpaque,
-        }, .penalty = penaltyOpaque, .prefetch_penalty = prefetchPenaltyOpaque, .all_resident = allResident };
+        }, .penalty = penaltyOpaque, .penalty_host = penaltyHostOpaque, .has_penalty = hasPenaltyOpaque, .prefetch_penalty = prefetchPenaltyOpaque, .fix_spec = fixSpecOpaque, .all_resident = allResident };
+    }
+
+    fn fixSpecOpaque(ctx: *anyopaque) anyerror!void {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        try self.engine.fixSpecMaps();
+    }
+
+    fn penaltyHostOpaque(ctx: *anyopaque, layer: usize, out: []f32) anyerror!bool {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        return self.engine.cachePenaltyHost(@intCast(layer), out);
+    }
+
+    fn hasPenaltyOpaque(ctx: *anyopaque, layer: usize) bool {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        if (!(self.engine.cache_bias > 0) or stream.pick_tolerance > 0 or layer >= self.engine.layers.len) return false;
+        const st = &self.engine.layers[layer];
+        return st.active and !st.borrowed and st.resident_map.ctx == null and !self.engine.plan.resident;
     }
 
     fn allResident(ctx: *anyopaque) bool {
@@ -240,15 +296,30 @@ pub const StqStream = struct {
     /// The chain over the slots the layer's GPU map holds for the picks, which the host checks in `settle`.
     fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, local_in: A, wts: A, shared: model.SharedOp, ride: ?[]const A) anyerror!model.Experts.Queued {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
-        const spec = try self.engine.specGrouped(@intCast(layer)) orelse return error.Dsv41StqLayerNotGrouped;
+        var spec_slots: A = .{ .ctx = null };
+        var spec_host: []const i32 = &.{};
+        var spec_bank: *const exl3.Ragged = undefined;
+        if (plan_api.session.mode == .dry) {
+            const st = &self.engine.layers[layer];
+            const gl = st.grouped orelse return error.Dsv41StqLayerNotGrouped;
+            if (st.spec_slots.ctx == null) return error.Dsv41StqSpecMapNotFixed;
+            spec_slots = st.spec_slots;
+            spec_host = st.spec_host;
+            spec_bank = &gl.cache_ragged;
+        } else {
+            const spec = try self.engine.specGrouped(@intCast(layer)) orelse return error.Dsv41StqLayerNotGrouped;
+            spec_slots = spec.slots;
+            spec_host = spec.host;
+            spec_bank = spec.bank;
+        }
         const idx32 = try sc.astype(idx, .int32);
         // Submitted before the chain, so the host's read of the picks waits for the router only, not for the chain.
         if (ride) |r| try model.submitWith(idx32, r);
-        const local = if (local_in.ctx != null) local_in else try sc.take(spec.slots, idx32, 0);
+        const local = if (local_in.ctx != null) local_in else try sc.take(spec_slots, idx32, 0);
         var kept: exl3.rate_groups.Kept = .{};
         errdefer kept.deinit();
-        const out = try model.stqRoutedKept(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), spec.bank, x, local, wts, shared, &kept);
-        return .{ .out = out, .idx = idx32, .map = spec.host, .kept = kept };
+        const out = try model.stqRoutedKept(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), spec_bank, x, local, wts, shared, &kept);
+        return .{ .out = out, .idx = idx32, .map = spec_host, .kept = kept };
     }
 
     /// Reads the picks and resolves them in the cache: null when each sat in the slot `map` gave the queued chain, else
@@ -257,46 +328,76 @@ pub const StqStream = struct {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         const gpa = self.engine.allocator;
         var clock = stream.Clock.init();
-        const ids = try sc_mod.hostI32(idx);
-        if (self.engine.prefetcher) |pf| {
-            self.settles +%= 1;
-            if (self.settles % 4096 == 0) log.info("[expert-stream] prefetch: {d} jobs queued, {d} read {d} experts ({d} skipped for lack of credit) in {d:.1} ms, the host waited {d:.1} ms for them\n", .{ pf.jobs_queued.load(.monotonic), pf.jobs_run.load(.monotonic), pf.experts_read.load(.monotonic), pf.experts_skipped.load(.monotonic), @as(f64, @floatFromInt(pf.job_ns.load(.monotonic))) / 1e6, @as(f64, @floatFromInt(pf.host_wait_ns.load(.monotonic))) / 1e6 });
-        }
-        self.engine.noteRoute(@intCast(layer), false, .{ .ids_wait_ns = clock.lap() });
+        const ids = try sc_mod.hostResultI32(idx, @intCast(self.cfg.experts));
         const host = try scratch(u16, &self.picks, gpa, ids.len);
         for (host, ids) |*h, id| {
             if (id < 0 or id >= self.cfg.experts) return error.ExpertOutOfRange;
             h.* = @intCast(id);
         }
-        var prepared = try self.engine.prepareHost(@intCast(layer), host);
+        const dry = plan_api.session.mode == .dry;
+        var prepared = if (dry) blk: {
+            const missed = plan_api.choose(@src(), bool, false);
+            if (!missed) return null;
+            const may_ws = self.engine.routeMayOverflow(@intCast(layer), host.len);
+            const use_ws = may_ws and plan_api.choose(@src(), bool, false);
+            break :blk try self.engine.prepareDry(@intCast(layer), host, use_ws);
+        } else blk: {
+            if (self.engine.prefetcher) |pf| {
+                self.settles +%= 1;
+                if (self.settles % 4096 == 0) log.info("[expert-stream] prefetch: {d} jobs queued, {d} read {d} experts ({d} skipped for lack of credit) in {d:.1} ms, the host waited {d:.1} ms for them\n", .{ pf.jobs_queued.load(.monotonic), pf.jobs_run.load(.monotonic), pf.experts_read.load(.monotonic), pf.experts_skipped.load(.monotonic), @as(f64, @floatFromInt(pf.job_ns.load(.monotonic))) / 1e6, @as(f64, @floatFromInt(pf.host_wait_ns.load(.monotonic))) / 1e6 });
+            }
+            self.engine.noteRoute(@intCast(layer), false, .{ .ids_wait_ns = clock.lap() });
+            const p = try self.engine.prepareHost(@intCast(layer), host);
+            if (stream.specMatches(map, host, p.remapped, p.workspace)) {
+                var pd = p;
+                pd.deinit();
+                return null;
+            }
+            break :blk p;
+        };
         defer prepared.deinit();
         errdefer _ = mlx.mlx_synchronize(sc.s);
-        if (stream.specMatches(map, host, prepared.remapped, prepared.workspace)) return null;
         const rb = prepared.ragged orelse return error.Dsv41StqLayerNotGrouped;
         const slots = try scratch(i32, &self.slots, gpa, host.len);
         for (slots, prepared.remapped) |*o, r| o.* = r;
-        const local = try sc.ints(slots, mlx.getShape(idx));
         _ = clock.lap();
-        model.spec_rebuilt_picks += host.len;
+        if (!dry) model.spec_rebuilt_picks += host.len;
         // The picks that held keep the planes the queued chain made; only the ones that moved run again.
         const bad = try scratch(u32, &self.bad, gpa, host.len);
         var n_bad: usize = 0;
-        for (host, prepared.remapped, 0..) |expert, slot, i| {
-            if (stream.specPickHeld(map, expert, slot)) continue;
-            bad[n_bad] = @intCast(i);
-            n_bad += 1;
+        var bounded: usize = 0;
+        if (dry) {
+            const want_redo = !prepared.workspace and kept.down.ctx != null and host.len > 1 and plan_api.choose(@src(), bool, true);
+            n_bad = if (want_redo) host.len - 1 else host.len;
+            for (bad[0..n_bad], 0..) |*b, bi| b.* = @intCast(bi);
+            if (!prepared.workspace and n_bad < host.len and kept.down.ctx != null) {
+                bounded = plan_api.bound(n_bad, host.len - 1);
+            }
+        } else {
+            for (host, prepared.remapped, 0..) |expert, slot, i| {
+                if (stream.specPickHeld(map, expert, slot)) continue;
+                bad[n_bad] = @intCast(i);
+                n_bad += 1;
+            }
+            if (!prepared.workspace and n_bad < host.len and kept.down.ctx != null) {
+                bounded = plan_api.bound(n_bad, host.len - 1);
+            }
         }
-        if (!prepared.workspace and n_bad < host.len) {
-            if (try model.stqRoutedRedo(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, prepared.remapped, wts, shared, kept, bad[0..n_bad])) |out| {
-                model.spec_redone += 1;
-                model.spec_redo_picks += n_bad;
-                self.engine.noteExpertCompute(@intCast(layer), clock.lap());
+        const can_redo = !prepared.workspace and n_bad < host.len and kept.down.ctx != null;
+        const local = try sc.ints(slots, mlx.getShape(idx));
+        if (can_redo) {
+            if (try model.stqRoutedRedo(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, prepared.remapped, wts, shared, kept, bad[0..bounded])) |out| {
+                if (!dry) {
+                    model.spec_redone += 1;
+                    model.spec_redo_picks += bounded;
+                    self.engine.noteExpertCompute(@intCast(layer), clock.lap());
+                }
                 return out;
             }
         }
-        model.spec_redo_picks += host.len;
+        if (!dry) model.spec_redo_picks += host.len;
         const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared);
-        self.engine.noteExpertCompute(@intCast(layer), clock.lap());
+        if (!dry) self.engine.noteExpertCompute(@intCast(layer), clock.lap());
         return out;
     }
 
@@ -322,7 +423,14 @@ pub const StqStream = struct {
 
     fn slotMapOpaque(ctx: *anyopaque, layer: usize, queued: bool) A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
-        if (queued) return if (self.engine.specGrouped(@intCast(layer)) catch null) |spec| spec.slots else .{ .ctx = null };
+        if (queued) {
+            if (plan_api.session.mode == .dry) {
+                if (layer >= self.engine.layers.len) return .{ .ctx = null };
+                const st = &self.engine.layers[layer];
+                return if (st.grouped != null and st.spec_slots.ctx != null) st.spec_slots else .{ .ctx = null };
+            }
+            return if (self.engine.specGrouped(@intCast(layer)) catch null) |spec| spec.slots else .{ .ctx = null };
+        }
         return if (self.engine.residentRoute(@intCast(layer))) |rr| rr.map else .{ .ctx = null };
     }
 
@@ -359,31 +467,37 @@ pub const StqStream = struct {
         // The wait for the picks is the GPU's attention of this layer; the breakdown line reports it as idswait.
         const read_t0 = model.readStart();
         try sc_mod.evalAll(if (scores) |sv| &.{ idx32, sv } else &.{idx32});
-        const ids = try sc_mod.hostI32(idx32);
+        const ids = try sc_mod.hostResultI32(idx32, @intCast(self.cfg.experts));
         model.readDone(.picks_sync, read_t0);
-        self.engine.noteRoute(@intCast(layer), false, .{ .ids_wait_ns = clock.lap() });
+        const dry = plan_api.session.mode == .dry;
+        if (!dry) self.engine.noteRoute(@intCast(layer), false, .{ .ids_wait_ns = clock.lap() });
         const host = try gpa.alloc(u16, ids.len);
         defer gpa.free(host);
         for (host, ids) |*h, id| {
             if (id < 0 or id >= self.cfg.experts) return error.ExpertOutOfRange;
             h.* = @intCast(id);
         }
-        if (scores) |sv| _ = try self.engine.swapGroupedMisses(@intCast(layer), host, try sc_mod.hostF32(sv), tolerance, @intCast(mlx.getShape(idx)[1]));
-        // The engine encodes each op into its open pass as it is called, and a rate group's start hands over that whole
-        // pass, groups not yet filled included; MLX evaluates only the planes it is asked for. So the engine's chain reads
-        // the fill group by group (`ranged`), encoding a group's GEMMs only once it has landed.
-        // Which order follows the stream the chain is encoded on, whoever calls: a load's warm runs outside a request's scope.
+        if (scores) |sv| {
+            const svals = try sc_mod.hostResultF32(sv);
+            if (!dry) _ = try self.engine.swapGroupedMisses(@intCast(layer), host, svals, tolerance, @intCast(mlx.getShape(idx)[1]));
+        }
         const on_engine = mlx.engine.isStream(sc.s);
         const staged = wide and self.overlap and (!on_engine or self.stage_on_engine);
         const ranged = wide and self.overlap and on_engine and !self.stage_on_engine;
-        self.mlx_order_routes += @intFromBool(staged);
-        // Slab views an MLX-stream expert engine makes are MLX's own arrays; the engine imports them when a kernel reads them.
-        const theirs: ?mlx.engine.Makers = if (wide and !mlx.engine.isStream(self.engine.s)) mlx.engine.makers(false) else null;
-        var prepared = (if (ranged) self.engine.prepareHostStagedRanged(@intCast(layer), host) else if (staged) self.engine.prepareHostStaged(@intCast(layer), host) else if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host)) catch |e| {
+        if (!dry) self.mlx_order_routes += @intFromBool(staged);
+        var prepared = if (dry) blk: {
+            const use_ws = if (wide) (!self.engine.plan.resident) else (self.engine.routeMayOverflow(@intCast(layer), host.len) and plan_api.choose(@src(), bool, false));
+            break :blk try self.engine.prepareDry(@intCast(layer), host, use_ws and !ranged);
+        } else blk: {
+            // Slab views an MLX-stream expert engine makes are MLX's own arrays; the engine imports them when a kernel reads them.
+            const theirs: ?mlx.engine.Makers = if (wide and !mlx.engine.isStream(self.engine.s)) mlx.engine.makers(false) else null;
+            const p = (if (ranged) self.engine.prepareHostStagedRanged(@intCast(layer), host) else if (staged) self.engine.prepareHostStaged(@intCast(layer), host) else if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host)) catch |e| {
+                if (theirs) |made| made.end();
+                return e;
+            };
             if (theirs) |made| made.end();
-            return e;
+            break :blk p;
         };
-        if (theirs) |made| made.end();
         defer prepared.deinit();
         errdefer _ = mlx.mlx_synchronize(sc.s);
         const slots = try gpa.alloc(i32, host.len);
@@ -394,40 +508,67 @@ pub const StqStream = struct {
         const fill_before = self.engine.layers[@intCast(layer)].stats.fill_ns;
         var early: exl3.rate_groups.EarlyPlanes = .{};
         defer early.deinit();
+        const dry_gl = if (dry) (self.engine.layers[layer].grouped orelse return error.Dsv41StqLayerNotGrouped) else null;
+        const DryBankKind = enum { cache, @"union", split };
+        const dry_bank_kind: DryBankKind = if (dry and ranged) blk: {
+            if (!self.engine.plan.resident and dry_gl.?.union_ragged.count == dry_gl.?.cache_ragged.count) {
+                break :blk plan_api.choose(@src(), DryBankKind, .cache);
+            }
+            break :blk .cache;
+        } else .cache;
+        var dry_split: ?exl3.Ragged = if (dry_bank_kind == .split) blk: {
+            var overflow: [stream.quant.rate_group_limit]u32 = @splat(0);
+            var room: u32 = exl3.rate_groups.PREFILL_MAX_EXPERTS -| dry_gl.?.cache_ragged.experts;
+            for (0..dry_gl.?.cache_ragged.count) |g| {
+                const take = @min(dry_gl.?.union_ragged.experts_of[g], room);
+                overflow[g] = take;
+                room -= take;
+            }
+            break :blk try exl3.Ragged.initSplit(self.engine.s, &dry_gl.?.cache_ragged, &dry_gl.?.union_ragged, overflow[0..dry_gl.?.cache_ragged.count]);
+        } else null;
+        defer if (dry_split) |*sb| sb.deinit();
+        const dry_rb: ?*const exl3.Ragged = if (dry and ranged) switch (dry_bank_kind) {
+            .cache => &dry_gl.?.cache_ragged,
+            .@"union" => &dry_gl.?.union_ragged,
+            .split => &dry_split.?,
+        } else null;
         // The caller evaluates the sum before a later layer can refill the union: the next layer's picks read it.
         const Reads = struct {
             engine: *stream.Engine,
             prepared: *stream.Prepared,
             stall_ns: u64,
             held: *u64,
-            fn scales(ctx: *anyopaque) anyerror!*const exl3.Ragged {
-                const r: *@This() = @ptrCast(@alignCast(ctx));
+            dry_rb: ?*const exl3.Ragged,
+            fn scales(ctx_: *anyopaque) anyerror!*const exl3.Ragged {
+                const r: *@This() = @ptrCast(@alignCast(ctx_));
                 try mlx.engine.submit();
+                if (r.dry_rb) |drb| return drb;
                 r.held.* += mlx.engine.openDispatches();
                 try r.engine.stageScales(r.prepared);
                 return r.engine.stageBank(r.prepared);
             }
-            fn group(ctx: *anyopaque, g: usize) anyerror!void {
-                const r: *@This() = @ptrCast(@alignCast(ctx));
+            fn group(ctx_: *anyopaque, g: usize) anyerror!void {
+                const r: *@This() = @ptrCast(@alignCast(ctx_));
                 if (g > 0 and r.stall_ns != 0) _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(r.stall_ns) }, null);
                 try mlx.engine.submit();
+                if (r.dry_rb != null) return;
                 r.held.* += mlx.engine.openDispatches();
                 try r.engine.stageGroup(r.prepared, g);
             }
         };
-        var reads = Reads{ .engine = self.engine, .prepared = &prepared, .stall_ns = self.stall_ns, .held = &self.held_at_read };
+        var reads = Reads{ .engine = self.engine, .prepared = &prepared, .stall_ns = self.stall_ns, .held = &self.held_at_read, .dry_rb = dry_rb };
         const out = if (ranged)
             try model.stqRoutedStaged(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), x, local, wts, shared, .{ .ctx = &reads, .scales = Reads.scales, .group = Reads.group })
         else
             try model.stqRoutedEarly(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), prepared.ragged orelse return error.Dsv41StqLayerNotGrouped, x, local, wts, shared, if (staged) &early else null, null);
-        if (ranged) try self.engine.stageEnd(&prepared);
-        if (staged) {
+        if (ranged and !dry) try self.engine.stageEnd(&prepared);
+        if (staged and !dry) {
             const Start = struct {
                 early: *const exl3.rate_groups.EarlyPlanes,
                 rb: *const exl3.Ragged,
                 stall_ns: u64,
-                fn ready(ctx: *anyopaque, group: usize) anyerror!void {
-                    const st: *@This() = @ptrCast(@alignCast(ctx));
+                fn ready(ctx_: *anyopaque, group: usize) anyerror!void {
+                    const st: *@This() = @ptrCast(@alignCast(ctx_));
                     try st.early.start(st.rb, group);
                     if (st.stall_ns != 0) _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(st.stall_ns) }, null);
                 }
@@ -436,7 +577,7 @@ pub const StqStream = struct {
             try self.engine.fillStaged(&prepared, &start, Start.ready);
         }
         // The staged fill runs inside this span; fill_ms already reports it.
-        self.engine.noteExpertCompute(@intCast(layer), clock.lap() -| (self.engine.layers[@intCast(layer)].stats.fill_ns - fill_before));
+        if (!dry) self.engine.noteExpertCompute(@intCast(layer), clock.lap() -| (self.engine.layers[@intCast(layer)].stats.fill_ns - fill_before));
         return out;
     }
 };

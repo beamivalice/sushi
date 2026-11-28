@@ -634,7 +634,7 @@ pub fn Rounds(comptime A: type) type {
             const in: VerdictIn = .{ .logits = logits, .ids = ids, .sampling = self.sampling, .committed = if (sampler.penaltyActive(self.sampling)) self.generated_ids.items else null, .masks = masks, .streams = streams };
             const run = try arch_cooler.beginSample(self.xfm, in.mix());
             const v = verdictOf(in) catch |e| {
-                try run.fail();
+                run.fail();
                 return e;
             };
             try run.end();

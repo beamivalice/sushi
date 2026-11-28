@@ -380,7 +380,7 @@ test "row store: a grow that fails at any part's MLX call leaves every part and 
     }
 }
 
-test "row store: an append on the engine lands at once: the rows it was handed die inside the frame that appended them" {
+test "row store: an append on the engine lands at once: the rows it was handed die inside the execution" {
     try mlx.requireGpu();
     const core = @import("tensor/core.zig");
     const plan = @import("tensor/plan/plan_api.zig");
@@ -394,21 +394,19 @@ test "row store: an append on the engine lands at once: the rows it was handed d
     defer st.deinit();
     // Room first: a grow inside the recording would be an ask of its own.
     try st.reserveAppend(8, s);
-    var rec = try plan.Recorder.begin(std.testing.allocator, .{ .site = 1 });
+    var rec = plan.Recorder.begin(std.testing.allocator);
     defer rec.deinit();
     {
         try core.beginRecording(.real, &rec);
         defer core.endRecording() catch {};
-        const f = try plan.frame(@src(), .{});
-        defer f.end();
         const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
         const rows = try mlx.newData(&vals, &[_]c_int{ 2, 4 }, .float32);
         try st.append(&.{rows}, s);
         _ = mlx.mlx_array_free(rows);
     }
-    const asked = rec.instances.items[1].asks.items;
+    const asked = rec.asks.items;
     try std.testing.expect(asked.len >= 1);
-    try std.testing.expect(asked[0].death != @import("tensor/plan/plan_trace.zig").none and asked[0].lift == 0);
+    try std.testing.expect(asked[0].death != @import("tensor/plan/plan_trace.zig").none);
 }
 
 test "row store: an append whose write fails to land leaves the store its buffer, released once by the store" {

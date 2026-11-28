@@ -66,8 +66,10 @@ pub const ChunkBounds = struct {
 /// The widest chunk a model's prefill runs when no bound names its max: the static bill's own default (Hy4's 4096),
 /// else the widest ladder rung at or below the width the arch starts its prefill at.
 pub fn defaultChunkMax(config: *const model_mod.ModelConfig) u32 {
-    const widest = arch_config.staticChunkMax(config);
-    if (widest != 0) return arch_config.staticChunkDefault(config);
+    if (bills.ledgerArch(config)) {
+        const widest = arch_config.staticChunkMax(config);
+        if (widest != 0) return arch_config.staticChunkDefault(config);
+    }
     const start = config.prefillStartWidth();
     for (static_chunk_rungs) |r| if (r <= start) return r;
     return static_chunk_rungs[static_chunk_rungs.len - 1];

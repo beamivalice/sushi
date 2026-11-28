@@ -138,7 +138,7 @@ pub fn windowBytes(m: *hy4_model.Model, gpa: std.mem.Allocator, rows: u64, chunk
     while (at < rows) : (at += chunk) {
         var passes = try hy4_plan.recordChecked(m, gpa, .{ .rows = @intCast(@min(chunk, rows - at)), .readout = .none, .keep_hidden = false, .kv = .dense, .n = @intCast(at), .phase = .wide }, @intCast(rows));
         defer passes.deinit();
-        for (passes.traces) |*t| most = most.max(try plan.region.need(gpa, t, @import("../tensor/plan/plan_book.zig").default_alignment));
+        for (passes.traces) |*t| most = most.max(try plan.region.need(gpa, t, plan.region.default_alignment));
     }
     return most.scratch +| most.host;
 }
@@ -1741,7 +1741,7 @@ test "hy4 layer-major window: a window of several pieces is billed by the pieces
     var passes = try hy4_plan.recordChecked(m, a, .{ .rows = rows, .readout = .none, .keep_hidden = false, .kv = .dense, .phase = .wide }, rows);
     defer passes.deinit();
     var whole: plan.region.Need = .{};
-    for (passes.traces) |*tr| whole = whole.max(try plan.region.need(a, tr, @import("../tensor/plan/plan_book.zig").default_alignment));
+    for (passes.traces) |*tr| whole = whole.max(try plan.region.need(a, tr, plan.region.default_alignment));
     errdefer std.debug.print("a window of {d} rows is billed {d} B, one forward of them {d} B\n", .{ rows, window, whole.scratch + whole.host });
     try testing.expect(window < whole.scratch + whole.host);
     // The pieces as `runBatch` runs them.

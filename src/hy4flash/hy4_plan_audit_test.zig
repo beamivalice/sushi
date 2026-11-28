@@ -8,8 +8,6 @@ const mlx = @import("../mlx.zig");
 const core = @import("../tensor/core.zig");
 const plan = @import("../tensor/plan/plan_api.zig");
 const plan_trace = @import("../tensor/plan/plan_trace.zig");
-const plan_shape = @import("../tensor/plan/plan_shape.zig");
-const plan_pack = @import("../tensor/plan/plan_pack.zig");
 const model_mod = @import("../model.zig");
 const hy4_config = @import("hy4_config.zig");
 const hy4_load = @import("hy4_load.zig");
@@ -24,42 +22,31 @@ const Model = hy4_model.Model;
 extern "c" fn time(t: ?*i64) i64;
 extern "c" fn fflush(f: *std.c.FILE) c_int;
 
-/// One recording dry: a frame of its own for `root`, its survivors state-owned (stage 2 gives them their owners).
 const Dry = struct {
     rec: plan.Recorder,
     driver: plan.Driver,
 
-    fn begin(self: *Dry, root: plan.FrameId) !void {
-        self.rec = try plan.Recorder.begin(testing.allocator, root);
+    fn begin(self: *Dry) !void {
+        self.rec = plan.Recorder.begin(testing.allocator);
         errdefer self.rec.deinit();
         self.driver = .{ .gpa = testing.allocator };
         try core.beginRecording(.{ .dry = .{ .driver = &self.driver } }, &self.rec);
     }
 
-    /// The recording's end, packed: the arena its asks take (`Tables.g`) where a reuse adds no barrier and where any may,
-    /// and the host ring (`Tables.h`).
+    /// The recording's end, measured with D97 first-fit region (`plan.region.need`).
     fn planned(self: *Dry) !struct { g: u64, lifetimes: u64, h: u64 } {
         try core.endRecording();
         defer {
             self.driver.deinit();
             self.rec.deinit();
         }
-        for (self.rec.instances.items) |*inst| for (inst.asks.items) |*as| {
+        for (self.rec.asks.items) |*as| {
             if (as.death == plan_trace.none) as.external = true;
-        };
+        }
         var trace = try self.rec.end();
         defer trace.deinit();
-        var why: plan_shape.Ambiguity = undefined;
-        var shapes = plan_shape.merge(testing.allocator, (&trace)[0..1], .{ .refused = &why }) catch |e| {
-            std.log.err("hy4 plan audit: one recording is ambiguous: frame {d}/{d}, {t} at node {d}", .{ why.id.site, why.id.key, why.why, why.node });
-            return e;
-        };
-        defer shapes.deinit();
-        var tables = try plan_pack.pack(testing.allocator, &shapes, .{});
-        defer tables.deinit();
-        var loose = try plan_pack.pack(testing.allocator, &shapes, .{ .level_rule = false });
-        defer loose.deinit();
-        return .{ .g = tables.g, .lifetimes = loose.g, .h = tables.h };
+        const got = try plan.region.need(testing.allocator, &trace, plan.region.default_alignment);
+        return .{ .g = got.scratch, .lifetimes = got.scratch, .h = got.host };
     }
 
     /// The recording dropped: the load's, whose asks are the model's for good.
@@ -160,7 +147,7 @@ fn acquireShared(s: mlx.mlx_stream) !*Shared {
     const c = try hy4_config.parseText(hy4_config.release_config);
     try @import("../hc_kernels.zig").probeIdentity(s, c.hc_mult, c.dim);
     var load: Dry = undefined;
-    try load.begin(.{ .site = 100 });
+    try load.begin();
     var w = dryWeights(gpa, &c) catch |e| return load.failed(e);
     errdefer w.deinit();
     const m = Model.initWith(gpa, c, &w, s, .{}) catch |e| return load.failed(e);
@@ -241,14 +228,14 @@ test "hy4 plan audit: a dry model of the release plans decode, verify at every b
         const last: usize = @intCast(@min(chunk, ctx));
         {
             var d: Dry = undefined;
-            try d.begin(.{ .site = 4 });
+            try d.begin();
             m.dryState(@intCast(ctx - last), @intCast(ctx + 64)) catch |e| return d.failed(e);
             d.abort();
         }
         at = ctx - last;
         {
             var d: Dry = undefined;
-            try d.begin(.{ .site = 1, .key = last });
+            try d.begin();
             const lg = m.forwardReadout(idsFrom(ids[0..last], at, c.vocab), .none) catch |e| return d.failed(e);
             _ = mlx.mlx_array_free(lg);
             at += last;
@@ -258,7 +245,7 @@ test "hy4 plan audit: a dry model of the release plans decode, verify at every b
         // A decode, a verify block of every width (and 16 rows, past them), and a draft, each from where the last left.
         for (widths) |t| {
             var d: Dry = undefined;
-            try d.begin(.{ .site = 2, .key = t });
+            try d.begin();
             const lg = m.forwardReadout(idsFrom(ids[0..t], at, c.vocab), if (t == 1) .last else .all) catch |e| return d.failed(e);
             _ = mlx.mlx_array_free(lg);
             const p = try d.planned();
@@ -267,7 +254,7 @@ test "hy4 plan audit: a dry model of the release plans decode, verify at every b
         }
         {
             var d: Dry = undefined;
-            try d.begin(.{ .site = 3 });
+            try d.begin();
             var dr = drafter.draft(m, ids[0]) catch |e| return d.failed(e);
             dr.deinit();
             const p = try d.planned();
@@ -296,7 +283,7 @@ test "hy4 plan audit: a dry model of the release builds the plans of its one-row
     mc.hy4flash = c;
     const media = @import("hy4_media.zig");
     const hy4_plan = @import("hy4_plan.zig");
-    const p = try hy4_plan.record(m, a, 1 << 20, &sh.drafter, .engine_default, null, .{ .tower = &tower, .max_patches = media.maxImagePatches(media.preproc(&mc)) }, 0);
+    const p = try hy4_plan.record(m, a, 1 << 20, &sh.drafter, .engine_default, .{ .tower = &tower, .max_patches = media.maxImagePatches(media.preproc(&mc)) }, 0);
     m.recorded = p;
     defer {
         p.deinit(a);
@@ -315,14 +302,14 @@ test "hy4 plan audit: a dry model of the release builds the plans of its one-row
 fn expectRegionHolds(a: std.mem.Allocator, m: *Model, chunk: usize, reach: usize, shapes: []const [2]usize) !void {
     const hy4_plan = @import("hy4_plan.zig");
     const p = try a.create(hy4_plan.Plans);
-    p.* = .{ .book = .{ .gpa = a, .options = .{ .level_rule = true, .level_rule_cap = hy4_plan.level_rule_cap } }, .reach = reach, .kv = .engine_default };
+    p.* = .{ .gpa = a, .reach = reach, .kv = .engine_default, .guard = 0 };
     defer p.deinit(a);
     const region = try hy4_plan.regionAt(m, p, chunk);
     for (shapes) |sh| for ([_]Model.Readout{ .none, .last }) |readout| {
         var passes = try hy4_plan.recordChecked(m, a, .{ .rows = sh[0], .readout = readout, .keep_hidden = m.keep_hidden, .kv = p.kv, .n = sh[1], .phase = .wide }, reach);
         defer passes.deinit();
         for (passes.traces) |*tr| {
-            const need = try plan.region.need(a, tr, p.book.alignment);
+            const need = try plan.region.need(a, tr, p.alignment);
             errdefer std.debug.print("a forward of {d} rows at {d} ({t}) asks scratch {d} B, host {d} B; the region of {d}-row chunks holds {d} B, host {d} B\n", .{ sh[0], sh[1], readout, need.scratch, need.host, chunk, region.scratch, region.host });
             try testing.expect(need.scratch <= region.scratch and need.host <= region.host);
         }

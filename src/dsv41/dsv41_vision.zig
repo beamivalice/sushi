@@ -28,6 +28,7 @@ const attention_plan = @import("../tensor/attention.zig");
 const metal = @import("../metal.zig");
 const manifest = @import("../pipeline_manifest.zig");
 const io_util = @import("../io_util.zig");
+const plan_api = @import("../tensor/plan/plan_api.zig");
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -305,6 +306,7 @@ const Load = struct {
     weights: *model.Weights,
     s: mlx.mlx_stream,
     quantize: bool,
+    consume: bool = true,
     linears: u32 = 0,
     bf16_bytes: u64 = 0,
     quant_bytes: u64 = 0,
@@ -325,14 +327,14 @@ fn lin(ld: *Load, comptime fmt: []const u8, args: anytype, out_dim: usize, in_di
         ld.bf16_bytes += 2 * out_dim * in_dim;
         return l;
     }
-    if (mlx.engine.isStream(ld.s)) {
+    if (mlx.engine.isStream(ld.s) and ld.consume) {
         // The codes, scales and biases outlive every forward: the pool's cap rises by them.
         const groups = 2 * out_dim * (in_dim / QUANT_GROUP);
         mlx.engine.room(&.{ out_dim * in_dim * common.QUANT_BITS / 8, groups, groups });
     }
     // The bf16 copy goes as soon as its codes exist: the load holds one linear's worth of both.
     const q = try common.requantize(l.w, QUANT_GROUP, ld.s);
-    _ = mlx.mlx_array_free(ld.weights.take(name).?);
+    if (ld.consume) _ = mlx.mlx_array_free(ld.weights.take(name).?);
     ld.linears += 1;
     ld.bf16_bytes += 2 * out_dim * in_dim;
     ld.quant_bytes += quantizedBytes(out_dim, in_dim);
@@ -362,6 +364,15 @@ pub const Dsv41Vision = struct {
     /// The serving tower: its block and aligner matrices are requantized to affine 8-bit and their bf16 copies leave
     /// `weights`. The tower's other handles are borrowed from `weights`, which outlives it.
     pub fn init(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights) !Dsv41Vision {
+        return initOpts(allocator, config, weights, true);
+    }
+
+    /// Builds a temporary tower to record encode plans without removing bf16 weights or double-billing `mlx.engine.room`.
+    pub fn initForPlan(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights) !Dsv41Vision {
+        return initOpts(allocator, config, weights, false);
+    }
+
+    fn initOpts(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights, consume: bool) !Dsv41Vision {
         const quantize_at_load = !common.vision_bf16;
         const c = config.dsv41 orelse return error.MissingVisionWeights;
         const v = c.vision orelse return error.MissingVisionWeights;
@@ -378,7 +389,7 @@ pub const Dsv41Vision = struct {
         // The requantization's kernel is this load's to make, as the warm's are.
         const making = @import("../arch/cooler.zig").making(own);
         defer if (making) |seal| seal.end();
-        var self = try load(allocator, config, weights, quantize_at_load, own);
+        var self = try load(allocator, config, weights, quantize_at_load, own, consume);
         errdefer self.deinit();
         if (own) try self.useEngine();
         return self;
@@ -401,6 +412,19 @@ pub const Dsv41Vision = struct {
         return if (self.own) mlx.engine.stream() else null;
     }
 
+    pub fn writesMedia(self: *const Dsv41Vision) bool {
+        return self.own;
+    }
+
+    pub fn makeMedia(self: *Dsv41Vision, rows: usize) !A {
+        return @import("dsv41_encode_plan.zig").makeMedia(self.out_dim, rows);
+    }
+
+    pub fn encodeInto(self: *Dsv41Vision, xfm: *@import("../trunk.zig").Trunk, media: *A, row0: usize, pixels: []const u8, grid_h: u32, grid_w: u32) !void {
+        const m = @import("dsv41_state.zig").modelOf(xfm) orelse return error.Dsv41NoModel;
+        return @import("dsv41_encode_plan.zig").run(m.plans, self, media, row0, pixels, grid_h, grid_w);
+    }
+
     /// The engine runs this pass: its ops take over, an MLX stream among them is refused by name, and its pool may
     /// hold the pass's scratch, or the encode's bill when one is installed. A no-op on MLX's side.
     const Run = struct {
@@ -413,17 +437,17 @@ pub const Dsv41Vision = struct {
 
     fn engage(self: *const Dsv41Vision, patches: usize) !Run {
         if (!self.own) return .{ .makers = null };
-        if (!dsv41_borrow.visionBilled()) try mlx.engine.budget(scratchOf(self.v, self.out_dim, patches));
+        if (!dsv41_borrow.visionBilled() and !plan_api.planned()) try mlx.engine.budget(scratchOf(self.v, self.out_dim, patches));
         return .{ .makers = mlx.engine.makers(true) };
     }
 
     /// `quantize` false keeps every linear bf16 (the reference-parity tests).
     pub fn initWith(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights, quantize: bool) !Dsv41Vision {
-        return load(allocator, config, weights, quantize, false);
+        return load(allocator, config, weights, quantize, false, true);
     }
 
     /// `own`: the requantization runs on the engine of our own, which then holds the codes.
-    fn load(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights, quantize: bool, own: bool) !Dsv41Vision {
+    fn load(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights, quantize: bool, own: bool, consume: bool) !Dsv41Vision {
         const c = config.dsv41 orelse return error.MissingVisionWeights;
         const v = c.vision orelse return error.MissingVisionWeights;
         const d = v.hidden;
@@ -450,7 +474,7 @@ pub const Dsv41Vision = struct {
             self.release();
             _ = mlx.mlx_stream_free(self.s);
         }
-        var ld: Load = .{ .weights = weights, .s = if (own) mlx.engine.stream() else self.s, .quantize = quantize };
+        var ld: Load = .{ .weights = weights, .s = if (own) mlx.engine.stream() else self.s, .quantize = quantize, .consume = consume };
         var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         self.patch = try lin(&ld, "vision.patch_embed.proj", .{}, d, feat, true);
         for (blocks, 0..) |*b, i| {
@@ -498,11 +522,11 @@ pub const Dsv41Vision = struct {
     pub fn forward(self: *Dsv41Vision, patches: A, grid_h: u32, grid_w: u32) !A {
         const out = try self.encode(patches, grid_h, grid_w);
         // The pass's scratch leaves the pool; the span stays.
-        if (self.own) mlx.engine.trim();
+        if (self.own and !plan_api.planned()) mlx.engine.trim();
         return out;
     }
 
-    fn encode(self: *Dsv41Vision, patches: A, grid_h: u32, grid_w: u32) !A {
+    pub fn encode(self: *Dsv41Vision, patches: A, grid_h: u32, grid_w: u32) !A {
         transient_peak.begin();
         defer transient_peak.end(.vision_encode, grid_h * grid_w, null);
         const run = try self.engage(@as(usize, grid_h) * grid_w);

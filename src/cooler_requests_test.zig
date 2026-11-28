@@ -214,6 +214,7 @@ test "cooler contract: Qwen grouped MTP ticks after a DeepSeek request ends run 
 test "cooler contract: Qwen grouped MTP ticks that grow their caches after a DeepSeek request add nothing to the DeepSeek model's cap" {
     try qwenBesideDeepSeek(struct {
         fn run(qsv: *Served, dsv: *Served, qids: []const u32, dids: []const u32) !void {
+            try contract.requirePoolCap(dsv.entry.config.?);
             const got = try ticksAfterDeepSeek(qsv, dsv, qids, dids, .{ 200, 220, 240 });
             try testing.expect(got.ds_before != null);
             try testing.expectEqual(got.ds_before, got.ds_after);

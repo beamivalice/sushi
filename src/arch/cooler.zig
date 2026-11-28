@@ -192,22 +192,23 @@ pub fn warmAbandoned(seal: ?mlx.engine.Seal) void {
 }
 
 /// A load that plans makes its arena: on the ledger once its chunk is fixed, before its warm, so the warm runs what a
-/// request runs (D107); else at its warm's end. An arch that declares `planBuild` records and packs its plans and keeps
-/// the shapes its misses record in `cache` (its pipeline manifest's directory); any other serves on the pool.
-pub fn planLoad(xfm: *Trunk, cache: ?@import("../tensor/plan/plan_book.zig").Cache) !void {
+/// request runs (D107); else at its warm's end. An arch that declares `planBuild` sizes its arena regions (`planRecord`);
+/// any other serves on the pool.
+pub fn planLoad(xfm: *Trunk) !void {
     // The warm's free buffers leave the pool before the arena is made, so the two never stand together.
     mlx.engine.close();
     mlx.engine.trim();
     switch (registry.handleOf(xfm)) {
-        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "planBuild")) try registry.Mod(t).planBuild(m, cache),
+        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "planBuild")) try registry.Mod(t).planBuild(m),
     }
 }
 
 /// A load on the ledger records its plans before its warm (D98), so its chunk is chosen on the arena they and the
-/// region ask (`planArena`); an arch that declares no `planRecord` records none.
-pub fn planRecord(xfm: *Trunk, cache: ?@import("../tensor/plan/plan_book.zig").Cache) !void {
+/// region ask (`planArena`); an arch that declares no `planRecord` records none. `tower` is passed directly so encode
+/// probes run without ad-hoc state back-channels.
+pub fn planRecord(xfm: *Trunk, tower: ?*@import("media.zig").Tower) !void {
     switch (registry.handleOf(xfm)) {
-        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "planRecord")) try registry.Mod(t).planRecord(m, cache),
+        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "planRecord")) try registry.Mod(t).planRecord(m, tower),
     }
 }
 
@@ -224,14 +225,13 @@ pub fn planArena(xfm: *Trunk, chunk: u32) !?u64 {
 }
 
 /// A sample on a load whose arch plans its samples (docs/bill_redesign.md, D24): from `beginSample` to `end` (or `token`,
-/// or `fail`) the sampler's work from the logits to the token is one execution of the root its mix names. An arch that
-/// declares `sampleBegin` answers whether one began, and refuses by name a mix it did not plan (`PlanMiss`); every other
-/// load samples as before.
+/// or `fail`) the sampler's work from the logits to the token is one narrow execution on the shared arena region. An arch that
+/// declares `sampleBegin` answers whether one began; every other load samples as before.
 pub const Sample = struct {
     xfm: *Trunk,
     on: bool,
 
-    /// The execution ends: a miss it met is `PlanMiss`.
+    /// The execution ends.
     pub fn end(run: Sample) !void {
         if (!run.on) return;
         switch (registry.handleOf(run.xfm)) {
@@ -248,11 +248,11 @@ pub const Sample = struct {
         return lazy;
     }
 
-    /// The sampler failed inside the execution, which goes: a miss it met is `PlanMiss`, any other failure the caller's.
-    pub fn fail(run: Sample) error{PlanMiss}!void {
+    /// The sampler failed inside the execution, which aborts cleanly.
+    pub fn fail(run: Sample) void {
         if (!run.on) return;
         switch (registry.handleOf(run.xfm)) {
-            inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "sampleBegin")) return registry.Mod(t).sampleFail(m),
+            inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "sampleBegin")) registry.Mod(t).sampleFail(m),
         }
     }
 };

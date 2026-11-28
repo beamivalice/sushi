@@ -18,7 +18,7 @@ const plan = @import("plan/plan_api.zig");
 pub const max_dims = 8;
 pub const Dtype = mlx.mlx_dtype;
 
-pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, TensorNull, MlxAtRest, PoolOverBudget, ReadsFillingSlab, EnvUnparsed, DryReadback, DryHostWrite, DryStore, PlanMiss, PlanNeedsLease, PlanEscape, PoolClosed, WideFull };
+pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, TensorNull, MlxAtRest, PoolOverBudget, ReadsFillingSlab, EnvUnparsed, DryReadback, DryHostWrite, DryStore, PlanNeedsLease, PlanEscape, PoolClosed, WideFull };
 
 /// The restriction behind the last `TensorUnsupported` or `TensorDtype` an op returned through `refusing`; the route
 /// that reports the refusal names it once and clears it.
@@ -80,7 +80,7 @@ pub const Store = struct {
     origin: Origin,
     /// The recording that asked for it (`Recording.gen`, 0 for none) and its ask there.
     plan_gen: u32 = 0,
-    plan_ref: plan.Ref = .{ .instance = 0, .ordinal = 0 },
+    plan_ref: plan.Ref = 0,
     /// The recording one of whose dispatches wrote it: a host read of it then reads that execution's GPU work (D10).
     wrote_gen: u32 = 0,
     /// A dry recording's dispatch wrote it, dropped: its bytes are not the ones its tensors say, so no real dispatch or
@@ -111,13 +111,9 @@ pub const Store = struct {
         mapped: struct { payload: ?*anyopaque, release: MappedRelease, owned: bool = false },
         /// A buffer the engine holds for the process (`counterPage`): never released, never written in place.
         held,
-        /// A place in the arena (`beginExecution`), the plan binder's for one execution: its slot goes back to the
-        /// binder when its last reference goes. A host-filled ask, from the host ring, holds no slot.
-        arena: plan.binder.Slot,
-        /// A place of a wide execution in the arena's scratch (`beginWide`), `len` bytes from `at`, given back to the
-        /// region's gaps when its last reference goes; a host-filled one, in the host ring's replica, at the next eval
-        /// (`evalPoint`).
-        wide: struct { at: u64, len: u64, host: bool },
+        /// A place in the arena's D97 region (`beginNarrow` / `beginWide`): scratch from the scratch region (`len` bytes
+        /// starting at `at`, given back to first-fit gaps on drop) or host-filled from the host ring's replica.
+        arena: struct { at: u64, len: u64, host: bool },
     };
 };
 
@@ -1047,8 +1043,7 @@ fn dropStore(store: *Store) void {
             publishPool(s);
         },
         .held => {},
-        .arena => |slot| dropArenaStore(store, slot),
-        .wide => |w| dropWideStore(store, w.at, w.len, w.host),
+        .arena => |a| dropArenaStore(store, a.at, a.len, a.host),
         // The buffer aliases pages someone else keeps: the last pass that binds it runs before they may go.
         .mlx, .mapped => if (store.seq > s.done) {
             s.retired.append(gpa, store) catch {
@@ -1062,7 +1057,7 @@ fn dropStore(store: *Store) void {
 /// The end of a store over memory the pool does not own, once no pass binds it.
 fn freeAlias(s: *State, store: *Store) void {
     switch (store.origin) {
-        .pool, .held, .dry, .arena, .wide => unreachable,
+        .pool, .held, .dry, .arena => unreachable,
         .mlx => |kept| _ = mlx.mlx_array_free(kept),
         .mapped => |m| {
             store.buffer.release();
@@ -1113,7 +1108,7 @@ pub fn lend(t: *Tensor) Error!mlx.mlx_array {
     // A lent store dies on MLX's thread, at a time no recording can order.
     if (plan.session.mode != .off) return refusing("a tensor lent to MLX inside a recording", error.TensorUnsupported);
     if (t.store.escaped) return refusing("an arena store its execution left alive, lent to MLX", error.PlanEscape);
-    if (t.store.origin == .arena or t.store.origin == .wide) return refusing("an arena store lent to MLX: its bytes are an execution's", error.TensorUnsupported);
+    if (t.store.origin == .arena) return refusing("an arena store lent to MLX: its bytes are an execution's", error.TensorUnsupported);
     if (mlx.engine.mlx_at_rest.on.load(.monotonic)) return error.MlxAtRest;
     if (t.offset != 0 or !t.rowContiguous() or t.pending != null) return error.NotRowContiguous;
     const s = try st();
@@ -1200,7 +1195,6 @@ pub fn freshOut(dtype: Dtype, shape: []const c_int) Error!*Tensor {
     const t = try share(dst);
     errdefer release(t);
     if (recordingOn()) _ = plan.session.recorder.?.ask(@max(t.nbytes(), 1), false, true) catch return error.OutOfMemory;
-    if (plan.session.mode == .replay) _ = plan.session.binder.?.ask(@max(t.nbytes(), 1), .external) catch |e| return planError(e);
     into_taken = dst.store;
     return t;
 }
@@ -1243,10 +1237,8 @@ fn freshFor(dtype: Dtype, shape: []const c_int, for_host: bool) Error!*Tensor {
     t.dtype = dtype;
     t.offset = 0;
     const len = @max(t.nbytes(), 1);
-    if (plan.session.mode == .replay) {
+    if (plan.arenaActive()) {
         t.store = try arenaStore(len, for_host);
-    } else if (plan.session.mode == .wide) {
-        t.store = try wideStore(len, for_host);
     } else if (dryOn()) {
         t.store = try dryStore(len, for_host);
     } else {
@@ -1269,16 +1261,8 @@ fn freshFor(dtype: Dtype, shape: []const c_int, for_host: bool) Error!*Tensor {
 
 // ── Recording (docs/bill_redesign.md#recorder) ──
 
-/// The engine's side of a recording: its generation, which tells its asks from an earlier recording's, and the levels
-/// of the stores its dispatches bound over the whole execution (D9): `dispatchLevel`'s rule on maps no pass cut clears,
-/// a store keyed by its ask, or by its address when it is from before the recording, until it dies.
 const Recording = struct {
     gen: u32 = 0,
-    lv_write: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    lv_read: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    lv_whole: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    /// A level map could not grow: the recording's levels are short of some dispatches.
-    failed: bool = false,
     /// Host reads of bytes the execution's dispatches wrote, and those of them a classified site made (`hostResult`).
     readbacks: u32 = 0,
     results: u32 = 0,
@@ -1289,9 +1273,6 @@ const Recording = struct {
     fn deinit(r: *Recording) void {
         for (r.made_up.items) |b| gpa.free(b);
         r.made_up.deinit(gpa);
-        r.lv_write.deinit(gpa);
-        r.lv_read.deinit(gpa);
-        r.lv_whole.deinit(gpa);
     }
 };
 var recording: Recording = .{};
@@ -1393,65 +1374,15 @@ pub fn hostResult(t: *const Tensor, below: ?u32) Error![]u8 {
     return b;
 }
 
-fn recKey(store: *const Store) u64 {
-    return if (store.plan_gen == recording.gen) (@as(u64, 1) << 63) | (@as(u64, store.plan_ref.instance) << 32) | store.plan_ref.ordinal else @intFromPtr(store);
-}
-
-/// The store's last reference went: its ask died, or a store from before the recording leaves the maps, so that its
-/// address cannot lend a later store its levels.
+/// The store's last reference went: notify the active recording if this ask belonged to it.
 fn noteDeath(store: *const Store) void {
-    if (store.plan_gen == recording.gen) return plan.session.recorder.?.free(store.plan_ref);
-    const key: u64 = @intFromPtr(store);
-    _ = recording.lv_write.remove(key);
-    _ = recording.lv_read.remove(key);
-    _ = recording.lv_whole.remove(key);
+    if (store.plan_gen == recording.gen) plan.session.recorder.?.free(store.plan_ref);
 }
 
-/// The dispatch whose stores were just bound, at its level over the execution, given to the recorder for each ask it
-/// binds.
+/// Marks stores written by the dispatch just encoded so dry/real readback checks recognize GPU writes.
 fn noteDispatch(s: *State) void {
-    noteLevels(s) catch {
-        recording.failed = true;
-    };
-}
-
-fn noteLevels(s: *State) !void {
-    const r = &recording;
-    var lev: u32 = 0;
-    var it = s.next_in.keyIterator();
-    while (it.next()) |k| lev = @max(lev, r.lv_write.get(recKey(k.*)) orelse 0);
-    it = s.next_out.keyIterator();
-    while (it.next()) |k| {
-        const key = recKey(k.*);
-        const after = if (s.next_in.contains(k.*)) r.lv_write.get(key) orelse 0 else r.lv_whole.get(key) orelse 0;
-        lev = @max(lev, @max(after, r.lv_read.get(key) orelse 0));
-    }
-    lev += 1;
-    it = s.next_in.keyIterator();
-    while (it.next()) |k| {
-        touchAsk(k.*, lev);
-        if (s.next_out.contains(k.*)) continue;
-        const g = try r.lv_read.getOrPut(gpa, recKey(k.*));
-        g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, lev) else lev;
-    }
-    it = s.next_out.keyIterator();
-    while (it.next()) |k| {
-        k.*.wrote_gen = r.gen;
-        const key = recKey(k.*);
-        const g = try r.lv_write.getOrPut(gpa, key);
-        if (s.next_in.contains(k.*)) {
-            g.value_ptr.* = lev;
-            try r.lv_whole.put(gpa, key, lev);
-            _ = r.lv_read.remove(key);
-        } else {
-            g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, lev) else lev;
-            touchAsk(k.*, lev);
-        }
-    }
-}
-
-fn touchAsk(store: *const Store, lev: u32) void {
-    if (store.plan_gen == recording.gen) plan.session.recorder.?.touch(store.plan_ref, lev);
+    var it = s.next_out.keyIterator();
+    while (it.next()) |k| k.*.wrote_gen = recording.gen;
 }
 
 /// The made-up bytes a dry recording's classified readbacks read (`hostResult`): zeros, or a ramp of distinct words.
@@ -1482,7 +1413,7 @@ pub fn beginRecording(how: How, recorder: *plan.Recorder) Error!void {
     }
 }
 
-/// The recording's end; `OutOfMemory` when a level map could not grow, so its levels are short of some dispatches.
+/// The recording's end.
 pub fn endRecording() Error!void {
     if (dryOn()) {
         clearHazards(&state.?);
@@ -1491,11 +1422,8 @@ pub fn endRecording() Error!void {
     plan.session = .{};
     into_next = null;
     into_taken = null;
-    defer {
-        recording.deinit();
-        recording = .{};
-    }
-    if (recording.failed) return error.OutOfMemory;
+    recording.deinit();
+    recording = .{};
 }
 
 // ── The arena (docs/bill_redesign.md#arena) ──
@@ -1505,16 +1433,15 @@ pub fn endRecording() Error!void {
 pub const ring_replicas = 2;
 
 /// The engine's one arena, `[host ring x replicas | scratch]`, made at a load's end and shared by every planned model:
-/// executions never overlap. An execution's asks are places in it that its binder gives.
+/// executions never overlap.
 const Arena = struct {
     buffer: metal.Buffer,
     base: [*]u8,
-    layout: plan.binder.Layout,
-    binder: plan.Binder,
+    layout: plan.region.Layout,
     /// Per replica of the host ring, the last pass of the execution that filled it last.
     ring_seq: [ring_replicas]u64 = @splat(0),
-    /// This execution's host asks have waited for their replica.
-    ring_ready: bool = false,
+    /// Completed or started arena executions (cycles host-ring replicas).
+    executions: u64 = 0,
     /// The arena stores alive now, each at its `live_at`: one alive when its execution ends escaped.
     live: std.ArrayList(*Store) = .empty,
     /// Escaped stores not yet dropped: the arena may not go under them.
@@ -1522,6 +1449,12 @@ const Arena = struct {
     spare: std.ArrayList(*Store) = .empty,
     /// The planned loads that hold it (`arenaFor`): it goes with the last one's `arenaRelease`.
     holders: u32 = 0,
+    /// Non-null when `layout.keep != null`: `base` is an `mmap` mapping of `mapped.len` bytes wrapped via `dev.wrap`.
+    mapped: ?[]align(std.heap.page_size_max) u8 = null,
+    /// True while the tail past `layout.keep` is leased from its borrower for GPU use.
+    tail_leased: bool = false,
+    /// Highest pass sequence that bound bytes reaching into `[h * replicas + keep ..)`: waited before returning lease.
+    tail_end_seq: u64 = 0,
 };
 var arena: ?Arena = null;
 var arena_total = std.atomic.Value(u64).init(0);
@@ -1532,22 +1465,22 @@ pub fn arenaTotal() u64 {
 }
 
 /// The arena's layout; null before the first planned load.
-pub fn arenaLayout() ?plan.binder.Layout {
+pub fn arenaLayout() ?plan.region.Layout {
     return if (arena) |ar| ar.layout else null;
 }
 
 /// Makes the arena `layout` asks for, at a planned load's end, which holds it until its `arenaRelease`; or keeps the one
 /// held where it holds each part at least as large: a second model takes the larger of each. Remade only between
 /// executions, the new buffer made before the old goes, so a refusal leaves the arena held as it was.
-pub fn arenaFor(layout: plan.binder.Layout) Error!void {
+pub fn arenaFor(layout: plan.region.Layout) Error!void {
     const s = try st();
     if (plan.session.mode != .off) return refusing("an arena made inside a recording or an execution", error.TensorUnsupported);
     if (layout.replicas != ring_replicas) return refusing("an arena of another number of ring replicas than the engine's", error.TensorUnsupported);
     var want = layout;
     var holders: u32 = 1;
     if (arena) |*ar| {
-        if (ar.layout.alignment != layout.alignment or ar.layout.keep != layout.keep)
-            return refusing("an arena of another alignment or lease than the one held", error.TensorUnsupported);
+        if (ar.layout.alignment != layout.alignment or ar.layout.keep != layout.keep or ar.layout.guard != layout.guard)
+            return refusing("an arena of another alignment, lease, or guard than the one held", error.TensorUnsupported);
         if (layout.g <= ar.layout.g and layout.h <= ar.layout.h) {
             ar.holders += 1;
             return;
@@ -1557,10 +1490,29 @@ pub fn arenaFor(layout: plan.binder.Layout) Error!void {
         want.h = @max(want.h, ar.layout.h);
         holders += ar.holders;
     }
-    const buffer = try s.dev.allocArena(want.arenaBytes());
+    const buffer, const mapped_slice = try allocArenaBuffer(s, want);
+    errdefer {
+        buffer.release();
+        metal.commitResident();
+        if (mapped_slice) |m| std.posix.munmap(m);
+    }
     if (arena != null) arenaDrop(s);
-    arena = .{ .buffer = buffer, .base = buffer.bytes().ptr, .layout = want, .binder = plan.Binder.init(gpa, want), .holders = holders };
+    arena = .{ .buffer = buffer, .base = buffer.bytes().ptr, .mapped = mapped_slice, .layout = want, .holders = holders };
     arena_total.store(buffer.allocatedSize(), .monotonic);
+}
+
+fn allocArenaBuffer(s: *State, want: plan.region.Layout) Error!struct { metal.Buffer, ?[]align(std.heap.page_size_max) u8 } {
+    const keep = want.keep orelse return .{ try s.dev.allocArena(want.arenaBytes()), null };
+    const page: u64 = @max(std.heap.pageSize(), std.heap.page_size_max);
+    const tail_off = want.h * want.replicas + keep;
+    if (keep > want.g or tail_off % page != 0)
+        return refusing("an arena whose tail is not page-aligned inside the scratch region", error.TensorUnsupported);
+    const mapped_len = std.mem.alignForward(usize, @max(want.arenaBytes(), 1), page);
+    const mapped = std.posix.mmap(null, mapped_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch return error.OutOfMemory;
+    errdefer std.posix.munmap(mapped);
+    const aligned: []align(std.heap.page_size_max) u8 = @alignCast(mapped);
+    const buffer = try s.dev.wrap(aligned.ptr, aligned.len);
+    return .{ buffer, aligned };
 }
 
 /// A planned load lets go of the arena: it goes with the last holder, when none of its stores is alive.
@@ -1576,7 +1528,8 @@ pub fn arenaRelease() Error!void {
 }
 
 fn arenaDroppable(ar: *const Arena) Error!void {
-    if (plan.session.mode == .replay) return refusing("the arena dropped inside an execution", error.TensorUnsupported);
+    if (plan.arenaActive()) return refusing("the arena dropped inside an execution", error.TensorUnsupported);
+    if (ar.tail_leased) return refusing("the arena dropped while its tail lease is held", error.TensorUnsupported);
     if (ar.live.items.len > 0 or ar.escaped > 0) return refusing("the arena dropped while a store of it is alive", error.TensorUnsupported);
 }
 
@@ -1586,22 +1539,65 @@ fn arenaDrop(s: *State) void {
     syncState(s) catch {};
     ar.buffer.release();
     metal.commitResident();
+    if (ar.mapped) |m| std.posix.munmap(m);
     for (ar.spare.items) |store| gpa.destroy(store);
     ar.spare.deinit(gpa);
     ar.live.deinit(gpa);
-    ar.binder.deinit();
     arena = null;
     arena_total.store(0, .monotonic);
 }
 
-/// The engine's mark: the open pass and the highest level of its dispatches so far; with no pass open, the next pass
-/// at level 0, which orders nothing (`plan_binder.zig`, "Order").
-fn markNow(s: *const State) u64 {
-    return (s.seq << 32) | (if (s.pass != null) s.pass_level_hi else 0);
+/// The page-aligned tail past `Layout.keep` in a mapped arena, ready to alias as `PageSlab`s; null without a kept tail.
+pub fn arenaTail() ?[]align(std.heap.page_size_max) u8 {
+    const ar = &(arena orelse return null);
+    const keep = ar.layout.keep orelse return null;
+    const mapped = ar.mapped orelse return null;
+    const tail_off: usize = @intCast(ar.layout.h * ar.layout.replicas + keep);
+    return @alignCast(mapped[tail_off..]);
 }
 
-fn sessionMark() u64 {
-    return markNow(&state.?);
+/// True while the tail past `Layout.keep` is leased from its borrower for GPU use.
+pub fn arenaLeaseHeld() bool {
+    const ar = &(arena orelse return false);
+    return ar.tail_leased;
+}
+
+/// Leases the arena's tail past `Layout.keep` to the GPU after its borrower drains its aliased slabs.
+pub fn arenaTakeLease() Error!void {
+    const ar = &(arena orelse return refusing("a tail lease without an arena", error.TensorUnsupported));
+    if (ar.layout.keep == null or ar.mapped == null)
+        return refusing("a tail lease on an arena without Layout.keep", error.TensorUnsupported);
+    if (plan.arenaActive())
+        return refusing("a tail lease taken inside an execution", error.TensorUnsupported);
+    if (ar.tail_leased) return;
+    if (arenaTail()) |tail| {
+        if (fill_marks.live.load(.acquire) != 0 and fill_marks.snapshot().met(@intFromPtr(tail.ptr), tail.len) != null)
+            return error.ReadsFillingSlab;
+    }
+    ar.tail_leased = true;
+}
+
+/// Waits for any pass touching the arena's tail to complete and returns the tail lease to the borrower.
+pub fn arenaReturnLease() Error!void {
+    const s = try st();
+    const ar = &(arena orelse return);
+    if (!ar.tail_leased) return;
+    if (plan.arenaActive())
+        return refusing("a tail lease returned inside an execution", error.TensorUnsupported);
+    const tail_off = ar.layout.h * ar.layout.replicas + (ar.layout.keep orelse ar.layout.g);
+    for (ar.live.items) |store| {
+        if (store.at + store.len > tail_off)
+            return refusing("a tail lease returned while a store in the tail is alive", error.TensorUnsupported);
+    }
+    if (s.pass != null and ar.tail_end_seq >= s.seq) try submit();
+    if (ar.tail_end_seq > s.done) try waitFor(s, ar.tail_end_seq);
+    ar.tail_leased = false;
+}
+
+/// The engine's mark: the open pass and the highest level of its dispatches so far; with no pass open, the next pass
+/// at level 0, which orders nothing.
+fn markNow(s: *const State) u64 {
+    return (s.seq << 32) | (if (s.pass != null) s.pass_level_hi else 0);
 }
 
 /// The mark of an arena store's last dispatches: the next tenant of its bytes goes above them.
@@ -1618,173 +1614,95 @@ fn noteArenaLevel(store: *Store, seq: u64, lev: u32) void {
     }
 }
 
-fn planError(e: plan.binder.Error) Error {
-    return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.PlanMiss => refusing("an ask the plan did not foresee (the binder's miss names it)", error.PlanMiss),
-        error.PlanNeedsLease => error.PlanNeedsLease,
-    };
-}
+// ── D97 Everywhere region (used uniformly for both narrow and wide executions) ──
 
-/// An execution of `root` on the arena begins: until `endExecution` (or `abortExecution`) every ask is a place the
-/// binder gives from `tables`, and one the plan did not foresee is refused by name (`executionMiss`), never allocated.
-pub fn beginExecution(tables: *const plan.pack.Tables, root: plan.FrameId) Error!void {
-    if (plan.session.mode != .off) return refusing("an execution begun inside a recording or another execution", error.TensorUnsupported);
-    if (into_next != null) return refusing("an execution begun with an `into` armed", error.TensorUnsupported);
-    const s = try st();
-    const ar = &(arena orelse return refusing("an execution with no arena made", error.TensorUnsupported));
-    if (tables.alignment != ar.layout.alignment) return refusing("tables packed at another alignment than the arena's", error.TensorUnsupported);
-    ar.binder.begin(tables, root, false, markNow(s)) catch |e| return planError(e);
-    ar.ring_ready = false;
-    plan.session = .{ .mode = .replay, .binder = &ar.binder, .mark = sessionMark };
-    s.stats.executions += 1;
-}
-
-/// The execution ended as it should: its root closes. A miss it met, or a store of it still alive, is `PlanMiss`.
-pub fn endExecution() Error!void {
-    const ar = &arena.?;
-    // A frame its code left open: the root cannot close over it.
-    if (ar.binder.stack.items.len != 1) {
-        ar.binder.refuse(.{ .kind = .structure, .id = ar.binder.innermost() }) catch {};
-        abortExecution();
-        return refusing("an execution ended with a frame still open", error.PlanMiss);
-    }
-    // A host-filled ask holds no slot the binder judges: alive past its execution, its replica is refilled under it.
-    if (ar.live.items.len > 0) ar.binder.refuse(.{ .kind = .lifetime, .id = ar.binder.innermost() }) catch {};
-    ar.binder.end() catch |e| {
-        leaveExecution(ar);
-        return planError(e);
-    };
-    leaveExecution(ar);
-}
-
-/// The execution failed: its frames go, and its stores still alive are escaped.
-pub fn abortExecution() void {
-    const ar = &arena.?;
-    ar.binder.abort();
-    leaveExecution(ar);
-}
-
-/// The first miss of the last execution: what was asked against what was recorded, where.
-pub fn executionMiss() ?plan.binder.Miss {
-    return if (arena) |ar| ar.binder.miss else null;
-}
-
-fn leaveExecution(ar: *Arena) void {
-    const s = &state.?;
-    if (comptime builtin.is_test) arena_check.ended(s, ar);
-    ar.ring_seq[ar.binder.replica()] = if (s.pass != null) s.seq else s.seq - 1;
-    for (ar.live.items) |store| store.escaped = true;
-    ar.escaped += @intCast(ar.live.items.len);
-    ar.live.clearRetainingCapacity();
-    plan.session = .{};
-    into_next = null;
-    into_taken = null;
-}
-
-// ── The wide region (D97, docs/bill_redesign.md): a prefill chunk's or an encode's execution ──
-
-/// A wide execution's placement in the arena: its scratch from the scratch's start by first fit, its host asks one after
-/// another in the host ring's replica. A place reused within the open pass goes above every dispatch that bound its
-/// bytes before, as an arena place does; the execution's first places go above everything the pass encoded before it.
+/// An execution's placement in the arena: scratch from the scratch region by address-ordered first fit, and
+/// host-filled asks sequentially in the host ring's replica. A reused place goes above prior dispatches on it.
 const Region = struct {
     fit: plan.region.Fit = .{},
     host_top: u64 = 0,
     begin: u64 = 0,
     replica: u32 = 0,
     ring_ready: bool = false,
-    /// The passes `beginWidePadded` pads to; the one followed, its next scratch ask, the choices met, and a choice no
-    /// pass took there, which refuses the next ask.
-    pad: ?[]const PadPass = null,
-    pass: usize = 0,
-    cursor: usize = 0,
-    met: usize = 0,
-    missed: bool = false,
 };
-
-/// One pass of a dry recording, as a padded wide execution follows it: each scratch ask's place in order
-/// (`plan.region.padOf`), and the choices it took (`plan.region.choicesAgree` says the passes may be mixed).
-pub const PadPass = struct { sizes: []const u64, choices: []const plan.TraceChoice = &.{} };
 var region: Region = .{};
 
 pub const WideRefusal = struct { asked: u64, room: u64, host: bool };
 
-/// The first ask the open or last wide execution was refused (`WideFull`): what it wanted of the region a load holds,
-/// and the room there. An op behind MLX's C API reports any failure as its own, so the caller reads it here.
+/// The first ask the open or last region execution was refused (`WideFull`): what it wanted and the room available.
 pub var refused_wide: ?WideRefusal = null;
 
-/// A wide execution begins (D97): until `endWide` (or `abortWide`) every ask is a place in the arena's region, and one
-/// past it is refused by name (`WideFull`), never asked of the pool or of Metal.
+/// Begins a planned narrow execution (decode, verify, draft, joined, sample) on the D97 arena region.
+pub fn beginNarrow() Error!void {
+    return beginRegion(.narrow);
+}
+
+/// Ends a planned narrow execution; refuses with `PlanEscape` if any store of it remains alive.
+pub fn endNarrow() Error!void {
+    return endRegion();
+}
+
+/// Aborts a planned narrow execution; any live stores become escaped.
+pub fn abortNarrow() void {
+    abortRegion();
+}
+
+/// Begins a planned wide execution (prefill chunk, vision encode) on the D97 arena region.
 pub fn beginWide() Error!void {
-    if (plan.session.mode != .off) return refusing("a wide execution begun inside a recording or another execution", error.TensorUnsupported);
-    if (into_next != null) return refusing("a wide execution begun with an `into` armed", error.TensorUnsupported);
+    return beginRegion(.wide);
+}
+
+/// Ends a planned wide execution; refuses with `PlanEscape` if any store of it remains alive.
+pub fn endWide() Error!void {
+    return endRegion();
+}
+
+/// Aborts a planned wide execution; any live stores become escaped.
+pub fn abortWide() void {
+    abortRegion();
+}
+
+fn beginRegion(mode: plan.Mode) Error!void {
+    std.debug.assert(mode == .narrow or mode == .wide);
+    if (plan.session.mode != .off) return refusing("an execution begun inside a recording or another execution", error.TensorUnsupported);
+    if (into_next != null) return refusing("an execution begun with an `into` armed", error.TensorUnsupported);
     const s = try st();
-    const ar = &(arena orelse return refusing("a wide execution with no arena made", error.TensorUnsupported));
+    const ar = &(arena orelse return refusing("an execution with no arena made", error.TensorUnsupported));
     region.fit.gaps.clearRetainingCapacity();
     region.fit.top = 0;
     region.fit.top_mark = 0;
+    region.fit.top_mark_hi = 0;
     region.fit.high = 0;
     region.host_top = 0;
     region.begin = markNow(s);
-    // The host ring's replicas turn with every execution, planned or wide: each waits only for its replica's last.
-    region.replica = ar.binder.replica();
-    ar.binder.executions += 1;
+    region.replica = @intCast(ar.executions % ar.layout.replicas);
+    ar.executions += 1;
     region.ring_ready = false;
     refused_wide = null;
-    plan.session = .{ .mode = .wide, .mark = sessionMark };
-    s.stats.wide_executions += 1;
+    plan.session = .{ .mode = mode };
+    if (mode == .narrow) s.stats.executions += 1 else s.stats.wide_executions += 1;
 }
 
-/// `beginWide` with each scratch ask placed at the size its pass recorded for it, in order: first fit then places them
-/// as the recording did, so the execution tops out where its recording does whatever its own sizes. At each choice it
-/// follows a pass that took the same one there. An ask past its recorded size or past the sequence, or one after a
-/// choice no pass took there, is refused by name (`PlanMiss`). `passes` outlive the execution.
-pub fn beginWidePadded(passes: []const PadPass) Error!void {
-    try beginWide();
-    region.pad = passes;
-    region.pass = 0;
-    region.cursor = 0;
-    region.met = 0;
-    region.missed = false;
-    plan.session.on_choice = wideChoice;
-}
-
-fn wideChoice(site: plan.Site, value: u32) void {
-    const passes = region.pad orelse return;
-    const j = region.met;
-    region.met += 1;
-    const cur = passes[region.pass].choices;
-    if (j >= cur.len or cur[j].site != site or cur[j].at != region.cursor) {
-        region.missed = true;
-        return;
-    }
-    if (cur[j].value == value) return;
-    for (passes, 0..) |ps, q| if (j < ps.choices.len and ps.choices[j].site == site and ps.choices[j].value == value) {
-        region.pass = q;
-        region.cursor = ps.choices[j].at;
-        return;
-    };
-    region.missed = true;
-}
-
-/// The wide execution ended as it should: a store of it still alive is refused by name (`PlanEscape`), and escapes.
-pub fn endWide() Error!void {
+fn endRegion() Error!void {
     const ar = &arena.?;
     const alive = ar.live.items.len;
-    leaveWide(ar);
-    if (alive > 0) return refusing("a wide execution ended with a store of it still alive", error.PlanEscape);
+    leaveRegion(ar);
+    if (alive > 0) return refusing("an execution ended with a store of it still alive", error.PlanEscape);
 }
 
-/// The wide execution failed: its stores still alive escape.
-pub fn abortWide() void {
-    leaveWide(&arena.?);
+fn abortRegion() void {
+    leaveRegion(&arena.?);
 }
 
-fn leaveWide(ar: *Arena) void {
+fn leaveRegion(ar: *Arena) void {
     const s = &state.?;
-    const high = region.fit.high;
-    s.stats.wide_high = @max(s.stats.wide_high, high);
-    s.stats.wide_last_high = high;
+    const was_wide = plan.session.mode == .wide;
+    if (comptime builtin.is_test) arena_check.ended(s, ar);
+    if (was_wide) {
+        const high = region.fit.high;
+        s.stats.wide_high = @max(s.stats.wide_high, high);
+        s.stats.wide_last_high = high;
+    }
     ar.ring_seq[region.replica] = if (s.pass != null) s.seq else s.seq - 1;
     for (ar.live.items) |store| store.escaped = true;
     ar.escaped += @intCast(ar.live.items.len);
@@ -1792,49 +1710,48 @@ fn leaveWide(ar: *Arena) void {
     plan.session = .{};
     into_next = null;
     into_taken = null;
-    region.pad = null;
 }
 
-fn wideStore(len: usize, for_host: bool) Error!*Store {
+fn arenaStore(len: usize, for_host: bool) Error!*Store {
     const s = &state.?;
     const ar = &arena.?;
-    var place = std.mem.alignForward(u64, @max(len, 1), ar.layout.alignment);
+    const aligned = std.mem.alignForward(u64, @max(len, 1), ar.layout.alignment);
+    const place_len = if (for_host) aligned else aligned + (if (comptime builtin.is_test) ar.layout.guard else 0);
     var at: u64 = undefined;
     var after: u64 = region.begin;
-    if (!for_host) if (region.pad) |passes| {
-        const pad = passes[region.pass].sizes;
-        if (region.missed) return refusing("a wide execution's scratch ask after a choice no pass of its recording took there", error.PlanMiss);
-        if (region.cursor == pad.len) return refusing("a wide execution's scratch ask past the sequence its recording made", error.PlanMiss);
-        if (place > pad[region.cursor]) return refusing("a wide execution's scratch ask past the size its recording made", error.PlanMiss);
-        place = pad[region.cursor];
-        region.cursor += 1;
-    };
     if (for_host) {
         if (!region.ring_ready) {
             const seq = ar.ring_seq[region.replica];
             if (seq > s.done) try waitFor(s, seq);
             region.ring_ready = true;
         }
-        if (region.host_top + place > ar.layout.h) {
-            if (refused_wide == null) refused_wide = .{ .asked = region.host_top + place, .room = ar.layout.h, .host = true };
-            return refusing("a wide execution's host asks past the region the load holds", error.WideFull);
+        if (region.host_top + place_len > ar.layout.h) {
+            if (refused_wide == null) refused_wide = .{ .asked = region.host_top + place_len, .room = ar.layout.h, .host = true };
+            return refusing("an execution's host asks past the region the load holds", error.WideFull);
         }
         at = region.replica * ar.layout.h + region.host_top;
-        region.host_top += place;
+        region.host_top += place_len;
     } else {
-        const got = region.fit.take(place);
-        if (got.at + place > ar.layout.g) {
-            region.fit.give(gpa, got.at, got.at + place, got.mark) catch {};
-            if (refused_wide == null) refused_wide = .{ .asked = got.at + place, .room = ar.layout.g, .host = false };
-            return refusing("a wide execution's scratch past the region the load holds", error.WideFull);
+        const cap = if (ar.tail_leased) ar.layout.g else (ar.layout.keep orelse ar.layout.g);
+        const got = if (plan.session.mode == .narrow)
+            (region.fit.takePreferCold(gpa, place_len, (s.seq << 32) | 1, cap, @min(@as(u64, 4 << 20), cap / 8)) catch return error.OutOfMemory)
+        else
+            region.fit.take(place_len);
+        if (got.at + place_len > cap) {
+            region.fit.give(gpa, got.at, got.at + place_len, got.mark) catch {};
+            if (!ar.tail_leased and ar.layout.keep != null and got.at + place_len <= ar.layout.g)
+                return refusing("an execution's scratch past Layout.keep without the tail lease", error.PlanNeedsLease);
+            if (refused_wide == null) refused_wide = .{ .asked = got.at + place_len, .room = cap, .host = false };
+            return refusing("an execution's scratch past the region the load holds", error.WideFull);
         }
         at = ar.layout.h * ar.layout.replicas + got.at;
         after = @max(after, got.mark);
     }
-    errdefer if (!for_host) region.fit.give(gpa, at - ar.layout.h * ar.layout.replicas, at - ar.layout.h * ar.layout.replicas + place, after) catch {};
+    errdefer if (!for_host) region.fit.give(gpa, at - ar.layout.h * ar.layout.replicas, at - ar.layout.h * ar.layout.replicas + place_len, after) catch {};
     try ar.live.ensureUnusedCapacity(gpa, 1);
     const store = ar.spare.pop() orelse (gpa.create(Store) catch return error.OutOfMemory);
-    store.* = .{ .buffer = ar.buffer, .at = at, .ptr = ar.base + at, .len = len, .origin = .{ .wide = .{ .at = at, .len = place, .host = for_host } } };
+    errdefer ar.spare.append(gpa, store) catch gpa.destroy(store);
+    store.* = .{ .buffer = ar.buffer, .at = at, .ptr = ar.base + at, .len = len, .origin = .{ .arena = .{ .at = at, .len = place_len, .host = for_host } } };
     const floor: u32 = @truncate(after);
     if (after >> 32 == s.seq and floor > 0) {
         store.lev_seq = s.seq;
@@ -1843,62 +1760,15 @@ fn wideStore(len: usize, for_host: bool) Error!*Store {
         store.lev_whole = floor;
         s.stats.arena_floors += 1;
     }
+    if (comptime builtin.is_test) if (!for_host) try arena_check.handOut(s, ar, store, place_len, after);
     store.live_at = @intCast(ar.live.items.len);
     ar.live.appendAssumeCapacity(store);
-    s.stats.wide_asks += 1;
-    return store;
-}
-
-fn dropWideStore(store: *Store, at: u64, len: u64, host: bool) void {
-    const ar = &arena.?;
-    if (store.escaped) {
-        ar.escaped -= 1;
-    } else {
-        if (!host) region.fit.give(gpa, at - ar.layout.h * ar.layout.replicas, at - ar.layout.h * ar.layout.replicas + len, markOf(store)) catch {};
-        const last = ar.live.pop().?;
-        if (last != store) {
-            ar.live.items[store.live_at] = last;
-            last.live_at = store.live_at;
-        }
-    }
-    ar.spare.append(gpa, store) catch gpa.destroy(store);
-}
-
-/// A place in the arena for the next ask of the execution: scratch at its recorded offset, or a host-filled ask from
-/// this execution's replica of the host ring. Its first dispatch in the open pass goes above every dispatch that held
-/// its bytes before (`Got.after`): the level maps start it at that level.
-fn arenaStore(len: usize, for_host: bool) Error!*Store {
-    const s = &state.?;
-    const ar = &arena.?;
-    const got = ar.binder.ask(len, if (for_host) .host else .scratch) catch |e| return planError(e);
-    if (for_host and !ar.ring_ready) {
-        const seq = ar.ring_seq[ar.binder.replica()];
-        if (seq > s.done) try waitFor(s, seq);
-        ar.ring_ready = true;
-    }
-    // A place that fails from here is no store's: the binder gets it back, dead, and no record of it stays alive.
-    errdefer ar.binder.release(got.slot, 0);
-    try ar.live.ensureUnusedCapacity(gpa, 1);
-    const store = ar.spare.pop() orelse (gpa.create(Store) catch return error.OutOfMemory);
-    errdefer ar.spare.append(gpa, store) catch gpa.destroy(store);
-    store.* = .{ .buffer = ar.buffer, .at = got.offset, .ptr = ar.base + got.offset, .len = len, .origin = .{ .arena = got.slot } };
-    const floor: u32 = @truncate(got.after);
-    if (got.after >> 32 == s.seq and floor > 0) {
-        store.lev_seq = s.seq;
-        store.lev_read = floor;
-        store.lev_write = floor;
-        store.lev_whole = floor;
-        s.stats.arena_floors += 1;
-    }
-    if (comptime builtin.is_test) if (got.slot.item != plan.trace_mod.none) try arena_check.handOut(s, ar, store, got.room, got.after);
-    store.live_at = @intCast(ar.live.items.len);
-    ar.live.appendAssumeCapacity(store);
-    s.stats.arena_asks += 1;
+    if (plan.session.mode == .narrow) s.stats.arena_asks += 1 else s.stats.wide_asks += 1;
     return store;
 }
 
 /// TEST-ONLY, the arena's `poison`: with `byte` set, a place is handed out over `byte` once every pass before it has run,
-/// and its guard (`plan_pack.Options.guard`) holds a canary. A canary found changed when its bytes are next handed out,
+/// and its guard (`Layout.guard`) holds a canary. A canary found changed when its bytes are next handed out,
 /// or when its execution ends, counts in `hits`: a kernel wrote past its output. Compiled only under test.
 pub const arena_check = struct {
     pub var byte: ?u8 = null;
@@ -1956,13 +1826,13 @@ pub const arena_check = struct {
     }
 };
 
-fn dropArenaStore(store: *Store, slot: plan.binder.Slot) void {
+fn dropArenaStore(store: *Store, at: u64, len: u64, host: bool) void {
     const ar = &arena.?;
-    if (comptime builtin.is_test) arena_check.died(store);
+    if (comptime builtin.is_test) if (!host) arena_check.died(store);
     if (store.escaped) {
         ar.escaped -= 1;
     } else {
-        if (plan.session.mode == .replay) ar.binder.release(slot, markOf(store));
+        if (!host) region.fit.give(gpa, at - ar.layout.h * ar.layout.replicas, at - ar.layout.h * ar.layout.replicas + len, markOf(store)) catch {};
         const last = ar.live.pop().?;
         if (last != store) {
             ar.live.items[store.live_at] = last;
@@ -2114,7 +1984,7 @@ pub fn import(a: mlx.mlx_array) Error!*Tensor {
     const dims = mlx.getShape(a);
     for (dims) |d| if (d == 0) return fresh(mlx.mlx_array_dtype(a), dims);
     if (dryOn()) return refusing("an MLX array met by a dry recording: MLX's work is never dry", error.TensorUnsupported);
-    if (plan.session.mode == .replay) return refusing("an MLX array met by an execution on the arena: MLX's memory is no part of the plan", error.TensorUnsupported);
+    if (plan.session.mode == .narrow) return refusing("an MLX array met by a narrow execution on the arena: MLX's memory is no part of the plan", error.TensorUnsupported);
     const s = try st();
     var available = false;
     try mlx.check(mlx._mlx_array_is_available(&available, a));
@@ -2173,7 +2043,7 @@ pub fn adopt(t: *Tensor, from: *Tensor) void {
 pub fn sole(store: *const Store) Error!bool {
     if (store.refs != 1) return false;
     switch (store.origin) {
-        .pool, .dry, .arena, .wide => return true,
+        .pool, .dry, .arena => return true,
         .mlx => |kept| {
             var only = false;
             try mlx.check(mlx._mlx_array_is_donatable(&only, kept));
@@ -2244,7 +2114,7 @@ pub fn pass() Error!metal.Pass {
             s.pass = null;
             try commitPass(s, open);
             s.stats.freed_kicks += 1;
-        } else if (plan.session.mode == .replay and s.pass_dispatches >= execution_pass_bounds.dispatches and s.next_in.count() == 0 and s.next_out.count() == 0) {
+        } else if (plan.session.mode == .narrow and s.pass_dispatches >= execution_pass_bounds.dispatches and s.next_in.count() == 0 and s.next_out.count() == 0) {
             s.pass = null;
             try commitPass(s, open);
             s.stats.bound_kicks += 1;
@@ -2270,16 +2140,30 @@ pub fn bind(p: metal.Pass, t: *const Tensor, index: usize) void {
     bindBuffer(s, p, t, index);
 }
 
+fn appendPassMapped(s: *State, ptr: usize, len: usize) void {
+    const range: Range = .{ .ptr = ptr, .len = len };
+    const n = s.pass_mapped.items.len;
+    if (n == 0 or !std.meta.eql(s.pass_mapped.items[n - 1], range))
+        s.pass_mapped.append(gpa, range) catch @panic("engine: out of memory tracking a pass");
+}
+
 fn bindBuffer(s: *State, p: metal.Pass, t: *const Tensor, index: usize) void {
     if (t.store.origin == .dry or t.store.dry_written) @panic("engine: a real dispatch binds a store a dry recording made or wrote: reset the state it ran on");
     if (t.store.escaped) @panic("engine: a dispatch binds an arena store its execution left alive: its bytes are another execution's");
     t.store.seq = s.seq;
     s.pass_binds.put(gpa, t.store, {}) catch @panic("engine: out of memory tracking a pass");
     if (t.store.origin == .mapped) {
-        const range: Range = .{ .ptr = @intFromPtr(t.store.ptr) + t.offset, .len = t.reach() };
-        const n = s.pass_mapped.items.len;
-        if (n == 0 or !std.meta.eql(s.pass_mapped.items[n - 1], range))
-            s.pass_mapped.append(gpa, range) catch @panic("engine: out of memory tracking a pass");
+        appendPassMapped(s, @intFromPtr(t.store.ptr) + t.offset, t.reach());
+    } else if (t.store.origin == .arena) {
+        if (arena) |*ar| if (ar.layout.keep) |keep| {
+            const tail_off = ar.layout.h * ar.layout.replicas + keep;
+            const start = t.store.at + t.offset;
+            const end = start + t.reach();
+            if (end > tail_off) {
+                ar.tail_end_seq = @max(ar.tail_end_seq, s.seq);
+                if (ar.mapped != null) appendPassMapped(s, @intFromPtr(t.store.ptr) + t.offset, t.reach());
+            }
+        };
     }
     p.buffer(t.store.buffer, t.store.at + t.offset, index);
 }
@@ -2381,13 +2265,13 @@ fn dispatchLevel(s: *State) u32 {
     s.pass_level_hi = @max(s.pass_level_hi, lev);
     it = s.next_in.keyIterator();
     while (it.next()) |k| {
-        if (k.*.origin == .arena or k.*.origin == .wide) noteArenaLevel(k.*, s.seq, lev);
+        if (k.*.origin == .arena) noteArenaLevel(k.*, s.seq, lev);
         if (s.next_out.contains(k.*)) continue;
         levSet(k.*, s, lev);
     }
     it = s.next_out.keyIterator();
     while (it.next()) |k| {
-        if (k.*.origin == .arena or k.*.origin == .wide) noteArenaLevel(k.*, s.seq, lev);
+        if (k.*.origin == .arena) noteArenaLevel(k.*, s.seq, lev);
         levSetWrite(k.*, s, lev, s.next_in.contains(k.*));
     }
     return lev;
@@ -2515,7 +2399,7 @@ pub fn nowNs() u64 {
 fn commitPass(s: *State, open: metal.Pass) Error!void {
     if (fill_marks.live.load(.acquire) != 0) try refuseFillingReads(s, open);
     // At most `passes` committed and unfinished once this one is: the open pass is not one of them, so no wait commits it.
-    if (plan.session.mode == .replay and s.flying.items.len >= execution_pass_bounds.passes)
+    if (plan.session.mode == .narrow and s.flying.items.len >= execution_pass_bounds.passes)
         try waitFor(s, s.flying.items[s.flying.items.len - execution_pass_bounds.passes].seq);
     s.stats.barriers += open.replay();
     clearHazards(s);
@@ -2633,18 +2517,18 @@ pub fn sync() Error!void {
     return syncState(try st());
 }
 
-/// The forward evaluated an array: a recording marks the wait, and a wide execution waits for every pass submitted
+/// The forward evaluated an array: a recording marks the wait, and an arena execution waits for every pass submitted
 /// and gives back its host ring's bytes past the highest host ask still alive (`plan_region`).
 pub fn evalPoint() Error!void {
     if (recordingOn()) plan.session.recorder.?.wait() catch return error.OutOfMemory;
-    if (plan.session.mode != .wide) return;
+    if (!plan.arenaActive()) return;
     try syncState(try st());
     const ar = &arena.?;
     const base = region.replica * ar.layout.h;
     var top: u64 = 0;
     for (ar.live.items) |store| switch (store.origin) {
-        .wide => |w| if (w.host) {
-            top = @max(top, w.at - base + w.len);
+        .arena => |a| if (a.host) {
+            top = @max(top, a.at - base + a.len);
         },
         else => {},
     };
@@ -2824,8 +2708,7 @@ pub fn hostBytes(t: *const Tensor) Error![]u8 {
         return (t.store.ptr + t.offset)[0..t.nbytes()];
     }
     // The host writes only what it filled: arena scratch is reused under the GPU's own order, which no host write follows.
-    if (t.store.origin == .wide and !t.store.origin.wide.host) return refusing("a host write into a wide execution's scratch", error.TensorUnsupported);
-    if (t.store.origin == .arena and t.store.origin.arena.item != plan.trace_mod.none) return refusing("a host write into the arena's scratch", error.TensorUnsupported);
+    if (t.store.origin == .arena and !t.store.origin.arena.host) return refusing("a host write into an arena execution's scratch", error.TensorUnsupported);
     if (t.store.escaped) return refusing("a host write into an arena store its execution left alive", error.PlanEscape);
     const s = try st();
     if (t.store.seq > s.done) try waitFor(s, t.store.seq);
@@ -3257,7 +3140,7 @@ const TestRecording = struct {
     driver: plan.Driver,
 
     fn begin(self: *TestRecording, dry: ?Fill) !void {
-        self.recorder = try plan.Recorder.begin(std.testing.allocator, .{ .site = 1 });
+        self.recorder = plan.Recorder.begin(std.testing.allocator);
         self.driver = .{ .gpa = std.testing.allocator };
         try beginRecording(if (dry) |f| .{ .dry = .{ .driver = &self.driver, .fill = f } } else .real, &self.recorder);
     }
@@ -3319,8 +3202,8 @@ test "two fills of a dry recording give one trace where a classified readback st
             try readThenAsk(steer);
         }
         defer for (&under) |*r| r.deinit();
-        const d = plan.trace_mod.firstDifference(under[0].recorder.instances.items, under[1].recorder.instances.items);
-        const want: ?plan.trace_mod.Difference = if (steer) .{ .instance = 0, .what = .asks, .at = 3 } else null;
+        const d = plan.trace_mod.firstDifference(under[0].recorder.view(), under[1].recorder.view());
+        const want: ?plan.trace_mod.Difference = if (steer) .{ .what = .asks, .at = 3 } else null;
         try t.expectEqual(want, d);
     }
 }
@@ -3355,12 +3238,12 @@ test "a store a dry recording made, or wrote over, is refused by name where the 
     try t.expectEqualSlices(u8, std.mem.sliceAsBytes(&nine), try hostRead(one));
 }
 
-/// `run` recorded dry as an execution of root site 1, merged and packed by lifetimes.
-fn planOfTest(run: anytype) !plan.pack.Tables {
-    return planOfTestWith(run, .{ .level_rule = false });
+/// `run` recorded dry and sized with first-fit.
+fn planOfTest(run: anytype) !plan.region.Need {
+    return planOfTestWith(run, 0);
 }
 
-fn planOfTestWith(run: anytype, options: plan.pack.Options) !plan.pack.Tables {
+fn planOfTestWith(run: anytype, guard: u64) !plan.region.Need {
     var r: TestRecording = undefined;
     try r.begin(.zeros);
     defer r.deinit();
@@ -3370,13 +3253,11 @@ fn planOfTestWith(run: anytype, options: plan.pack.Options) !plan.pack.Tables {
     }
     var tr = try r.recorder.end();
     defer tr.deinit();
-    var shapes = try plan.shape.merge(std.testing.allocator, &.{tr}, .{});
-    defer shapes.deinit();
-    return plan.pack.pack(std.testing.allocator, &shapes, options);
+    return plan.region.needWithGuard(std.testing.allocator, &tr, 256, guard);
 }
 
-fn arenaOfTest(tables: *const plan.pack.Tables) !void {
-    try arenaFor(.{ .g = tables.g, .h = tables.h, .alignment = tables.alignment });
+fn arenaOfTest(need: plan.region.Need) !void {
+    try arenaFor(.{ .g = need.scratch, .h = need.host });
 }
 
 /// A forward in small, read out into `out`: `2a^2 + a` of the ramp `a`, with a scratch that dies before a later one is
@@ -3412,16 +3293,15 @@ test "arena: an execution gives the bytes of the pool and asks the pool for noth
     const t = std.testing;
     try mlx.requireGpu();
     var out: [2][8]f32 = undefined;
-    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out[0] });
-    defer tables.deinit();
-    try arenaOfTest(&tables);
+    const need = try planOfTest(SmallForward{ .n = 8, .out = &out[0] });
+    try arenaOfTest(need);
     defer arenaRelease() catch {};
     try (SmallForward{ .n = 8, .out = &out[0] }).go();
     try sync();
     const before = stats();
-    try beginExecution(&tables, .{ .site = 1 });
+    try beginNarrow();
     try (SmallForward{ .n = 8, .out = &out[1] }).go();
-    try endExecution();
+    try endNarrow();
     try t.expectEqualSlices(f32, &out[0], &out[1]);
     try t.expectEqual(before.asks, stats().asks);
     try t.expectEqual(before.pool_bytes, stats().pool_bytes);
@@ -3461,20 +3341,16 @@ test "arena: a place whose last tenant is still read in the open pass is written
     const t = std.testing;
     try mlx.requireGpu();
     var out: [2][8]f32 = undefined;
-    var tables = try planOfTest(Reuse{ .out = &out[0] });
-    defer tables.deinit();
-    const root = tables.get(.{ .site = 1 }).?;
-    // The fourth ask (x*x) takes the place of the second (x+x).
-    try t.expectEqual(root.asks[1].place.offset, root.asks[3].place.offset);
-    try arenaOfTest(&tables);
+    const need = try planOfTest(Reuse{ .out = &out[0] });
+    try arenaOfTest(need);
     defer arenaRelease() catch {};
     var barriers: [2]u64 = undefined;
     for (&barriers, 0..) |*b, arm| {
         try sync();
         const before = stats();
-        if (arm == 1) try beginExecution(&tables, .{ .site = 1 });
+        if (arm == 1) try beginNarrow();
         try (Reuse{ .out = &out[arm] }).go();
-        if (arm == 1) try endExecution();
+        if (arm == 1) try endNarrow();
         b.* = stats().barriers - before.barriers;
         if (arm == 1) try t.expectEqual(before.arena_floors + 1, stats().arena_floors);
     }
@@ -3502,17 +3378,16 @@ test "arena: a host-filled ask writes its replica of the ring once the execution
     const t = std.testing;
     try mlx.requireGpu();
     var at: [3]usize = undefined;
-    var tables = try planOfTest(HostWrite{ .at = &at[0] });
-    defer tables.deinit();
-    try arenaOfTest(&tables);
+    const need = try planOfTest(HostWrite{ .at = &at[0] });
+    try arenaOfTest(need);
     defer arenaRelease() catch {};
     try sync();
     var waits: [3]u64 = undefined;
     for (&at, &waits) |*a, *w| {
         const before = stats().waits;
-        try beginExecution(&tables, .{ .site = 1 });
+        try beginNarrow();
         try (HostWrite{ .at = a }).go();
-        try endExecution();
+        try endNarrow();
         w.* = stats().waits - before;
     }
     try t.expectEqual(at[0], at[2]);
@@ -3521,40 +3396,34 @@ test "arena: a host-filled ask writes its replica of the ring once the execution
     try t.expectEqualSlices(u64, &.{ 0, 0, 1 }, &waits);
 }
 
-test "arena: an ask past what the plan recorded is refused by name, and nothing is allocated for it" {
+test "arena: an ask past the narrow region is refused with WideFull, and nothing is allocated for it" {
     const t = std.testing;
     try mlx.requireGpu();
-    var out: [16]f32 = undefined;
-    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out });
-    defer tables.deinit();
-    try arenaOfTest(&tables);
+    try arenaFor(.{ .g = 8 << 10, .h = 4 << 10 });
     defer arenaRelease() catch {};
-    try sync();
     const before = stats();
-    try beginExecution(&tables, .{ .site = 1 });
-    try t.expectError(error.PlanMiss, (SmallForward{ .n = 16, .out = &out }).go());
-    abortExecution();
-    const miss = executionMiss().?;
-    try t.expectEqual(plan.binder.MissKind.oversize, miss.kind);
-    try t.expectEqual(@as(u64, 16 * 4), miss.asked);
-    try t.expectEqual(@as(u64, 8 * 4), miss.cap);
+    try beginNarrow();
+    const a = try fresh(.uint8, &.{6 << 10});
+    try t.expectError(error.WideFull, fresh(.uint8, &.{4 << 10}));
+    try t.expectEqual(@as(u64, 8 << 10), refused_wide.?.room);
+    try t.expect(!refused_wide.?.host);
+    release(a);
+    try endNarrow();
     try t.expectEqual(before.asks, stats().asks);
     try t.expectEqual(before.pool_bytes, stats().pool_bytes);
 }
 
-test "arena: a store alive when its execution ends is a miss, and a read of it after is refused by name" {
+test "arena: a store alive when its narrow execution ends escapes, and a read of it after is refused by name" {
     const t = std.testing;
     try mlx.requireGpu();
     var out: [8]f32 = undefined;
-    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out });
-    defer tables.deinit();
-    try arenaOfTest(&tables);
+    const need = try planOfTest(SmallForward{ .n = 8, .out = &out });
+    try arenaOfTest(need);
     defer arenaRelease() catch {};
     var kept: ?*Tensor = null;
-    try beginExecution(&tables, .{ .site = 1 });
+    try beginNarrow();
     try (SmallForward{ .n = 8, .out = &out, .kept = &kept }).go();
-    try t.expectError(error.PlanMiss, endExecution());
-    try t.expectEqual(plan.binder.MissKind.lifetime, executionMiss().?.kind);
+    try t.expectError(error.PlanEscape, endNarrow());
     try t.expectError(error.PlanEscape, hostRead(kept.?));
     try t.expectError(error.PlanEscape, lend(kept.?));
     // A write owed from it to a tensor outside the execution is refused, never bound.
@@ -3568,18 +3437,15 @@ test "arena: a store alive when its execution ends is a miss, and a read of it a
     // The arena does not go while the escaped store is alive.
     try t.expectError(error.TensorUnsupported, arenaRelease());
     release(kept.?);
-    // A host-filled ask holds no place the binder judges: the engine finds it alive at the end.
     var at: usize = 0;
-    var host_tables = try planOfTest(HostWrite{ .at = &at });
-    defer host_tables.deinit();
-    try arenaFor(.{ .g = host_tables.g, .h = host_tables.h, .alignment = host_tables.alignment });
+    const host_need = try planOfTest(HostWrite{ .at = &at });
+    try arenaFor(.{ .g = host_need.scratch, .h = host_need.host });
     defer arenaRelease() catch {};
-    try beginExecution(&host_tables, .{ .site = 1 });
+    try beginNarrow();
     const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const host = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8});
     release(try ops.binary(.add, host, host));
-    try t.expectError(error.PlanMiss, endExecution());
-    try t.expectEqual(plan.binder.MissKind.lifetime, executionMiss().?.kind);
+    try t.expectError(error.PlanEscape, endNarrow());
     try t.expectError(error.PlanEscape, hostRead(host));
     release(host);
 }
@@ -3608,9 +3474,8 @@ test "arena: an execution hands a pass over at its bound on dispatches and waits
     const t = std.testing;
     try mlx.requireGpu();
     var out: [2][8]f32 = undefined;
-    var tables = try planOfTest(Chain{ .n = 64, .out = &out[0] });
-    defer tables.deinit();
-    try arenaOfTest(&tables);
+    const need = try planOfTest(Chain{ .n = 64, .out = &out[0] });
+    try arenaOfTest(need);
     defer arenaRelease() catch {};
     const was = execution_pass_bounds;
     execution_pass_bounds = .{ .dispatches = 8, .passes = 2 };
@@ -3619,9 +3484,9 @@ test "arena: an execution hands a pass over at its bound on dispatches and waits
     for (&highs, 0..) |*h, arm| {
         try sync();
         _ = takePassHighs();
-        if (arm == 1) try beginExecution(&tables, .{ .site = 1 });
+        if (arm == 1) try beginNarrow();
         try (Chain{ .n = 64, .out = &out[arm] }).go();
-        if (arm == 1) try endExecution();
+        if (arm == 1) try endNarrow();
         h.* = takePassHighs();
     }
     try t.expectEqualSlices(f32, &out[0], &out[1]);
@@ -3651,22 +3516,20 @@ test "arena: with poison on, a write past a place is found by its canary, and a 
     try mlx.requireGpu();
     arena_check.byte = 0xFF;
     defer arena_check.byte = null;
-    var over = try planOfTestWith(Overrun{}, .{ .level_rule = false, .guard = 256 });
-    defer over.deinit();
+    const over = try planOfTestWith(Overrun{}, 256);
     var out: [2][8]f32 = undefined;
-    var small = try planOfTestWith(SmallForward{ .n = 8, .out = &out[0] }, .{ .level_rule = false, .guard = 256 });
-    defer small.deinit();
-    try arenaFor(.{ .g = @max(over.g, small.g), .h = @max(over.h, small.h), .alignment = over.alignment });
+    const small = try planOfTestWith(SmallForward{ .n = 8, .out = &out[0] }, 256);
+    try arenaFor(.{ .g = @max(over.scratch, small.scratch), .h = @max(over.host, small.host), .guard = 256 });
     defer arenaRelease() catch {};
     const hits = arena_check.hits;
-    try beginExecution(&over, .{ .site = 1 });
+    try beginNarrow();
     try (Overrun{}).go();
-    try endExecution();
+    try endNarrow();
     try t.expectEqual(hits + 1, arena_check.hits);
     try (SmallForward{ .n = 8, .out = &out[0] }).go();
-    try beginExecution(&small, .{ .site = 1 });
+    try beginNarrow();
     try (SmallForward{ .n = 8, .out = &out[1] }).go();
-    try endExecution();
+    try endNarrow();
     try t.expectEqual(hits + 1, arena_check.hits);
     try t.expectEqualSlices(f32, &out[0], &out[1]);
 }
@@ -3691,36 +3554,16 @@ test "arena: with poison on, an op that asks for scratch with its pass open keep
     const t = std.testing;
     try mlx.requireGpu();
     var got: [2]f32 = undefined;
-    var tables = try planOfTestWith(SumAll{ .out = &got[0] }, .{ .level_rule = false, .guard = 256 });
-    defer tables.deinit();
-    try arenaOfTest(&tables);
+    const need = try planOfTestWith(SumAll{ .out = &got[0] }, 256);
+    try arenaFor(.{ .g = need.scratch, .h = need.host, .guard = 256 });
     defer arenaRelease() catch {};
     try (SumAll{ .out = &got[0] }).go();
     arena_check.byte = 0xFF;
     defer arena_check.byte = null;
-    try beginExecution(&tables, .{ .site = 1 });
+    try beginNarrow();
     try (SumAll{ .out = &got[1] }).go();
-    try endExecution();
+    try endNarrow();
     try t.expectEqual(got[0], got[1]);
-}
-
-test "arena: an execution ended with a frame still open is refused by name, and the binder is idle after" {
-    const t = std.testing;
-    try mlx.requireGpu();
-    var out: [8]f32 = undefined;
-    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out });
-    defer tables.deinit();
-    try arenaOfTest(&tables);
-    defer arenaRelease() catch {};
-    try t.expectError(error.TensorUnsupported, arenaFor(.{ .g = tables.g, .h = tables.h, .alignment = tables.alignment, .replicas = 3 }));
-    try beginExecution(&tables, .{ .site = 1 });
-    // A frame no `end` closes: its code took the error path past its defer, or never had one.
-    plan.session.binder.?.enter(.{ .site = 9 }, .exact) catch {};
-    try t.expectError(error.PlanMiss, endExecution());
-    try t.expect(!arena.?.binder.active());
-    try beginExecution(&tables, .{ .site = 1 });
-    try (SmallForward{ .n = 8, .out = &out }).go();
-    try endExecution();
 }
 
 test "arena: its bytes count in the engine's live bytes from its making, as its weights do" {
@@ -3728,13 +3571,13 @@ test "arena: its bytes count in the engine's live bytes from its making, as its 
     try mlx.requireGpu();
     const gpu_mem = @import("../gpu_mem.zig");
     var out: [8]f32 = undefined;
-    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out });
-    defer tables.deinit();
+    const need = try planOfTest(SmallForward{ .n = 8, .out = &out });
     try sync();
     const before = gpu_mem.activeBytes();
     const peak_before = gpu_mem.peakBytes();
-    try arenaOfTest(&tables);
+    try arenaOfTest(need);
     defer arenaRelease() catch {};
+    try t.expectError(error.TensorUnsupported, arenaFor(.{ .g = need.scratch, .h = need.host, .replicas = 3 }));
     try t.expect(arenaTotal() > 0);
     try t.expectEqual(before + arenaTotal(), gpu_mem.activeBytes());
     try t.expect(gpu_mem.peakBytes() >= peak_before + arenaTotal());
@@ -3800,181 +3643,6 @@ test "wide: an execution gives the bytes of the pool, asks the pool for nothing,
     try t.expectEqual(before.pool_bytes, stats().pool_bytes);
     try t.expect(stats().wide_asks > before.wide_asks);
     try t.expectEqual(need.scratch, stats().wide_high);
-}
-
-test "wide: an execution padded to its recording asks each place at the recorded size, so it tops out where the recording's first fit does though its own asks are smaller; an ask past its size or past the sequence is refused by name" {
-    const t = std.testing;
-    try mlx.requireGpu();
-    try arenaFor(.{ .g = 1 << 20, .h = 64 << 10 });
-    defer arenaRelease() catch {};
-    const u: c_int = 64 << 10;
-    const U: u64 = 64 << 10;
-    // First fit is not monotone: a smaller first ask leaves a gap the third no longer fits, so it goes on top.
-    for ([_]?[]const u64{ null, &.{ 2 * U, U, 2 * U } }, [_]u64{ 4 * U, 3 * U }) |pad, high| {
-        if (pad) |sizes| try beginWidePadded(&.{.{ .sizes = sizes }}) else try beginWide();
-        const a = try fresh(.uint8, &.{u});
-        const b = try fresh(.uint8, &.{u});
-        release(a);
-        const c = try fresh(.uint8, &.{2 * u});
-        release(b);
-        release(c);
-        try endWide();
-        try t.expectEqual(high, stats().wide_last_high);
-    }
-    try beginWidePadded(&.{.{ .sizes = &.{U} }});
-    try t.expectError(error.PlanMiss, fresh(.uint8, &.{2 * u}));
-    abortWide();
-    try beginWidePadded(&.{.{ .sizes = &.{U} }});
-    const a = try fresh(.uint8, &.{u});
-    try t.expectError(error.PlanMiss, fresh(.uint8, &.{u}));
-    release(a);
-    try endWide();
-}
-
-test "wide: a smaller execution padded to a larger one's recording runs as it would, refused nothing, and tops out at the recording's first fit" {
-    const t = std.testing;
-    try mlx.requireGpu();
-    var r: TestRecording = undefined;
-    try r.begin(.zeros);
-    var big: [64]f32 = undefined;
-    {
-        defer endRecording() catch {};
-        try (SmallForward{ .n = 64, .out = &big }).go();
-    }
-    var tr = try r.recorder.end();
-    defer tr.deinit();
-    r.deinit();
-    const need = try plan.region.need(t.allocator, &tr, 256);
-    const pad = try plan.region.padOf(t.allocator, &tr, 256);
-    defer t.allocator.free(pad);
-    try arenaFor(.{ .g = 1 << 20, .h = 64 << 10 });
-    defer arenaRelease() catch {};
-    var out: [2][32]f32 = undefined;
-    try (SmallForward{ .n = 32, .out = &out[0] }).go();
-    try sync();
-    try beginWidePadded(&.{.{ .sizes = pad }});
-    try (SmallForward{ .n = 32, .out = &out[1] }).go();
-    try endWide();
-    try t.expectEqualSlices(f32, &out[0], &out[1]);
-    try t.expectEqual(need.scratch, stats().wide_last_high);
-}
-
-/// A forward that takes `picks.len` choices at one site: two pages at once, or one and then another; `leak` keeps the
-/// first choice's pages past it.
-const ChoiceForward = struct {
-    picks: []const bool,
-    leak: bool = false,
-
-    fn go(self: ChoiceForward) !void {
-        const u: c_int = 64 << 10;
-        const x = try fresh(.uint8, &.{u});
-        var kept: ?*Tensor = null;
-        for (self.picks, 0..) |real, i| {
-            if (plan.choose(@src(), bool, real)) {
-                const a = try fresh(.uint8, &.{2 * u});
-                if (self.leak and i == 0) kept = a else release(a);
-            } else {
-                const a = try fresh(.uint8, &.{u});
-                const b = try fresh(.uint8, &.{u});
-                release(a);
-                release(b);
-            }
-        }
-        if (kept) |k| release(k);
-        const y = try fresh(.uint8, &.{u});
-        release(y);
-        release(x);
-    }
-};
-
-/// Every pass of `run`'s dry recording, one trace each.
-fn passesOfTest(run: anytype) ![]plan.trace_mod.Trace {
-    var traces: std.ArrayList(plan.trace_mod.Trace) = .empty;
-    errdefer {
-        for (traces.items) |*tr| tr.deinit();
-        traces.deinit(std.testing.allocator);
-    }
-    var driver: plan.Driver = .{ .gpa = std.testing.allocator };
-    defer driver.deinit();
-    while (true) {
-        var rec = try plan.Recorder.begin(std.testing.allocator, .{ .site = 1 });
-        defer rec.deinit();
-        try beginRecording(.{ .dry = .{ .driver = &driver, .fill = .zeros } }, &rec);
-        {
-            defer endRecording() catch {};
-            try run.go();
-        }
-        try traces.append(std.testing.allocator, try rec.end());
-        if (!try driver.next()) break;
-    }
-    return traces.toOwnedSlice(std.testing.allocator);
-}
-
-test "wide: an execution padded to every pass of its recording follows its own choices from pass to pass, mixed as no pass took them, and tops out within the passes' first fit; passes whose choices leave the scratch apart are told" {
-    const t = std.testing;
-    try mlx.requireGpu();
-    const traces = try passesOfTest(ChoiceForward{ .picks = &.{ true, true } });
-    defer {
-        for (traces) |*tr| tr.deinit();
-        t.allocator.free(traces);
-    }
-    try t.expectEqual(@as(usize, 2), traces.len);
-    try t.expect(try plan.region.choicesAgree(t.allocator, traces, 256));
-    var passes: [2]PadPass = undefined;
-    var most: u64 = 0;
-    for (traces, &passes) |*tr, *ps| {
-        ps.* = .{ .sizes = try plan.region.padOf(t.allocator, tr, 256), .choices = tr.choices };
-        most = @max(most, (try plan.region.need(t.allocator, tr, 256)).scratch);
-    }
-    defer for (passes) |ps| t.allocator.free(ps.sizes);
-    try arenaFor(.{ .g = 1 << 20, .h = 64 << 10 });
-    defer arenaRelease() catch {};
-    for ([_][2]bool{ .{ true, false }, .{ false, true }, .{ false, false } }) |picks| {
-        try beginWidePadded(&passes);
-        try (ChoiceForward{ .picks = &picks }).go();
-        try endWide();
-        try t.expect(stats().wide_last_high <= most);
-    }
-    const apart = try passesOfTest(ChoiceForward{ .picks = &.{ true, true }, .leak = true });
-    defer {
-        for (apart) |*tr| tr.deinit();
-        t.allocator.free(apart);
-    }
-    try t.expect(!try plan.region.choicesAgree(t.allocator, apart, 256));
-}
-
-/// A choice made in a frame whose two arms ask the same bytes; `hand_up` keeps the arm's ask past the frame's end.
-const FramedChoiceForward = struct {
-    hand_up: bool,
-
-    fn go(self: FramedChoiceForward) !void {
-        const u: c_int = 64 << 10;
-        var out: ?*Tensor = null;
-        {
-            const f = try plan.frame(@src(), .{});
-            defer f.end();
-            _ = plan.choose(@src(), bool, true);
-            const a = try fresh(.uint8, &.{u});
-            if (self.hand_up) out = a else release(a);
-        }
-        if (out) |o| release(o);
-        const y = try fresh(.uint8, &.{u});
-        release(y);
-    }
-};
-
-test "wide: an ask made after a choice that outlives the frame the choice was made in parts the passes, though first fit agrees after either arm" {
-    const t = std.testing;
-    try mlx.requireGpu();
-    for ([_]bool{ false, true }) |hand_up| {
-        const traces = try passesOfTest(FramedChoiceForward{ .hand_up = hand_up });
-        defer {
-            for (traces) |*tr| tr.deinit();
-            t.allocator.free(traces);
-        }
-        try t.expectEqual(@as(usize, 2), traces.len);
-        try t.expectEqual(!hand_up, try plan.region.choicesAgree(t.allocator, traces, 256));
-    }
 }
 
 test "wide: a gap reused while its last tenant is still read in the open pass is written only after that read" {
@@ -4107,4 +3775,61 @@ test "engine: a dispatch's level is its stores' last use, and a later pass start
     beforeDispatch();
     try t.expectEqual(@as(u32, 2), s.rec.next_level);
     try submit();
+}
+
+test "arena tail lease: PlanNeedsLease, arenaTakeLease, ReadsFillingSlab, arenaReturnLease, and arenaRelease" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const page: usize = @max(std.heap.pageSize(), std.heap.page_size_max);
+    try arenaFor(.{ .g = 2 * page, .h = page, .keep = page });
+    defer arenaRelease() catch {};
+
+    const tail = arenaTail() orelse return error.TestUnexpectedResult;
+    try t.expectEqual(page, tail.len);
+    try t.expect(!arenaLeaseHeld());
+
+    // Without the tail lease, a wide ask past Layout.keep fails with PlanNeedsLease.
+    try beginWide();
+    const head = try fresh(.uint8, &.{page});
+    var head_released = false;
+    defer if (!head_released) release(head);
+    try t.expectError(error.PlanNeedsLease, fresh(.uint8, &.{page}));
+    release(head);
+    head_released = true;
+    try endWide();
+
+    // Holding the lease allows wide asks into the tail, while still guarding against active fill_marks.
+    try arenaTakeLease();
+    try t.expect(arenaLeaseHeld());
+    try t.expectError(error.TensorUnsupported, arenaRelease());
+
+    try beginWide();
+    const first = try fresh(.uint8, &.{page});
+    var first_released = false;
+    defer if (!first_released) release(first);
+    const in_tail = try fresh(.uint8, &.{page});
+    try t.expectEqual(@as(usize, 2 * page + page), in_tail.store.at);
+    var in_tail_released = false;
+    defer if (!in_tail_released) release(in_tail);
+    fill_marks.add(@intFromPtr(tail.ptr), tail.len);
+    const pass_open = try pass();
+    bind(pass_open, in_tail, 0);
+    submit() catch |e| {
+        fill_marks.remove(@intFromPtr(tail.ptr));
+        if (e != error.ReadsFillingSlab) return e;
+        const retry_pass = try pass();
+        bind(retry_pass, in_tail, 0);
+        try submit();
+        release(in_tail);
+        in_tail_released = true;
+        release(first);
+        first_released = true;
+        try endWide();
+        try arenaReturnLease();
+        try t.expect(!arenaLeaseHeld());
+        try arenaRelease();
+        return;
+    };
+    fill_marks.remove(@intFromPtr(tail.ptr));
+    return error.TestUnexpectedResult;
 }

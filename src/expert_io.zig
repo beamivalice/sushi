@@ -760,6 +760,7 @@ pub var slab_bytes: std.atomic.Value(u64) = .init(0);
 pub const PageSlab = struct {
     allocator: std.mem.Allocator,
     bytes: []align(align_bytes) u8,
+    owns_mapping: bool = true,
     state: SlabState = .free,
     epoch: u64 = 0,
     next_id: u64 = 1,
@@ -784,12 +785,22 @@ pub const PageSlab = struct {
         return slab;
     }
 
+    /// Wraps a caller-owned page-aligned slice without mmap/munmap or counting it in `slab_bytes`.
+    pub fn createAliased(allocator: std.mem.Allocator, backing: []align(align_bytes) u8) !*PageSlab {
+        if (backing.len == 0) return error.SlabEmpty;
+        const slab = try allocator.create(PageSlab);
+        slab.* = .{ .allocator = allocator, .bytes = backing, .owns_mapping = false };
+        return slab;
+    }
+
     pub fn destroy(self: *PageSlab) void {
         const allocator = self.allocator;
         fill_marks.remove(@intFromPtr(self.bytes.ptr));
         self.live.deinit(allocator);
-        _ = slab_bytes.fetchSub(self.bytes.len, .monotonic);
-        std.posix.munmap(self.bytes);
+        if (self.owns_mapping) {
+            _ = slab_bytes.fetchSub(self.bytes.len, .monotonic);
+            std.posix.munmap(self.bytes);
+        }
         allocator.destroy(self);
     }
 
@@ -2120,4 +2131,23 @@ test "preadBatch reads multiple files and unaligned offsets in parallel and repo
 
     var past: [64]u8 = undefined;
     try t.expectError(error.FillShortRead, preadBatch(t.allocator, &.{.{ .fd = fda, .offset = a_bytes.len - 10, .dst = &past }}, 2));
+}
+
+test "aliased PageSlab does not touch slab_bytes or unmap caller backing" {
+    const before = slab_bytes.load(.monotonic);
+    const backing = try std.posix.mmap(
+        null,
+        align_bytes,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(backing);
+    const slab = try PageSlab.createAliased(std.testing.allocator, @alignCast(backing));
+    try std.testing.expectEqual(before, slab_bytes.load(.monotonic));
+    @memset(slab.bytes, 0xA5);
+    slab.destroy();
+    try std.testing.expectEqual(before, slab_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0xA5), backing[0]);
 }

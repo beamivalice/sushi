@@ -24,7 +24,9 @@ pub const default_preserve_thinking = true;
 pub const default_max_request_mb: u32 = 128;
 pub const max_request_mb_limit: u32 = 1024;
 /// The safety margin under the GPU memory limit, in GiB: `--wired-margin-gib` and `server.wired_margin_gib` share it.
+/// Static-bill loads default to `0` (`BILL_MARGIN_BYTES` and measured ledger terms cover their headroom).
 pub const default_wired_margin_gib: u32 = 1;
+pub const default_static_wired_margin_gib: u32 = 0;
 pub const wired_margin_gib_min: u32 = 0;
 pub const wired_margin_gib_max: u32 = 32;
 

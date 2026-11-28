@@ -8,7 +8,11 @@ const dsv41_prefix = @import("dsv41_prefix.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const prefill_plan = @import("../prefill_plan.zig");
 const prefix_cache_mod = @import("../prefix_cache.zig");
+const ledger = @import("../ledger.zig");
+const pool_class = @import("../tensor/pool_class.zig");
 const Room = @import("../kv_cache.zig").Room;
+
+pub const Terms = ledger.RequestTerms;
 
 comptime {
     std.debug.assert(dsv41_config.max_layers == @import("../kv_cache.zig").store_layers_max);
@@ -177,4 +181,44 @@ pub fn billedParkedBytes(config: *const model_mod.ModelConfig) u64 {
 pub fn parkedBytes(config: *const model_mod.ModelConfig, engine_free: u64) u64 {
     if (@import("../cooler_side.zig").onEngine(config)) return @max(engine_free, config.expertPoolBytes());
     return engine_free +| config.expertPoolBytes();
+}
+
+fn coolerJoinedMax(config: *const model_mod.ModelConfig) u64 {
+    const c = config.dsv41 orelse return 1;
+    if (!@import("../cooler_side.zig").onEngine(config) or !c.widthExactLayout()) return 1;
+    const hw_max: usize = @intCast(@import("sushi_exl3").project_rows.rowsMax(.{ .exact = true, .wide = true }));
+    if (config.expert_resident) return hw_max;
+    return dsv41_config.streamedRowsCap(c.experts, c.top_k, config.expert_cache_slots, hw_max);
+}
+
+/// Request terms on the static ledger for DeepSeek-V4.1 (`bills.ledgerArch`).
+pub fn ledgerTerms(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) ?Terms {
+    _ = kv_bits;
+    const c = config.dsv41 orelse return null;
+    const raw_rate = c.stateBytesPerToken();
+    const rate = raw_rate +| (std.math.divCeil(u64, raw_rate, pool_class.steps) catch unreachable);
+    var store_bufs: u64 = 0;
+    for (0..c.layers) |l| {
+        if (c.isKvSource(l)) store_bufs += 2;
+        if (c.isOwner(l)) store_bufs += 2;
+    }
+    const floors = store_bufs * pool_class.page_bytes +| rate *| dsv41_config.verify_rows;
+    const drafts = config.drafterOn();
+    const rings_raw = c.stateFixedBytes(drafts);
+    const ring_bufs: u64 = @as(u64, c.layers) + (if (drafts) @as(u64, c.n_mtp) else 0) + store_bufs;
+    const rings_fixed = rings_raw +| (std.math.divCeil(u64, rings_raw, pool_class.steps) catch unreachable) +| ring_bufs * pool_class.page_bytes;
+    const joined = coolerJoinedMax(config);
+    const logits_rows: u64 = @max(@as(u64, dsv41_config.verify_rows), joined);
+    const logits_fixed: u64 = 2 *| pool_class.poolBytes(@intCast(logits_rows * @as(u64, c.vocab) * 4));
+    const points = (1 + @as(u64, dsv41_prefix.live_point_cap)) *| rings_fixed;
+    const base = bills.launchCheckpointStride(config);
+    const widen_cap: usize = if (bills.adaptivePrefillChunkEnabled(config)) bills.checkpointStrideBase(config) else 0;
+    const stride: u64 = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), widen_cap));
+    const copy_cap: u64 = if (stride == 0 or bills.launch_state.prefix_cache_ram_enabled or bills.diskBytesFor(config) == 0) 0 else bills.launch_state.disk_writer_permit_bytes;
+    return .{
+        .per_token = rate,
+        .fixed = rings_fixed +| floors +| logits_fixed,
+        .points = points,
+        .copy_cap = copy_cap,
+    };
 }

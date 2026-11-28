@@ -102,7 +102,7 @@ fn checkAllMixes(a: std.mem.Allocator, ld: *contract.Load) !void {
         const before = core.stats();
         try testing.expect(try sample_plan.begin(m, mix));
         const got = sample_plan.draw(m, st, &in, mix) catch |e| {
-            try sample_plan.fail(m);
+            sample_plan.fail(m);
             return e;
         };
         defer got.deinit();
@@ -115,7 +115,6 @@ fn checkAllMixes(a: std.mem.Allocator, ld: *contract.Load) !void {
         try expectSame(want, got);
     };
     try testing.expectEqual(m.plans.?.drafter != null, verdicts > 0);
-    try testing.expectEqual(@as(u64, 0), st.misses);
     try testing.expectEqual(hits, core.arena_check.hits);
 }
 
@@ -222,7 +221,6 @@ test "hy4 sample plan: a served request's draws, greedy and sampled, under penal
         // takes its id from the load's input block (`Model.idsInput`).
         try testing.expectEqual(@as(u64, 0), got.closed);
     }
-    try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
 }
 
 test "hy4 sample plan: a request whose stop set holds a token the model emits ends at it with the pool's tokens before it and none sampled after, plain and in DFly2 rounds (HY4_STQ_TINY)" {
@@ -255,7 +253,6 @@ test "hy4 sample plan: a request whose stop set holds a token the model emits en
             try testing.expectEqualSlices(u32, free.tokens[0..stop_at], stopped.tokens[0..stopped.n]);
         }
     }
-    try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
 }
 
 test "hy4 sample plan: a request whose forced call ends samples on after the forced token with the pool's tokens, no draw missing (HY4_STQ_TINY)" {
@@ -282,7 +279,6 @@ test "hy4 sample plan: a request whose forced call ends samples on after the for
     try testing.expectEqual(served[0].n, served[1].n);
     try testing.expectEqualSlices(u32, served[0].tokens[0..served[0].n], served[1].tokens[0..served[1].n]);
     try testing.expectEqualSlices(u32, &call, served[1].tokens[0..call.len]);
-    try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
 }
 
 test "hy4 sample plan: a forced call's token made outside any draw past the seal is the load's token block, written in place, asking the closed pool nothing (HY4_STQ_TINY)" {
@@ -316,18 +312,15 @@ test "hy4 sample plan: a planned draw that misses while its token is written is 
     const m = ld.xfm.arch_state.hy4flash.model.?;
     defer m.reset();
     const st = &m.plans.?.sample;
-    const misses_was = st.misses;
-    defer st.misses = misses_was;
     try fillLogits(a, m);
     defer core.closePool(.open) catch {};
     const mix: sampler.Mix = .{ .entry = .step, .suppress = true, .greedy = true };
-    // Either block may be the one the missed draw was writing.
+    // Either block may be the one the failed draw was writing.
     for ([_]u1{ 0, 1 }) |at| {
         st.turn = at;
         var in = try sample_plan.makeInputs(m, st, a, .{ .mix = mix });
         defer in.deinit();
-        // A view of every block: the draw takes none that is sole, so it writes block `at` not in place, which the plan
-        // did not record.
+        // A view of every block: the draw takes none that is sole.
         var views: [sample_plan.token_slots]mlx.mlx_array = @splat(.{ .ctx = null });
         defer {
             for (views) |v| _ = mlx.mlx_array_free(v);
@@ -336,12 +329,10 @@ test "hy4 sample plan: a planned draw that misses while its token is written is 
             v.* = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_reshape(v, block.?, &[_]c_int{1}, 1, m.s));
         }
-        const misses = st.misses;
         try core.closePool(.refuse);
         try testing.expect(try sample_plan.begin(m, mix));
         try testing.expect(std.meta.isError(sample_plan.draw(m, st, &in, mix)));
-        try testing.expectError(error.PlanMiss, sample_plan.fail(m));
-        try testing.expectEqual(misses + 1, st.misses);
+        sample_plan.fail(m);
         try testing.expectEqual(at, st.turn);
         for (&views) |*v| {
             _ = mlx.mlx_array_free(v.*);
@@ -388,60 +379,4 @@ test "hy4 sample plan: on a GPU that grants the draw fewer threads than its wide
     defer core.closePool(.open) catch {};
     const got = try serve(a, &ld, ids[0..24], .{ .temperature = 0.8, .seed = 11 }, .{}, &.{}, true);
     try testing.expect(got.n > 0);
-    try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
-}
-
-test "hy4 sample plan: a draw of a mix the load did not plan is refused by name, learned in place and kept, and served the next time with the pool's token (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    hy4_held.releaseHeld();
-    var ld: contract.Load = undefined;
-    try ld.openLight(hy4_held.Drafting, dir, true);
-    defer _ = ld.close();
-    const turn = hy4_contract.openTurn(ld.h, &ld.config);
-    defer turn.end();
-    defer @import("../arch/sched.zig").endRequest(&ld.config);
-    const m = ld.xfm.arch_state.hy4flash.model.?;
-    defer m.reset();
-    const p = m.plans.?;
-    const st = &p.sample;
-    try fillLogits(a, m);
-    const mix: sampler.Mix = .{ .entry = .step, .repeat = true, .additive = true };
-    // The load planned no root for it: its tables and traces go.
-    const r = for (p.book.roots.items) |r| {
-        if (r.id.eql(sample_plan.root(mix))) break r;
-    } else return error.TestNoRoot;
-    for (r.traces.items) |*t| t.deinit();
-    r.traces.clearRetainingCapacity();
-    r.tables.?.deinit();
-    r.tables = null;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    p.cache = .init(testing.io, .{ .handle = tmp.dir }, "scope-build");
-    defer p.cache = null;
-    var in = try sample_plan.makeInputs(m, st, a, .{ .mix = mix });
-    defer in.deinit();
-    try testing.expectError(error.PlanMiss, sample_plan.begin(m, mix));
-    try testing.expectEqual(@as(u64, 1), st.misses);
-    try testing.expectEqual(@as(u64, 1), st.learned);
-    const kept = try p.cache.?.read(a);
-    defer a.free(kept);
-    try testing.expectEqual(@as(usize, 1), kept.len);
-    try testing.expectEqual(sample_plan.shapeOf(mix), kept[0]);
-    try testing.expectEqual(mix, sample_plan.mixOf(kept[0]).?);
-    st.planned = false;
-    const want = try heard(try sample_plan.draw(m, st, &in, mix));
-    st.planned = true;
-    const before = core.stats().executions;
-    try testing.expect(try sample_plan.begin(m, mix));
-    const got = sample_plan.draw(m, st, &in, mix) catch |e| {
-        try sample_plan.fail(m);
-        return e;
-    };
-    defer got.deinit();
-    try sample_plan.end(m);
-    try testing.expectEqual(before + 1, core.stats().executions);
-    try expectSame(want, got);
-    try testing.expectEqual(@as(u64, 1), st.misses);
 }

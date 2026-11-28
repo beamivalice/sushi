@@ -1053,7 +1053,8 @@ test "dsv41 borrow: with decode on the engine of our own every forward installs 
             const sets = PoolProbe.own_sets;
             _ = endRequest(&config, PoolProbe.ops);
             try testing.expectEqual(sets, PoolProbe.own_sets);
-            try testing.expectEqual(c.forwardCap(verify_rows, 1), @import("../arch/cooler.zig").restCap(&config));
+            const want_rest: u64 = if (@import("../bills.zig").ledgerArch(&config)) 0 else c.forwardCap(verify_rows, 1);
+            try testing.expectEqual(want_rest, @import("../arch/cooler.zig").restCap(&config));
             // The unload trims the engine's pool and leaves it without a cap for the next load.
             _ = unloadModel(&config, PoolProbe.ops);
             try testing.expectEqual(@as(u64, std.math.maxInt(u64)), PoolProbe.own);
@@ -1245,8 +1246,9 @@ test "dsv41 borrow: the ledger bills the pool that is parked: MLX's decode pool,
     config.cooler_for_test = true;
     try testing.expectEqual(c.forwardCap(verify_rows, 1), config.expertPoolBytes());
     try testing.expect(config.expertPoolBytes() < cfg_mod.dsv41_pool_bytes);
-    // What a request's end leaves the engine is what the ledger billed.
-    try testing.expectEqual(config.expertPoolBytes(), @import("../arch/cooler.zig").restCap(&config));
+    // What a request's end leaves the engine is what the ledger billed (0 when on the static ledger).
+    const want_rest: u64 = if (@import("../bills.zig").ledgerArch(&config)) 0 else config.expertPoolBytes();
+    try testing.expectEqual(want_rest, @import("../arch/cooler.zig").restCap(&config));
 }
 
 test "the opt-out flag reaches a DeepSeek load's decode side through the parse and the settings stamp, and outranks a test's side" {

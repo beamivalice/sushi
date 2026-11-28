@@ -2094,6 +2094,7 @@ pub const Scheduler = struct {
 
         // ── Stage 2: build + post LoadRequest, wait for completion.
         const cold_disk = coldLoadDisk(self.ssm_checkpoint_stride, self.prefix_cache_capacity, self.prefix_cache_ram_enabled);
+        if (comptime @import("builtin").is_test) owned.config.test_skip_warm = self.test_skip_warm;
         var req = LoadRequest{
             .entry = entry,
             .config = owned.config,
@@ -2106,7 +2107,7 @@ pub const Scheduler = struct {
             .drafter_dir = model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
             .no_drafter = self.no_drafter,
             .load_vision = model_load.coldLoadVision(owned.config, false),
-            .warmup_eager = if (comptime @import("builtin").is_test) !self.test_skip_warm else true,
+            .warmup_eager = true,
             .kv_quant = self.kv_quant,
             // Cold loads get the SAME prefix-cache configuration as the
             // startup model — pre-plumbing these were (1, 0, stride 0),

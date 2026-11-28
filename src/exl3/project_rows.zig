@@ -1699,9 +1699,7 @@ pub fn normedRingFits(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, norm: Norm, 
     return @rem(kr.kv_dim * elem_bytes, 16) == 0;
 }
 
-/// `launchRowsNormed` for a 2-segment `[q_lora, kv_row]` attention input that writes the normed query `[rows, norm.cols]`
-/// and the updated KV ring `[cap, kv_dim]` in one finish dispatch, eliminating `ropeKvRing`.
-pub fn launchRowsNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, bounds: [3]c_int, pin: ?PinnedCfg, norm: Norm, kr: KvRing) !NormedRingOut {
+fn launchRowsNormedRingPart(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, bounds: [3]c_int, pin: ?PinnedCfg, norm: Norm, kr: KvRing) !mlx.mlx_array {
     if (!normedRingFits(l, g, bounds, norm, kr)) return error.BadExl3Shape;
     const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g, .thru = l.thru };
     const cfg = if (pin) |p| p.cfg else rows_cfgs.get(key) orelse blk: {
@@ -1712,8 +1710,16 @@ pub fn launchRowsNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.ml
     const pv = try kernels.applyOuts(s, kernel, &.{ x, trellis, suh, svh }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(pv);
     var part = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(part);
+    errdefer _ = mlx.mlx_array_free(part);
     try mlx.check(mlx.mlx_vector_array_get(&part, pv, 0));
+    return part;
+}
+
+/// `launchRowsNormed` for a 2-segment `[q_lora, kv_row]` attention input that writes the normed query `[rows, norm.cols]`
+/// and the updated KV ring `[cap, kv_dim]` in one finish dispatch, eliminating `ropeKvRing`.
+pub fn launchRowsNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, bounds: [3]c_int, pin: ?PinnedCfg, norm: Norm, kr: KvRing) !NormedRingOut {
+    const part = try launchRowsNormedRingPart(s, x, trellis, suh, svh, l, g, kernel, bounds, pin, norm, kr);
+    defer _ = mlx.mlx_array_free(part);
     const fkey = RowsFinishRmsRingKey{ .out_dim = l.out_dim, .rows = l.rows, .nsplit = g.nsplit, .out_dt = l.out_dt, .norm = norm.cols, .kv_dim = kr.kv_dim, .rd = kr.rd, .qat = kr.qat, .cap = kr.cap };
     if (kr.qout_in_place.ctx != null) {
         const fcfg_ip = rows_finish_rms_ring_ip_cfgs.get(fkey) orelse blk: {

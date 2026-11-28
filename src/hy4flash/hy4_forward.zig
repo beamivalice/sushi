@@ -3049,7 +3049,7 @@ test "hy4 placedZeros: zeros written on the GPU, so a dry recording asks the are
         defer o.deinit();
         for (try hostRows(&o, try o.own(try placedZeros(s, 3, 2, 40)))) |v| try testing.expectEqual(@as(f32, 0), v);
     }
-    var rec = try plan.Recorder.begin(std.testing.allocator, .{ .site = 1 });
+    var rec = plan.Recorder.begin(std.testing.allocator);
     defer rec.deinit();
     var driver: plan.Driver = .{ .gpa = std.testing.allocator };
     defer driver.deinit();
@@ -3058,10 +3058,10 @@ test "hy4 placedZeros: zeros written on the GPU, so a dry recording asks the are
     _ = mlx.mlx_array_free(z);
     try core.endRecording();
     var asked: u64 = 0;
-    for (rec.instances.items) |inst| for (inst.asks.items) |as| {
+    for (rec.asks.items) |as| {
         try testing.expectEqual(false, as.host);
         asked += as.bytes;
-    };
+    }
     try testing.expect(asked >= 3 * 2 * 40 * 4);
 }
 

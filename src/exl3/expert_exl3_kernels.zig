@@ -2715,6 +2715,15 @@ pub fn getNamedKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, in
 }
 
 pub fn applyOuts(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, cfg: mlx.mlx_fast_metal_kernel_config, n_out: usize) !mlx.mlx_vector_array {
+    return applyOutsAs(s, kernel, inputs, cfg, n_out, null);
+}
+
+/// `applyOuts` with output 0 written over `into` on the engine stream (`mlx.kernelApplyInto`).
+pub fn applyOutsInto(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, cfg: mlx.mlx_fast_metal_kernel_config, n_out: usize, into: mlx.mlx_array) !mlx.mlx_vector_array {
+    return applyOutsAs(s, kernel, inputs, cfg, n_out, into);
+}
+
+fn applyOutsAs(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, cfg: mlx.mlx_fast_metal_kernel_config, n_out: usize, into: ?mlx.mlx_array) !mlx.mlx_vector_array {
     fused_dispatches += 1;
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -2723,7 +2732,11 @@ pub fn applyOuts(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: [
     const host_on = applyUbenchOn();
     const io = std.Io.Threaded.global_single_threaded.io();
     var sw = if (host_on) io_util.Stopwatch.init(io) else undefined;
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
+    if (into) |dst| {
+        try mlx.check(mlx.kernelApplyInto(&outputs_vec, kernel, inputs_vec, cfg, s, dst) orelse return error.TensorUnsupported);
+    } else {
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
+    }
     if (host_on) {
         apply_host_ns += sw.read();
         apply_host_n += 1;

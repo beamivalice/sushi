@@ -266,9 +266,6 @@ pub const Model = struct {
     /// Set by a drafter (`hy4_dfly`): each forward keeps its last row's hidden state, the head's collapse of the
     /// streams before the final norm (`last_hidden`, [1, D] f32), the DFly2 handover.
     keep_hidden: bool = false,
-    /// While the load records its joined roots: the one dry depth whose tick records the grouped attention arm. Past the
-    /// window that arm reads each row's full ring, the same at every depth; null records both arms at every depth.
-    joined_grouped_at: ?usize = null,
     /// Every expert of one layer held in the stream's slots (`pin`): that layer's picks run as one group, no SSD read.
     pinned: ?Pinned = null,
     /// A calibration tap, called only when set: the default path makes no call of its.
@@ -490,7 +487,7 @@ pub const Model = struct {
             for (1..hc.rows_max + 1) |rows| {
                 self.reset();
                 defer self.reset();
-                var rec = try plan.Recorder.begin(self.gpa, .{ .site = plan.siteOf(@src()) });
+                var rec = plan.Recorder.begin(self.gpa);
                 defer rec.deinit();
                 var driver: plan.Driver = .{ .gpa = self.gpa };
                 defer driver.deinit();
@@ -998,13 +995,6 @@ pub const Model = struct {
         self.dropPicks();
         if (!self.keep_hidden) self.dropHidden();
         for (0..self.config.layers) |l| {
-            // A layer is a frame of its own, keyed by its index: each layer's kinds and geometry are its own. Inside it,
-            // the facts of this forward's rows that decide its structure (`layerKey`) pick a variant: one iteration of
-            // a loop whose key may differ from one forward to the next.
-            const f = try plan.frame(@src(), .{l});
-            defer f.end();
-            const v = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0, t)) else plan.Frame.none;
-            defer v.end();
             const next = try self.passLayerAhead(l, hs, ahead, rows, t, p0 + t, p0, engram_pf);
             freeMixed(ahead);
             ahead = next.next;
@@ -1195,8 +1185,6 @@ pub const Model = struct {
             const exact = mlx.engine.exactF32();
             defer exact.end();
             const L = &self.layers[l];
-            const layer_frame = try plan.frame(@src(), .{l});
-            defer layer_frame.end();
             if (L.engram != null and engram_joined != null) {
                 const d = try self.engramDeltaWith(l, hs, engram_joined, @intCast(n), engram_pf);
                 _ = mlx.mlx_array_free(hs);
@@ -1222,9 +1210,7 @@ pub const Model = struct {
                 const can_join = (!@import("builtin").is_test or fwd.joined_attention_on) and n >= 2 and L.indexer == null and self.tap == null and same_kv and kv.scheme != .off and
                     hy4_latent.appendFits(self.s, 1, @intCast(c.kv_lora), @intCast(c.rope_dim), kv.group_size, kv.bits, win_w);
                 const all_past = all_past_pos or self.warm_grouped;
-                // A dry recording runs the choice both ways: only where the layer can join at all.
-                const one_arm = @import("../tensor/core.zig").dryOn() and self.joined_grouped_at != null and p0[0] != self.joined_grouped_at.?;
-                const joined_attn = can_join and !one_arm and plan.choose(@src(), bool, all_past);
+                const joined_attn = can_join and plan.choose(@src(), bool, all_past);
                 var gated_joined: Arr = undefined;
                 if (proj.q_pe_rows != null and self.tap == null) {
                     const q_lat_rows = try fwd.absorbQueryRows(&o, proj.q_raw.?, L.attn, L.geometry);
@@ -1236,8 +1222,6 @@ pub const Model = struct {
                         _ = mlx.mlx_array_free(u);
                     };
                     if (joined_attn) {
-                        const joined_var = if (plan.planned()) try plan.each(@src(), .{ .layer = l, .rows = n, .join = true }) else plan.Frame.none;
-                        defer joined_var.end();
                         var cs: [max_rows]Arr = @splat(none);
                         var pes: [max_rows]Arr = @splat(none);
                         defer for (cs[0..n], pes[0..n]) |a, b| {
@@ -1271,8 +1255,6 @@ pub const Model = struct {
                             const ri: c_int = @intCast(i);
                             const lent = self.lend(sg.request);
                             defer lent.end();
-                            const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], 1)) else plan.Frame.none;
-                            defer variant.end();
                             const u_i = try self.attendLatentSingleRow(&row_o, l, q_lat_rows, proj.q_pe_rows.?, proj.c, proj.k_pe, keys_joined, idx_q_joined, idx_hw_joined, ri, p0[i]);
                             try mlx.check(mlx.mlx_array_set(&u_rows[i], u_i));
                             u_made = i + 1;
@@ -1291,8 +1273,6 @@ pub const Model = struct {
                     defer for (front[0..front_made]) |*f| f.deinit();
                     const q_full = proj.q_full.?;
                     if (joined_attn) {
-                        const joined_var = if (plan.planned()) try plan.each(@src(), .{ .layer = l, .rows = n, .join = true }) else plan.Frame.none;
-                        defer joined_var.end();
                         var qs: [max_rows]Arr = undefined;
                         var raws: [max_rows]?Arr = undefined;
                         var gts: [max_rows]Arr = @splat(none);
@@ -1344,8 +1324,6 @@ pub const Model = struct {
                             .gated = &gated[i],
                         };
                         const lent = self.lend(sg.request);
-                        const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], 1)) else plan.Frame.none;
-                        defer variant.end();
                         front[i] = try self.layerFrontWith(l, fi.h, null, null, 1, p0[i] + 1, p0[i], fi, null);
                         lent.end();
                         front_made += 1;
@@ -1596,8 +1574,6 @@ pub const Model = struct {
             const exact = mlx.engine.exactF32();
             defer exact.end();
             const L = &self.layers[l];
-            const layer_frame = try plan.frame(@src(), .{l});
-            defer layer_frame.end();
             if (L.engram != null and engram_joined != null) {
                 const d = try self.engramDeltaWith(l, hs, engram_joined, @intCast(total), engram_pf);
                 _ = mlx.mlx_array_free(hs);
@@ -1623,18 +1599,13 @@ pub const Model = struct {
                     hy4_latent.appendFits(self.s, max_t, @intCast(c.kv_lora), @intCast(c.rope_dim), kv.group_size, kv.bits, win_w) and
                     hy4_latent.ringWindowsFits(self.s, @intCast(c.kv_lora), @intCast(c.rope_dim), kv.group_size, kv.bits);
                 const all_past = all_past_pos or self.warm_grouped;
-                const joined_attn = can_join and (if (@import("../tensor/core.zig").dryOn() and self.joined_grouped_at != null)
-                    @as(usize, @intCast(p0[0])) == self.joined_grouped_at.?
-                else
-                    all_past);
+                const joined_attn = can_join and plan.choose(@src(), bool, all_past);
                 var gated_joined: Arr = undefined;
                 if (proj.q_pe_rows != null and self.tap == null) {
                     const q_lat_rows = try fwd.absorbQueryRows(&o, proj.q_raw.?, L.attn, L.geometry);
                     const idx_q_joined: ?Arr = if (L.indexer) |iw| try fwd.linearF32(&o, proj.q_resid, iw.query) else null;
                     const idx_hw_joined: ?Arr = if (L.indexer) |iw| try o.cast(try fwd.linearF32(&o, x_joined, iw.head_weight), .float32) else null;
                     const u_joined: Arr = blk_attn: {
-                        const attn_arm = if (plan.planned()) try plan.each(@src(), .{ .layer = l, .rows = total, .join = joined_attn }) else plan.Frame.none;
-                        defer attn_arm.end();
                         if (joined_attn) {
                             var c_parts: [max_rows]Arr = @splat(none);
                             var pe_parts: [max_rows]Arr = @splat(none);
@@ -1685,16 +1656,11 @@ pub const Model = struct {
                         var row_o: Ops = .{ .s = self.s };
                         defer row_o.deinit();
                         {
-                            const rows_loop = try plan.frame(@src(), .{});
-                            defer rows_loop.end();
                             for (groups, 0..) |g, i| {
                                 const r0: c_int = @intCast(start[i]);
                                 const r1: c_int = @intCast(start[i + 1]);
-                                const t: c_int = r1 - r0;
                                 const lent = self.lend(g.request);
                                 defer lent.end();
-                                const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], t)) else plan.Frame.none;
-                                defer variant.end();
                                 const u_i = try self.attendLatentGroup(&row_o, l, q_lat_rows, proj.q_pe_rows.?, proj.c, proj.k_pe, keys_joined, idx_q_joined, idx_hw_joined, r0, r1, p0[i]);
                                 try mlx.check(mlx.mlx_array_set(&u_rows[i], u_i));
                                 u_made = i + 1;
@@ -1736,8 +1702,6 @@ pub const Model = struct {
                             .gated = &gated[i],
                         };
                         const lent = self.lend(g.request);
-                        const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], t)) else plan.Frame.none;
-                        defer variant.end();
                         front[i] = try self.layerFrontWith(l, fi.h, null, null, t, p0[i] + t, p0[i], fi, null);
                         lent.end();
                         front_made += 1;
@@ -4048,7 +4012,7 @@ fn streamedSum(self: *Model, s: mlx.mlx_stream, l: usize, lat: Arr, weights: Arr
     const slots = engine.slotsPerLayer();
     const groups = try expertGroups(self.gpa, host, slots);
     defer self.gpa.free(groups);
-    const n_groups = try plan.bound(groupCount(groups), mostGroups(host.len, experts, slots));
+    const n_groups = plan.bound(groupCount(groups), mostGroups(host.len, experts, slots));
     const occurrences = try self.gpa.alloc(u16, host.len);
     defer self.gpa.free(occurrences);
     // A group's expert ids for the tap, kept only when tapped.
@@ -4064,15 +4028,8 @@ fn streamedSum(self: *Model, s: mlx.mlx_stream, l: usize, lat: Arr, weights: Arr
     for (row_ids, 0..) |*d, i| d.* = @intCast(i);
     var acc = try fwd.placedZeros(s, t, 1, mlx.getShape(lat)[1]);
     errdefer _ = mlx.mlx_array_free(acc);
-    const arm = try plan.frame(@src(), .{});
-    defer arm.end();
     const many = if (mostGroups(host.len, experts, slots) > 1) plan.choose(@src(), bool, n_groups > 1) else false;
-    const kind = if (plan.planned()) try plan.each(@src(), many) else plan.Frame.none;
-    defer kind.end();
-    // The arm keys the loop and its iterations: the one-group arm lands the sum inside its only iteration.
-    const loop = try plan.frame(@src(), many);
-    defer loop.end();
-    // The groups land their picks in one sum made before them: no group hands one up.
+    // The groups land their picks in one sum made before them.
     var placed: ?Arr = null;
     defer if (placed) |p| {
         _ = mlx.mlx_array_free(p);
@@ -4080,8 +4037,6 @@ fn streamedSum(self: *Model, s: mlx.mlx_stream, l: usize, lat: Arr, weights: Arr
     if (many) placed = try fwd.placedZeros(s, t, g.top_k, mlx.getShape(lat)[1]);
     var gi: u32 = 0;
     while (gi < (if (many) n_groups else 1)) : (gi += 1) {
-        const it = if (plan.planned()) try plan.each(@src(), .{ many, gi > 0 }) else plan.Frame.none;
-        defer it.end();
         var picked: usize = 0;
         for (host, groups, 0..) |v, gv, i| if (gv == gi) {
             occurrences[picked] = @intCast(v);
@@ -4090,7 +4045,7 @@ fn streamedSum(self: *Model, s: mlx.mlx_stream, l: usize, lat: Arr, weights: Arr
             picked += 1;
         };
         // A dry recording's made-up picks fill the widest group there can be: every pick.
-        const n = try plan.bound(picked, host.len);
+        const n = plan.bound(picked, host.len);
         for (picked..n) |i| {
             occurrences[i] = @intCast(host[i]);
             if (at != null) tapped[i] = host[i];
@@ -4173,7 +4128,7 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
     const max_groups = mostGroups(host.len, experts, slots_per_layer);
     const groups = try expertGroups(self.gpa, host, slots_per_layer);
     defer self.gpa.free(groups);
-    const n_groups = try plan.bound(groupCount(groups), max_groups);
+    const n_groups = plan.bound(groupCount(groups), max_groups);
     const occurrences = try self.gpa.alloc(u16, host.len);
     defer self.gpa.free(occurrences);
     const slots = try self.gpa.alloc(u32, host.len);
@@ -4196,10 +4151,6 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
         };
         if (mlx.engine.isStream(o.s) and !mlx.engine.dryOn()) try mlx.engine.submit();
         for (host, occurrences) |v, *d| d.* = @intCast(v);
-        const loop = try plan.frame(@src(), .{});
-        defer loop.end();
-        const it = if (plan.planned()) try plan.each(@src(), false) else plan.Frame.none;
-        defer it.end();
         var prepared = try prepareRoute(engine, @intCast(l), occurrences, @min(host.len, slots_per_layer));
         defer prepared.deinit();
         const rb = prepared.ragged orelse {
@@ -4210,8 +4161,6 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
         var go: Ops = .{ .s = o.s };
         defer go.deinit();
         const pk = try go.own(mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .uint32));
-        const kind = try routeKind(&prepared);
-        defer kind.end();
         var ko: Ops = .{ .s = o.s };
         defer ko.deinit();
         const part = try ko.own(try hy4_stq.routed(ko.s, dec, g.swiglu_limit, rb, lat, pk, r.weights));
@@ -4222,20 +4171,14 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
     }
     const mask_v = try self.gpa.alloc(f32, host.len);
     defer self.gpa.free(mask_v);
-    // The groups' sum, made before them and written in place: no group, and no arm of a route's `plan.choose`, hands
-    // up what it made (`choicesAgree`).
     var sum = try fwd.placedZeros(o.s, shape[0], 1, mlx.getShape(lat)[1]);
     var handed = false;
     errdefer if (!handed) {
         _ = mlx.mlx_array_free(sum);
     };
     // Every group runs every pick, those outside it at weight 0: a group's sizes are the picks'.
-    const loop = try plan.frame(@src(), .{});
-    defer loop.end();
     var gi: u32 = 0;
     while (gi < n_groups) : (gi += 1) {
-        const it = if (plan.planned()) try plan.each(@src(), gi > 0) else plan.Frame.none;
-        defer it.end();
         var first: u16 = 0;
         for (host, groups) |v, gv| if (gv == gi) {
             first = @intCast(v);
@@ -4258,10 +4201,7 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
         const pk = try go.own(mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .uint32));
         const mask = try go.own(mlx.mlx_array_new_data(mask_v.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .float32));
         const w = try go.binary(.mul, r.weights, mask);
-        // Read from the route's slots: landed (and so evaluated) before they are given back. Its frame is the bank's
-        // alone, and what it makes dies in it.
-        const kind = try routeKind(&prepared);
-        defer kind.end();
+        // Read from the route's slots: landed (and so evaluated) before they are given back.
         var ko: Ops = .{ .s = o.s };
         defer ko.deinit();
         const part = try ko.own(try hy4_stq.routed(ko.s, dec, g.swiglu_limit, rb, lat, pk, w));
@@ -4286,13 +4226,6 @@ fn prepareRoute(engine: *expert_stream.Engine, layer: u16, occurrences: []const 
     if (plan.session.mode != .dry) return engine.prepareHost(layer, occurrences);
     const workspace = engine.routeMayOverflow(layer, distinct) and plan.choose(@src(), bool, false);
     return engine.prepareDry(layer, occurrences, workspace);
-}
-
-/// The frame of what a route reads, keyed by the bank `prepareRoute` handed out. Open in every layer, the ones that
-/// cannot overflow included: the frames around it are keyed without the layer.
-fn routeKind(prepared: *const expert_stream.Prepared) plan.Error!plan.Frame {
-    if (!plan.planned()) return plan.Frame.none;
-    return plan.each(@src(), prepared.workspace);
 }
 
 /// Each pick's group: the distinct experts in order of first pick, `slots` to a group, so an expert's picks are one

@@ -212,6 +212,8 @@ const EngineFixture = struct {
         try self.prepare(dir, null, cache_bytes);
         self.config.test_skip_warm = false;
         try self.load(dir);
+        errdefer self.deinit();
+        try @import("arch.zig").warmup(&self.xfm);
     }
 
     /// What the test reads before a load: the fixture's token ids and the pack's config, with the route chosen.
@@ -1770,6 +1772,7 @@ test "dsv41 engine: the load clock times every phase of a load and the phases ad
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     load_clock.buildDone(build_t0);
+    try @import("arch.zig").warmup(&xfm);
     const wired_t0 = load_clock.now();
     _ = mlx.applyWiredPolicy();
     load_clock.wiredDone(wired_t0);

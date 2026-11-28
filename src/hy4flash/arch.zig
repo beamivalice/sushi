@@ -233,17 +233,20 @@ pub fn warmup(xfm: Model) !void {
     if (marker) |mk| mlx.engine.pipeline_registry.recordMarker("hy4 arch warm", &mk);
 }
 
-/// The load's plans recorded before its warm (D98, `hy4_plan.record`), its samples' with them, kept on the model
-/// (`Model.recorded`) until the warm's end makes their arena (`planBuild`). A load whose plans are recorded or built
-/// already records nothing.
-pub fn planRecord(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Cache) !void {
+/// The load's plans recorded before its warm (D97 everywhere, `hy4_plan.record`), its samples' with them, kept on
+/// the model (`Model.recorded`) until the warm's end makes their arena (`planBuild`).
+pub fn planRecord(xfm: Model, loaded_tower: ?*@import("../arch/media.zig").Tower) !void {
     const m = xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
     if (m.plans != null or m.recorded != null) return;
     const bills = @import("../bills.zig");
     const hy4_plan = @import("hy4_plan.zig");
     const dfly: ?*const @import("hy4_dfly.zig").Drafter = if (xfm.arch_state.hy4flash.drafter) |*d| d else null;
     const v = m.config.vision;
-    const has_tower_weight = v != null and if (xfm.arch_state.hy4flash.loader_weights) |w| w.get("vit.embeddings.patch_embedding.weight") != null else false;
+    const tower_ptr: ?*const @import("hy4_vision.zig").Tower = if (loaded_tower) |lt| switch (lt.arch) {
+        .hy4flash => |*ht| &ht.tower,
+        else => null,
+    } else null;
+    const has_tower_weight = tower_ptr != null or (v != null and if (xfm.arch_state.hy4flash.loader_weights) |w| w.get("vit.embeddings.patch_embedding.weight") != null else false);
     // The ledger holds the encode where the load recorded that it keeps the tower (`ModelConfig.keeps_tower`).
     if (has_tower_weight != xfm.config.keeps_tower) return error.Hy4TowerUnbilled;
     const max_patches: u64 = if (has_tower_weight) media.maxImagePatches(media.preproc(&xfm.config)) else 0;
@@ -251,34 +254,19 @@ pub fn planRecord(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Ca
     const kv = bills.configuredKvQuantFor(&xfm.config);
     const joined = hy4_plan.joinedRows(&xfm.config);
     const masks: @import("hy4_sample_plan.zig").Masks = .{ .suppress = xfm.suppress_mask };
-    const facts: hy4_plan.BookFacts = .{ .pack = try packKey(xfm), .reach = reach, .joined = joined, .kv = kv, .has_drafter = dfly != null, .keeps_tower = has_tower_weight, .max_patches = max_patches, .has_suppress = masks.suppress != null };
-    if (cache) |c| if (try hy4_plan.readCachedBook(m, xfm.allocator, c, facts, dfly, masks)) |cached| {
-        m.recorded = cached;
-        return;
-    };
 
-    // A load that keeps the vision tower plans its encode beside its forwards, over the tower's own tensors.
-    var tower: ?@import("hy4_vision.zig").Tower = null;
-    defer if (tower) |*t| t.deinit();
-    if (has_tower_weight) {
-        tower = try @import("hy4_vision.zig").Tower.init(xfm.allocator, v.?, xfm.arch_state.hy4flash.loader_weights.?);
-    }
-    const encode: ?hy4_plan.Encode = if (tower) |*t| .{ .tower = t, .max_patches = max_patches } else null;
-    const p = try hy4_plan.record(m, xfm.allocator, reach, dfly, kv, cache, encode, joined);
+    // Use the already-loaded media tower when passed in; fall back to initializing from weights only in standalone tests.
+    var temp_tower: ?@import("hy4_vision.zig").Tower = null;
+    defer if (temp_tower) |*t| t.deinit();
+    const encode_tower: ?*const @import("hy4_vision.zig").Tower = if (tower_ptr) |tp| tp else if (has_tower_weight) blk: {
+        temp_tower = try @import("hy4_vision.zig").Tower.init(xfm.allocator, v.?, xfm.arch_state.hy4flash.loader_weights.?);
+        break :blk &temp_tower.?;
+    } else null;
+    const encode: ?hy4_plan.Encode = if (encode_tower) |t| .{ .tower = t, .max_patches = max_patches } else null;
+    const p = try hy4_plan.record(m, xfm.allocator, reach, dfly, kv, encode, joined);
     errdefer p.deinit(xfm.allocator);
-    p.pack = facts.pack;
     try @import("hy4_sample_plan.zig").record(m, p, masks);
-    p.book_key = try hy4_plan.bookKey(m, facts);
-    hy4_plan.keepCachedBook(p) catch |e| @import("../log.zig").warn("[plan] the plan book was not kept for the next load: {s}\n", .{@errorName(e)});
     m.recorded = p;
-}
-
-/// The pack's identity, which names the region a load keeps (`hy4_plan.Plans.pack`).
-fn packKey(xfm: Model) ![16]u8 {
-    const manifest = @import("../pipeline_manifest.zig");
-    var d: manifest.Digest = .{};
-    try manifest.addPack(&d, xfm.allocator, std.Io.Threaded.global_single_threaded.io(), xfm.config.expert_source_dir orelse return error.MissingExpertSourceDir);
-    return d.hex();
 }
 
 /// The arena a load whose plans are recorded or built holds with prefill chunks of `chunk` rows: its plans' and the
@@ -292,18 +280,17 @@ pub fn planArena(xfm: Model, chunk: u32) !?u64 {
 /// The load's plans, at its warm's end (`arch/cooler.zig` `planLoad`): those recorded before the warm (`planRecord`),
 /// else recorded now, and the arena made for them and the region of the load's widest prefill chunk (D97). Every load
 /// plans, a streamed one with `--expert-cache-bias` too (D102).
-pub fn planBuild(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Cache) !void {
+pub fn planBuild(xfm: Model) !void {
     const m = xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
     if (m.plans != null) return;
-    try planRecord(xfm, cache);
+    try planRecord(xfm, null);
     const p = m.recorded.?;
     try @import("hy4_plan.zig").makeArena(m, p, @min(@import("../prefill_plan.zig").widestPrefillWidth(&xfm.config), p.reach));
     m.recorded = null;
     m.plans = p;
 }
 
-/// A draw of a served request begins (`arch/cooler.zig` `Sample`): an execution of its mix's root where the load planned
-/// it (D24).
+/// A draw of a served request begins (`arch/cooler.zig` `Sample`): a narrow execution where the load planned it.
 pub fn sampleBegin(xfm: Model, mix: @import("../sampler.zig").Mix) !bool {
     const m = xfm.arch_state.hy4flash.model orelse return false;
     return @import("hy4_sample_plan.zig").begin(m, mix);
@@ -323,8 +310,8 @@ pub fn sampleEnd(xfm: Model) !void {
     return @import("hy4_sample_plan.zig").end(xfm.arch_state.hy4flash.model.?);
 }
 
-pub fn sampleFail(xfm: Model) error{PlanMiss}!void {
-    return @import("hy4_sample_plan.zig").fail(xfm.arch_state.hy4flash.model.?);
+pub fn sampleFail(xfm: Model) void {
+    @import("hy4_sample_plan.zig").fail(xfm.arch_state.hy4flash.model.?);
 }
 
 /// A planned load's forward input: `ids` written into the model's input block (`Model.idsInput`); null where the load

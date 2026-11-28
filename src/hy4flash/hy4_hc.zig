@@ -1371,26 +1371,28 @@ test "hy4 hc: a dry recording that meets a one-threadgroup launch no probe latch
         forgetGrants();
         var dd: plan.Driver = .{ .gpa = testing.allocator };
         defer dd.deinit();
-        var dry = try plan.Recorder.begin(testing.allocator, .{ .site = 1 });
+        var dry = plan.Recorder.begin(testing.allocator);
         defer dry.deinit();
         {
+            var od: Ops = .{ .s = es };
+            defer od.deinit();
             try core.beginRecording(.{ .dry = .{ .driver = &dd } }, &dry);
             defer core.endRecording() catch {};
-            var od: Ops = .{ .s = es };
-            defer od.deinit();
             _ = try c.run(&od, form);
         }
-        var real = try plan.Recorder.begin(testing.allocator, .{ .site = 1 });
+        var real = plan.Recorder.begin(testing.allocator);
         defer real.deinit();
         {
-            try core.beginRecording(.real, &real);
-            defer core.endRecording() catch {};
             var od: Ops = .{ .s = es };
             defer od.deinit();
-            const got = try c.run(&od, form);
+            const got = blk: {
+                try core.beginRecording(.real, &real);
+                defer core.endRecording() catch {};
+                break :blk try c.run(&od, form);
+            };
             try mlx.check(mlx.mlx_array_eval(got.h));
         }
-        try testing.expectEqual(@as(?plan.trace_mod.Difference, null), plan.trace_mod.firstDifference(real.instances.items, dry.instances.items));
+        try testing.expectEqual(@as(?plan.trace_mod.Difference, null), plan.trace_mod.firstDifference(real.view(), dry.view()));
     }
 }
 
@@ -1442,10 +1444,12 @@ test "hy4 hc: a GPU that refuses one form's wide pipeline: a dry recording with 
         }
         /// `form`'s launch recorded `dry` or real into `x`, its outputs owned by `od`.
         fn run(x: *@This(), cs: FormCase, od: *Ops, form: Form, dry: bool) !void {
-            x.r = try plan.Recorder.begin(testing.allocator, .{ .site = 1 });
-            try core.beginRecording(if (dry) .{ .dry = .{ .driver = &x.d } } else .real, &x.r);
-            defer core.endRecording() catch {};
-            const got = try cs.run(od, form);
+            x.r = plan.Recorder.begin(testing.allocator);
+            const got = blk: {
+                try core.beginRecording(if (dry) .{ .dry = .{ .driver = &x.d } } else .real, &x.r);
+                defer core.endRecording() catch {};
+                break :blk try cs.run(od, form);
+            };
             if (!dry) try mlx.check(mlx.mlx_array_eval(got.h));
         }
     };
@@ -1500,7 +1504,7 @@ test "hy4 hc: a GPU that refuses one form's wide pipeline: a dry recording with 
             const before = wide_launches;
             try real.run(c, &od, form, false);
             try testing.expectEqual(!was_refused, wide_launches > before);
-            try testing.expectEqual(@as(?plan.trace_mod.Difference, null), plan.trace_mod.firstDifference(real.r.instances.items, dry.r.instances.items));
+            try testing.expectEqual(@as(?plan.trace_mod.Difference, null), plan.trace_mod.firstDifference(real.r.view(), dry.r.view()));
         }
     }
 }

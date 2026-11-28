@@ -49,11 +49,10 @@ pub const Recordings = struct {
     };
 
     fn begin(r: *Recordings, ids: mlx.mlx_array) !*Recorded {
-        const shape = mlx.getShape(ids);
-        const rows: u32 = if (shape.len == 0) 1 else @intCast(shape[shape.len - 1]);
+        _ = ids;
         const one = try r.gpa.create(Recorded);
         errdefer r.gpa.destroy(one);
-        one.* = .{ .recorder = try plan.Recorder.begin(r.gpa, .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{rows}) }) };
+        one.* = .{ .recorder = plan.Recorder.begin(r.gpa) };
         errdefer one.recorder.deinit();
         try r.list.append(r.gpa, one);
         errdefer _ = r.list.pop();

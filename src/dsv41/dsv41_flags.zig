@@ -39,13 +39,13 @@ pub const serve = struct {
         borrow.poolCapped(prev);
     }
     pub fn unloadModel(config: *const model.ModelConfig) void {
-        borrow.unloadModelMlx(config);
+        if (!@import("../bills.zig").ledgerArch(config)) borrow.unloadModelMlx(config);
     }
     pub fn enterVision(bill: u64, config: *const model.ModelConfig) void {
-        borrow.enterVisionMlx(bill, config);
+        if (!@import("../bills.zig").ledgerArch(config)) borrow.enterVisionMlx(bill, config);
     }
     pub fn leaveVision(config: *const model.ModelConfig) void {
-        borrow.leaveVisionMlx(config);
+        if (!@import("../bills.zig").ledgerArch(config)) borrow.leaveVisionMlx(config);
     }
     pub fn plannedBorrowBytes(config: *const model.ModelConfig, exl3: bool, cache_bytes: u64) u64 {
         const c = config.dsv41 orelse return 0;

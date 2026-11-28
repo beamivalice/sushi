@@ -5,7 +5,6 @@
 //! 0505773a (Apache-2.0; NOTICE). A drafter changes how fast the target speaks, never what it says.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const plan = @import("../tensor/plan/plan_api.zig");
 const Ops = @import("../mlx_ops.zig").Ops;
 const model_mod = @import("../model.zig");
 const fwd = @import("hy4_forward.zig");
@@ -171,13 +170,7 @@ pub const Drafter = struct {
         const fused = try fwd.linear(o, try o.concat(&.{ try fwd.norm(o, e0, self.enorm, c.eps), hn }, 1), self.eh_proj);
         const row0 = try o.binary(.add, e0, try o.binary(.mul, fused, try o.reshape(try o.cast(self.fusion_gate, .float32), &.{ 1, dim })));
         var x = try o.concat(&.{ row0, try o.slice(e, 0, 1, t) }, 0);
-        for (self.layers, 0..) |*ly, i| {
-            // A layer is a frame of its own; inside it, whether it reads its target's selection (past the threshold) or
-            // every row of it picks the variant (`Model.sharedRows`).
-            const f = try plan.frame(@src(), .{i});
-            defer f.end();
-            const v = if (plan.planned()) try plan.each(@src(), req_.last_picks[ly.target] != null) else plan.Frame.none;
-            defer v.end();
+        for (self.layers) |*ly| {
             var ol: Ops = .{ .s = o.s };
             defer ol.deinit();
             const a = try fwd.norm(&ol, x, ly.input_norm, c.eps);
@@ -290,9 +283,7 @@ pub const Drafter = struct {
         }
         var x = try o.concat(x_parts[0 .. 2 * n], 0);
 
-        for (self.layers, 0..) |*ly, li| {
-            const f = try plan.frame(@src(), .{li});
-            defer f.end();
+        for (self.layers) |*ly| {
             var ol: Ops = .{ .s = o.s };
             defer ol.deinit();
             const a = try fwd.norm(&ol, x, ly.input_norm, c.eps);
@@ -300,13 +291,9 @@ pub const Drafter = struct {
             const gate_all = try fwd.linearStored(&ol, a, ly.attn.gate);
             var gated_parts: [max_batch_slots]Arr = undefined;
             {
-                const slots_f = try plan.frame(@src(), .{});
-                defer slots_f.end();
                 for (reqs, 0..) |req_i, i| {
                     const lent = m.lend(req_i);
                     defer lent.end();
-                    const v = if (plan.planned()) try plan.each(@src(), req_i.last_picks[ly.target] != null) else plan.Frame.none;
-                    defer v.end();
                     var sl: Ops = .{ .s = ol.s };
                     defer sl.deinit();
                     const r0: c_int = @intCast(i * tu);

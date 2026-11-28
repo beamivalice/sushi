@@ -16,10 +16,20 @@ pub const State = struct {
     stq_experts: ?*dsv41_stream.StqStream = null,
     /// What `lendOwn` replaced, for `endOwn`.
     own_run: ?dsv41_model.Lent = null,
+    /// Cooler ledger loads defer `warmAll` from `initDsv41` into `arch.warmup` so the warm runs on the arena (D107).
+    warm_scope: dsv41_model.WarmScope = .all,
+    warm_deferred: bool = false,
+    warm_plan: ?@import("../arch/cooler_pipelines.zig").Plan = null,
+    loader_weights: ?*trunk.Weights = null,
 
     /// `Model.deinit` frees the model itself, and a `Stream` holds no resource of its own (the engine it reads is the
     /// trunk's `expert_stream`): neither takes more than the destroy below.
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        self.loader_weights = null;
+        if (self.warm_plan) |*p| {
+            p.deinit();
+            self.warm_plan = null;
+        }
         if (self.model) |m| {
             m.deinit();
             self.model = null;
@@ -49,13 +59,14 @@ pub const State = struct {
     /// The served warm's forwards run under the caps a request of their rows has (`dsv41_borrow.enterWarm`), and its
     /// requests, which no slot carries, read the model's own state: with joined rows it is lent for the warm.
     pub fn servedWarmBegin(self: *State) void {
-        dsv41_borrow.warm_budget = true;
-        const m = self.model orelse return;
-        if (m.serves_rows and m.bound == null) self.own_run = dsv41_model.lendOwn(m);
+        if (self.model == null or self.model.?.plans == null) dsv41_borrow.warm_budget = true;
+        if (self.model) |m| {
+            if (m.serves_rows and m.bound == null) self.own_run = dsv41_model.lendOwn(m);
+        }
     }
 
     pub fn servedWarmEnd(self: *State) void {
-        dsv41_borrow.endWarmMlx();
+        if (self.model == null or self.model.?.plans == null) dsv41_borrow.endWarmMlx();
         if (self.own_run) |l| l.end();
         self.own_run = null;
     }

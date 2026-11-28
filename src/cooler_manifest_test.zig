@@ -248,34 +248,6 @@ test "cooler contract: a manifest rewritten after its root directory was removed
     try testing.expect(found == .same);
 }
 
-test "cooler contract: a plan's kept shapes land in a root removed and made again" {
-    const shared = @import("arch/cooler_pipelines.zig");
-    const pm = @import("pipeline_manifest.zig");
-    try mlx.requireGpu();
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try pm.setRootFromHome(buf[0..try tmp.dir.realPath(io, &buf)]);
-    defer pm.clearRootForTest();
-    defer shared.forget();
-    mlx.engine.pipeline_registry.resetForTest();
-    var plan = shared.beginScope(testing.allocator, io, @as([16]u8, "aaaaaaaaaaaaaaaa".*));
-    defer plan.deinit();
-    _ = plan.settle();
-    const cache = plan.shapeCache() orelse return error.NoShapeCache;
-    try cache.keep(testing.allocator, .{ .phase = 1 });
-    // Another process or a cleanup removes the root; the load's later misses are kept in the one made again.
-    try tmp.dir.deleteTree(io, ".sushi");
-    cache.keep(testing.allocator, .{ .phase = 2 }) catch |e| {
-        std.debug.print("a shape was not kept in the root made again: {s}\n", .{@errorName(e)});
-        return e;
-    };
-    const kept = try cache.read(testing.allocator);
-    defer testing.allocator.free(kept);
-    try testing.expectEqual(@as(usize, 1), kept.len);
-    try testing.expectEqual(@as(u32, 2), kept[0].phase);
-}
-
 /// Two DeepSeek packs whose scopes differ (the tile order does) and whose served warm has one shape.
 fn twoPacks() ?struct { a: []const u8, b: []const u8 } {
     const a = std.mem.span(std.c.getenv("DSV41_STQ_TINY_PM") orelse return null);
@@ -335,14 +307,18 @@ test "cooler contract: a served-warm marker one pack's warm recorded is not writ
     defer two.end();
     // Process 1: A at the default shape, then B at a narrower chunk: B's warm never ran at the default shape.
     const a_first = try warmRuns(C, two.packs.a, 0);
-    const b_narrow = try warmRuns(C, two.packs.b, 2048);
-    // Process 2: B at the default shape enters its warm instead of skipping (a tiny bill fails it fast).
+    const b_narrow = try warmRuns(C, two.packs.b, 1024);
+    // Process 2: B at the default shape enters its warm instead of skipping (a tiny bill fails it fast off-ledger).
     two.restart();
-    cooler_warm.bill_for_test = 1 << 20;
-    defer cooler_warm.bill_for_test = null;
-    try testing.expectError(error.WarmOverBill, warmRuns(C, two.packs.b, 0));
-    var msg: [512]u8 = undefined;
-    _ = mlx.takeError(&msg);
+    if (try isLedgerArch(C, two.packs.b)) {
+        try testing.expectEqual(@as(u32, 1), try warmRuns(C, two.packs.b, 0));
+    } else {
+        cooler_warm.bill_for_test = 1 << 20;
+        defer cooler_warm.bill_for_test = null;
+        try testing.expectError(error.WarmOverBill, warmRuns(C, two.packs.b, 0));
+        var msg: [512]u8 = undefined;
+        _ = mlx.takeError(&msg);
+    }
     errdefer std.debug.print("served warms that ran: a_first={d} b_narrow={d}\n", .{ a_first, b_narrow });
     try testing.expectEqual(@as(u32, 1), a_first);
     try testing.expectEqual(@as(u32, 1), b_narrow);
@@ -355,19 +331,23 @@ test "cooler contract: two packs whose served warms have one shape and one bill 
     try two.begin();
     defer two.end();
     // Process 1: B at a narrower chunk, then A at the shape both share.
-    const b_narrow = try warmRuns(C, two.packs.b, 2048);
+    const b_narrow = try warmRuns(C, two.packs.b, 1024);
     const a_first = try warmRuns(C, two.packs.a, 0);
     try testing.expectEqual(@as(u32, 1), b_narrow);
     try testing.expectEqual(@as(u32, 1), a_first);
     // Process 2: A skips its warm, as its own manifest says. B, whose manifest holds no warm of this shape, runs it, and
-    // the measure of its widest request runs with it: a bill it exceeds is refused by name.
+    // off-ledger the measure of its widest request runs with it: a bill it exceeds is refused by name.
     two.restart();
     try testing.expectEqual(@as(u32, 0), try warmRuns(C, two.packs.a, 0));
-    cooler_warm.bill_for_test = 1 << 20;
-    defer cooler_warm.bill_for_test = null;
-    try testing.expectError(error.WarmOverBill, warmRuns(C, two.packs.b, 0));
-    var msg: [512]u8 = undefined;
-    _ = mlx.takeError(&msg);
+    if (try isLedgerArch(C, two.packs.b)) {
+        try testing.expectEqual(@as(u32, 1), try warmRuns(C, two.packs.b, 0));
+    } else {
+        cooler_warm.bill_for_test = 1 << 20;
+        defer cooler_warm.bill_for_test = null;
+        try testing.expectError(error.WarmOverBill, warmRuns(C, two.packs.b, 0));
+        var msg: [512]u8 = undefined;
+        _ = mlx.takeError(&msg);
+    }
 }
 
 const mtp_settings = .{ LookupSetting, MaxMtpCtxSetting, MtpMaxDepthSetting };

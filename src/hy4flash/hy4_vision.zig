@@ -11,7 +11,6 @@ const hy4_config = @import("hy4_config.zig");
 const fwd = @import("hy4_forward.zig");
 const log = @import("../log.zig");
 const io_util = @import("../io_util.zig");
-const plan = @import("../tensor/plan/plan_api.zig");
 const Arr = mlx.mlx_array;
 
 const eps: f32 = 1e-5;
@@ -290,9 +289,6 @@ pub const Tower = struct {
         for (self.blocks, 0..) |*b, i| {
             const next = blk: {
                 errdefer _ = mlx.mlx_array_free(x);
-                // Every block asks alike: one frame, its instances at their places in the encode.
-                const f = try plan.frame(@src(), .{});
-                defer f.end();
                 var bo: Ops = .{ .s = o.s };
                 defer bo.deinit();
                 const a = try bo.layerNorm(x, try bo.cast(b.norm1_w, .float32), try bo.cast(b.norm1_b, .float32), eps);
@@ -346,8 +342,6 @@ pub const Tower = struct {
         defer self.gpa.free(outs);
         for (outs, 0..) |*out, ci| {
             const r0: c_int = @as(c_int, @intCast(ci)) * rows;
-            const it = try plan.each(@src(), .{});
-            defer it.end();
             var co: Ops = .{ .s = o.s };
             defer co.deinit();
             out.* = try o.own(try co.result(try chunkContext(&co, q, kt, vv, scale, r0, @min(n, r0 + rows)))); // [H, rows, hd]

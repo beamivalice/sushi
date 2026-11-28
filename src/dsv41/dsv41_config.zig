@@ -390,6 +390,9 @@ pub fn prefillWidthFor(chip: []const u8) u32 {
 /// The widest chunk the load's own kernel warm runs (`dsv41_serving.warmAll`); the served warm (`cooler_warm`) runs a
 /// request's widest rung.
 pub const warm_width: u32 = 2048;
+/// Static-bill chunk bounds for DeepSeek-V4.1 (`arch_config.Facts`).
+pub const widest_chunk: u32 = 8192;
+pub const default_chunk: u32 = 2048;
 
 /// Rows the router scores in one dense product on a prefill chunk (`dsv41_model.gateLogitsWide`): a divisor of every
 /// ladder rung from 2048 up, so those chunks pad nothing. A narrower forward pads one f32 tile a layer at a time (42 MB

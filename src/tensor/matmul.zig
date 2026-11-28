@@ -743,11 +743,7 @@ fn steel(c: Call) Error!void {
     // A dry recording makes no pipeline: the dtype stays open for the first real product (the warm's).
     if (!core.sealed and !core.dryOn()) completeFamily(c);
     const path = steelPath(c);
-    // The path follows the product's sizes: under a plan each is a variant of its own.
-    const f = try plan_api.frame(@src(), .{});
-    defer f.end();
-    const v = if (plan_api.planned()) try plan_api.each(@src(), path) else plan_api.Frame.none;
-    defer v.end();
+    // The path follows the product's sizes.
     return switch (path) {
         .split_k => splitK(c),
         .split_k_nax => splitKNax(c),

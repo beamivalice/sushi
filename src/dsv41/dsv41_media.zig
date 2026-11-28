@@ -12,6 +12,13 @@ pub const mode = .dsv41;
 pub const Tower = dsv41_vision.Dsv41Vision;
 pub const scratchBytes = dsv41_vision.encodeScratchBytes;
 
+pub fn mediaBill(config: *const model.ModelConfig, _: u64, input_bytes: u64, rows: usize) ?u64 {
+    if (!@import("../cooler_side.zig").onEngine(config)) return null;
+    const c = config.dsv41 orelse return null;
+    if (c.vision == null) return null;
+    return @import("dsv41_encode_plan.zig").mediaBytes(c.dim, rows) +| input_bytes;
+}
+
 pub fn claims(config: *const model.ModelConfig) bool {
     return arch_config.isOf(config, "dsv41") or config.dsv41 != null;
 }

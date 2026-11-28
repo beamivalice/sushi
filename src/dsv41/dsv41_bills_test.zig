@@ -399,7 +399,8 @@ test "DeepSeek: a request's decode state is billed as growth after admission onl
 fn warmHeadroomAfterLoad(config: *const model_mod.ModelConfig, ceiling: u64, weights: u64) u64 {
     const held = bills.expertStreamingGateBytes(weights, config.expert_cache_bytes, model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes);
     const pool = config.expertPoolBytes();
-    return bills.liveHeadroomFrom(config, ceiling, held - pool, 0, pool);
+    const engine_free: u64 = if (@import("../cooler_side.zig").onEngine(config)) pool else 0;
+    return bills.liveHeadroomFrom(config, ceiling, held - pool, 0, engine_free);
 }
 
 /// The 32 GB ledger's planner at a smaller budget: the GiBs it gives up come out of the cache, which keeps whole slots of
@@ -423,7 +424,7 @@ test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac l
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
-    config.cooler_for_test = true;
+    config.cooler_for_test = false;
     // dsv41-memory, the 32 GB Mac at --ssd-budget-gb 18: trunk, MTP and vision 9.55 GB, workspace 3.70, bounce 0.54,
     // cache 4.23 GB; decoder pools about 2.1 GB, which the warm cannot borrow.
     const MiB: u64 = 1 << 20;
@@ -823,7 +824,8 @@ test "DeepSeek: a fully resident load whose ceiling fits it and its floor warm s
     const MiB: u64 = 1 << 20;
     const max_span: u64 = 24 * (1 << 30);
     for ([_]bool{ true, false }) |lend| {
-        const config = try residentPack(lend);
+        var config = try residentPack(lend);
+        config.cooler_for_test = false;
         const owned = resident_weights + config.expert_cache_bytes;
         const max_ceiling = owned + max_span - 1;
         const bits = bills.defaultKvBits(&config);
@@ -884,7 +886,8 @@ test "DeepSeek: a fully resident load whose ceiling fits it and its floor warm s
                     });
                     return error.TestUnexpectedResult;
                 }
-                const need = config.dsv41.?.chunkCap(top, seq);
+                const widest = @import("../prefill_plan.zig").widestForward(@intCast(seq -| 1), @intCast(@max(top, 1)), false);
+                const need = config.dsv41.?.forwardCapOn(@import("../cooler_side.zig").onEngine(&config), @max(@min(top, @max(seq, 1)), widest), seq);
                 if (ceiling - owned < need and bills.prefillNeededAtChunk(&config, seq, 256, bits, top, .{}) <= ceiling - owned) borrowed += 1;
             }
         }
@@ -1008,4 +1011,42 @@ test "a resident DeepSeek load's cold bill holds its Engram row caches, as a str
     const with = try model_load.sushiResidentLoadBytes(io, a, path, &cfg, false, false);
     const without = try model_load.sushiResidentLoadBytes(io, a, path, &none, false, false);
     try std.testing.expectEqual(caches, with - without);
+}
+
+test "DeepSeek static bill: ledgerArch on Cooler vs MLX, ledgerTerms covers state across 1M, and chooseLedgerPrefillChunk picks widest fitting rung" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+
+    @import("../cooler_side.zig").forTest(&config, false);
+    try t.expect(!bills.ledgerArch(&config));
+    @import("../cooler_side.zig").forTest(&config, true);
+    defer @import("../cooler_side.zig").forTest(&config, false);
+    try t.expect(bills.ledgerArch(&config));
+
+    const c = &config.dsv41.?;
+    const kv = bills.defaultKvBits(&config);
+    const terms = dsv41_bill.ledgerTerms(&config, kv, 2048).?;
+    for ([_]u64{ 1, 4096, 131_072, 1_000_000 }) |reach| {
+        const want = c.stateReservedBytes(true, reach) +| c.stateFixedBytes(true);
+        try t.expect(terms.at(reach) >= want);
+    }
+
+    const arena_struct = struct {
+        fn at(_: *anyopaque, chunk: u32) anyerror!u64 {
+            return (128 << 20) + @as(u64, chunk) * (512 << 10);
+        }
+        var tok: u8 = 0;
+        const iface: bills.ArenaAt = .{ .ctx = &tok, .at = at };
+    };
+    const bounds: bills.ChunkBounds = .{ .min = 512, .max = 8192 };
+    const ctx: u64 = 16_384;
+    config.ctx_override = @intCast(ctx);
+    const room_8192 = (try arena_struct.iface.of(8192)) + terms.at(ctx);
+    try t.expectEqual(@as(u32, 8192), (try bills.chooseLedgerPrefillChunk(&config, bounds, .{ .room = room_8192, .arena = arena_struct.iface })).chunk);
+    const room_512 = (try arena_struct.iface.of(512)) + dsv41_bill.ledgerTerms(&config, kv, 512).?.at(ctx);
+    try t.expectEqual(@as(u32, 512), (try bills.chooseLedgerPrefillChunk(&config, bounds, .{ .room = room_512, .arena = arena_struct.iface })).chunk);
+    try t.expect((try bills.chooseLedgerPrefillChunk(&config, bounds, .{ .room = room_512 - 1, .arena = arena_struct.iface })) == .refused);
 }

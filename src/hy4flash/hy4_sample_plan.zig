@@ -1,12 +1,9 @@
-//! Hy4-Flash's samples on the arena (docs/bill_redesign.md, D24): a served draw, from the logits to its token, is one
-//! execution of a `sample` root keyed by its mix (`sampler.Mix`). Each mix the sampler can take is recorded dry at the
-//! load's end beside the forwards' roots (`build`); a served draw of a mix no probe recorded, or one that misses inside
-//! its execution, is refused by name and its mix recorded and learned (D5), the shape kept for the next load.
+//! Hy4-Flash's samples on the arena (D97 everywhere): a served draw, from the logits to its token, is one narrow
+//! execution on the shared arena region, sized by dry-probing sample mixes beside forwards during load planning.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const core = @import("../tensor/core.zig");
 const plan = @import("../tensor/plan/plan_api.zig");
-const plan_book = @import("../tensor/plan/plan_book.zig");
 const plan_trace = @import("../tensor/plan/plan_trace.zig");
 const log = @import("../log.zig");
 const sampler = @import("../sampler.zig");
@@ -17,32 +14,25 @@ const Model = hy4_model.Model;
 const Mix = sampler.Mix;
 const Arr = mlx.mlx_array;
 
-/// A sample's root: its mix, a verdict's rows only as one row or a block (its rows are a size).
-pub fn root(mix: Mix) plan.FrameId {
-    return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ mix.entry, mix.rows <= 1, mix.suppress, mix.greedy, mix.repeat, mix.additive, mix.grammar }) };
-}
-
 pub const token_slots = 32;
 
 /// What a load's samples hold beside its forwards' plans (`hy4_plan.Plans.sample`).
 pub const State = struct {
-    /// Whether the load's samples are planned (`build`).
+    /// Whether the load's samples are planned.
     planned: bool = false,
     /// The load's reserved-token mask, which its requests' draws read.
     masks: Masks = .{},
-    /// The two blocks a step's token is written into, in turn: the generator holds one token across the next draw.
+    /// The ring blocks a step's token is written into, in turn: the generator holds one token across the next draw.
     tokens: [token_slots]?Arr = @splat(null),
     turn: usize = 0,
-    /// The mix of the execution open, when one is.
-    open: ?Mix = null,
+    /// Whether a narrow execution is open for the current draw.
+    open: bool = false,
     /// A draw no root holds that runs on the pool by design, open until it ends: a verdict wider than a verify block.
     wide: ?core.Wide = null,
     /// The widest verdict planned: a verify block's (D18) where the load drafts, else none.
     rows_max: u8 = 0,
-    /// Draws run as executions since the load; misses served, and of them the mixes learned in place.
+    /// Draws run as narrow executions since load.
     draws: u64 = 0,
-    misses: u64 = 0,
-    learned: u64 = 0,
 
     pub fn deinit(st: *State) void {
         freeTokens(&st.tokens);
@@ -59,9 +49,8 @@ fn freeTokens(tokens: *[token_slots]?Arr) void {
 /// What a load's requests' draws read of the load's own: its reserved-token mask (`Trunk.suppress_mask`), borrowed.
 pub const Masks = struct { suppress: ?Arr = null };
 
-/// A served draw of `mix` begins: an execution of its root where the load planned it (true), else none (false): a
-/// load without plans, or a verdict wider than a verify block, which is a prefill block's on the pool (D18). A mix the
-/// load planned no root for is refused by name (`PlanMiss`), recorded and learned.
+/// A served draw of `mix` begins: a narrow execution on the arena where the load planned it (`true`), or `false` on a
+/// load without planned samples. Verdicts wider than a verify block run on the pool past the seal (`State.wide`).
 pub fn begin(m: *Model, mix: Mix) !bool {
     const p = m.plans orelse return false;
     const st = &p.sample;
@@ -72,9 +61,8 @@ pub fn begin(m: *Model, mix: Mix) !bool {
         st.wide = core.widePhase();
         return true;
     }
-    const tables = p.book.tables(root(mix)) orelse return missed(m, mix, null);
-    try core.beginExecution(tables, root(mix));
-    st.open = mix;
+    try core.beginNarrow();
+    st.open = true;
     st.draws += 1;
     return true;
 }
@@ -87,23 +75,21 @@ fn endWide(st: *State) bool {
     return true;
 }
 
-/// The execution ends; a miss it met is `PlanMiss`.
+/// Ends the active sample execution.
 pub fn end(m: *Model) !void {
     const st = &m.plans.?.sample;
     if (endWide(st)) return;
-    const mix = st.open.?;
-    st.open = null;
-    core.endExecution() catch |e| return if (core.executionMiss()) |miss| missed(m, mix, miss) else e;
+    st.open = false;
+    try core.endNarrow();
 }
 
-/// The sampler failed inside the execution: it goes, and a miss it met is `PlanMiss`.
-pub fn fail(m: *Model) error{PlanMiss}!void {
+/// Aborts the active sample execution on error.
+pub fn fail(m: *Model) void {
     const st = &m.plans.?.sample;
     if (endWide(st)) return;
-    const mix = st.open orelse return;
-    st.open = null;
-    core.abortExecution();
-    if (core.executionMiss()) |miss| return missed(m, mix, miss);
+    if (!st.open) return;
+    st.open = false;
+    core.abortNarrow();
 }
 
 /// A step's token `lazy` (owned) kept past its execution, which ends: written into the token block of this turn, the
@@ -112,7 +98,7 @@ pub fn token(m: *Model, lazy: Arr) !Arr {
     // A draw on the pool keeps its token as the sampler made it.
     if (endWide(&m.plans.?.sample)) return lazy;
     const view = kept(m, &m.plans.?.sample, lazy) catch |e| {
-        try fail(m);
+        fail(m);
         return e;
     };
     errdefer _ = mlx.mlx_array_free(view);
@@ -120,8 +106,7 @@ pub fn token(m: *Model, lazy: Arr) !Arr {
     return view;
 }
 
-/// A forced call's token `id` kept as a draw's is (D36): the next draw's probes took a pending token as a view of a
-/// token block, so it is one. Null on a load that plans no samples.
+/// A forced call's token `id` kept as a draw's is (D36): null on a load that plans no samples.
 pub fn forced(m: *Model, id: u32) !?Arr {
     const p = m.plans orelse return null;
     if (!p.sample.planned) return null;
@@ -160,7 +145,7 @@ fn freeToken(st: *State, sole_only: bool) !usize {
 
 fn kept(m: *Model, st: *State, lazy: Arr) !Arr {
     defer _ = mlx.mlx_array_free(lazy);
-    const turn = try freeToken(st, false);
+    const turn = try freeToken(st, true);
     // A write that fails inside an execution leaves its block owing bytes of the arena, which the execution's end takes
     // back: the block goes, and `remakeTokens` makes it again outside one.
     errdefer {
@@ -179,74 +164,11 @@ fn kept(m: *Model, st: *State, lazy: Arr) !Arr {
     return view;
 }
 
-/// A kept shape's phase: a sample (`Mix`), its mix packed in the first number.
-pub const shape_phase: u32 = 3;
+// ── Probes ──
 
-pub fn shapeOf(mix: Mix) plan_book.Shape {
-    const flags: u64 = @as(u64, @intFromBool(mix.suppress)) | @as(u64, @intFromBool(mix.greedy)) << 1 | @as(u64, @intFromBool(mix.repeat)) << 2 |
-        @as(u64, @intFromBool(mix.additive)) << 3 | @as(u64, @intFromBool(mix.grammar)) << 4;
-    // args[2] stays 0 so cached shapes written by older binaries still read cleanly (mixOf rejects non-zero).
-    return .{ .phase = shape_phase, .args = .{ @intFromEnum(mix.entry), mix.rows, 0, flags } };
-}
-
-/// The mix a kept shape names, or null when it names none.
-pub fn mixOf(s: plan_book.Shape) ?Mix {
-    if (s.phase != shape_phase or s.args[1] == 0 or s.args[1] > 255 or s.args[2] != 0 or s.args[3] >> 5 != 0) return null;
-    const entry = std.enums.fromInt(Mix.Entry, s.args[0]) orelse return null;
-    const f = s.args[3];
-    if (entry != .verdict and s.args[1] != 1) return null;
-    return .{ .entry = entry, .rows = @intCast(s.args[1]), .suppress = f & 1 != 0, .greedy = f & 2 != 0, .repeat = f & 4 != 0, .additive = f & 8 != 0, .grammar = f & 16 != 0 };
-}
-
-/// A served draw of `mix` missed (`miss`, null for a mix no root was planned for): it is refused by name, its mix
-/// recorded and learned (`plan_book.Book.learnAll`) and kept beside the load's manifest either way.
-fn missed(m: *Model, mix: Mix, miss: ?plan.binder.Miss) error{PlanMiss} {
-    const p = m.plans.?;
-    const st = &p.sample;
-    st.misses += 1;
-    if (miss) |x| {
-        log.warn("[plan] miss: a sample ({t}, {d} rows) asked {d} B against {d} B ({t}, frame {d}/{d}, ordinal {d})\n", .{ mix.entry, mix.rows, x.asked, x.cap, x.kind, x.id.site, x.id.key, x.ordinal });
-    } else log.warn("[plan] miss: a sample ({t}, {d} rows) of a mix the load did not plan\n", .{ mix.entry, mix.rows });
-    remakeTokens(st, m.s) catch |e| {
-        log.warn("[plan] the token blocks of a missed sample were not made again ({t}); the next draw makes them or fails\n", .{e});
-        return error.PlanMiss;
-    };
-    const held = core.arenaLayout() orelse return error.PlanMiss;
-    // A mix's probes make their inputs on the pool, past the seal.
-    const wide = core.widePhase();
-    const passes = recordMix(m, st, p.book.gpa, mix);
-    wide.end();
-    var traces = passes catch |e| {
-        log.warn("[plan] the missed sample was not recorded ({t}); it misses again until a load plans it\n", .{e});
-        return error.PlanMiss;
-    };
-    defer traces.deinit(p.book.gpa);
-    const learned = p.book.learnAll(root(mix), traces.items, held) catch |e| {
-        traces.items.len = 0;
-        log.warn("[plan] the missed sample was recorded and not learned ({t})\n", .{e});
-        return error.PlanMiss;
-    };
-    traces.items.len = 0;
-    switch (learned) {
-        .swapped => {
-            st.learned += 1;
-            log.warn("[plan] the missed sample is learned in place: the next such draw is served\n", .{});
-        },
-        .next_load => log.warn("[plan] the missed sample needs more arena than the load holds: the next load plans it\n", .{}),
-    }
-    if (p.cache) |*c| c.keep(p.book.gpa, shapeOf(mix)) catch |e| log.warn("[plan] the missed sample was not kept in {s} ({t}): a restart misses it again\n", .{ c.name(), e });
-    if (learned == .swapped) @import("hy4_plan.zig").keepLearned(p);
-    return error.PlanMiss;
-}
-
-// ── The probes ──
-
-/// One shape a sample's root is recorded at: its mix, and which of two sets of the values its key leaves out (the
-/// temperature's value, top-k, top-p, min-p, the seed and the penalties' ids).
 pub const Probe = struct { mix: Mix, other: bool = false };
 
-/// Every mix a draw of the load can take: each entry under each penalty, greedy or not, a grammar mask; the load's own
-/// reserved-token mask; a verdict at every rows up to a verify block's where the load drafts.
+/// Mixes used to envelope sample demand (`hy4_sample_plan.record`) and verified by tests.
 pub fn mixes(gpa: std.mem.Allocator, st: *const State) ![]Mix {
     const suppress = st.masks.suppress != null;
     var list: std.ArrayList(Mix) = .empty;
@@ -270,6 +192,26 @@ pub fn mixes(gpa: std.mem.Allocator, st: *const State) ![]Mix {
         sync.entry = .sync;
         try list.append(gpa, sync);
     };
+    return list.toOwnedSlice(gpa);
+}
+
+/// Worst-case envelope mixes to size D97 sample demand quickly at boot.
+fn envelopeMixes(gpa: std.mem.Allocator, st: *const State) ![]Mix {
+    const suppress = st.masks.suppress != null;
+    var list: std.ArrayList(Mix) = .empty;
+    errdefer list.deinit(gpa);
+    for ([_]bool{ false, true }) |greedy| {
+        for ([_]bool{ false, true }) |grammar| {
+            try list.append(gpa, .{ .entry = .step, .suppress = suppress, .greedy = greedy, .repeat = true, .additive = true, .grammar = grammar });
+            if (st.rows_max > 0) {
+                try list.append(gpa, .{ .entry = .verdict, .rows = 1, .suppress = suppress, .greedy = greedy, .repeat = true, .additive = true, .grammar = grammar });
+                if (st.rows_max > 1) {
+                    try list.append(gpa, .{ .entry = .verdict, .rows = st.rows_max, .suppress = suppress, .greedy = greedy, .repeat = true, .additive = true, .grammar = grammar });
+                }
+            }
+        }
+        try list.append(gpa, .{ .entry = .sync, .suppress = suppress, .greedy = greedy, .repeat = true, .additive = true });
+    }
     return list.toOwnedSlice(gpa);
 }
 
@@ -339,8 +281,7 @@ pub const Drawn = union(enum) {
 
 const Verdict = @import("hy4_drafter.zig").rounds.Verdict;
 
-/// A draw of `mix` over `in`, as a served draw of its mix runs it (a step's token kept in its block, the execution, if
-/// any, left open).
+/// A draw of `mix` over `in`, as a served draw of its mix runs it.
 pub fn draw(m: *Model, st: *State, in: *const Inputs, mix: Mix) !Drawn {
     const s = m.s;
     switch (mix.entry) {
@@ -362,8 +303,6 @@ pub fn draw(m: *Model, st: *State, in: *const Inputs, mix: Mix) !Drawn {
     }
 }
 
-/// `probe` recorded dry under `fill`. The token blocks it writes are its own, made dry beside it: a dry recording leaves
-/// the blocks it writes unusable, and the generator may hold a view of the load's.
 fn recordPass(m: *Model, st: *State, gpa: std.mem.Allocator, probe: Probe, fill: core.Fill) !plan_trace.Trace {
     var in = try makeInputs(m, st, gpa, probe);
     defer in.deinit();
@@ -378,13 +317,13 @@ fn recordPass(m: *Model, st: *State, gpa: std.mem.Allocator, probe: Probe, fill:
     var driver: plan.Driver = .{ .gpa = gpa };
     defer driver.deinit();
     {
-        var rec = try plan.Recorder.begin(gpa, .{ .site = plan.siteOf(@src()) });
+        var rec = plan.Recorder.begin(gpa);
         defer rec.deinit();
         try core.beginRecording(.{ .dry = .{ .driver = &driver } }, &rec);
         defer core.endRecording() catch {};
         try makeTokens(m, st);
     }
-    var rec = try plan.Recorder.begin(gpa, root(probe.mix));
+    var rec = plan.Recorder.begin(gpa);
     defer rec.deinit();
     {
         try core.beginRecording(.{ .dry = .{ .driver = &driver, .fill = fill } }, &rec);
@@ -416,92 +355,39 @@ fn remakeTokens(st: *State, s: mlx.mlx_stream) !void {
     };
 }
 
-/// `probe` recorded under both fills: the zeros' trace, once the ramp's is found to be the same execution (a readback
-/// that steered a shape would part them).
+/// `probe` recorded under both fills: verifies readbacks do not steer allocation shapes.
 fn recordChecked(m: *Model, st: *State, gpa: std.mem.Allocator, probe: Probe) !plan_trace.Trace {
     var zeros = try recordPass(m, st, gpa, probe, .zeros);
     errdefer zeros.deinit();
     var ramp = try recordPass(m, st, gpa, probe, .ramp);
     defer ramp.deinit();
-    if (plan_trace.firstDifference(zeros.instances, ramp.instances)) |d| {
-        log.err("[plan] a sample ({t}, {d} rows) records two shapes under two fills (instance {d}, {t} at {d}): a readback steers it\n", .{ probe.mix.entry, probe.mix.rows, d.instance, d.what, d.at });
+    if (plan_trace.firstDifference(zeros.view(), ramp.view())) |d| {
+        log.err("[plan] a sample ({t}, {d} rows) records two shapes under two fills ({t} at {d}): a readback steers it\n", .{ probe.mix.entry, probe.mix.rows, d.what, d.at });
         return error.Hy4PlanReadbackSteers;
     }
     return zeros;
 }
 
-/// The traces of `mix`'s probes: each set of the values its key leaves out.
-fn recordMix(m: *Model, st: *State, gpa: std.mem.Allocator, mix: Mix) !std.ArrayList(plan_trace.Trace) {
-    var list: std.ArrayList(plan_trace.Trace) = .empty;
-    errdefer {
-        for (list.items) |*t| t.deinit();
-        list.deinit(gpa);
-    }
-    for ([_]bool{ false, true }) |other| {
-        try list.ensureUnusedCapacity(gpa, 1);
-        list.appendAssumeCapacity(try recordChecked(m, st, gpa, .{ .mix = mix, .other = other }));
-    }
-    return list;
-}
-
-/// The samples of `m`'s load, planned beside its forwards in `p` (after `hy4_plan.record`, before its arena): every mix
-/// (`mixes`) recorded under both fills, merged and packed into the book, and the shapes earlier misses kept learned.
+/// Measures worst-case D97 sample demand and folds it into `p.narrow`.
 pub fn record(m: *Model, p: *Plans, masks: Masks) !void {
     const t0 = @import("../load_clock.zig").now();
-    const gpa = p.book.gpa;
+    const gpa = p.gpa;
     const st = &p.sample;
     st.* = .{ .planned = true, .masks = masks, .rows_max = if (p.drafter != null) @intCast(fwd.verify_rows_max) else 0 };
     errdefer st.deinit();
-    // The draw's threads a group settle on what the GPU grants before the probes record them (an M1 grants it 512).
     try @import("../sampler_draw.zig").settle(m.config.vocab, .float32, m.s);
     try makeTokens(m, st);
-    const all = try mixes(gpa, st);
-    defer gpa.free(all);
-    for (all) |mix| {
-        var traces = try recordMix(m, st, gpa, mix);
-        defer traces.deinit(gpa);
-        for (traces.items, 0..) |t, i| p.book.add(root(mix), t) catch |e| {
-            for (traces.items[i + 1 ..]) |*rest| rest.deinit();
-            return e;
-        };
+    const envs = try envelopeMixes(gpa, st);
+    defer gpa.free(envs);
+    var sample_need: plan.region.Need = .{};
+    for (envs) |mix| {
+        for ([_]bool{ false, true }) |other| {
+            var tr = try recordChecked(m, st, gpa, .{ .mix = mix, .other = other });
+            defer tr.deinit();
+            sample_need = sample_need.max(try plan.region.needWithGuard(gpa, &tr, p.alignment, p.guard));
+        }
     }
-    p.book.build() catch |e| {
-        if (e == error.PlanAmbiguous) log.err("[plan] a sample's frame {d}/{d} is ambiguous: {t} at node {d}\n", .{ p.book.ambiguity.id.site, p.book.ambiguity.id.key, p.book.ambiguity.why, p.book.ambiguity.node });
-        return e;
-    };
-    if (p.cache) |*c| learnKept(m, p, c);
-    const l = p.book.layout();
+    p.narrow = p.narrow.max(sample_need);
     const ms = (@import("../load_clock.zig").now() - t0) / std.time.ns_per_ms;
-    log.info("[plan] samples: {d} mixes, verdicts to {d} rows; scratch {d} KB, host ring {d} KB x {d} with them; recorded in {d} ms\n", .{ all.len, st.rows_max, l.g >> 10, l.h >> 10, l.replicas, ms });
-}
-
-/// The sample shapes earlier loads' misses kept, each recorded and learned into the book; one this load cannot run is
-/// passed over by name.
-fn learnKept(m: *Model, p: anytype, c: *const plan_book.Cache) void {
-    const gpa = p.book.gpa;
-    const kept_shapes = c.read(gpa) catch return;
-    defer gpa.free(kept_shapes);
-    const unbounded: plan.binder.Layout = .{ .g = std.math.maxInt(u64), .h = std.math.maxInt(u64), .alignment = p.book.alignment };
-    var learned: usize = 0;
-    var named: usize = 0;
-    for (kept_shapes) |s| if (s.phase == shape_phase) {
-        named += 1;
-        const mix = mixOf(s) orelse {
-            log.warn("[plan] a kept shape is no sample of this load ({d} {d} {d} {d})\n", .{ s.args[0], s.args[1], s.args[2], s.args[3] });
-            continue;
-        };
-        var traces = recordMix(m, &p.sample, gpa, mix) catch |e| {
-            log.warn("[plan] a kept sample ({t}, {d} rows) was not recorded ({t})\n", .{ mix.entry, mix.rows, e });
-            continue;
-        };
-        defer traces.deinit(gpa);
-        _ = p.book.learnAll(root(mix), traces.items, unbounded) catch |e| {
-            traces.items.len = 0;
-            log.warn("[plan] a kept sample ({t}, {d} rows) was not planned ({t})\n", .{ mix.entry, mix.rows, e });
-            continue;
-        };
-        traces.items.len = 0;
-        learned += 1;
-    };
-    if (named > 0) log.info("[plan] {d} of {d} samples kept by earlier misses planned\n", .{ learned, named });
+    log.info("[plan] samples: {d} envelopes, verdicts to {d} rows; scratch {d} KB, host ring {d} KB in {d} ms\n", .{ envs.len, st.rows_max, sample_need.scratch >> 10, sample_need.host >> 10, ms });
 }

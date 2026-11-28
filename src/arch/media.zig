@@ -111,7 +111,7 @@ pub const Tower = struct {
     /// grids, in place of an array an image that the caller joins.
     pub fn writesMedia(self: *const Tower) bool {
         switch (self.arch) {
-            inline else => |*t| return @hasDecl(@TypeOf(t.*), "encodeInto"),
+            inline else => |*t| return if (comptime @hasDecl(@TypeOf(t.*), "writesMedia")) t.writesMedia() else @hasDecl(@TypeOf(t.*), "encodeInto"),
         }
     }
 
@@ -160,10 +160,7 @@ pub fn mediaBill(config: *const model.ModelConfig, worst: u64, input_bytes: u64,
 /// an arch that plans it (one that declares `mediaBill`); null for every other arch. The processor's resize can pass
 /// its pixel bound at an extreme aspect, where a side's floor of one cell outweighs it.
 pub fn imagePastPlan(config: *const model.ModelConfig, images: []const chat.ImageData) ?usize {
-    const tag = ofConfig(config) orelse return null;
-    switch (tag) {
-        inline else => |t| if (comptime !@hasDecl(M(t), "mediaBill")) return null,
-    }
+    if (mediaBill(config, 0, 0, 0) == null) return null;
     const most = maxImagePatches(preproc(config));
     for (images, 0..) |img, i| if (@as(u64, img.grid_h) * img.grid_w > most) return i;
     return null;

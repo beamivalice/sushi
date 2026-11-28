@@ -96,7 +96,7 @@ pub fn sampleJoinedRows(
             const step = gen.stepFor(rows[i]);
             const run = try @import("../arch/cooler.zig").beginSample(xfm, step.mix());
             const lazy = @import("../sampler.zig").sampleStep(std.heap.page_allocator, step, xfm.outStream()) catch |e| {
-                try run.fail();
+                run.fail();
                 return e;
             };
             kept[j] = try run.token(lazy);
@@ -525,21 +525,15 @@ fn groupForward(
     }
 
     var final_w: [max_rows]u16 = sorted_w;
-    var probe: ?hy4_plan.Probe = null;
-    if (m.plans != null) {
-        if (hy4_plan.joinedGroupsProbe(m, sorted_reqs[0..n], sorted_w[0..n])) |exact_pr| {
-            probe = exact_pr;
-        } else {
+    const use_narrow = m.plans != null;
+    if (use_narrow) {
+        var total_sorted: usize = 0;
+        for (sorted_w[0..n]) |w| total_sorted += w;
+        const cap_w = @import("hy4_forward.zig").groupRows(@as(usize, m.config.dfly.draft), cap, n);
+        if (total_sorted > cap or sorted_w[0] > cap_w) {
             var templates: [20][max_rows]u16 = undefined;
             const n_tpl = hy4_plan.groupWidthTemplates(@as(usize, m.config.dfly.draft), cap, n, &templates);
-            var allowed: [20]bool = @splat(false);
-            var tpl_probes: [20]?hy4_plan.Probe = @splat(null);
-            for (0..n_tpl) |ti| {
-                if (hy4_plan.joinedGroupsProbe(m, sorted_reqs[0..n], templates[ti][0..n])) |pr| {
-                    allowed[ti] = true;
-                    tpl_probes[ti] = pr;
-                }
-            }
+            var allowed: [20]bool = @splat(true);
             const allow_plain = !@import("builtin").is_test and !any_forced;
             if (pickPlannedTemplate(
                 n,
@@ -554,7 +548,6 @@ fn groupForward(
                 allow_plain,
             )) |best_ti| {
                 @memcpy(final_w[0..n], templates[best_ti][0..n]);
-                probe = tpl_probes[best_ti];
             } else {
                 if (any_forced or @import("builtin").is_test) noteGroupsRefused(sorted_w[0..n]);
                 return plainBatchedForward(sch, allocator, xfm, next_tokens, ctxs, allow_plain, draft_ms);
@@ -597,16 +590,16 @@ fn groupForward(
 
     const GemmScope = @import("sushi_exl3").linear.GemmScope;
     var timer = @import("../io_util.zig").Stopwatch.init(sch.io);
-    if (probe) |pr| try hy4_plan.beginJoinedGroups(m, pr);
+    if (use_narrow) try hy4_plan.beginJoinedGroups(m);
     const scope = GemmScope.begin() catch |e| {
-        if (probe != null) @import("../tensor/core.zig").abortExecution();
+        if (use_narrow) @import("../tensor/core.zig").abortNarrow();
         return e;
     };
     if (xfm.expert_stream) |engine| engine.beginForward();
     const joined = m.extendGroups(groups[0..n]) catch |e| {
         if (xfm.expert_stream) |engine| engine.finishForward(total_rows);
         scope.end();
-        if (probe != null) @import("../tensor/core.zig").abortExecution();
+        if (use_narrow) @import("../tensor/core.zig").abortNarrow();
         return e;
     };
     if (xfm.expert_stream) |engine| engine.finishForward(total_rows);
@@ -622,14 +615,14 @@ fn groupForward(
         views_perm[k] = hy4_model.writeGroupBlock(g.request, joined, @intCast(start), @intCast(start + w_k), m.logits_rows, xfm.s) catch |e| {
             _ = mlx.mlx_array_free(joined);
             scope.end();
-            if (probe != null) @import("../tensor/core.zig").abortExecution();
+            if (use_narrow) @import("../tensor/core.zig").abortNarrow();
             return e;
         };
         start += w_k;
     }
     _ = mlx.mlx_array_free(joined);
     scope.end();
-    if (probe) |pr| try hy4_plan.endJoinedGroups(m, pr, groups[0..n]);
+    if (use_narrow) try hy4_plan.endJoinedGroups(m, groups[0..n]);
 
     // Map permuted slot outputs back to original slot indices so `batch.*` and `out` preserve slot order.
     var inv_perm: [max_rows]usize = undefined;
@@ -768,28 +761,28 @@ fn plainBatchedForward(
     if (m.plans != null) {
         const core = @import("../tensor/core.zig");
         const GemmScope = @import("sushi_exl3").linear.GemmScope;
-        const probe = try @import("hy4_plan.zig").beginJoined(m, segs[0..ctxs.len]);
+        try @import("hy4_plan.zig").beginJoined(m, segs[0..ctxs.len]);
         const scope = GemmScope.begin() catch |e| {
-            core.abortExecution();
+            core.abortNarrow();
             return e;
         };
         if (xfm.expert_stream) |engine| engine.beginForward();
         const joined = m.extendRows(segs[0..ctxs.len]) catch |e| {
             if (xfm.expert_stream) |engine| engine.finishForward(ctxs.len);
             scope.end();
-            core.abortExecution();
+            core.abortNarrow();
             return e;
         };
         if (xfm.expert_stream) |engine| engine.finishForward(ctxs.len);
         const out = rowsIntoRequests(allocator, joined, segs[0..ctxs.len], m.logits_rows, xfm.s) catch |e| {
             _ = mlx.mlx_array_free(joined);
             scope.end();
-            core.abortExecution();
+            core.abortNarrow();
             return e;
         };
         _ = mlx.mlx_array_free(joined);
         scope.end();
-        try @import("hy4_plan.zig").endJoined(m, probe, segs[0..ctxs.len]);
+        try @import("hy4_plan.zig").endJoined(m, segs[0..ctxs.len]);
         if (observe_plain_gate) {
             try mlx.check(mlx.mlx_array_eval(out[out.len - 1]));
             const ms: f64 = @as(f64, @floatFromInt(plain_timer.read())) / 1e6;
