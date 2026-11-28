@@ -6186,7 +6186,8 @@ test "dsv41 metallib: FC specs resolve valid parameters, reject OOB, and hold PS
         .{ .name = "MODE", .value = .{ .int = 0 } },
     };
     try testing.expect(catalog.resolve("dsv41_attn_fused_fp4", &fus_ins, &.{.bfloat16}, &fus_ok, &res));
-    try checkPso(dev, lib, &res, min_threads);
+    // An M1 Max grants the fused FP4 core 384 threads a group: without matrix units it is held to what its launch asks.
+    try checkPso(dev, lib, &res, if (nax_gate.verifyQmmNaxAvailable()) min_threads else fused_nsg * 32);
     for ([_][2]i32{ .{ 576, 16 }, .{ 32, 16 }, .{ 512, 4 } }) |bad| {
         var targs = fus_ok;
         targs[0].value = .{ .int = bad[0] };

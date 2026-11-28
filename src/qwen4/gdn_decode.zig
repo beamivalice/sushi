@@ -899,6 +899,7 @@ test "gdn recur FC: TL > 9 resolves via sushi.metallib and matches serial decode
     if (fk.ctx == null) return error.MetalKernelCompileFailed;
     defer _ = mlx.mlx_fast_metal_kernel_free(fk);
 
+    var fold_noted = false;
     for (cases) |tc| {
         const tl = tc.tl;
         const tlu: usize = @intCast(tl);
@@ -1039,7 +1040,18 @@ test "gdn recur FC: TL > 9 resolves via sushi.metallib and matches serial decode
         defer _ = mlx.mlx_vector_array_free(v13);
         var f_out = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(f_out);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&f_out, fk, v13, fcfg, s));
+        // A GPU that grants the fold fewer than FOLD_NT threads a group is not served it (`stepFold` declines the
+        // launch there, as an M1 Max's 832 does): the two recurrence kernels are held above, the fold's part said.
+        mlx.expected_refusal = "Thread group size";
+        const fold_rc = mlx.mlx_fast_metal_kernel_apply(&f_out, fk, v13, fcfg, s);
+        mlx.expected_refusal = null;
+        if (fold_rc != 0) {
+            if (!mlx.takeErrorIf("Thread group size")) return error.MlxError;
+            try testing.expectEqual(mlx_before, mlx.engine.mlxCalls());
+            if (!fold_noted) @import("../test_note.zig").notePartSkipped("the verify fold: this GPU grants it fewer than 1,024 threads a group");
+            fold_noted = true;
+            continue;
+        }
         var f_gated = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f_gated);
         var f_conv = mlx.mlx_array_new();

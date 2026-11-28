@@ -434,7 +434,10 @@ parameters rather than `.ct_int` / `.ct_bool` build-time sweeps ([sushi.metallib
   silent truncation.
 - **Check PSO occupancy and TG SRAM on every converted kernel.** Static `threadgroup` memory must stay `<= 16 KiB` (or
   use a small `.ct_int` capacity bucket like `CAP ∈ {2, 4, 9}` when smaller TG SRAM preserves wave overlap); verify every
-  specialized PSO holds `maxTotalThreadsPerThreadgroup = 1024` on M3+/M5 and keeps `>= 640`-thread headroom on M1–M4.
+  specialized PSO holds `maxTotalThreadsPerThreadgroup = 1024` on M3+/M5. An M1 Max grants less, by kernel: 640 or more
+  where a launch may ask it, and 384 to 576 for the 256-thread kernels (QSA's split core, the FP8 block gemvs, the
+  gathered down-reduce, DeepSeek's fused FP4 attention). The rule there is the launch's own width, measured on the chip:
+  a rehearsal as another GPU (`MLX_METAL_GPU_ARCH`) does not show its grants.
 
 ## Proving a kernel
 

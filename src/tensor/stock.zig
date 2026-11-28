@@ -1604,6 +1604,9 @@ test "stock metallib: shared SIMD FC specs resolve valid parameters, reject OOB,
     const catalog = @import("../metallib_catalog.zig");
     const has_nax = @import("sushi_exl3").device.current().has(.matrix_g17);
     const min_threads: usize = if (has_nax) 1024 else 640;
+    // Kernels whose launches ask at most 256 threads a group (QSA's split core, the FP8 block gemvs, the gathered
+    // down-reduce): an M1 Max grants them 384 to 576, so a GPU without matrix units holds them to what they ask.
+    const min_narrow: usize = if (has_nax) 1024 else 256;
 
     const checkPso = struct {
         fn run(d: *const metal.Device, lib_h: metal.Library, r: *const catalog.Resolved, floor: usize) !void {
@@ -1823,14 +1826,14 @@ test "stock metallib: shared SIMD FC specs resolve valid parameters, reject OOB,
         var t = qsplit_ok;
         t[5] = .{ .name = "BITS", .value = .{ .int = bits } };
         try testing.expect(catalog.resolve("sushi_attn_qsa256_qsplit", &qsplit_ins, &.{ .float32, .float32 }, &t, &res));
-        try checkPso(dev, l, &res, min_threads);
+        try checkPso(dev, l, &res, min_narrow);
     }
     var qsplit_bk32 = qsplit_ok;
     qsplit_bk32[3] = .{ .name = "BK", .value = .{ .int = 32 } };
     qsplit_bk32[8] = .{ .name = "DK", .value = .{ .int = 64 } };
     qsplit_bk32[9] = .{ .name = "DV", .value = .{ .int = 64 } };
     try testing.expect(catalog.resolve("sushi_attn_qsa256_qsplit", &qsplit_ins, &.{ .float32, .float32 }, &qsplit_bk32, &res));
-    try checkPso(dev, l, &res, min_threads);
+    try checkPso(dev, l, &res, min_narrow);
     for ([_][4]i32{ .{ 5, 64, 256, 256 }, .{ 8, 64, 320, 256 }, .{ 8, 64, 256, 264 }, .{ 8, 12, 256, 256 }, .{ 8, 64, 252, 256 } }) |bad| {
         const targs = [_]catalog.RuntimeTarg{
             .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
@@ -1869,7 +1872,7 @@ test "stock metallib: shared SIMD FC specs resolve valid parameters, reject OOB,
         .{ .name = "VSB", .value = .{ .int = 0 } },
     };
     try testing.expect(catalog.resolve("sushi_fp8_block_gemv", &fp8_ins, &.{.bfloat16}, &fp8_ok, &res));
-    try checkPso(dev, l, &res, min_threads);
+    try checkPso(dev, l, &res, min_narrow);
     const fp8_bad_m = [_]catalog.RuntimeTarg{
         .{ .name = "M", .value = .{ .int = 9 } },
         .{ .name = "NR", .value = .{ .int = 2 } },
@@ -1903,7 +1906,7 @@ test "stock metallib: shared SIMD FC specs resolve valid parameters, reject OOB,
         .{ .name = "VSB", .value = .{ .int = 0 } },
     };
     try testing.expect(catalog.resolve("sushi_fp8_block_gemv_staged", &fp8_ins, &.{.bfloat16}, &fp8_st_ok, &res));
-    try checkPso(dev, l, &res, min_threads);
+    try checkPso(dev, l, &res, min_narrow);
     var fp8_st_bad = fp8_st_ok;
     fp8_st_bad[0] = .{ .name = "M", .value = .{ .int = 17 } };
     try testing.expect(!catalog.resolve("sushi_fp8_block_gemv_staged", &fp8_ins, &.{.bfloat16}, &fp8_st_bad, &res));
@@ -1929,7 +1932,7 @@ test "stock metallib: shared SIMD FC specs resolve valid parameters, reject OOB,
         .{ .name = "KP", .value = .{ .int = 256 } },
     };
     try testing.expect(catalog.resolve("sushi_moe_gather_qmv_downred", &dr_ins, &.{.bfloat16}, &dr_ok, &res));
-    try checkPso(dev, l, &res, min_threads);
+    try checkPso(dev, l, &res, min_narrow);
     var dr_bad = dr_ok;
     dr_bad[2] = .{ .name = "BITS", .value = .{ .int = 5 } };
     try testing.expect(!catalog.resolve("sushi_moe_gather_qmv_downred", &dr_ins, &.{.bfloat16}, &dr_bad, &res));
