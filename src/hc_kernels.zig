@@ -25,8 +25,7 @@ fn ci(v: usize) c_int {
 
 /// A mix's index into the three scales (pre, post, comb) the checkpoint ships.
 pub const HC_HEADER =
-    \\template <int HC>
-    \\inline int dsv41_scale_at(int m) { return m < HC ? 0 : (m < 2 * HC ? 1 : 2); }
+    \\inline int dsv41_scale_at(int m, int hc) { return m < hc ? 0 : (m < 2 * hc ? 1 : 2); }
 ;
 
 /// `hcMixes`' projection: per row, the mixing logits of the flattened stream, rms-scaled, times scale plus base.
@@ -38,32 +37,49 @@ pub const HC_MIX_SOURCE =
     \\const int m0 = threadgroup_position_in_grid.x * M, l0 = threadgroup_position_in_grid.y * R;
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int N = fn_shape[1], MIX = fn_shape[0], L = x_shape[0];
-    \\float d[R][M], ss[R];
-    \\for (int r = 0; r < R; ++r) { ss[r] = 0.0f; for (int j = 0; j < M; ++j) d[r][j] = 0.0f; }
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int R_CAP = 4;
+    \\constexpr int M_CAP = 12;
+    \\#else
+    \\constexpr int R_CAP = R;
+    \\constexpr int M_CAP = M;
+    \\#endif
+    \\float d[R_CAP][M_CAP], ss[R_CAP];
+    \\#pragma clang loop unroll(full)
+    \\for (int r = 0; r < R_CAP; ++r) {
+    \\  if (r >= R) break;
+    \\  ss[r] = 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int j = 0; j < M_CAP; ++j) { if (j >= M) break; d[r][j] = 0.0f; }
+    \\}
     \\for (int k = tid; k < N; k += TG) {
-    \\  float fv[M];
+    \\  float fv[M_CAP];
     \\  #pragma clang loop unroll(full)
-    \\  for (int j = 0; j < M; ++j) fv[j] = fn[size_t(m0 + j) * N + k];
+    \\  for (int j = 0; j < M_CAP; ++j) { if (j >= M) break; fv[j] = fn[size_t(m0 + j) * N + k]; }
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; ++r) {
+    \\  for (int r = 0; r < R_CAP; ++r) {
+    \\    if (r >= R) break;
     \\    const float v = l0 + r < L ? float(x[size_t(l0 + r) * N + k]) : 0.0f;
     \\    #pragma clang loop unroll(full)
-    \\    for (int j = 0; j < M; ++j) d[r][j] = metal::fma(v, fv[j], d[r][j]);
+    \\    for (int j = 0; j < M_CAP; ++j) { if (j >= M) break; d[r][j] = metal::fma(v, fv[j], d[r][j]); }
     \\    ss[r] = metal::fma(v, v, ss[r]);
     \\  }
     \\}
-    \\threadgroup float t_d[R][M][32], t_s[R][32];
-    \\for (int r = 0; r < R; ++r) {
-    \\  for (int j = 0; j < M; ++j) { const float v = metal::simd_sum(d[r][j]); if (lane == 0) t_d[r][j][sg] = v; }
+    \\threadgroup float t_d[R_CAP][M_CAP][32], t_s[R_CAP][32];
+    \\#pragma clang loop unroll(full)
+    \\for (int r = 0; r < R_CAP; ++r) {
+    \\  if (r >= R) break;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int j = 0; j < M_CAP; ++j) { if (j >= M) break; const float v = metal::simd_sum(d[r][j]); if (lane == 0) t_d[r][j][sg] = v; }
     \\  const float v = metal::simd_sum(ss[r]);
     \\  if (lane == 0) t_s[r][sg] = v;
     \\}
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (tid < R * M) {
-    \\  const int r = tid / M, j = tid % M;
+    \\if (int(tid) < R * M) {
+    \\  const int r = int(tid) / M, j = int(tid) % M;
     \\  float a = 0.0f, b = 0.0f;
     \\  for (int g = 0; g < TG / 32; ++g) { a += t_d[r][j][g]; b += t_s[r][g]; }
-    \\  if (l0 + r < L) z[(l0 + r) * MIX + m0 + j] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[dsv41_scale_at<HC>(m0 + j)] + base[m0 + j];
+    \\  if (l0 + r < L) z[(l0 + r) * MIX + m0 + j] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[dsv41_scale_at(m0 + j, HC)] + base[m0 + j];
     \\}
 ;
 
@@ -122,7 +138,7 @@ pub const HC_MIX_NAX_SOURCE =
     \\  const int r = tid / MIXN, j = tid % MIXN;
     \\  float a = 0.0f, b = 0.0f;
     \\  for (int g = 0; g < NSG; ++g) { a += t_d[g][r][j]; b += t_s[g][r]; }
-    \\  if (l0 + r < L) z[(l0 + r) * MIX + j] = (a * (1.0f / 1024.0f)) * metal::precise::rsqrt(b / float(NK) + eps[0]) * scale[dsv41_scale_at<HC>(j)] + base[j];
+    \\  if (l0 + r < L) z[(l0 + r) * MIX + j] = (a * (1.0f / 1024.0f)) * metal::precise::rsqrt(b / float(NK) + eps[0]) * scale[dsv41_scale_at(j, HC)] + base[j];
     \\}
 ;
 
@@ -137,16 +153,26 @@ const HC_STAGE_HEAD =
     \\const int l = threadgroup_position_in_grid.y;
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int D = x_shape[2], N = fn_shape[1];
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int HC_CAP = 4;
+    \\constexpr int ND_CAP = 32;
+    \\#else
+    \\constexpr int HC_CAP = HC;
+    \\constexpr int ND_CAP = ND;
+    \\#endif
     \\threadgroup float t_a[32], t_b[32];
     \\const device auto* xr = x + size_t(l) * HC * D;
-    \\float v[HC][ND];
+    \\float v[HC_CAP][ND_CAP];
     \\
 ;
 
 const HC_STAGE_LOOP =
-    \\for (int c = 0; c < ND; ++c) {
+    \\#pragma clang loop unroll(full)
+    \\for (int c = 0; c < ND_CAP; ++c) {
+    \\  if (c >= ND) break;
     \\  const int d = int(tid) + c * TG;
-    \\  for (int i = 0; i < HC; ++i) v[i][c] = 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < HC_CAP; ++i) { if (i >= HC) break; v[i][c] = 0.0f; }
 ;
 
 /// The collapse weights are `cpre`.
@@ -164,7 +190,7 @@ const HC_COEF_ARRAYS = HC_COEF_PLAIN ++
 
 /// The previous mixes `za` arrive unsplit: simdgroup 0 splits them into threadgroup memory.
 const HC_COEF_Z =
-    \\threadgroup float t_pre[HC], t_post[HC], t_comb[HC * HC];
+    \\threadgroup float t_pre[HC_CAP], t_post[HC_CAP], t_comb[HC_CAP * HC_CAP];
     \\#define HC_PRE(j) t_pre[(j)]
     \\#define HC_POST(i) t_post[(i)]
     \\#define HC_COMB(j, i) t_comb[(j) * HC + (i)]
@@ -181,19 +207,26 @@ const HC_COEF_Z =
 
 /// The stream is `x` itself.
 const HC_STAGE_LOAD_PLAIN =
-    \\  if (d < D) for (int i = 0; i < HC; ++i) v[i][c] = float(xr[i * D + d]);
+    \\  if (d < D) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < HC_CAP; ++i) { if (i >= HC) break; v[i][c] = float(xr[i * D + d]); }
+    \\  }
     \\}
 ;
 
 /// The stream is `hcExpand(x, y, previous split)`, rounded to T where the expand rounds it.
 const HC_STAGE_LOAD_EXPAND =
     \\  if (d < D) {
-    \\    float sv[HC];
-    \\    for (int j = 0; j < HC; ++j) sv[j] = float(xr[j * D + d]);
+    \\    float sv[HC_CAP];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int j = 0; j < HC_CAP; ++j) { if (j >= HC) break; sv[j] = float(xr[j * D + d]); }
     \\    const float yv = float(y[size_t(l) * D + d]);
-    \\    for (int i = 0; i < HC; ++i) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < HC_CAP; ++i) {
+    \\      if (i >= HC) break;
     \\      float acc = 0.0f;
-    \\      for (int j = 0; j < HC; ++j) acc = metal::fma(HC_COMB(j, i), sv[j], acc);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < HC_CAP; ++j) { if (j >= HC) break; acc = metal::fma(HC_COMB(j, i), sv[j], acc); }
     \\      const T o = T(metal::fma(HC_POST(i), yv, acc));
     \\      v[i][c] = float(o);
     \\      if (role == 0) x1[(size_t(l) * HC + i) * D + d] = o;
@@ -204,14 +237,17 @@ const HC_STAGE_LOAD_EXPAND =
 
 const HC_STAGE_TAIL =
     \\if (role == 0) {
-    \\  float cp[HC];
-    \\  for (int j = 0; j < HC; ++j) cp[j] = HC_PRE(j);
-    \\  float ss = 0.0f;
-    \\  T hv[ND];
+    \\  float cp[HC_CAP];
     \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
+    \\  for (int j = 0; j < HC_CAP; ++j) { if (j >= HC) break; cp[j] = HC_PRE(j); }
+    \\  float ss = 0.0f;
+    \\  T hv[ND_CAP];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int c = 0; c < ND_CAP; ++c) {
+    \\    if (c >= ND) break;
     \\    float h = 0.0f;
-    \\    for (int j = 0; j < HC; ++j) h += cp[j] * v[j][c];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int j = 0; j < HC_CAP; ++j) { if (j >= HC) break; h += cp[j] * v[j][c]; }
     \\    hv[c] = T(h);
     \\    ss += float(hv[c]) * float(hv[c]);
     \\  }
@@ -222,7 +258,8 @@ const HC_STAGE_TAIL =
     \\  for (int g = 0; g < TG / 32; ++g) tot += t_a[g];
     \\  const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
     \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
+    \\  for (int c = 0; c < ND_CAP; ++c) {
+    \\    if (c >= ND) break;
     \\    const int d = int(tid) + c * TG;
     \\    if (d < D) h_out[size_t(l) * D + d] = w[d] * T(float(hv[c]) * inv);
     \\  }
@@ -232,21 +269,24 @@ const HC_STAGE_TAIL =
     \\const device float* fr = fn + size_t(m) * N;
     \\float dd = 0.0f, sq = 0.0f;
     \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < HC; ++i)
+    \\for (int i = 0; i < HC_CAP; ++i) {
+    \\  if (i >= HC) break;
     \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
+    \\  for (int c = 0; c < ND_CAP; ++c) {
+    \\    if (c >= ND) break;
     \\    const int d = int(tid) + c * TG;
     \\    const float u = v[i][c];
     \\    if (d < D) dd = metal::fma(u, fr[i * D + d], dd);
     \\    sq = metal::fma(u, u, sq);
     \\  }
+    \\}
     \\dd = metal::simd_sum(dd); sq = metal::simd_sum(sq);
     \\if (lane == 0) { t_a[sg] = dd; t_b[sg] = sq; }
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\if (tid == 0) {
     \\  float a = 0.0f, b = 0.0f;
     \\  for (int g = 0; g < TG / 32; ++g) { a += t_a[g]; b += t_b[g]; }
-    \\  z[l * ((2 + HC) * HC) + m] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[dsv41_scale_at<HC>(m)] + base[m];
+    \\  z[l * ((2 + HC) * HC) + m] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[dsv41_scale_at(m, HC)] + base[m];
     \\}
 ;
 
@@ -382,19 +422,24 @@ pub fn stage(s: mlx.mlx_stream, dt: mlx.mlx_dtype, x: A, ex: ?HcExpand, cpre: A,
     const D = dim(x, 2);
     const mix = dim(hw.fn_w, 0);
     const tg = hc_tg;
+    const nd = (D + tg - 1) / tg;
+    if (hc == 0 or hc > 4 or nd == 0 or nd > 32 or tg < 32 or tg > 1024 or tg % 32 != 0) return error.UnsupportedHcGeometry;
     var o: [3]A = undefined;
     const outs3 = [_]OutSpec{
         .{ .shape = &.{ ci(L), ci(D) }, .dt = dt },
         .{ .shape = &.{ ci(L), ci(mix) }, .dt = .float32 },
         .{ .shape = mlx.getShape(x), .dt = dt },
     };
-    const ints = [_]Tmpl{ .{ .name = "TG", .v = ci(tg) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ND", .v = ci((D + tg - 1) / tg) } };
+    const ints = [_]Tmpl{ .{ .name = "TG", .v = ci(tg) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ND", .v = ci(nd) } };
     const dts = [_]TDtype{.{ .name = "T", .dt = dt }};
     if (ex) |e| {
         const grid: Grid = .{ (mix + 1) * tg, L, 1 };
         switch (e.prev) {
             .split => |sp| try launch(s, &hc_stage_x_def, &.{ x, e.y, sp.post, sp.comb, sp.pre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &ints, &dts, &o),
-            .z => |p| try launch(s, &hc_stage_z_def, &.{ x, e.y, p.z, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &(ints ++ [_]Tmpl{.{ .name = "ITERS", .v = ci(p.iters) }}), &dts, &o),
+            .z => |p| {
+                if (p.iters == 0) return error.UnsupportedHcGeometry;
+                try launch(s, &hc_stage_z_def, &.{ x, e.y, p.z, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &(ints ++ [_]Tmpl{.{ .name = "ITERS", .v = ci(p.iters) }}), &dts, &o);
+            },
         }
         return .{ .h = o[0], .z = o[1], .x1 = o[2] };
     }
@@ -419,8 +464,8 @@ pub fn mixTiled(s: mlx.mlx_stream, x: A, hw: HcWeights, eps: A, tile: HcMixTile)
     const L = dim(x, 0);
     const hc = dim(x, 1);
     const mix = dim(hw.fn_w, 0);
-    const cols = if (mix % tile.cols == 0) tile.cols else 1;
-    std.debug.assert(tile.rows * cols <= hc_tg);
+    const cols = if (tile.cols != 0 and mix % tile.cols == 0) tile.cols else 1;
+    if (tile.rows == 0 or tile.rows > 4 or cols == 0 or cols > 12 or hc == 0 or hc > 8 or hc_tg < 32 or hc_tg % 32 != 0 or tile.rows * cols > hc_tg) return error.UnsupportedHcGeometry;
     var o: [1]A = undefined;
     try launch(s, &hc_mix_def, &.{ x, hw.fn_w, hw.scale, hw.base, eps }, &.{.{ .shape = &.{ ci(L), ci(mix) }, .dt = .float32 }}, .{ mix / cols * hc_tg, (L + tile.rows - 1) / tile.rows, 1 }, .{ hc_tg, 1, 1 }, &.{
         .{ .name = "TG", .v = ci(hc_tg) }, .{ .name = "R", .v = ci(tile.rows) }, .{ .name = "M", .v = ci(cols) }, .{ .name = "HC", .v = ci(hc) },
@@ -622,8 +667,8 @@ pub fn mixExpandIdentity(s: mlx.mlx_stream, h: A, y: A, post: A, hw: HcWeights, 
     const L = dim(h, 0);
     const hc = dim(h, 1);
     const mix = dim(hw.fn_w, 0);
-    const cols = if (mix % tile.cols == 0) tile.cols else 1;
-    std.debug.assert(tile.rows * cols <= hc_tg);
+    const cols = if (tile.cols != 0 and mix % tile.cols == 0) tile.cols else 1;
+    if (tile.rows == 0 or tile.rows > 4 or cols == 0 or cols > 12 or hc == 0 or hc > 8 or hc_tg < 32 or hc_tg % 32 != 0 or tile.rows * cols > hc_tg) return error.UnsupportedHcGeometry;
     var o: [2]A = undefined;
     try launch(s, &hc_ident_mix_expand_def, &.{ h, y, post, hw.fn_w, hw.scale, hw.base, eps }, &.{
         .{ .shape = mlx.getShape(h), .dt = .float32 },

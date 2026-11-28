@@ -197,21 +197,30 @@ pub const IDX_SCORE_FIRST =
 ;
 
 pub const IDX_SCORE_SECOND =
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int IH_CAP = 64;
+    \\threadgroup float qs[QS_CAP];
+    \\#else
+    \\constexpr int IH_CAP = IH;
     \\threadgroup float qs[IH * IHD];
-    \\for (uint k = tid; k < IH * IHD; k += tgn) qs[k] = float(q[l * IH * IHD + k]);
+    \\#endif
+    \\for (uint k = tid; k < uint(IH * IHD); k += tgn) qs[k] = float(q[l * IH * IHD + k]);
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\if (n >= nb) return;
-    \\float dots[IH];
-    \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
+    \\float dots[IH_CAP];
+    \\#pragma clang loop unroll(full)
+    \\for (int h = 0; h < IH_CAP; ++h) { if (h >= IH) break; dots[h] = 0.0f; }
 ;
 
 pub const IDX_SCORE_DOT =
     \\for (int j = 0; j < IHD; ++j) {
     \\  const float kv = KEY(j);
-    \\  for (int h = 0; h < IH; ++h) dots[h] += qs[h * IHD + j] * kv;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int h = 0; h < IH_CAP; ++h) { if (h >= IH) break; dots[h] += qs[h * IHD + j] * kv; }
     \\}
     \\float s = 0.0f;
-    \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
+    \\#pragma clang loop unroll(full)
+    \\for (int h = 0; h < IH_CAP; ++h) { if (h >= IH) break; s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f); }
 ;
 
 /// `IDX_SCORE_SECOND` with q in four-wide rows, for `IDX_SCORE_DOT4`.
@@ -275,33 +284,43 @@ pub const IDX_TILE_SOURCE =
     \\  for (int n = n0 + int(tid); n < end; n += 128) scores[size_t(l) * nb + n] = -INFINITY;
     \\  return;
     \\}
-    \\constexpr int RT = IH / 8, CT = KT / 32, C4 = IHD / 4;
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int IH_CAP = 64, IHD_CAP = 128, RT_CAP = IH_CAP / 8;
+    \\#else
+    \\constexpr int IH_CAP = IH, IHD_CAP = IHD, RT_CAP = IH / 8;
+    \\#endif
+    \\const int RT = IH / 8, C4 = IHD / 4;
+    \\constexpr int CT = KT / 32;
     \\using T4 = metal::vec<T, 4>;
-    \\threadgroup T kt[KT * IHD];
-    \\threadgroup float wt[IH], red[4][64];
-    \\for (uint i = tid; i < KT * C4; i += 128) {
-    \\  const int n = n0 + int(i / C4);
-    \\  ((threadgroup T4*)kt)[i] = n < nb ? ((const device T4*)keys)[size_t(n) * C4 + i % C4] : T4(0);
+    \\threadgroup T kt[KT * IHD_CAP];
+    \\threadgroup float wt[IH_CAP], red[4][64];
+    \\for (uint i = tid; i < uint(KT * C4); i += 128) {
+    \\  const int n = n0 + int(i / uint(C4));
+    \\  ((threadgroup T4*)kt)[i] = n < nb ? ((const device T4*)keys)[size_t(n) * C4 + i % uint(C4)] : T4(0);
     \\}
-    \\if (tid < IH) wt[tid] = float(w[size_t(l) * IH + tid]) * wsc[0];
+    \\if (int(tid) < IH) wt[tid] = float(w[size_t(l) * IH + tid]) * wsc[0];
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\const device T* qr = q + size_t(l) * IH * IHD;
     \\const threadgroup T* kr = kt + sg * (KT / 4) * IHD;
-    \\metal::simdgroup_matrix<float, 8, 8> acc[RT][CT];
+    \\metal::simdgroup_matrix<float, 8, 8> acc[RT_CAP][CT];
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r)
+    \\for (int r = 0; r < RT_CAP; ++r) {
+    \\  if (r >= RT) break;
     \\  #pragma clang loop unroll(full)
     \\  for (int c = 0; c < CT; ++c) acc[r][c] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\}
     \\for (int d = 0; d < IHD; d += 8) {
-    \\  metal::simdgroup_matrix<T, 8, 8> a[RT], b[CT];
+    \\  metal::simdgroup_matrix<T, 8, 8> a[RT_CAP], b[CT];
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r) metal::simdgroup_load(a[r], qr + r * 8 * IHD + d, IHD);
+    \\  for (int r = 0; r < RT_CAP; ++r) { if (r >= RT) break; metal::simdgroup_load(a[r], qr + r * 8 * IHD + d, IHD); }
     \\  #pragma clang loop unroll(full)
     \\  for (int c = 0; c < CT; ++c) metal::simdgroup_load(b[c], kr + c * 8 * IHD + d, IHD, metal::ulong2(0, 0), true);
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r)
+    \\  for (int r = 0; r < RT_CAP; ++r) {
+    \\    if (r >= RT) break;
     \\    #pragma clang loop unroll(full)
     \\    for (int c = 0; c < CT; ++c) metal::simdgroup_multiply_accumulate(acc[r][c], a[r], b[c], acc[r][c]);
+    \\  }
     \\}
     \\// A finished tile's rows are heads: relu, weight and sum them through this simdgroup's scratch.
     \\// Threadgroup barriers: on M1 a simdgroup barrier let lanes read the scratch before the store landed.
@@ -310,17 +329,20 @@ pub const IDX_TILE_SOURCE =
     \\#pragma clang loop unroll(full)
     \\for (int c = 0; c < CT; ++c) s[c] = 0.0f;
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r)
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < CT; ++c) {
-    \\    metal::simdgroup_store(acc[r][c], red[sg], 8);
-    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\    float p = metal::max(red[sg][row * 8 + col], 0.0f) * wt[r * 8 + row] + metal::max(red[sg][(row + 1) * 8 + col], 0.0f) * wt[r * 8 + row + 1];
-    \\    p += metal::simd_shuffle_xor(p, 8);
-    \\    p += metal::simd_shuffle_xor(p, 16);
-    \\    s[c] += p;
-    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\for (int r = 0; r < RT_CAP; ++r) {
+    \\  if (r < RT) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int c = 0; c < CT; ++c) {
+    \\      metal::simdgroup_store(acc[r][c], red[sg], 8);
+    \\      metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\      float p = metal::max(red[sg][row * 8 + col], 0.0f) * wt[r * 8 + row] + metal::max(red[sg][(row + 1) * 8 + col], 0.0f) * wt[r * 8 + row + 1];
+    \\      p += metal::simd_shuffle_xor(p, 8);
+    \\      p += metal::simd_shuffle_xor(p, 16);
+    \\      s[c] += p;
+    \\      metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    }
     \\  }
+    \\}
     \\if (lane < 8)
     \\  for (int c = 0; c < CT; ++c) {
     \\    const int n = n0 + int(sg) * (KT / 4) + c * 8 + col;
@@ -518,13 +540,22 @@ pub fn indexKeyTile(dt: mlx.mlx_dtype) usize {
 
 /// Whether `indexScoresTile` serves `ih` heads of `ihd` channels (the matrix tiles need multiples of 8).
 pub fn indexTileFits(ih: usize, ihd: usize, nb: usize) bool {
-    return nb > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0 and ihd % 4 == 0;
+    return nb > 0 and ih >= 8 and ih <= 64 and ih % 8 == 0 and ihd >= 8 and ihd <= 128 and ihd % 8 == 0;
+}
+
+/// Threadgroup SRAM bucket for `dsv41_index_scores` (`qs[QS_CAP]`), keeping Hy4 at 8 KiB and DS41/GLM-5 at 16 KiB.
+pub fn indexScoresQsCap(ih: usize, ihd: usize) usize {
+    const elems = ih * ihd;
+    return if (elems <= 2048) 2048 else if (elems <= 4096) 4096 else 8192;
 }
 
 /// Scores `[L, nb]` of `q` `[L, IH, IHD]` (f32) against `keys` `[nb, IHD]`, one thread a key: the decode arm. `w`
 /// `[L, IH]` are the head weights, times `wscale`; a key past the groups row l sees, `(p0 + l + 1) / ratio`, is -inf.
 pub fn indexScores(s: mlx.mlx_stream, q: A, keys: A, w: A, wscale: f32, p0: i32, ratio: usize) !A {
     const L = dim(q, 0);
+    const ih = dim(q, 1);
+    const ihd = dim(q, 2);
+    if (ih == 0 or ih > 64 or ihd == 0 or ihd > 128 or ih * ihd > 8192) return error.UnsupportedIndexGeometry;
     const nb = dim(keys, 0);
     const meta = try ints(&.{ p0, @intCast(ratio) });
     defer _ = mlx.mlx_array_free(meta);
@@ -533,7 +564,7 @@ pub fn indexScores(s: mlx.mlx_stream, q: A, keys: A, w: A, wscale: f32, p0: i32,
     const tg: usize = 256;
     var o: [1]A = undefined;
     try launch(s, &idx_score_def, &.{ q, keys, w, meta, wsc }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + tg - 1) / tg * tg, L, 1 }, .{ tg, 1, 1 }, &.{
-        .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(q, 2)) },
+        .{ .name = "QS_CAP", .v = ci(indexScoresQsCap(ih, ihd)) }, .{ .name = "IH", .v = ci(ih) }, .{ .name = "IHD", .v = ci(ihd) },
     }, &.{.{ .name = "KT", .dt = mlx.mlx_array_dtype(keys) }}, &o);
     return o[0];
 }
@@ -542,7 +573,10 @@ pub fn indexScores(s: mlx.mlx_stream, q: A, keys: A, w: A, wscale: f32, p0: i32,
 /// on, a multiple of the kernel's key tile, so a slice scores the bits the whole list's columns would.
 pub fn indexScoresTile(s: mlx.mlx_stream, q: A, keys: A, w: A, wscale: f32, p0: i32, ratio: usize, key0: usize) !A {
     const L = dim(q, 0);
+    const ih = dim(q, 1);
+    const ihd = dim(keys, 1);
     const nb = dim(keys, 0);
+    if (!indexTileFits(ih, ihd, nb)) return error.UnsupportedIndexGeometry;
     const dt = mlx.mlx_array_dtype(keys);
     const kt = indexKeyTile(dt);
     std.debug.assert(key0 % kt == 0 and mlx.mlx_array_dtype(q) == dt);
@@ -551,7 +585,7 @@ pub fn indexScoresTile(s: mlx.mlx_stream, q: A, keys: A, w: A, wscale: f32, p0: 
     const wsc = try mlx.newData(&[_]f32{wscale}, &.{1}, .float32);
     defer _ = mlx.mlx_array_free(wsc);
     var o: [1]A = undefined;
-    if (dt == .bfloat16 and dim(q, 1) == 32 and dim(keys, 1) == 128 and mlx.engine.isStream(s) and nax_gate.verifyQmmNaxAvailable()) {
+    if (dt == .bfloat16 and ih == 32 and ihd == 128 and mlx.engine.isStream(s) and nax_gate.verifyQmmNaxAvailable()) {
         const it: usize = 4;
         const step = it * 32;
         try launch(s, &idx_tile_nax_def, &.{ q, keys, w, meta, wsc }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + step - 1) / step * 256, (L + 7) / 8, 1 }, .{ 256, 1, 1 }, &.{
@@ -560,7 +594,7 @@ pub fn indexScoresTile(s: mlx.mlx_stream, q: A, keys: A, w: A, wscale: f32, p0: 
         return o[0];
     }
     try launch(s, &idx_tile_def, &.{ q, keys, w, meta, wsc }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + kt - 1) / kt * 128, L, 1 }, .{ 128, 1, 1 }, &.{
-        .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(q, 2)) }, .{ .name = "KT", .v = ci(kt) },
+        .{ .name = "IH", .v = ci(ih) }, .{ .name = "IHD", .v = ci(ihd) }, .{ .name = "KT", .v = ci(kt) },
     }, &.{.{ .name = "T", .dt = dt }}, &o);
     return o[0];
 }

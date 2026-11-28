@@ -18,23 +18,37 @@ pub const SOURCE =
     \\const device uchar* ws = (const device uchar*)w + size_t(out_row) * K + lane * VPT;
     \\const device T* sp = sc + size_t(out_row) * groups + lane / (GS / VPT);
     \\const device T* bp = bi + size_t(out_row) * groups + lane / (GS / VPT);
-    \\const device T* xp[NV];
-    \\for (int v = 0; v < NV; ++v) xp[v] = x + size_t(min(vec0 + uint(v), uint(M - 1))) * K + lane * VPT;
-    \\float result[NV][RPS] = {};
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int NV_CAP = 4;
+    \\#else
+    \\constexpr int NV_CAP = NV;
+    \\#endif
+    \\const device T* xp[NV_CAP];
+    \\#pragma clang loop unroll(full)
+    \\for (int v = 0; v < NV_CAP; ++v) { if (v >= NV) break; xp[v] = x + size_t(min(vec0 + uint(v), uint(M - 1))) * K + lane * VPT; }
+    \\float result[NV_CAP][RPS] = {};
     \\int k = 0;
     \\for (; k < (FAST ? K : K - BLOCK); k += BLOCK) {
-    \\  float xt[NV][VPT];
-    \\  float sums[NV] = {};
-    \\  for (int v = 0; v < NV; ++v) {
+    \\  float xt[NV_CAP][VPT];
+    \\  float sums[NV_CAP] = {};
+    \\  #pragma clang loop unroll(full)
+    \\  for (int v = 0; v < NV_CAP; ++v) {
+    \\    if (v >= NV) break;
+    \\    #pragma clang loop unroll(full)
     \\    for (int i = 0; i < VPT; ++i) { sums[v] += xp[v][i]; xt[v][i] = xp[v][i]; }
     \\  }
+    \\  #pragma clang loop unroll(full)
     \\  for (int row = 0; row < RPS; ++row) {
     \\    uchar codes[VPT];
+    \\    #pragma clang loop unroll(full)
     \\    for (int i = 0; i < VPT; ++i) codes[i] = ws[row * K + i];
     \\    const float scale = sp[row * groups];
     \\    const float bias = bp[row * groups];
-    \\    for (int v = 0; v < NV; ++v) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int v = 0; v < NV_CAP; ++v) {
+    \\      if (v >= NV) break;
     \\      float accum = 0.0f;
+    \\      #pragma clang loop unroll(full)
     \\      for (int i = 0; i < VPT; ++i) accum += xt[v][i] * codes[i];
     \\      result[v][row] += scale * accum + sums[v] * bias;
     \\    }
@@ -42,22 +56,28 @@ pub const SOURCE =
     \\  ws += BLOCK;
     \\  sp += BLOCK / GS;
     \\  bp += BLOCK / GS;
-    \\  for (int v = 0; v < NV; ++v) xp[v] += BLOCK;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int v = 0; v < NV_CAP; ++v) { if (v >= NV) break; xp[v] += BLOCK; }
     \\}
     \\if (!FAST) {
     \\  const int remaining = clamp(K - k - int(lane) * VPT, 0, VPT);
     \\  if (remaining > 0) {
-    \\    float xt[NV][VPT];
-    \\    float sums[NV] = {};
-    \\    for (int v = 0; v < NV; ++v) {
+    \\    float xt[NV_CAP][VPT];
+    \\    float sums[NV_CAP] = {};
+    \\    #pragma clang loop unroll(full)
+    \\    for (int v = 0; v < NV_CAP; ++v) {
+    \\      if (v >= NV) break;
     \\      for (int i = 0; i < remaining; ++i) { sums[v] += xp[v][i]; xt[v][i] = xp[v][i]; }
     \\    }
+    \\    #pragma clang loop unroll(full)
     \\    for (int row = 0; row < RPS; ++row) {
     \\      uchar codes[VPT];
     \\      for (int i = 0; i < remaining; ++i) codes[i] = ws[row * K + i];
     \\      const float scale = sp[row * groups];
     \\      const float bias = bp[row * groups];
-    \\      for (int v = 0; v < NV; ++v) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int v = 0; v < NV_CAP; ++v) {
+    \\        if (v >= NV) break;
     \\        float accum = 0.0f;
     \\        for (int i = 0; i < remaining; ++i) accum += xt[v][i] * codes[i];
     \\        result[v][row] += scale * accum + sums[v] * bias;
@@ -65,7 +85,10 @@ pub const SOURCE =
     \\    }
     \\  }
     \\}
-    \\for (int v = 0; v < NV; ++v) {
+    \\#pragma clang loop unroll(full)
+    \\for (int v = 0; v < NV_CAP; ++v) {
+    \\  if (v >= NV) break;
+    \\  #pragma clang loop unroll(full)
     \\  for (int row = 0; row < RPS; ++row) {
     \\    const float value = simd_sum(result[v][row]);
     \\    if (lane == 0 && vec0 + uint(v) < uint(M)) y[size_t(vec0 + uint(v)) * N + out_row + row] = T(value);
@@ -80,35 +103,62 @@ pub const STREAM_SOURCE =
     \\const int sgi = int(simdgroup_index_in_threadgroup);
     \\const int output0 = (int(threadgroup_position_in_grid.x) * (SPLIT ? SG / 2 : SG) + (SPLIT ? sgi / 2 : sgi)) * O;
     \\const int row0 = SPLIT ? (sgi % 2) * MT : 0;
-    \\float result[MT][O];
-    \\for (int m = 0; m < MT; ++m) for (int o = 0; o < O; ++o) result[m][o] = 0.0f;
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int O_CAP = 4;
+    \\constexpr int MT_CAP = 7;
+    \\#else
+    \\constexpr int O_CAP = O;
+    \\constexpr int MT_CAP = MT;
+    \\#endif
+    \\float result[MT_CAP][O_CAP];
+    \\#pragma clang loop unroll(full)
+    \\for (int m = 0; m < MT_CAP; ++m) {
+    \\  if (m >= MT) break;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int o = 0; o < O_CAP; ++o) { if (o >= O) break; result[m][o] = 0.0f; }
+    \\}
     \\for (int k = 0; k < K; k += 256) {
-    \\  float codes[O][8];
-    \\  float sc[O];
-    \\  float bi[O];
-    \\  for (int o = 0; o < O; ++o) {
+    \\  float codes[O_CAP][8];
+    \\  float sc[O_CAP];
+    \\  float bi[O_CAP];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int o = 0; o < O_CAP; ++o) {
+    \\    if (o >= O) break;
     \\    const device uint8_t* q = reinterpret_cast<const device uint8_t*>(w) + size_t(output0 + o) * K + k + lane * 8;
+    \\    #pragma clang loop unroll(full)
     \\    for (int i = 0; i < 8; ++i) codes[o][i] = float(q[i]);
     \\    const int group = (output0 + o) * (K / GS) + (k + lane * 8) / GS;
     \\    sc[o] = float(scales[group]);
     \\    bi[o] = float(biases[group]);
     \\  }
-    \\  for (int m = 0; m < MT; ++m) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int m = 0; m < MT_CAP; ++m) {
+    \\    if (m >= MT) break;
     \\    if (row0 + m >= M) break;
     \\    const device bfloat16_t* xp = x + (row0 + m) * K + k + lane * 8;
     \\    float xt[8];
     \\    float sum = 0.0f;
+    \\    #pragma clang loop unroll(full)
     \\    for (int i = 0; i < 8; ++i) { sum += xp[i]; xt[i] = xp[i]; }
-    \\    for (int o = 0; o < O; ++o) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int o = 0; o < O_CAP; ++o) {
+    \\      if (o >= O) break;
     \\      float accum = 0.0f;
+    \\      #pragma clang loop unroll(full)
     \\      for (int i = 0; i < 8; ++i) accum += xt[i] * codes[o][i];
     \\      result[m][o] += sc[o] * accum + sum * bi[o];
     \\    }
     \\  }
     \\}
-    \\for (int m = 0; m < MT; ++m) for (int o = 0; o < O; ++o) {
-    \\  const float value = simd_sum(result[m][o]);
-    \\  if (lane == 0 && row0 + m < M) y[(row0 + m) * N + output0 + o] = bfloat16_t(value);
+    \\#pragma clang loop unroll(full)
+    \\for (int m = 0; m < MT_CAP; ++m) {
+    \\  if (m >= MT) break;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int o = 0; o < O_CAP; ++o) {
+    \\    if (o >= O) break;
+    \\    const float value = simd_sum(result[m][o]);
+    \\    if (lane == 0 && row0 + m < M) y[(row0 + m) * N + output0 + o] = bfloat16_t(value);
+    \\  }
     \\}
 ;
 

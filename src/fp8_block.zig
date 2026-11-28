@@ -99,24 +99,48 @@ const GEOMETRY =
     \\
 ;
 
+pub const GEMV_DIRECT_CAP =
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int FP8_M_CAP = 8;
+    \\constexpr int FP8_NR_CAP = 4;
+    \\#else
+    \\constexpr int FP8_M_CAP = M;
+    \\constexpr int FP8_NR_CAP = NR;
+    \\#endif
+    \\
+;
+
+pub const GEMV_STAGED_CAP =
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int FP8_M_CAP = 16;
+    \\constexpr int FP8_NR_CAP = 4;
+    \\#else
+    \\constexpr int FP8_M_CAP = M;
+    \\constexpr int FP8_NR_CAP = NR;
+    \\#endif
+    \\
+;
+
 /// One simdgroup owns NR stored rows for all M input rows.
 pub const GEMV_HEAD = GEOMETRY ++
     \\uint lane = thread_index_in_simdgroup;
     \\uint row0 = (threadgroup_position_in_grid.x * uint(SGS) + simdgroup_index_in_threadgroup) * uint(NR);
-    \\const device uint4* wp[NR];
-    \\uint srow[NR];
+    \\const device uint4* wp[FP8_NR_CAP];
+    \\uint srow[FP8_NR_CAP];
     \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < NR; ++r) {
+    \\for (int r = 0; r < FP8_NR_CAP; ++r) {
+    \\  if (r >= NR) break;
     \\  uint o = metal::min(row0 + uint(r), NROWS - 1u);
     \\  uint rank = o / RPR;
     \\  srow[r] = (rank * uint(BPR) + (o - rank * RPR) / 128u) * KB;
     \\  wp[r] = (const device uint4*)(w + (size_t)o * (size_t)K);
     \\}
-    \\float acc[M][NR];
+    \\float acc[FP8_M_CAP][FP8_NR_CAP];
     \\#pragma clang loop unroll(full)
-    \\for (int m = 0; m < M; ++m) {
+    \\for (int m = 0; m < FP8_M_CAP; ++m) {
+    \\  if (m >= M) break;
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < NR; ++r) acc[m][r] = 0.0f;
+    \\  for (int r = 0; r < FP8_NR_CAP; ++r) { if (r >= NR) break; acc[m][r] = 0.0f; }
     \\}
     \\
 ;
@@ -125,23 +149,25 @@ pub const GEMV_HEAD = GEOMETRY ++
 /// and read x from device memory: the narrow widths.
 pub const GEMV_DIRECT =
     \\for (uint c = lane; c < KC; c += 32u) {
-    \\  uint4 wr[NR];
-    \\  float sc[NR];
+    \\  uint4 wr[FP8_NR_CAP];
+    \\  float sc[FP8_NR_CAP];
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < NR; ++r) {
+    \\  for (int r = 0; r < FP8_NR_CAP; ++r) {
+    \\    if (r >= NR) break;
     \\    wr[r] = wp[r][c];
     \\    sc[r] = scales[srow[r] + (c >> 3)];
     \\  }
     \\  #pragma clang loop unroll(full)
     \\  for (int i = 0; i < 4; ++i) {
-    \\    float4 wv[NR];
+    \\    float4 wv[FP8_NR_CAP];
     \\    #pragma clang loop unroll(full)
-    \\    for (int r = 0; r < NR; ++r) wv[r] = sushi_e4m3_decode4(wr[r][i]) * sc[r];
+    \\    for (int r = 0; r < FP8_NR_CAP; ++r) { if (r >= NR) break; wv[r] = sushi_e4m3_decode4(wr[r][i]) * sc[r]; }
     \\    #pragma clang loop unroll(full)
-    \\    for (int m = 0; m < M; ++m) {
+    \\    for (int m = 0; m < FP8_M_CAP; ++m) {
+    \\      if (m >= M) break;
     \\      float4 xv = float4(*((const device vec<T, 4>*)(x + (size_t)m * (size_t)K + c * 16u + uint(i) * 4u)));
     \\      #pragma clang loop unroll(full)
-    \\      for (int r = 0; r < NR; ++r) acc[m][r] += dot(xv, wv[r]);
+    \\      for (int r = 0; r < FP8_NR_CAP; ++r) { if (r >= NR) break; acc[m][r] += dot(xv, wv[r]); }
     \\    }
     \\  }
     \\}
@@ -151,7 +177,7 @@ pub const GEMV_DIRECT =
 /// x staged per S tiles in threadgroup memory, shared by the SGS*NR rows of
 /// the threadgroup: past a few rows, re-reading x per row outweighs the weight.
 pub const GEMV_STAGED =
-    \\threadgroup float xs[M * 128 * S];
+    \\threadgroup float xs[FP8_M_CAP * 128 * S];
     \\uint tid = simdgroup_index_in_threadgroup * 32u + lane;
     \\for (uint k0 = 0; k0 < uint(K); k0 += 128u * uint(S)) {
     \\  for (uint i = tid; i < uint(M) * 128u * uint(S); i += 32u * uint(SGS)) {
@@ -162,15 +188,18 @@ pub const GEMV_STAGED =
     \\  #pragma clang loop unroll(full)
     \\  for (int b = 0; b < S; ++b) {
     \\    uint col = k0 + uint(b) * 128u + lane * 4u;
-    \\    float4 wv[NR];
+    \\    float4 wv[FP8_NR_CAP];
     \\    #pragma clang loop unroll(full)
-    \\    for (int r = 0; r < NR; ++r)
+    \\    for (int r = 0; r < FP8_NR_CAP; ++r) {
+    \\      if (r >= NR) break;
     \\      wv[r] = sushi_e4m3_decode4(((const device uint*)wp[r])[col >> 2]) * scales[srow[r] + (col >> 7)];
+    \\    }
     \\    #pragma clang loop unroll(full)
-    \\    for (int m = 0; m < M; ++m) {
+    \\    for (int m = 0; m < FP8_M_CAP; ++m) {
+    \\      if (m >= M) break;
     \\      float4 xv = *((threadgroup const float4*)(xs + m * 128 * S + b * 128) + lane);
     \\      #pragma clang loop unroll(full)
-    \\      for (int r = 0; r < NR; ++r) acc[m][r] += dot(xv, wv[r]);
+    \\      for (int r = 0; r < FP8_NR_CAP; ++r) { if (r >= NR) break; acc[m][r] += dot(xv, wv[r]); }
     \\    }
     \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -180,9 +209,11 @@ pub const GEMV_STAGED =
 
 pub const GEMV_TAIL =
     \\#pragma clang loop unroll(full)
-    \\for (int m = 0; m < M; ++m) {
+    \\for (int m = 0; m < FP8_M_CAP; ++m) {
+    \\  if (m >= M) break;
     \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < NR; ++r) {
+    \\  for (int r = 0; r < FP8_NR_CAP; ++r) {
+    \\    if (r >= NR) break;
     \\    float total = simd_sum(acc[m][r]);
     \\    uint o = row0 + uint(r);
     \\    if (lane == 0u && o < NROWS) {
@@ -380,8 +411,8 @@ fn getKernel(kind: Kind, three: bool) !mlx.mlx_fast_metal_kernel {
     const inputs: []const [*:0]const u8 = if (kind == .dequant) input_names[1..] else &input_names;
     const outputs: []const [*:0]const u8 = if (three) &outs3 else &outs1;
     const source: [*:0]const u8 = switch (kind) {
-        .gemv => if (three) GEMV_HEAD ++ GEMV_DIRECT ++ GEMV_TAIL ++ GEMV_STORE_3 else GEMV_HEAD ++ GEMV_DIRECT ++ GEMV_TAIL ++ GEMV_STORE_1,
-        .staged => if (three) GEMV_HEAD ++ GEMV_STAGED ++ GEMV_TAIL ++ GEMV_STORE_3 else GEMV_HEAD ++ GEMV_STAGED ++ GEMV_TAIL ++ GEMV_STORE_1,
+        .gemv => if (three) GEMV_DIRECT_CAP ++ GEMV_HEAD ++ GEMV_DIRECT ++ GEMV_TAIL ++ GEMV_STORE_3 else GEMV_DIRECT_CAP ++ GEMV_HEAD ++ GEMV_DIRECT ++ GEMV_TAIL ++ GEMV_STORE_1,
+        .staged => if (three) GEMV_STAGED_CAP ++ GEMV_HEAD ++ GEMV_STAGED ++ GEMV_TAIL ++ GEMV_STORE_3 else GEMV_STAGED_CAP ++ GEMV_HEAD ++ GEMV_STAGED ++ GEMV_TAIL ++ GEMV_STORE_1,
         .dequant => if (three) DEQUANT_BODY ++ DEQUANT_DST_3 ++ DEQUANT_TAIL else DEQUANT_BODY ++ DEQUANT_DST_1 ++ DEQUANT_TAIL,
         .tile => if (three) comptime tileSource(true) else comptime tileSource(false),
     };
@@ -446,6 +477,9 @@ fn buildConfig(key: CfgKey) !mlx.mlx_fast_metal_kernel_config {
     }
     switch (key.kind) {
         .gemv, .staged => {
+            const max_m: c_int = if (key.kind == .gemv) 8 else 16;
+            if (key.m < 1 or key.m > max_m or (key.nr != 1 and key.nr != 2 and key.nr != 4) or key.sgs < 1 or key.sgs > 32) return error.Fp8ShapeMismatch;
+            if (key.kind == .staged and (key.nr != 4 or key.tiles != 1)) return error.Fp8ShapeMismatch;
             const rows_per_group = key.nr * key.sgs;
             const groups = @divTrunc(nrows + rows_per_group - 1, rows_per_group);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * key.sgs * groups, 1, 1));

@@ -1566,3 +1566,429 @@ test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across a
         }
     }
 }
+
+test "stock metallib: shared SIMD FC specs resolve valid parameters, reject OOB, and hold PSO occupancy" {
+    try @import("../mlx.zig").requireGpu();
+    const dev = try metal.device();
+    const l = try lib(dev);
+    const catalog = @import("../metallib_catalog.zig");
+    const has_nax = @import("sushi_exl3").device.current().has(.matrix_g17);
+    const min_threads: usize = if (has_nax) 1024 else 640;
+
+    const checkPso = struct {
+        fn run(d: *const metal.Device, lib_h: metal.Library, r: *const catalog.Resolved, floor: usize) !void {
+            var fbuf: [512]u8 = undefined;
+            const fname = try std.fmt.bufPrintSentinel(&fbuf, "{s}", .{r.fnName()}, 0);
+            var flags: [catalog.max_fc_bools]metal.Flag = undefined;
+            for (r.flagSlice(), 0..) |f, i| flags[i] = .{ .index = f.index, .value = f.value };
+            var ints_fc: [catalog.max_fc_ints]metal.IntConstant = undefined;
+            for (r.intSlice(), 0..) |c, i| ints_fc[i] = .{ .index = c.index, .value = c.value };
+            const p = try d.pipelineOfConstants(lib_h, fname, flags[0..r.n_flags], ints_fc[0..r.n_ints]);
+            try testing.expect(p.max_threads >= floor);
+        }
+    }.run;
+
+    var res: catalog.Resolved = undefined;
+
+    // 1. dsv41_hc_mix & hc_ident_mix_expand: valid R/M/HC/TG + OOB rejection.
+    const hc_mix_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "fn", .dtype = .float32 },
+        .{ .name = "scale", .dtype = .float32 },
+        .{ .name = "base", .dtype = .float32 },
+        .{ .name = "eps", .dtype = .float32 },
+    };
+    const hc_mix_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "TG", .value = .{ .int = 1024 } },
+        .{ .name = "R", .value = .{ .int = 2 } },
+        .{ .name = "M", .value = .{ .int = 12 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+    };
+    try testing.expect(catalog.resolve("dsv41_hc_mix", &hc_mix_ins, &.{.float32}, &hc_mix_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    const hc_ident_ins = [_]catalog.RuntimeInput{
+        .{ .name = "h", .dtype = .float32 },
+        .{ .name = "y", .dtype = .bfloat16 },
+        .{ .name = "post", .dtype = .float32 },
+        .{ .name = "fn", .dtype = .float32 },
+        .{ .name = "scale", .dtype = .float32 },
+        .{ .name = "base", .dtype = .float32 },
+        .{ .name = "eps", .dtype = .float32 },
+    };
+    try testing.expect(catalog.resolve("hc_ident_mix_expand", &hc_ident_ins, &.{ .float32, .float32 }, &hc_mix_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    for ([_][4]i32{ .{ 1024, 5, 12, 4 }, .{ 1024, 2, 16, 4 }, .{ 1024, 2, 12, 9 }, .{ 2048, 2, 12, 4 }, .{ 32, 4, 12, 4 } }) |bad| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "TG", .value = .{ .int = bad[0] } },
+            .{ .name = "R", .value = .{ .int = bad[1] } },
+            .{ .name = "M", .value = .{ .int = bad[2] } },
+            .{ .name = "HC", .value = .{ .int = bad[3] } },
+        };
+        try testing.expect(!catalog.resolve("dsv41_hc_mix", &hc_mix_ins, &.{.float32}, &targs, &res));
+        try testing.expect(!catalog.resolve("hc_ident_mix_expand", &hc_ident_ins, &.{ .float32, .float32 }, &targs, &res));
+    }
+
+    // 2. dsv41_hc_stage{,_z}: valid HC/ND/TG/ITERS + OOB rejection.
+    const hc_st_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "cpre", .dtype = .float32 },
+        .{ .name = "w", .dtype = .bfloat16 },
+        .{ .name = "fn", .dtype = .float32 },
+        .{ .name = "scale", .dtype = .float32 },
+        .{ .name = "base", .dtype = .float32 },
+        .{ .name = "eps", .dtype = .float32 },
+    };
+    const hc_st_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "TG", .value = .{ .int = 1024 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "ND", .value = .{ .int = 5 } },
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+    };
+    try testing.expect(catalog.resolve("dsv41_hc_stage", &hc_st_ins, &.{ .bfloat16, .float32 }, &hc_st_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    const hc_stz_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "y", .dtype = .bfloat16 },
+        .{ .name = "za", .dtype = .float32 },
+        .{ .name = "w", .dtype = .bfloat16 },
+        .{ .name = "fn", .dtype = .float32 },
+        .{ .name = "scale", .dtype = .float32 },
+        .{ .name = "base", .dtype = .float32 },
+        .{ .name = "eps", .dtype = .float32 },
+    };
+    const hc_stz_ok = hc_st_ok ++ [_]catalog.RuntimeTarg{.{ .name = "ITERS", .value = .{ .int = 20 } }};
+    try testing.expect(catalog.resolve("dsv41_hc_stage_z", &hc_stz_ins, &.{ .bfloat16, .float32, .bfloat16 }, &hc_stz_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    var hc_stz_bad = hc_stz_ok;
+    hc_stz_bad[4] = .{ .name = "ITERS", .value = .{ .int = 0 } };
+    try testing.expect(!catalog.resolve("dsv41_hc_stage_z", &hc_stz_ins, &.{ .bfloat16, .float32, .bfloat16 }, &hc_stz_bad, &res));
+    const hc_st_narrow = [_]catalog.RuntimeTarg{
+        .{ .name = "TG", .value = .{ .int = 256 } },
+        .{ .name = "HC", .value = .{ .int = 4 } },
+        .{ .name = "ND", .value = .{ .int = 20 } },
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+    };
+    try testing.expect(catalog.resolve("dsv41_hc_stage", &hc_st_ins, &.{ .bfloat16, .float32 }, &hc_st_narrow, &res));
+    try checkPso(dev, l, &res, 256);
+    for ([_][3]i32{ .{ 1024, 8, 5 }, .{ 1024, 4, 33 }, .{ 2048, 4, 5 }, .{ 1024, 4, 0 } }) |bad| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "TG", .value = .{ .int = bad[0] } },
+            .{ .name = "HC", .value = .{ .int = bad[1] } },
+            .{ .name = "ND", .value = .{ .int = bad[2] } },
+            .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        };
+        try testing.expect(!catalog.resolve("dsv41_hc_stage", &hc_st_ins, &.{ .bfloat16, .float32 }, &targs, &res));
+    }
+
+    // 3. dsv41_index_scores & dsv41_index_tile: valid QS_CAP/IH/IHD + OOB rejection.
+    const idx_ins = [_]catalog.RuntimeInput{
+        .{ .name = "q", .dtype = .float32 },
+        .{ .name = "keys", .dtype = .bfloat16 },
+        .{ .name = "w", .dtype = .float32 },
+        .{ .name = "meta", .dtype = .int32 },
+        .{ .name = "wsc", .dtype = .float32 },
+    };
+    const idx_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "QS_CAP", .value = .{ .int = 4096 } },
+        .{ .name = "IH", .value = .{ .int = 32 } },
+        .{ .name = "IHD", .value = .{ .int = 128 } },
+        .{ .name = "KT", .value = .{ .dtype = .bfloat16 } },
+    };
+    try testing.expect(catalog.resolve("dsv41_index_scores", &idx_ins, &.{.float32}, &idx_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    for ([_][3]i32{ .{ 2048, 32, 128 }, .{ 8192, 65, 128 }, .{ 8192, 32, 136 } }) |bad| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "QS_CAP", .value = .{ .int = bad[0] } },
+            .{ .name = "IH", .value = .{ .int = bad[1] } },
+            .{ .name = "IHD", .value = .{ .int = bad[2] } },
+            .{ .name = "KT", .value = .{ .dtype = .bfloat16 } },
+        };
+        try testing.expect(!catalog.resolve("dsv41_index_scores", &idx_ins, &.{.float32}, &targs, &res));
+    }
+    const tile_ins = [_]catalog.RuntimeInput{
+        .{ .name = "q", .dtype = .bfloat16 },
+        .{ .name = "keys", .dtype = .bfloat16 },
+        .{ .name = "w", .dtype = .float32 },
+        .{ .name = "meta", .dtype = .int32 },
+        .{ .name = "wsc", .dtype = .float32 },
+    };
+    const tile_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "IH", .value = .{ .int = 32 } },
+        .{ .name = "IHD", .value = .{ .int = 128 } },
+        .{ .name = "KT", .value = .{ .int = 64 } },
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+    };
+    try testing.expect(catalog.resolve("dsv41_index_tile", &tile_ins, &.{.float32}, &tile_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    for ([_][2]i32{ .{ 72, 128 }, .{ 12, 128 }, .{ 32, 136 } }) |bad| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "IH", .value = .{ .int = bad[0] } },
+            .{ .name = "IHD", .value = .{ .int = bad[1] } },
+            .{ .name = "KT", .value = .{ .int = 64 } },
+            .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        };
+        try testing.expect(!catalog.resolve("dsv41_index_tile", &tile_ins, &.{.float32}, &targs, &res));
+    }
+
+    // 4. gated_delta_step{,_vec}: valid Dk + KDA (InT=f32, BT=bf16) + OOB rejection.
+    const gdn_ins = [_]catalog.RuntimeInput{
+        .{ .name = "q", .dtype = .float32 },
+        .{ .name = "k", .dtype = .float32 },
+        .{ .name = "v", .dtype = .float32 },
+        .{ .name = "g", .dtype = .float32 },
+        .{ .name = "beta", .dtype = .bfloat16 },
+        .{ .name = "state_in", .dtype = .float32 },
+        .{ .name = "T", .dtype = .int32, .scalar = true },
+    };
+    const gdn_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "InT", .value = .{ .dtype = .float32 } },
+        .{ .name = "StT", .value = .{ .dtype = .float32 } },
+        .{ .name = "OutT", .value = .{ .dtype = .float32 } },
+        .{ .name = "Dk", .value = .{ .int = 128 } },
+        .{ .name = "Dv", .value = .{ .int = 128 } },
+        .{ .name = "Hk", .value = .{ .int = 16 } },
+        .{ .name = "Hv", .value = .{ .int = 48 } },
+    };
+    try testing.expect(catalog.resolve("gated_delta_step_vec", &gdn_ins, &.{ .float32, .float32 }, &gdn_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    const gdn_seq_ins = gdn_ins ++ [_]catalog.RuntimeInput{
+        .{ .name = "seq_stride", .dtype = .int32, .scalar = true },
+    };
+    var gdn_seq_ok = gdn_ok;
+    gdn_seq_ok[2] = .{ .name = "OutT", .value = .{ .dtype = .bfloat16 } };
+    try testing.expect(catalog.resolve("gated_delta_step_seq_vec", &gdn_seq_ins, &.{ .bfloat16, .float32, .float32 }, &gdn_seq_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    for ([_][3]i32{ .{ 288, 16, 48 }, .{ 48, 16, 48 }, .{ 128, 16, 50 } }) |bad| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "InT", .value = .{ .dtype = .float32 } },
+            .{ .name = "StT", .value = .{ .dtype = .float32 } },
+            .{ .name = "OutT", .value = .{ .dtype = .float32 } },
+            .{ .name = "Dk", .value = .{ .int = bad[0] } },
+            .{ .name = "Dv", .value = .{ .int = 128 } },
+            .{ .name = "Hk", .value = .{ .int = bad[1] } },
+            .{ .name = "Hv", .value = .{ .int = bad[2] } },
+        };
+        try testing.expect(!catalog.resolve("gated_delta_step_vec", &gdn_ins, &.{ .float32, .float32 }, &targs, &res));
+    }
+
+    // 5. sushi_attn_qsa256_qsplit: valid BITS ∈ {2,3,4,6,8}, BK ∈ {16,32}, DK/DV + OOB rejection.
+    const qsplit_ins = [_]catalog.RuntimeInput{
+        .{ .name = "q", .dtype = .bfloat16 },
+        .{ .name = "scl", .dtype = .float32 },
+        .{ .name = "blocks", .dtype = .int32 },
+        .{ .name = "kq", .dtype = .uint32 },
+        .{ .name = "ksc", .dtype = .bfloat16 },
+        .{ .name = "kbi", .dtype = .bfloat16 },
+        .{ .name = "vq", .dtype = .uint32 },
+        .{ .name = "vsc", .dtype = .bfloat16 },
+        .{ .name = "vbi", .dtype = .bfloat16 },
+    };
+    const qsplit_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "NSG", .value = .{ .int = 2 } },
+        .{ .name = "NSGT", .value = .{ .int = 2 } },
+        .{ .name = "BK", .value = .{ .int = 16 } },
+        .{ .name = "RATIO", .value = .{ .int = 4 } },
+        .{ .name = "BITS", .value = .{ .int = 8 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "QUANT", .value = .{ .int = 1 } },
+        .{ .name = "DK", .value = .{ .int = 256 } },
+        .{ .name = "DV", .value = .{ .int = 256 } },
+        .{ .name = "SPARSE", .value = .{ .int = 1 } },
+    };
+    for ([_]i32{ 2, 3, 4, 6, 8 }) |bits| {
+        var t = qsplit_ok;
+        t[5] = .{ .name = "BITS", .value = .{ .int = bits } };
+        try testing.expect(catalog.resolve("sushi_attn_qsa256_qsplit", &qsplit_ins, &.{ .float32, .float32 }, &t, &res));
+        try checkPso(dev, l, &res, min_threads);
+    }
+    var qsplit_bk32 = qsplit_ok;
+    qsplit_bk32[3] = .{ .name = "BK", .value = .{ .int = 32 } };
+    qsplit_bk32[8] = .{ .name = "DK", .value = .{ .int = 64 } };
+    qsplit_bk32[9] = .{ .name = "DV", .value = .{ .int = 64 } };
+    try testing.expect(catalog.resolve("sushi_attn_qsa256_qsplit", &qsplit_ins, &.{ .float32, .float32 }, &qsplit_bk32, &res));
+    try checkPso(dev, l, &res, min_threads);
+    for ([_][4]i32{ .{ 5, 64, 256, 256 }, .{ 8, 64, 320, 256 }, .{ 8, 64, 256, 264 }, .{ 8, 12, 256, 256 }, .{ 8, 64, 252, 256 } }) |bad| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "NSG", .value = .{ .int = 2 } },
+            .{ .name = "NSGT", .value = .{ .int = 2 } },
+            .{ .name = "BK", .value = .{ .int = 16 } },
+            .{ .name = "RATIO", .value = .{ .int = 4 } },
+            .{ .name = "BITS", .value = .{ .int = bad[0] } },
+            .{ .name = "GS", .value = .{ .int = bad[1] } },
+            .{ .name = "QUANT", .value = .{ .int = 1 } },
+            .{ .name = "DK", .value = .{ .int = bad[2] } },
+            .{ .name = "DV", .value = .{ .int = bad[3] } },
+            .{ .name = "SPARSE", .value = .{ .int = 1 } },
+        };
+        try testing.expect(!catalog.resolve("sushi_attn_qsa256_qsplit", &qsplit_ins, &.{ .float32, .float32 }, &targs, &res));
+    }
+
+    // 6. sushi_fp8_block_gemv{,_staged}: valid M/NR + OOB rejection.
+    const fp8_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "w", .dtype = .uint8 },
+        .{ .name = "scales", .dtype = .float32 },
+    };
+    const fp8_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "M", .value = .{ .int = 4 } },
+        .{ .name = "NR", .value = .{ .int = 2 } },
+        .{ .name = "SGS", .value = .{ .int = 8 } },
+        .{ .name = "S", .value = .{ .int = 0 } },
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "K", .value = .{ .int = 4096 } },
+        .{ .name = "TP", .value = .{ .int = 1 } },
+        .{ .name = "P0", .value = .{ .int = 4096 } },
+        .{ .name = "P1", .value = .{ .int = 0 } },
+        .{ .name = "P2", .value = .{ .int = 0 } },
+        .{ .name = "BPR", .value = .{ .int = 32 } },
+        .{ .name = "VSB", .value = .{ .int = 0 } },
+    };
+    try testing.expect(catalog.resolve("sushi_fp8_block_gemv", &fp8_ins, &.{.bfloat16}, &fp8_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    const fp8_bad_m = [_]catalog.RuntimeTarg{
+        .{ .name = "M", .value = .{ .int = 9 } },
+        .{ .name = "NR", .value = .{ .int = 2 } },
+        .{ .name = "SGS", .value = .{ .int = 8 } },
+        .{ .name = "S", .value = .{ .int = 0 } },
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "K", .value = .{ .int = 4096 } },
+        .{ .name = "TP", .value = .{ .int = 1 } },
+        .{ .name = "P0", .value = .{ .int = 4096 } },
+        .{ .name = "P1", .value = .{ .int = 0 } },
+        .{ .name = "P2", .value = .{ .int = 0 } },
+        .{ .name = "BPR", .value = .{ .int = 32 } },
+        .{ .name = "VSB", .value = .{ .int = 0 } },
+    };
+    try testing.expect(!catalog.resolve("sushi_fp8_block_gemv", &fp8_ins, &.{.bfloat16}, &fp8_bad_m, &res));
+    var fp8_bad_p = fp8_ok;
+    fp8_bad_p[7] = .{ .name = "P0", .value = .{ .int = 0 } };
+    try testing.expect(!catalog.resolve("sushi_fp8_block_gemv", &fp8_ins, &.{.bfloat16}, &fp8_bad_p, &res));
+    const fp8_st_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "M", .value = .{ .int = 16 } },
+        .{ .name = "NR", .value = .{ .int = 4 } },
+        .{ .name = "SGS", .value = .{ .int = 8 } },
+        .{ .name = "S", .value = .{ .int = 1 } },
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "K", .value = .{ .int = 4096 } },
+        .{ .name = "TP", .value = .{ .int = 1 } },
+        .{ .name = "P0", .value = .{ .int = 4096 } },
+        .{ .name = "P1", .value = .{ .int = 0 } },
+        .{ .name = "P2", .value = .{ .int = 0 } },
+        .{ .name = "BPR", .value = .{ .int = 32 } },
+        .{ .name = "VSB", .value = .{ .int = 0 } },
+    };
+    try testing.expect(catalog.resolve("sushi_fp8_block_gemv_staged", &fp8_ins, &.{.bfloat16}, &fp8_st_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    var fp8_st_bad = fp8_st_ok;
+    fp8_st_bad[0] = .{ .name = "M", .value = .{ .int = 17 } };
+    try testing.expect(!catalog.resolve("sushi_fp8_block_gemv_staged", &fp8_ins, &.{.bfloat16}, &fp8_st_bad, &res));
+
+    // 7. sushi_moe_gather_qmv_downred, sushi_expert_bf16_down_reduce, mtp_serial_qmv8_rows{,_stream}: valid + OOB.
+    const dr_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "w_q", .dtype = .uint32 },
+        .{ .name = "scales", .dtype = .bfloat16 },
+        .{ .name = "biases", .dtype = .bfloat16 },
+        .{ .name = "inds", .dtype = .uint32 },
+        .{ .name = "scores", .dtype = .bfloat16 },
+        .{ .name = "K_size", .dtype = .int32, .scalar = true },
+        .{ .name = "N_size", .dtype = .int32, .scalar = true },
+    };
+    const dr_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "BITS", .value = .{ .int = 4 } },
+        .{ .name = "TOPK", .value = .{ .int = 8 } },
+        .{ .name = "ROWS", .value = .{ .int = 4 } },
+        .{ .name = "LPR", .value = .{ .int = 8 } },
+        .{ .name = "KP", .value = .{ .int = 256 } },
+    };
+    try testing.expect(catalog.resolve("sushi_moe_gather_qmv_downred", &dr_ins, &.{.bfloat16}, &dr_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    var dr_bad = dr_ok;
+    dr_bad[2] = .{ .name = "BITS", .value = .{ .int = 5 } };
+    try testing.expect(!catalog.resolve("sushi_moe_gather_qmv_downred", &dr_ins, &.{.bfloat16}, &dr_bad, &res));
+    dr_bad = dr_ok;
+    dr_bad[3] = .{ .name = "TOPK", .value = .{ .int = 33 } };
+    try testing.expect(!catalog.resolve("sushi_moe_gather_qmv_downred", &dr_ins, &.{.bfloat16}, &dr_bad, &res));
+    dr_bad = dr_ok;
+    dr_bad[6] = .{ .name = "KP", .value = .{ .int = 513 } }; // ceil(513/8)=65 > pw[64]
+    try testing.expect(!catalog.resolve("sushi_moe_gather_qmv_downred", &dr_ins, &.{.bfloat16}, &dr_bad, &res));
+    dr_bad = dr_ok;
+    dr_bad[6] = .{ .name = "KP", .value = .{ .int = std.math.maxInt(i32) } };
+    try testing.expect(!catalog.resolve("sushi_moe_gather_qmv_downred", &dr_ins, &.{.bfloat16}, &dr_bad, &res));
+
+    const bf16_dr_ins = [_]catalog.RuntimeInput{
+        .{ .name = "h", .dtype = .bfloat16 },
+        .{ .name = "down", .dtype = .bfloat16 },
+        .{ .name = "slots", .dtype = .int32 },
+        .{ .name = "weights", .dtype = .float32 },
+    };
+    const bf16_dr_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "TOPK", .value = .{ .int = 8 } },
+        .{ .name = "NDIM", .value = .{ .int = 2560 } },
+        .{ .name = "KDIM", .value = .{ .int = 640 } },
+        .{ .name = "LPR", .value = .{ .int = 8 } },
+        .{ .name = "NPT", .value = .{ .int = 4 } },
+        .{ .name = "SSG", .value = .{ .int = 4 } },
+        .{ .name = "STAGE", .value = .{ .int = 1 } },
+    };
+    try testing.expect(catalog.resolve("sushi_expert_bf16_down_reduce", &bf16_dr_ins, &.{.bfloat16}, &bf16_dr_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    var bf16_dr_npt3 = bf16_dr_ok;
+    bf16_dr_npt3[5] = .{ .name = "NPT", .value = .{ .int = 3 } };
+    try testing.expect(catalog.resolve("sushi_expert_bf16_down_reduce", &bf16_dr_ins, &.{.bfloat16}, &bf16_dr_npt3, &res));
+    try checkPso(dev, l, &res, min_threads);
+    var bf16_dr_bad = bf16_dr_ok;
+    bf16_dr_bad[5] = .{ .name = "NPT", .value = .{ .int = 16 } };
+    try testing.expect(!catalog.resolve("sushi_expert_bf16_down_reduce", &bf16_dr_ins, &.{.bfloat16}, &bf16_dr_bad, &res));
+    bf16_dr_bad = bf16_dr_ok;
+    bf16_dr_bad[3] = .{ .name = "KDIM", .value = .{ .int = 4104 } }; // STAGE=1 exceeds hstage[512]
+    try testing.expect(!catalog.resolve("sushi_expert_bf16_down_reduce", &bf16_dr_ins, &.{.bfloat16}, &bf16_dr_bad, &res));
+
+    const mtp_tile_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "w", .dtype = .uint32 },
+        .{ .name = "sc", .dtype = .bfloat16 },
+        .{ .name = "bi", .dtype = .bfloat16 },
+        .{ .name = "K_size", .dtype = .int32, .scalar = true },
+        .{ .name = "N_size", .dtype = .int32, .scalar = true },
+    };
+    const mtp_tile_bad = [_]catalog.RuntimeTarg{
+        .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+        .{ .name = "M", .value = .{ .int = 4 } },
+        .{ .name = "GS", .value = .{ .int = 12 } }, // FAST=1 requires GS % 8 == 0
+        .{ .name = "NV", .value = .{ .int = 4 } },
+        .{ .name = "FAST", .value = .{ .int = 1 } },
+        .{ .name = "RPS", .value = .{ .int = 2 } },
+    };
+    try testing.expect(!catalog.resolve("mtp_serial_qmv8_rows", &mtp_tile_ins, &.{.bfloat16}, &mtp_tile_bad, &res));
+
+    const mtp_st_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "w", .dtype = .uint32 },
+        .{ .name = "scales", .dtype = .bfloat16 },
+        .{ .name = "biases", .dtype = .bfloat16 },
+    };
+    const mtp_st_ok = [_]catalog.RuntimeTarg{
+        .{ .name = "M", .value = .{ .int = 7 } },
+        .{ .name = "N", .value = .{ .int = 2560 } },
+        .{ .name = "K", .value = .{ .int = 2560 } },
+        .{ .name = "GS", .value = .{ .int = 64 } },
+        .{ .name = "O", .value = .{ .int = 2 } },
+        .{ .name = "SG", .value = .{ .int = 8 } },
+        .{ .name = "MT", .value = .{ .int = 4 } },
+        .{ .name = "SPLIT", .value = .{ .int = 1 } },
+    };
+    try testing.expect(catalog.resolve("mtp_serial_qmv8_rows_stream", &mtp_st_ins, &.{.bfloat16}, &mtp_st_ok, &res));
+    try checkPso(dev, l, &res, min_threads);
+    var mtp_st_bad = mtp_st_ok;
+    mtp_st_bad[6] = .{ .name = "MT", .value = .{ .int = 8 } };
+    try testing.expect(!catalog.resolve("mtp_serial_qmv8_rows_stream", &mtp_st_ins, &.{.bfloat16}, &mtp_st_bad, &res));
+    mtp_st_bad = mtp_st_ok;
+    mtp_st_bad[5] = .{ .name = "SG", .value = .{ .int = 1 } }; // SPLIT=1 requires even SG >= 2
+    try testing.expect(!catalog.resolve("mtp_serial_qmv8_rows_stream", &mtp_st_ins, &.{.bfloat16}, &mtp_st_bad, &res));
+}

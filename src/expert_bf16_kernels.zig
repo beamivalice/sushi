@@ -46,9 +46,14 @@ pub const GATEUP_SOURCE: [:0]const u8 =
     \\const device uint4* xp = (const device uint4*)(x + (size_t)r * (size_t)KDIM);
     \\const uint RSTRIDE = uint(KDIM) / 8u;
     \\
-    \\float4 gl[NPT], gh[NPT], ul[NPT], uh[NPT];
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int NPT_CAP = 8;
+    \\#else
+    \\constexpr int NPT_CAP = NPT;
+    \\#endif
+    \\float4 gl[NPT_CAP], gh[NPT_CAP], ul[NPT_CAP], uh[NPT_CAP];
     \\#pragma clang loop unroll(full)
-    \\for (int t = 0; t < NPT; ++t) { gl[t] = float4(0.0f); gh[t] = float4(0.0f); ul[t] = float4(0.0f); uh[t] = float4(0.0f); }
+    \\for (int t = 0; t < NPT_CAP; ++t) { if (t >= NPT) break; gl[t] = float4(0.0f); gh[t] = float4(0.0f); ul[t] = float4(0.0f); uh[t] = float4(0.0f); }
     \\for (int i = 0; i < IT; ++i) {
     \\  uint vi = sub + uint(LPR) * uint(i);
     \\  bool ok = vi < KV;
@@ -57,7 +62,8 @@ pub const GATEUP_SOURCE: [:0]const u8 =
     \\  float4 xlo = as_type<float4>(xw << 16);
     \\  float4 xhi = as_type<float4>(xw & 0xffff0000u);
     \\  #pragma clang loop unroll(full)
-    \\  for (int t = 0; t < NPT; ++t) {
+    \\  for (int t = 0; t < NPT_CAP; ++t) {
+    \\    if (t >= NPT) break;
     \\    uint4 gw = ok ? gp[uint(t) * RSTRIDE + vs] : uint4(0u);
     \\    uint4 uw = ok ? pp[uint(t) * RSTRIDE + vs] : uint4(0u);
     \\    gl[t] += xlo * as_type<float4>(gw << 16);
@@ -67,7 +73,8 @@ pub const GATEUP_SOURCE: [:0]const u8 =
     \\  }
     \\}
     \\#pragma clang loop unroll(full)
-    \\for (int t = 0; t < NPT; ++t) {
+    \\for (int t = 0; t < NPT_CAP; ++t) {
+    \\  if (t >= NPT) break;
     \\  float4 gt = gl[t] + gh[t];
     \\  float4 ut = ul[t] + uh[t];
     \\  float acc_g = (gt.x + gt.y) + (gt.z + gt.w);
@@ -86,6 +93,11 @@ pub const GATEUP_SOURCE: [:0]const u8 =
 pub const DOWNRED_SOURCE: [:0]const u8 =
     \\threadgroup float partial[1024];
     \\threadgroup uint4 hstage[STAGE ? 512 : 1];
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int NPT_CAP = 8;
+    \\#else
+    \\constexpr int NPT_CAP = NPT;
+    \\#endif
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint tile = threadgroup_position_in_grid.x;
@@ -113,9 +125,9 @@ pub const DOWNRED_SOURCE: [:0]const u8 =
     \\    for (uint v = lane; v < KV; v += 32u) hs[v] = hp[v];
     \\    simdgroup_barrier(mem_flags::mem_threadgroup);
     \\  }
-    \\  float4 al[NPT], ah[NPT];
+    \\  float4 al[NPT_CAP], ah[NPT_CAP];
     \\  #pragma clang loop unroll(full)
-    \\  for (int t = 0; t < NPT; ++t) { al[t] = float4(0.0f); ah[t] = float4(0.0f); }
+    \\  for (int t = 0; t < NPT_CAP; ++t) { if (t >= NPT) break; al[t] = float4(0.0f); ah[t] = float4(0.0f); }
     \\  for (int i = 0; i < IT; ++i) {
     \\    uint vi = sub + uint(LPR) * uint(i);
     \\    bool ok = vi < KV;
@@ -124,14 +136,16 @@ pub const DOWNRED_SOURCE: [:0]const u8 =
     \\    float4 hlo = as_type<float4>(hw << 16);
     \\    float4 hhi = as_type<float4>(hw & 0xffff0000u);
     \\    #pragma clang loop unroll(full)
-    \\    for (int t = 0; t < NPT; ++t) {
+    \\    for (int t = 0; t < NPT_CAP; ++t) {
+    \\      if (t >= NPT) break;
     \\      uint4 dw = ok ? dp[uint(t) * RSTRIDE + vs] : uint4(0u);
     \\      al[t] += hlo * as_type<float4>(dw << 16);
     \\      ah[t] += hhi * as_type<float4>(dw & 0xffff0000u);
     \\    }
     \\  }
     \\  #pragma clang loop unroll(full)
-    \\  for (int t = 0; t < NPT; ++t) {
+    \\  for (int t = 0; t < NPT_CAP; ++t) {
+    \\    if (t >= NPT) break;
     \\    float4 at = al[t] + ah[t];
     \\    float acc = (at.x + at.y) + (at.z + at.w);
     \\    for (uint d = uint(LPR) / 2u; d >= 1u; d >>= 1u) acc += simd_shuffle_xor(acc, ushort(d));
@@ -248,7 +262,7 @@ fn getDownReduceKernel() !mlx.mlx_fast_metal_kernel {
 fn autoSlotGroups(topk: c_int, k: c_int) c_int {
     var d = topk;
     while (d > 1) : (d -= 1) {
-        if (@rem(topk, d) == 0 and d * k * 2 <= DOWN_STAGE_BUDGET_BYTES) return d;
+        if (@rem(topk, d) == 0 and @as(i64, d) * @as(i64, k) * 2 <= DOWN_STAGE_BUDGET_BYTES) return d;
     }
     return 1;
 }
@@ -301,8 +315,9 @@ pub fn gateUpSwiglu(
     if (@rem(wsh[1], 2) != 0) return error.BadSlabShape;
     const N = @divExact(wsh[1], 2);
     const K = wsh[2];
+    if (N < 1) return error.BadSlabShape;
     if (K != xsh[1]) return error.HiddenWidthMismatch;
-    if (@rem(K, 8) != 0) return error.UnsupportedHiddenWidth;
+    if (K < 8 or @rem(K, 8) != 0) return error.UnsupportedHiddenWidth;
     const R = xsh[0];
     if (R < 1 or R > MAX_ROWS) return error.RowsOutOfRange;
     const ssh = mlx.getShape(slots);
@@ -313,7 +328,7 @@ pub fn gateUpSwiglu(
     if (lpr != 1 and lpr != 2 and lpr != 4 and lpr != 8 and lpr != 16 and lpr != 32) return error.UnsupportedLaneSplit;
     const lane_rows = @divExact(@as(c_int, 32), lpr);
     const npt = if (gateup_rows_per_lane > 0) gateup_rows_per_lane else autoRowsPerLane(N, lane_rows, GATEUP_PREFERRED_NPT, 1024);
-    if (npt > 8) return error.UnsupportedRowBlock;
+    if (npt < 1 or npt > 8) return error.UnsupportedRowBlock;
     const rows_per_sg = lane_rows * npt;
     if (@rem(N, rows_per_sg) != 0) return error.UnsupportedIntermediateWidth;
     const tiles = @divExact(N, rows_per_sg);
@@ -374,8 +389,9 @@ pub fn downReduce(
     if (U <= 0) return error.EmptySlab;
     const N = dsh[1];
     const K = dsh[2];
+    if (N < 1) return error.BadSlabShape;
     if (K != hsh[2]) return error.IntermediateWidthMismatch;
-    if (@rem(K, 8) != 0) return error.UnsupportedIntermediateWidth;
+    if (K < 8 or @rem(K, 8) != 0) return error.UnsupportedIntermediateWidth;
     const R = hsh[0];
     if (R < 1 or R > MAX_ROWS) return error.RowsOutOfRange;
     const topk = hsh[1];
@@ -385,16 +401,17 @@ pub fn downReduce(
     const lpr = down_lpr;
     if (lpr != 1 and lpr != 2 and lpr != 4 and lpr != 8 and lpr != 16 and lpr != 32) return error.UnsupportedLaneSplit;
     const lane_rows = @divExact(@as(c_int, 32), lpr);
-    const stage = down_stage_activation;
+    const stage = down_stage_activation and @as(i64, K) * 2 <= DOWN_STAGE_BUDGET_BYTES;
     const npt = if (down_rows_per_lane > 0) down_rows_per_lane else autoRowsPerLane(N, lane_rows, DOWN_PREFERRED_NPT, 32);
-    if (npt > 8) return error.UnsupportedRowBlock;
+    if (npt < 1 or npt > 8) return error.UnsupportedRowBlock;
     const rows_per_sg = lane_rows * npt;
     if (rows_per_sg > 32) return error.UnsupportedRowBlock;
     if (@rem(N, rows_per_sg) != 0) return error.UnsupportedHiddenWidth;
     try checkSlots(s, slots, R, topk, U);
 
     const ssg = if (down_slot_groups > 0) down_slot_groups else if (stage) autoSlotGroups(topk, K) else topk;
-    if (ssg > topk or @rem(topk, ssg) != 0) return error.UnsupportedSlotGrouping;
+    if (ssg < 1 or ssg > topk or ssg > 32 or @rem(topk, ssg) != 0) return error.UnsupportedSlotGrouping;
+    if (stage and @as(i64, ssg) * @as(i64, @divExact(K, 8)) > 512) return error.UnsupportedSlotGrouping;
     const key = DownRedKey{ .r = R, .topk = topk, .n = N, .k = K, .lpr = lpr, .npt = npt, .ssg = ssg, .stage = stage };
     const cached = downred_cfgs.get(key) orelse blk: {
         const cfg = mlx.mlx_fast_metal_kernel_config_new();

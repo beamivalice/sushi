@@ -51,13 +51,44 @@ fn cd(d: Dtype) CtVal {
 
 // ── Filters ──
 
-fn hcMixFilter(vals: []const CtVal) bool {
-    // vals: [R, M, HC, XDT]
-    const r = vals[0].int;
-    const m = vals[1].int;
-    return (r == 2 and (m == 12 or m == 8 or m == 1)) or
-        (r == 1 and (m == 12 or m == 8 or m == 4 or m == 1)) or
-        (r == 4 and (m == 12 or m == 8 or m == 1));
+fn findIntTarg(targs: []const custom.RuntimeTarg, name: []const u8) ?i32 {
+    for (targs) |ta| {
+        if (std.mem.eql(u8, ta.name, name)) {
+            return switch (ta.value) {
+                .int => |v| v,
+                .boolean => |b| @intFromBool(b),
+                .dtype => null,
+            };
+        }
+    }
+    return null;
+}
+
+fn isPow2Range(v: i32, lo: i32, hi: i32) bool {
+    return v >= lo and v <= hi and (v & (v - 1)) == 0;
+}
+
+fn hcMixFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const tg = findIntTarg(targs, "TG") orelse return false;
+    const r = findIntTarg(targs, "R") orelse return false;
+    const m = findIntTarg(targs, "M") orelse return false;
+    return tg >= 32 and tg <= 1024 and @rem(tg, 32) == 0 and r * m <= tg;
+}
+
+fn hcMixNaxFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const nk = findIntTarg(targs, "NK") orelse return false;
+    return nk > 0 and @rem(nk, 16 * 16) == 0;
+}
+
+fn hcStageFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const tg = findIntTarg(targs, "TG") orelse return false;
+    const nd = findIntTarg(targs, "ND") orelse return false;
+    return tg >= 32 and tg <= 1024 and @rem(tg, 32) == 0 and nd >= 1 and nd <= 32;
+}
+
+fn hcStageZFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const iters = findIntTarg(targs, "ITERS") orelse return false;
+    return hcStageFcFilter(targs) and iters >= 1;
 }
 
 fn hcIdentFilter(vals: []const CtVal) bool {
@@ -65,33 +96,140 @@ fn hcIdentFilter(vals: []const CtVal) bool {
     return vals[1].dtype == vals[0].dtype or vals[0].dtype == .float32;
 }
 
+fn indexScoresFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const qs_cap = findIntTarg(targs, "QS_CAP") orelse return false;
+    const ih = findIntTarg(targs, "IH") orelse return false;
+    const ihd = findIntTarg(targs, "IHD") orelse return false;
+    return ih >= 1 and ih <= 64 and ihd >= 1 and ihd <= 128 and @as(i64, ih) * @as(i64, ihd) <= @as(i64, qs_cap);
+}
+
 fn indexTileFilter(vals: []const CtVal) bool {
-    // vals: [IH, IHD, KT, T]
-    const kt = vals[2].int;
-    const t = vals[3].dtype;
+    // vals: [KT, T]
+    const kt = vals[0].int;
+    const t = vals[1].dtype;
     return (t == .float32 and kt == 32) or (t != .float32 and kt == 64);
 }
 
+fn indexTileFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const ih = findIntTarg(targs, "IH") orelse return false;
+    const ihd = findIntTarg(targs, "IHD") orelse return false;
+    return ih >= 8 and ih <= 64 and @rem(ih, 8) == 0 and ihd >= 8 and ihd <= 128 and @rem(ihd, 8) == 0;
+}
+
 fn gdnStepFilter(vals: []const CtVal) bool {
-    // vals: [InT, StT, OutT, Dk, GT, BT]
+    // vals: [InT, StT, OutT, GT, BT]
     const in_t = vals[0].dtype;
     const st_t = vals[1].dtype;
     const out_t = vals[2].dtype;
-    const gt = vals[4].dtype;
-    const bt = vals[5].dtype;
+    const gt = vals[3].dtype;
+    const bt = vals[4].dtype;
     if (st_t == .float16) return false;
-    if (out_t == .float16 and in_t != .float16) return false;
-    // g and beta are either f32 or match InT (beta can also be bf16 when InT=bf16).
+    if (out_t != .bfloat16 and out_t != in_t) return false;
+    // g and beta are either f32 or match InT (KDA also admits InT=f32 with bf16 beta).
     const g_ok = gt == .float32 or gt == in_t;
-    const b_ok = bt == .float32 or bt == in_t;
+    const b_ok = bt == .float32 or bt == in_t or (in_t == .float32 and bt == .bfloat16);
     return g_ok and b_ok;
 }
 
+fn gdnStepSeqFilter(vals: []const CtVal) bool {
+    // vals: [InT, StT, OutT, GT, BT] (OutT fixed to .bfloat16)
+    const in_t = vals[0].dtype;
+    const st_t = vals[1].dtype;
+    const gt = vals[3].dtype;
+    const bt = vals[4].dtype;
+    if (st_t == .float16) return false;
+    const g_ok = gt == .float32 or gt == in_t;
+    const b_ok = bt == .float32 or bt == in_t or (in_t == .float32 and bt == .bfloat16);
+    return g_ok and b_ok;
+}
+
+fn gdnStepFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const dv = findIntTarg(targs, "Dv") orelse return false;
+    const hk = findIntTarg(targs, "Hk") orelse return false;
+    const hv = findIntTarg(targs, "Hv") orelse return false;
+    return dv > 0 and hk > 0 and hv > 0 and @rem(hv, hk) == 0;
+}
+
+fn qsaQsplitFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const nsg = findIntTarg(targs, "NSG") orelse return false;
+    const nsgt = findIntTarg(targs, "NSGT") orelse return false;
+    const ratio = findIntTarg(targs, "RATIO") orelse return false;
+    const gs = findIntTarg(targs, "GS") orelse return false;
+    const dk = findIntTarg(targs, "DK") orelse return false;
+    const dv = findIntTarg(targs, "DV") orelse return false;
+    return nsg >= 1 and nsgt >= nsg and nsgt <= 32 and ratio >= 1 and
+        dk >= 8 and dk <= 256 and @rem(dk, 8) == 0 and
+        dv >= 8 and dv <= 256 and @rem(dv, 8) == 0 and
+        gs >= 8 and @rem(gs, 8) == 0 and @rem(dk, gs) == 0 and @rem(dv, gs) == 0;
+}
+
 fn gqmvPlainFilter(vals: []const CtVal) bool {
-    // vals: [T, BITS, ST]
+    // vals: [T, ST]
     const t = vals[0].dtype;
-    const st = vals[2].dtype;
+    const st = vals[1].dtype;
     return st == t or t == .float32;
+}
+
+fn gqmvAffineBaseOk(targs: []const custom.RuntimeTarg) bool {
+    const bits = findIntTarg(targs, "BITS") orelse return false;
+    const gs = findIntTarg(targs, "GS") orelse return false;
+    const vpw: i32 = if (bits == 3) 8 else @divExact(32, bits);
+    return gs > 0 and @rem(gs, vpw) == 0;
+}
+
+fn gqmvGateUpFcFilter(targs: []const custom.RuntimeTarg) bool {
+    if (!gqmvAffineBaseOk(targs)) return false;
+    const kp = findIntTarg(targs, "KP") orelse return false;
+    return kp >= 1 and kp <= 64 * 32;
+}
+
+fn gqmvGateUpRowsFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const topk = findIntTarg(targs, "TOPK") orelse return false;
+    return gqmvGateUpFcFilter(targs) and topk >= 1;
+}
+
+fn gqmvDownRedFcFilter(targs: []const custom.RuntimeTarg) bool {
+    if (!gqmvAffineBaseOk(targs)) return false;
+    const topk = findIntTarg(targs, "TOPK") orelse return false;
+    const rows = findIntTarg(targs, "ROWS") orelse return false;
+    const lpr = findIntTarg(targs, "LPR") orelse return false;
+    const kp = findIntTarg(targs, "KP") orelse return false;
+    return topk >= 1 and topk <= 32 and rows >= 1 and rows <= 4 and
+        isPow2Range(lpr, 1, 32) and @divExact(32, lpr) == rows and
+        kp >= 1 and kp <= 64 * lpr;
+}
+
+fn qmvRowsFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const bits = findIntTarg(targs, "BITS") orelse return false;
+    const gs = findIntTarg(targs, "GS") orelse return false;
+    const vpt: i32 = (if (bits == 3) @as(i32, 8) else @divExact(32, bits)) * 2;
+    return gs > 0 and @rem(gs, vpt) == 0;
+}
+
+fn expertBf16GateUpFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const topk = findIntTarg(targs, "TOPK") orelse return false;
+    const ndim = findIntTarg(targs, "NDIM") orelse return false;
+    const kdim = findIntTarg(targs, "KDIM") orelse return false;
+    const lpr = findIntTarg(targs, "LPR") orelse return false;
+    const sgs = findIntTarg(targs, "SGS") orelse return false;
+    return topk >= 1 and ndim >= 1 and kdim >= 8 and @rem(kdim, 8) == 0 and
+        isPow2Range(lpr, 1, 32) and sgs >= 1 and sgs <= 32;
+}
+
+fn expertBf16DownRedFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const topk = findIntTarg(targs, "TOPK") orelse return false;
+    const ndim = findIntTarg(targs, "NDIM") orelse return false;
+    const kdim = findIntTarg(targs, "KDIM") orelse return false;
+    const lpr = findIntTarg(targs, "LPR") orelse return false;
+    const npt = findIntTarg(targs, "NPT") orelse return false;
+    const ssg = findIntTarg(targs, "SSG") orelse return false;
+    const stage = findIntTarg(targs, "STAGE") orelse return false;
+    if (topk < 1 or ndim < 1 or kdim < 8 or @rem(kdim, 8) != 0) return false;
+    if (!isPow2Range(lpr, 1, 32) or ssg < 1 or ssg > 32 or @rem(topk, ssg) != 0) return false;
+    const blk = @divExact(32, lpr) * npt;
+    if (@as(i64, topk) * @as(i64, blk) > 1024) return false;
+    if (stage != 0 and @as(i64, ssg) * @as(i64, @divExact(kdim, 8)) > 512) return false;
+    return true;
 }
 
 fn routerGateFilter(vals: []const CtVal) bool {
@@ -99,28 +237,42 @@ fn routerGateFilter(vals: []const CtVal) bool {
     return vals[0].dtype == vals[1].dtype;
 }
 
-fn fp8GemvFilter(vals: []const CtVal) bool {
-    // vals: [M, NR, T]
-    const m = vals[0].int;
-    const nr = vals[1].int;
-    if (m <= 4) return nr == 1 or nr == 2;
-    return nr == 2 or nr == 4;
+fn fp8GemvFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const sgs = findIntTarg(targs, "SGS") orelse return false;
+    const k = findIntTarg(targs, "K") orelse return false;
+    const tp = findIntTarg(targs, "TP") orelse return false;
+    const p0 = findIntTarg(targs, "P0") orelse return false;
+    const p1 = findIntTarg(targs, "P1") orelse return false;
+    const p2 = findIntTarg(targs, "P2") orelse return false;
+    return sgs >= 1 and sgs <= 32 and k > 0 and @rem(k, 128) == 0 and tp >= 1 and
+        p0 >= 0 and p1 >= 0 and p2 >= 0 and (@as(i64, p0) + @as(i64, p1) + @as(i64, p2)) > 0;
 }
 
 fn mtpQmvTileFilter(vals: []const CtVal) bool {
-    // vals: [T, NV, FAST, RPS]
-    const fast = vals[2].int;
-    const rps = vals[3].int;
+    // vals: [T, FAST, RPS]
+    const fast = vals[1].int;
+    const rps = vals[2].int;
     return (fast == 1 and rps == 2) or (fast == 0 and rps == 4);
 }
 
-fn mtpQmvStreamFilter(vals: []const CtVal) bool {
-    // vals: [O, MT]
-    const o = vals[0].int;
-    const mt = vals[1].int;
-    return (o == 1 and (mt == 5 or mt == 7)) or
-        (o == 4 and (mt == 3 or mt == 4)) or
-        (o == 2 and mt == 4);
+fn mtpQmvTileFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const m = findIntTarg(targs, "M") orelse return false;
+    const gs = findIntTarg(targs, "GS") orelse return false;
+    const fast = findIntTarg(targs, "FAST") orelse return false;
+    const vpt: i32 = if (fast != 0) 8 else 4;
+    return m >= 1 and gs >= vpt and @rem(gs, vpt) == 0;
+}
+
+fn mtpQmvStreamFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const m = findIntTarg(targs, "M") orelse return false;
+    const n = findIntTarg(targs, "N") orelse return false;
+    const k = findIntTarg(targs, "K") orelse return false;
+    const gs = findIntTarg(targs, "GS") orelse return false;
+    const sg = findIntTarg(targs, "SG") orelse return false;
+    const split = findIntTarg(targs, "SPLIT") orelse return false;
+    return m >= 1 and n >= 1 and k >= 256 and @rem(k, 256) == 0 and
+        gs >= 8 and @rem(gs, 8) == 0 and sg >= 1 and sg <= 32 and
+        (split == 0 or (sg >= 2 and @rem(sg, 2) == 0));
 }
 
 // ── Dynamic source builders (build-time only) ──
@@ -158,7 +310,19 @@ const gdn_params = [_]ParamSpec{
     .{ .name = "InT", .kind = .ct_dtype, .dtypes = &floats },
     .{ .name = "StT", .kind = .ct_dtype, .dtypes = &.{ .bfloat16, .float32 } },
     .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &floats },
-    .{ .name = "Dk", .kind = .ct_int, .ints = &.{ 64, 128, 256 } },
+    .{ .name = "Dk", .kind = .fc_int, .ints = &.{ 32, 64, 96, 128, 160, 192, 224, 256 } },
+    .{ .name = "Dv", .kind = .fc_int },
+    .{ .name = "Hk", .kind = .fc_int },
+    .{ .name = "Hv", .kind = .fc_int },
+    .{ .name = "GT", .kind = .io_dtype, .dtypes = &floats },
+    .{ .name = "BT", .kind = .io_dtype, .dtypes = &floats },
+};
+
+const gdn_seq_params = [_]ParamSpec{
+    .{ .name = "InT", .kind = .ct_dtype, .dtypes = &floats },
+    .{ .name = "StT", .kind = .ct_dtype, .dtypes = &.{ .bfloat16, .float32 } },
+    .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
+    .{ .name = "Dk", .kind = .fc_int, .ints = &.{ 32, 64, 96, 128, 160, 192, 224, 256 } },
     .{ .name = "Dv", .kind = .fc_int },
     .{ .name = "Hk", .kind = .fc_int },
     .{ .name = "Hv", .kind = .fc_int },
@@ -325,12 +489,12 @@ const static_specs = [_]KernelSpec{
         .outputs = &.{.{ .name = "z", .ty = fix(.float32) }},
         .params = &.{
             .{ .name = "TG", .kind = .fc_int },
-            .{ .name = "R", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
-            .{ .name = "M", .kind = .ct_int, .ints = &.{ 1, 4, 8, 12 } },
-            .{ .name = "HC", .kind = .ct_int, .ints = &.{ 2, 4, 8 } },
+            .{ .name = "R", .kind = .fc_int, .ints = &.{ 1, 2, 4 } },
+            .{ .name = "M", .kind = .fc_int, .ints = &.{ 1, 4, 8, 12 } },
+            .{ .name = "HC", .kind = .fc_int, .ints = &.{ 2, 4, 8 } },
             .{ .name = "XDT", .kind = .io_dtype, .dtypes = &floats },
         },
-        .filter = hcMixFilter,
+        .fc_filter = hcMixFcFilter,
     },
     .{
         .name = "dsv41_hc_mix_nax",
@@ -349,9 +513,10 @@ const static_specs = [_]KernelSpec{
             .{ .name = "NK", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "MIXN", .kind = .ct_int, .ints = &.{ 8, 12, 16, 24 } },
-            .{ .name = "HC", .kind = .ct_int, .ints = &.{ 2, 4 } },
+            .{ .name = "HC", .kind = .fc_int, .ints = &.{ 2, 4 } },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
         },
+        .fc_filter = hcMixNaxFcFilter,
     },
     .{
         .name = "dsv41_hc_stage",
@@ -372,10 +537,11 @@ const static_specs = [_]KernelSpec{
         },
         .params = &.{
             .{ .name = "TG", .kind = .fc_int },
-            .{ .name = "HC", .kind = .ct_int, .ints = &.{ 2, 4 } },
-            .{ .name = "ND", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 12, 16 } },
+            .{ .name = "HC", .kind = .fc_int, .ints = &.{ 2, 4 } },
+            .{ .name = "ND", .kind = .fc_int },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
         },
+        .fc_filter = hcStageFcFilter,
     },
     .{
         .name = "dsv41_hc_stage_x",
@@ -400,10 +566,11 @@ const static_specs = [_]KernelSpec{
         },
         .params = &.{
             .{ .name = "TG", .kind = .fc_int },
-            .{ .name = "HC", .kind = .ct_int, .ints = &.{ 2, 4 } },
-            .{ .name = "ND", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 12, 16 } },
+            .{ .name = "HC", .kind = .fc_int, .ints = &.{ 2, 4 } },
+            .{ .name = "ND", .kind = .fc_int },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
         },
+        .fc_filter = hcStageFcFilter,
     },
     .{
         .name = "dsv41_hc_stage_z",
@@ -426,11 +593,12 @@ const static_specs = [_]KernelSpec{
         },
         .params = &.{
             .{ .name = "TG", .kind = .fc_int },
-            .{ .name = "HC", .kind = .ct_int, .ints = &.{ 2, 4 } },
-            .{ .name = "ND", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 12, 16 } },
+            .{ .name = "HC", .kind = .fc_int, .ints = &.{ 2, 4 } },
+            .{ .name = "ND", .kind = .fc_int },
             .{ .name = "ITERS", .kind = .fc_int },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
         },
+        .fc_filter = hcStageZFcFilter,
     },
     .{
         .name = "dsv41_hc_split",
@@ -567,12 +735,12 @@ const static_specs = [_]KernelSpec{
         },
         .params = &.{
             .{ .name = "TG", .kind = .fc_int },
-            .{ .name = "R", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
-            .{ .name = "M", .kind = .ct_int, .ints = &.{ 1, 4, 8, 12 } },
-            .{ .name = "HC", .kind = .ct_int, .ints = &.{ 2, 4, 8 } },
+            .{ .name = "R", .kind = .fc_int, .ints = &.{ 1, 2, 4 } },
+            .{ .name = "M", .kind = .fc_int, .ints = &.{ 1, 4, 8, 12 } },
+            .{ .name = "HC", .kind = .fc_int, .ints = &.{ 2, 4, 8 } },
             .{ .name = "YDT", .kind = .io_dtype, .dtypes = &floats },
         },
-        .filter = hcMixFilter,
+        .fc_filter = hcMixFcFilter,
     },
 
     // ── src/hc_prefill.zig (2 kernels) ──
@@ -673,11 +841,13 @@ const static_specs = [_]KernelSpec{
         },
         .outputs = &.{.{ .name = "scores", .ty = fix(.float32) }},
         .params = &.{
-            .{ .name = "IH", .kind = .ct_int, .ints = &.{ 4, 8, 16, 32, 64 } },
-            .{ .name = "IHD", .kind = .ct_int, .ints = &.{ 32, 64, 128 } },
+            .{ .name = "QS_CAP", .kind = .ct_int, .ints = &.{ 2048, 4096, 8192 } },
+            .{ .name = "IH", .kind = .fc_int },
+            .{ .name = "IHD", .kind = .fc_int },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &floats },
             .{ .name = "WDT", .kind = .io_dtype, .dtypes = &.{ .float32, .bfloat16 } },
         },
+        .fc_filter = indexScoresFcFilter,
     },
     .{
         .name = "dsv41_index_tile",
@@ -691,13 +861,14 @@ const static_specs = [_]KernelSpec{
         },
         .outputs = &.{.{ .name = "scores", .ty = fix(.float32) }},
         .params = &.{
-            .{ .name = "IH", .kind = .ct_int, .ints = &.{ 8, 16, 32, 64 } },
-            .{ .name = "IHD", .kind = .ct_int, .ints = &.{ 32, 64, 128 } },
+            .{ .name = "IH", .kind = .fc_int },
+            .{ .name = "IHD", .kind = .fc_int },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{ 32, 64 } },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
             .{ .name = "WDT", .kind = .io_dtype, .dtypes = &.{ .float32, .bfloat16 } },
         },
         .filter = indexTileFilter,
+        .fc_filter = indexTileFcFilter,
     },
     .{
         .name = "dsv41_index_tile_nax",
@@ -748,6 +919,7 @@ const static_specs = [_]KernelSpec{
         .outputs = &gdn_outs_plain,
         .params = &gdn_params,
         .filter = gdnStepFilter,
+        .fc_filter = gdnStepFcFilter,
     },
     .{
         .name = "gated_delta_step_vec",
@@ -756,22 +928,25 @@ const static_specs = [_]KernelSpec{
         .outputs = &gdn_outs_plain,
         .params = &gdn_params,
         .filter = gdnStepFilter,
+        .fc_filter = gdnStepFcFilter,
     },
     .{
         .name = "gated_delta_step_seq",
         .source = if (custom.is_codegen) trunk.gdnKernelSource(false, true) else "",
         .inputs = &gdn_ins_seq,
         .outputs = &gdn_outs_seq,
-        .params = &gdn_params,
-        .filter = gdnStepFilter,
+        .params = &gdn_seq_params,
+        .filter = gdnStepSeqFilter,
+        .fc_filter = gdnStepFcFilter,
     },
     .{
         .name = "gated_delta_step_seq_vec",
         .source = if (custom.is_codegen) trunk.gdnKernelSource(true, true) else "",
         .inputs = &gdn_ins_seq,
         .outputs = &gdn_outs_seq,
-        .params = &gdn_params,
-        .filter = gdnStepFilter,
+        .params = &gdn_seq_params,
+        .filter = gdnStepSeqFilter,
+        .fc_filter = gdnStepFcFilter,
     },
     .{
         .name = "sushi_swiglu",
@@ -845,13 +1020,14 @@ const static_specs = [_]KernelSpec{
             .{ .name = "NSGT", .kind = .fc_int },
             .{ .name = "BK", .kind = .ct_int, .ints = &.{ 16, 32 } },
             .{ .name = "RATIO", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 4, 6, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 6, 8 } },
             .{ .name = "GS", .kind = .fc_int },
             .{ .name = "QUANT", .kind = .ct_int, .ints = &.{1} },
-            .{ .name = "DK", .kind = .ct_int, .ints = &.{ 128, 192, 256 } },
-            .{ .name = "DV", .kind = .ct_int, .ints = &.{ 128, 256 } },
-            .{ .name = "SPARSE", .kind = .fc_int },
+            .{ .name = "DK", .kind = .fc_int },
+            .{ .name = "DV", .kind = .fc_int },
+            .{ .name = "SPARSE", .kind = .fc_int, .ints = &.{ 0, 1 } },
         },
+        .fc_filter = qsaQsplitFcFilter,
     },
     .{
         .name = "sushi_attn_qsa256_qsplit",
@@ -879,13 +1055,14 @@ const static_specs = [_]KernelSpec{
             .{ .name = "NSGT", .kind = .fc_int },
             .{ .name = "BK", .kind = .ct_int, .ints = &.{ 16, 32 } },
             .{ .name = "RATIO", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 4, 6, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 6, 8 } },
             .{ .name = "GS", .kind = .fc_int },
             .{ .name = "QUANT", .kind = .ct_int, .ints = &.{0} },
-            .{ .name = "DK", .kind = .ct_int, .ints = &.{ 128, 192, 256 } },
-            .{ .name = "DV", .kind = .ct_int, .ints = &.{ 128, 256 } },
-            .{ .name = "SPARSE", .kind = .fc_int },
+            .{ .name = "DK", .kind = .fc_int },
+            .{ .name = "DV", .kind = .fc_int },
+            .{ .name = "SPARSE", .kind = .fc_int, .ints = &.{ 0, 1 } },
         },
+        .fc_filter = qsaQsplitFcFilter,
     },
     .{
         .name = "sushi_attn_qsa256_qmerge",
@@ -1032,10 +1209,11 @@ const static_specs = [_]KernelSpec{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
             .{ .name = "GS", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 3, 4, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 8 } },
             .{ .name = "ST", .kind = .io_dtype, .dtypes = &floats },
         },
         .filter = gqmvPlainFilter,
+        .fc_filter = gqmvAffineBaseOk,
     },
     .{
         .name = "sushi_moe_gather_qmv_px",
@@ -1054,10 +1232,11 @@ const static_specs = [_]KernelSpec{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
             .{ .name = "GS", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 3, 4, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 8 } },
             .{ .name = "ST", .kind = .io_dtype, .dtypes = &floats },
         },
         .filter = gqmvPlainFilter,
+        .fc_filter = gqmvAffineBaseOk,
     },
     .{
         .name = "sushi_moe_gather_qmv_gateup",
@@ -1080,9 +1259,10 @@ const static_specs = [_]KernelSpec{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &f16s },
             .{ .name = "GS", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 3, 4, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 8 } },
             .{ .name = "KP", .kind = .fc_int },
         },
+        .fc_filter = gqmvGateUpFcFilter,
     },
     .{
         .name = "sushi_moe_gather_qmv_gateup_rows",
@@ -1105,10 +1285,11 @@ const static_specs = [_]KernelSpec{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &f16s },
             .{ .name = "GS", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 3, 4, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 8 } },
             .{ .name = "KP", .kind = .fc_int },
             .{ .name = "TOPK", .kind = .fc_int },
         },
+        .fc_filter = gqmvGateUpRowsFcFilter,
     },
     .{
         .name = "sushi_moe_gather_qmv_downred",
@@ -1128,12 +1309,13 @@ const static_specs = [_]KernelSpec{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &f16s },
             .{ .name = "GS", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 3, 4, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 8 } },
             .{ .name = "TOPK", .kind = .fc_int },
             .{ .name = "ROWS", .kind = .fc_int },
             .{ .name = "LPR", .kind = .fc_int },
             .{ .name = "KP", .kind = .fc_int },
         },
+        .fc_filter = gqmvDownRedFcFilter,
     },
     .{
         .name = "sushi_moe_gather_qmv_downred_rows",
@@ -1153,12 +1335,13 @@ const static_specs = [_]KernelSpec{
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &f16s },
             .{ .name = "GS", .kind = .fc_int },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 2, 3, 4, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 2, 3, 4, 8 } },
             .{ .name = "TOPK", .kind = .fc_int },
             .{ .name = "ROWS", .kind = .fc_int },
             .{ .name = "LPR", .kind = .fc_int },
             .{ .name = "KP", .kind = .fc_int },
         },
+        .fc_filter = gqmvDownRedFcFilter,
     },
     .{
         .name = "sushi_qmv_rows",
@@ -1174,9 +1357,10 @@ const static_specs = [_]KernelSpec{
         .outputs = &.{.{ .name = "y", .ty = par("T") }},
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &f16s },
-            .{ .name = "BITS", .kind = .ct_int, .ints = &.{ 3, 4, 8 } },
+            .{ .name = "BITS", .kind = .fc_int, .ints = &.{ 3, 4, 8 } },
             .{ .name = "GS", .kind = .fc_int },
         },
+        .fc_filter = qmvRowsFcFilter,
     },
 
     // ── src/expert_bf16_kernels.zig (2 kernels) ──
@@ -1196,8 +1380,9 @@ const static_specs = [_]KernelSpec{
             .{ .name = "KDIM", .kind = .fc_int },
             .{ .name = "LPR", .kind = .fc_int },
             .{ .name = "SGS", .kind = .fc_int },
-            .{ .name = "NPT", .kind = .ct_int, .ints = &.{ 1, 2, 4, 8 } },
+            .{ .name = "NPT", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
         },
+        .fc_filter = expertBf16GateUpFcFilter,
     },
     .{
         .name = "sushi_expert_bf16_down_reduce",
@@ -1215,70 +1400,73 @@ const static_specs = [_]KernelSpec{
             .{ .name = "NDIM", .kind = .fc_int },
             .{ .name = "KDIM", .kind = .fc_int },
             .{ .name = "LPR", .kind = .fc_int },
-            .{ .name = "NPT", .kind = .ct_int, .ints = &.{ 1, 2, 4, 8 } },
+            .{ .name = "NPT", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
             .{ .name = "SSG", .kind = .fc_int },
             .{ .name = "STAGE", .kind = .ct_int, .ints = &.{ 0, 1 } },
         },
+        .fc_filter = expertBf16DownRedFcFilter,
     },
 
     // ── src/fp8_block.zig (8 kernels, 2 NAX) ──
     .{
         .name = "sushi_fp8_block_gemv",
         .header = fp8.E4M3_HEADER,
-        .source = fp8.GEMV_HEAD ++ fp8.GEMV_DIRECT ++ fp8.GEMV_TAIL ++ fp8.GEMV_STORE_1,
+        .source = fp8.GEMV_DIRECT_CAP ++ fp8.GEMV_HEAD ++ fp8.GEMV_DIRECT ++ fp8.GEMV_TAIL ++ fp8.GEMV_STORE_1,
         .inputs = &fp8_ins_x,
         .outputs = &fp8_outs_1,
         .params = &([_]ParamSpec{
-            .{ .name = "M", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
-            .{ .name = "NR", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
+            .{ .name = "M", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
+            .{ .name = "NR", .kind = .fc_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "SGS", .kind = .fc_int },
             .{ .name = "S", .kind = .ignored },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
         } ++ fp8_common_fcs),
-        .filter = fp8GemvFilter,
+        .fc_filter = fp8GemvFcFilter,
     },
     .{
         .name = "sushi_fp8_block_gemv3",
         .header = fp8.E4M3_HEADER,
-        .source = fp8.GEMV_HEAD ++ fp8.GEMV_DIRECT ++ fp8.GEMV_TAIL ++ fp8.GEMV_STORE_3,
+        .source = fp8.GEMV_DIRECT_CAP ++ fp8.GEMV_HEAD ++ fp8.GEMV_DIRECT ++ fp8.GEMV_TAIL ++ fp8.GEMV_STORE_3,
         .inputs = &fp8_ins_x,
         .outputs = &fp8_outs_3,
         .params = &([_]ParamSpec{
-            .{ .name = "M", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
-            .{ .name = "NR", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
+            .{ .name = "M", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
+            .{ .name = "NR", .kind = .fc_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "SGS", .kind = .fc_int },
             .{ .name = "S", .kind = .ignored },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
         } ++ fp8_common_fcs),
-        .filter = fp8GemvFilter,
+        .fc_filter = fp8GemvFcFilter,
     },
     .{
         .name = "sushi_fp8_block_gemv_staged",
         .header = fp8.E4M3_HEADER,
-        .source = fp8.GEMV_HEAD ++ fp8.GEMV_STAGED ++ fp8.GEMV_TAIL ++ fp8.GEMV_STORE_1,
+        .source = fp8.GEMV_STAGED_CAP ++ fp8.GEMV_HEAD ++ fp8.GEMV_STAGED ++ fp8.GEMV_TAIL ++ fp8.GEMV_STORE_1,
         .inputs = &fp8_ins_x,
         .outputs = &fp8_outs_1,
         .params = &([_]ParamSpec{
-            .{ .name = "M", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
+            .{ .name = "M", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
             .{ .name = "NR", .kind = .ct_int, .ints = &.{4} },
             .{ .name = "SGS", .kind = .fc_int },
             .{ .name = "S", .kind = .ct_int, .ints = &.{1} },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
         } ++ fp8_common_fcs),
+        .fc_filter = fp8GemvFcFilter,
     },
     .{
         .name = "sushi_fp8_block_gemv_staged3",
         .header = fp8.E4M3_HEADER,
-        .source = fp8.GEMV_HEAD ++ fp8.GEMV_STAGED ++ fp8.GEMV_TAIL ++ fp8.GEMV_STORE_3,
+        .source = fp8.GEMV_STAGED_CAP ++ fp8.GEMV_HEAD ++ fp8.GEMV_STAGED ++ fp8.GEMV_TAIL ++ fp8.GEMV_STORE_3,
         .inputs = &fp8_ins_x,
         .outputs = &fp8_outs_3,
         .params = &([_]ParamSpec{
-            .{ .name = "M", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
+            .{ .name = "M", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
             .{ .name = "NR", .kind = .ct_int, .ints = &.{4} },
             .{ .name = "SGS", .kind = .fc_int },
             .{ .name = "S", .kind = .ct_int, .ints = &.{1} },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats },
         } ++ fp8_common_fcs),
+        .fc_filter = fp8GemvFcFilter,
     },
     .{
         .name = "sushi_fp8_block_dequant",
@@ -1389,11 +1577,12 @@ const static_specs = [_]KernelSpec{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
             .{ .name = "M", .kind = .fc_int },
             .{ .name = "GS", .kind = .fc_int },
-            .{ .name = "NV", .kind = .ct_int, .ints = &.{ 1, 2, 3, 4 } },
+            .{ .name = "NV", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4 } },
             .{ .name = "FAST", .kind = .ct_int, .ints = &.{ 0, 1 } },
             .{ .name = "RPS", .kind = .ct_int, .ints = &.{ 2, 4 } },
         },
         .filter = mtpQmvTileFilter,
+        .fc_filter = mtpQmvTileFcFilter,
     },
     .{
         .name = "mtp_serial_qmv8_rows_stream",
@@ -1410,12 +1599,12 @@ const static_specs = [_]KernelSpec{
             .{ .name = "N", .kind = .fc_int },
             .{ .name = "K", .kind = .fc_int },
             .{ .name = "GS", .kind = .fc_int },
-            .{ .name = "O", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
+            .{ .name = "O", .kind = .fc_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "SG", .kind = .fc_int },
-            .{ .name = "MT", .kind = .ct_int, .ints = &.{ 3, 4, 5, 7 } },
-            .{ .name = "SPLIT", .kind = .fc_int },
+            .{ .name = "MT", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7 } },
+            .{ .name = "SPLIT", .kind = .fc_int, .ints = &.{ 0, 1 } },
         },
-        .filter = mtpQmvStreamFilter,
+        .fc_filter = mtpQmvStreamFcFilter,
     },
     .{
         .name = "mtp_serial_gemv_f32_rows",

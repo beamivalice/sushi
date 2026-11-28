@@ -821,6 +821,15 @@ pub const KV_UNPACK_HEADER =
     \\  }
     \\}
     \\
+    \\template <typename T>
+    \\inline void sushi_kv_unpack8_fc(const device uint32_t* wq, int c8, float sj, float bj, thread T* ev, int bits) {
+    \\  if (bits == 2)      sushi_kv_unpack8<T, 2>(wq, c8, sj, bj, ev);
+    \\  else if (bits == 3) sushi_kv_unpack8<T, 3>(wq, c8, sj, bj, ev);
+    \\  else if (bits == 4) sushi_kv_unpack8<T, 4>(wq, c8, sj, bj, ev);
+    \\  else if (bits == 6) sushi_kv_unpack8<T, 6>(wq, c8, sj, bj, ev);
+    \\  else if (bits == 8) sushi_kv_unpack8<T, 8>(wq, c8, sj, bj, ev);
+    \\}
+    \\
     \\// Sixteen 6-bit values from three words (96 bits), as the matmul2d kernels load them.
     \\template <typename T>
     \\inline void sushi_kv_store16_b6(uint w0, uint w1, uint w2, float sj, float bj, threadgroup T* dst) {
@@ -848,14 +857,22 @@ pub const QSA_SCORE_KERNEL_HEADER =
 ;
 
 pub const QSA_ATTN_Q_SOURCE =
-    \\constexpr int KC = DK / 8;
-    \\constexpr int VC = DV / 8;
+    \\const int KC = DK / 8;
+    \\const int VC = DV / 8;
     \\constexpr int LDK = BK + 8;
-    \\constexpr int LDV = DV + 8;
+    \\const int LDV = DV + 8;
     \\// Simdgroups past NSG only stage tiles: who loads an element never changes its value.
     \\const int NT = 32 * NSGT;
     \\constexpr int KT = BK / 8;
-    \\constexpr int KV_ELEMS = (DK * LDK > BK * LDV) ? DK * LDK : BK * LDV;
+    \\#ifdef SUSHI_METALLIB
+    \\constexpr int KC_CAP = 32;
+    \\constexpr int VC_CAP = 32;
+    \\constexpr int KV_ELEMS = (256 * LDK > BK * (256 + 8)) ? 256 * LDK : BK * (256 + 8);
+    \\#else
+    \\constexpr int KC_CAP = DK / 8;
+    \\constexpr int VC_CAP = DV / 8;
+    \\constexpr int KV_ELEMS = (DK * LDK > BK * (DV + 8)) ? DK * LDK : BK * (DV + 8);
+    \\#endif
     \\// Per-length split counts ride the grid, never a template.
     \\const int NSPLIT = int(threadgroups_per_grid.z);
     \\
@@ -922,18 +939,22 @@ pub const QSA_ATTN_Q_SOURCE =
     \\const bool row_ok = row < gqa;
     \\const bool mma_sg = int(warp) < NSG;
     \\
-    \\float2 Qfrag[KC];
+    \\float2 Qfrag[KC_CAP];
     \\if (row_ok) {
     \\  const device T* Qrow = q + bb * q_strides[0] + (long)(hk * gqa + row) * q_strides[1] + (long)s * q_strides[2];
-    \\  for (int dd = 0; dd < KC; ++dd) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int dd = 0; dd < KC_CAP; ++dd) {
+    \\    if (dd >= KC) break;
     \\    const vec<T, 2> pr = *((const device vec<T, 2>*)(Qrow + dd * 8 + sn));
     \\    Qfrag[dd] = float2(float(pr.x), float(pr.y));
     \\  }
     \\} else {
-    \\  for (int dd = 0; dd < KC; ++dd) Qfrag[dd] = float2(0.0f);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int dd = 0; dd < KC_CAP; ++dd) { if (dd >= KC) break; Qfrag[dd] = float2(0.0f); }
     \\}
-    \\float2 Ofrag[VC];
-    \\for (int i = 0; i < VC; ++i) Ofrag[i] = float2(0.0f);
+    \\float2 Ofrag[VC_CAP];
+    \\#pragma clang loop unroll(full)
+    \\for (int i = 0; i < VC_CAP; ++i) { if (i >= VC) break; Ofrag[i] = float2(0.0f); }
     \\float max_score = -3.0e38f;
     \\float sum_score = 0.0f;
     \\
@@ -959,7 +980,7 @@ pub const QSA_ATTN_Q_SOURCE =
     \\      const int g = cb / GS;
     \\      const float sj = float(ksc[ksc_base + (long)pos * ksc_strides[2] + (long)g]);
     \\      const float bj = float(kbi[kbi_base + (long)pos * kbi_strides[2] + (long)g]);
-    \\      sushi_kv_unpack8<T, BITS>((const device uint32_t*)(kq + wrow), c8, sj, bj, ev);
+    \\      sushi_kv_unpack8_fc<T>((const device uint32_t*)(kq + wrow), c8, sj, bj, ev, BITS);
     \\      } else {
     \\        for (int j = 0; j < 8; ++j) ev[j] = T(kq[kq_base + (long)pos * kq_strides[2] + cb + j]);
     \\      }
@@ -973,7 +994,9 @@ pub const QSA_ATTN_Q_SOURCE =
     \\  float2 Sfrag[KT];
     \\  for (int i = 0; i < KT; ++i) Sfrag[i] = float2(0.0f);
     \\  if (mma_sg) {
-    \\  for (int dd = 0; dd < KC; ++dd) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int dd = 0; dd < KC_CAP; ++dd) {
+    \\    if (dd >= KC) break;
     \\    const float2 qf = Qfrag[dd];
     \\    const int kbase = Ks_off + dd * 8 * LDK;
     \\    for (int kt = 0; kt < KT; ++kt) {
@@ -1006,7 +1029,7 @@ pub const QSA_ATTN_Q_SOURCE =
     \\      const int g = cb / GS;
     \\      const float sj = float(vsc[vsc_base + (long)pos * vsc_strides[2] + (long)g]);
     \\      const float bj = float(vbi[vbi_base + (long)pos * vbi_strides[2] + (long)g]);
-    \\      sushi_kv_unpack8<T, BITS>((const device uint32_t*)(vq + wrow), c8, sj, bj, ev);
+    \\      sushi_kv_unpack8_fc<T>((const device uint32_t*)(vq + wrow), c8, sj, bj, ev, BITS);
     \\      } else {
     \\        for (int j = 0; j < 8; ++j) ev[j] = T(vq[vq_base + (long)pos * vq_strides[2] + cb + j]);
     \\      }
@@ -1027,12 +1050,15 @@ pub const QSA_ATTN_Q_SOURCE =
     \\  const float factor = metal::exp2(max_score - new_max);
     \\  max_score = new_max;
     \\  sum_score = sum_score * factor + rowsum;
-    \\  for (int i = 0; i < VC; ++i) Ofrag[i] *= factor;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < VC_CAP; ++i) { if (i >= VC) break; Ofrag[i] *= factor; }
     \\  }
     \\
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  if (mma_sg) {
-    \\  for (int id = 0; id < VC; ++id) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int id = 0; id < VC_CAP; ++id) {
+    \\    if (id >= VC) break;
     \\    const int vbase = Vs_off + id * 8;
     \\    for (int kt = 0; kt < KT; ++kt) {
     \\      const float2 vf = float2(float(Vs[vbase + kt * 8 * LDV]), float(Vs[vbase + kt * 8 * LDV + 1]));
@@ -1056,7 +1082,9 @@ pub const QSA_ATTN_Q_SOURCE =
     \\  const int hq = hk * gqa + row;
     \\  const long pidx = ((long)hq * (long)qL + (long)s) * NSPLIT + jsp;
     \\  device float* Aptr = pacc + pidx * DV + sn;
-    \\  for (int id = 0; id < VC; ++id) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int id = 0; id < VC_CAP; ++id) {
+    \\    if (id >= VC) break;
     \\    Aptr[id * 8] = Ofrag[id].x;
     \\    Aptr[id * 8 + 1] = Ofrag[id].y;
     \\  }
@@ -1234,9 +1262,15 @@ pub var qsa_attn_cfgs = QsaCfgCache(QsaAttnCfgKey, 2){};
 /// One split-K pass plus its merge. `arrays` = the packed K and V triples, or dense K and V
 /// three times each; `blocks` is read only when `key.sparse`. Null = a kernel failed to build.
 pub fn splitKAttnDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, blocks: mlx.mlx_array, arrays: [6]mlx.mlx_array, attn_scale: f32, key: QsaAttnCfgKey) !?mlx.mlx_array {
+    const qs = mlx.getShape(q);
+    if (qs.len != 4) return null;
+    if (qs[3] <= 0 or qs[3] > 256 or @rem(qs[3], 8) != 0 or key.dv <= 0 or key.dv > 256 or @rem(key.dv, 8) != 0) return null;
+    if (key.bk != 16 and key.bk != 32) return null;
+    if (key.nsg < 1 or key.nsgt < key.nsg or key.nsgt > 32 or key.ratio < 1) return null;
+    if (key.bits != 2 and key.bits != 3 and key.bits != 4 and key.bits != 6 and key.bits != 8) return null;
+    if (key.gs < 8 or key.gs % 8 != 0 or @rem(qs[3], @as(c_int, @intCast(key.gs))) != 0 or @rem(key.dv, @as(c_int, @intCast(key.gs))) != 0) return null;
     const kernel = getQsaAttnQKernel() catch return null;
     const merge_kernel = getQsaAttnMergeKernel() catch return null;
-    const qs = mlx.getShape(q);
     const seq_len = qs[2];
     const scl_data = [_]f32{attn_scale};
     const one = [_]c_int{1};

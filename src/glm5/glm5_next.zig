@@ -375,7 +375,7 @@ pub fn kda(in: KdaInputs, s: mlx.mlx_stream) !KdaResult {
     const v = mlx.getShape(in.v);
     if (q.len != 4 or v.len != 4 or !std.mem.eql(c_int, q, mlx.getShape(in.k)) or
         !std.mem.eql(c_int, q, mlx.getShape(in.decay))) return error.InvalidKdaShape;
-    if (q[0] <= 0 or q[1] <= 0 or q[2] <= 0 or q[3] <= 0 or @mod(q[3], 32) != 0 or
+    if (q[0] <= 0 or q[1] <= 0 or q[2] <= 0 or q[3] <= 0 or q[3] > 256 or @mod(q[3], 32) != 0 or
         v[3] <= 0 or @mod(v[3], 4) != 0 or !std.mem.eql(c_int, q[0..3], v[0..3]) or
         !std.mem.eql(c_int, q[0..3], mlx.getShape(in.beta))) return error.InvalidKdaShape;
     const state_shape = [_]c_int{ q[0], q[2], v[3], q[3] };

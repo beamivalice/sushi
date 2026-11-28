@@ -323,7 +323,9 @@ pub fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:
     const seq_write = if (capture_seq)
         \\  if (t + 1 < T) {
         \\    auto t_state = state_seq + t * seq_stride + seq_base;
-        \\    for (int i = 0; i < n_per_t; ++i) {
+        \\    #pragma clang loop unroll(full)
+        \\    for (int i = 0; i < N_PER_T_CAP; ++i) {
+        \\      if (i >= n_per_t) break;
         \\      auto s_idx = n_per_t * dk_idx + i;
         \\      t_state[s_idx] = static_cast<StT>(state[i]);
         \\      state[i] = static_cast<float>(t_state[s_idx]);
@@ -338,7 +340,12 @@ pub fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:
         "auto b_idx = n / Hv;\n" ++
         "auto hv_idx = n % Hv;\n" ++
         "auto hk_idx = hv_idx / (Hv / Hk);\n" ++
-        "constexpr int n_per_t = Dk / 32;\n" ++
+        "const int n_per_t = Dk / 32;\n" ++
+        "#ifdef SUSHI_METALLIB\n" ++
+        "constexpr int N_PER_T_CAP = 8;\n" ++
+        "#else\n" ++
+        "constexpr int N_PER_T_CAP = Dk / 32;\n" ++
+        "#endif\n" ++
         "\n" ++
         "auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;\n" ++
         "auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;\n" ++
@@ -353,8 +360,10 @@ pub fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:
         "auto o_state = state_out + (n * Dv + dv_idx) * Dk;\n" ++
         seq_base ++
         "\n" ++
-        "float state[n_per_t];\n" ++
-        "for (int i = 0; i < n_per_t; ++i) {\n" ++
+        "float state[N_PER_T_CAP];\n" ++
+        "#pragma clang loop unroll(full)\n" ++
+        "for (int i = 0; i < N_PER_T_CAP; ++i) {\n" ++
+        "  if (i >= n_per_t) break;\n" ++
         "  auto s_idx = n_per_t * dk_idx + i;\n" ++
         "  state[i] = static_cast<float>(i_state[s_idx]);\n" ++
         "}\n" ++
@@ -364,7 +373,9 @@ pub fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:
         "\n" ++
         "for (int t = 0; t < T; ++t) {\n" ++
         "  float kv_mem = 0.0f;\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
+        "  #pragma clang loop unroll(full)\n" ++
+        "  for (int i = 0; i < N_PER_T_CAP; ++i) {\n" ++
+        "    if (i >= n_per_t) break;\n" ++
         "    auto s_idx = n_per_t * dk_idx + i;\n" ++
         "    state[i] = state[i] * " ++ g_access ++ ";\n" ++
         "    kv_mem += state[i] * k_[s_idx];\n" ++
@@ -374,7 +385,9 @@ pub fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:
         "  auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];\n" ++
         "\n" ++
         "  float out = 0.0f;\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
+        "  #pragma clang loop unroll(full)\n" ++
+        "  for (int i = 0; i < N_PER_T_CAP; ++i) {\n" ++
+        "    if (i >= n_per_t) break;\n" ++
         "    auto s_idx = n_per_t * dk_idx + i;\n" ++
         "    state[i] = state[i] + k_[s_idx] * delta;\n" ++
         "    out += state[i] * q_[s_idx];\n" ++
@@ -391,7 +404,9 @@ pub fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:
         g_advance ++ "\n" ++
         "  beta_ += Hv;\n" ++
         "}\n" ++
-        "for (int i = 0; i < n_per_t; ++i) {\n" ++
+        "#pragma clang loop unroll(full)\n" ++
+        "for (int i = 0; i < N_PER_T_CAP; ++i) {\n" ++
+        "  if (i >= n_per_t) break;\n" ++
         "  auto s_idx = n_per_t * dk_idx + i;\n" ++
         "  o_state[s_idx] = static_cast<StT>(state[i]);\n" ++
         "}\n";

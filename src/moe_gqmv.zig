@@ -42,7 +42,7 @@ fn gatherQmvSource(comptime x_per_expert: bool) [:0]const u8 {
         \\
         \\int K = int(K_size);
         \\int N = int(N_size);
-        \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;  // values per pack: a word, or 3 bytes at 3-bit
+        \\const int VPW = (BITS == 3) ? 8 : 32 / BITS;  // values per pack: a word, or 3 bytes at 3-bit
         \\int K_by_p = K / VPW;                    // packs per row
         \\int K_by_w = K * BITS / 32;              // words per row
         \\int K_by_gs = K / GS;                    // quant groups per row
@@ -57,7 +57,7 @@ fn gatherQmvSource(comptime x_per_expert: bool) [:0]const u8 {
         \\// serial dependency; VPW is 16/8/4 for bits 2/4/8, always a multiple of 4.
         \\float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         \\for (int pack = int(lane); pack < K_by_p; pack += 32) {{
-        \\  uint32_t packed = sushi_qpack<BITS>(w_q, wbase, pack);
+        \\  uint32_t packed = sushi_qpack(w_q, wbase, pack, BITS);
         \\  int k_base = pack * VPW;
         \\  int gi = k_base / GS;                  // GS >= VPW, so one group per word
         \\{s}
@@ -75,7 +75,9 @@ fn gatherQmvSource(comptime x_per_expert: bool) [:0]const u8 {
 const GQMV_BODY_AFFINE =
     \\  float sj = float(scales[gbase + (size_t)gi]);
     \\  float bj = float(biases[gbase + (size_t)gi]);
-    \\  for (int ki = 0; ki < VPW; ki += 4) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int ki = 0; ki < 16; ki += 4) {
+    \\    if (ki >= VPW) break;
     \\    size_t xi = xoff + (size_t)(k_base + ki);
     \\    uint32_t q = packed >> (ki * BITS);
     \\    a0 += float(x[xi + 0]) * (float((q >> (0 * BITS)) & mask) * sj + bj);
@@ -89,9 +91,8 @@ const GQMV_BODY_AFFINE =
 // 3-bit, mx.quantize packs 8 values into 3 bytes (value i at bit 3i), so the
 // unit is a byte triple and the body's `>> (i * BITS)` walk is unchanged.
 pub const GQMV_AFFINE_HEADER =
-    \\template <int B>
-    \\inline uint32_t sushi_qpack(const device uint32_t* w, size_t wbase_words, int pack) {
-    \\  if (B == 3) {
+    \\inline uint32_t sushi_qpack(const device uint32_t* w, size_t wbase_words, int pack, int bits) {
+    \\  if (bits == 3) {
     \\    const device uchar* wb = (const device uchar*)w + wbase_words * 4 + (size_t)pack * 3;
     \\    return uint32_t(wb[0]) | (uint32_t(wb[1]) << 8) | (uint32_t(wb[2]) << 16);
     \\  }
@@ -122,7 +123,7 @@ fn gatherQmvGateUpSource() [:0]const u8 {
         \\
         \\int K = int(K_size);
         \\int N = int(N_size);
-        \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
+        \\const int VPW = (BITS == 3) ? 8 : 32 / BITS;
         \\int K_by_p = K / VPW;
         \\int K_by_w = K * BITS / 32;
         \\int K_by_gs = K / GS;
@@ -141,8 +142,8 @@ fn gatherQmvGateUpSource() [:0]const u8 {
         \\uint32_t pu[64];
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(lane) + 32 * i;
-        \\  pg[i] = (pack < KP) ? sushi_qpack<BITS>(wg_q, wbase, pack) : 0u;
-        \\  pu[i] = (pack < KP) ? sushi_qpack<BITS>(wu_q, wbase, pack) : 0u;
+        \\  pg[i] = (pack < KP) ? sushi_qpack(wg_q, wbase, pack, BITS) : 0u;
+        \\  pu[i] = (pack < KP) ? sushi_qpack(wu_q, wbase, pack, BITS) : 0u;
         \\}}
         \\// Two independent 4-way accumulator sets: the gate chain and the up
         \\// chain never wait on each other.
@@ -177,7 +178,9 @@ const GQMV_GATEUP_BODY_AFFINE =
     \\  float bjg = float(g_biases[gbase + (size_t)gi]);
     \\  float sju = float(u_scales[gbase + (size_t)gi]);
     \\  float bju = float(u_biases[gbase + (size_t)gi]);
-    \\  for (int ki = 0; ki < VPW; ki += 4) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int ki = 0; ki < 16; ki += 4) {
+    \\    if (ki >= VPW) break;
     \\    size_t xi = xrow + (size_t)(k_base + ki);
     \\    uint32_t qg = packed_g >> (ki * BITS);
     \\    uint32_t qu = packed_u >> (ki * BITS);
@@ -293,9 +296,12 @@ pub fn gatherQmvGateUp(
     const N: c_int = wsh[1];
     const K: c_int = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
     if (@rem(K, @as(c_int, @intCast(group_size))) != 0) return null;
+    const kp = affineQmvPackUnits(K, bits);
+    if (kp < 1 or kp > 64 * 32) return null;
     const ish = mlx.getShape(inds);
     if (ish.len != 1) return null;
     const topk: c_int = ish[0];
+    if (topk <= 0) return null;
     const xsh = mlx.getShape(x);
     var xelems: i64 = 1;
     for (xsh) |d| xelems *= d;
@@ -315,7 +321,7 @@ pub fn gatherQmvGateUp(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", kp));
         gateup_cfgs.put(key, .{config});
         break :blk config;
     };
@@ -352,7 +358,7 @@ fn gatherQmvGateUpRowsSource() [:0]const u8 {
         \\
         \\int K = int(K_size);
         \\int N = int(N_size);
-        \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
+        \\const int VPW = (BITS == 3) ? 8 : 32 / BITS;
         \\int K_by_p = K / VPW;
         \\int K_by_w = K * BITS / 32;
         \\int K_by_gs = K / GS;
@@ -368,8 +374,8 @@ fn gatherQmvGateUpRowsSource() [:0]const u8 {
         \\uint32_t pu[64];
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(lane) + 32 * i;
-        \\  pg[i] = (pack < KP) ? sushi_qpack<BITS>(wg_q, wbase, pack) : 0u;
-        \\  pu[i] = (pack < KP) ? sushi_qpack<BITS>(wu_q, wbase, pack) : 0u;
+        \\  pg[i] = (pack < KP) ? sushi_qpack(wg_q, wbase, pack, BITS) : 0u;
+        \\  pu[i] = (pack < KP) ? sushi_qpack(wu_q, wbase, pack, BITS) : 0u;
         \\}}
         \\float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
         \\float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
@@ -478,6 +484,8 @@ pub fn gatherQmvGateUpRows(
     const N: c_int = wsh[1];
     const K: c_int = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
     if (@rem(K, @as(c_int, @intCast(group_size))) != 0) return null;
+    const kp = affineQmvPackUnits(K, bits);
+    if (kp < 1 or kp > 64 * 32) return null;
     const ish = mlx.getShape(inds);
     if (ish.len != 2) return null;
     const nrows: c_int = ish[0];
@@ -500,7 +508,7 @@ pub fn gatherQmvGateUpRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", kp));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPK", topk));
         gateup_rows_cfgs.put(key, .{config});
         break :blk config;
@@ -685,7 +693,7 @@ fn gatherQmvDownReduceSource() [:0]const u8 {
         \\
         \\int K = int(K_size);
         \\int N = int(N_size);
-        \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
+        \\const int VPW = (BITS == 3) ? 8 : 32 / BITS;
         \\int K_by_w = K * BITS / 32;
         \\int K_by_gs = K / GS;
         \\uint mask = (1u << BITS) - 1u;
@@ -703,7 +711,7 @@ fn gatherQmvDownReduceSource() [:0]const u8 {
         \\uint32_t pw[64];
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(sub) + LPR * i;
-        \\  pw[i] = (pack < KP) ? sushi_qpack<BITS>(w_q, wbase, pack) : 0u;
+        \\  pw[i] = (pack < KP) ? sushi_qpack(w_q, wbase, pack, BITS) : 0u;
         \\}}
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(sub) + LPR * i;
@@ -761,7 +769,7 @@ fn getGatherQmvDownReduceKernel() !mlx.mlx_fast_metal_kernel {
 /// Lanes per output row in the down+reduce kernels; 32/LPR rows per simdgroup.
 /// 4 spills its hoisted packs, 16 measured the same as 8 on the shipped shapes.
 const DOWNRED_LPR: c_int = 8;
-const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+const DownRedCfgKey = struct { topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
 var downred_cfgs = QsaCfgCache(DownRedCfgKey, 1){};
 pub var downred_engaged: bool = false;
 pub var downred_override: ?bool = null;
@@ -802,6 +810,8 @@ pub fn gatherQmvDownReduce(
     const N: c_int = wsh[1];
     const K: c_int = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
     if (@rem(K, @as(c_int, @intCast(group_size))) != 0) return null;
+    const kp = affineQmvPackUnits(K, bits);
+    if (kp < 1 or kp > 64 * DOWNRED_LPR) return null;
     const ish = mlx.getShape(inds);
     if (ish.len != 1) return null;
     const topk: c_int = ish[0];
@@ -815,7 +825,7 @@ pub fn gatherQmvDownReduce(
     const rows: c_int = @divExact(32, DOWNRED_LPR);
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
+    const key = DownRedCfgKey{ .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd };
     const downred_cfg = blk: {
         if (downred_cfgs.get(key)) |hit| break :blk hit[0];
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -830,7 +840,7 @@ pub fn gatherQmvDownReduce(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TOPK", topk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", kp));
         downred_cfgs.put(key, .{cfg});
         break :blk cfg;
     };
@@ -863,7 +873,7 @@ fn gatherQmvDownReduceRowsSource() [:0]const u8 {
         \\
         \\int K = int(K_size);
         \\int N = int(N_size);
-        \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
+        \\const int VPW = (BITS == 3) ? 8 : 32 / BITS;
         \\int K_by_w = K * BITS / 32;
         \\int K_by_gs = K / GS;
         \\uint mask = (1u << BITS) - 1u;
@@ -881,7 +891,7 @@ fn gatherQmvDownReduceRowsSource() [:0]const u8 {
         \\uint32_t pw[64];
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(sub) + LPR * i;
-        \\  pw[i] = (pack < KP) ? sushi_qpack<BITS>(w_q, wbase, pack) : 0u;
+        \\  pw[i] = (pack < KP) ? sushi_qpack(w_q, wbase, pack, BITS) : 0u;
         \\}}
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(sub) + LPR * i;
@@ -935,7 +945,7 @@ fn getGatherQmvDownReduceRowsKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
 var downred_rows_cfgs = QsaCfgCache(DownRedRowsCfgKey, 1){};
 var downred_rows_engaged: bool = false;
 
@@ -984,6 +994,8 @@ pub fn gatherQmvDownReduceRows(
     const N: c_int = wsh[1];
     const K: c_int = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
     if (@rem(K, @as(c_int, @intCast(group_size))) != 0) return null;
+    const kp = affineQmvPackUnits(K, bits);
+    if (kp < 1 or kp > 64 * DOWNRED_LPR) return null;
     const ish = mlx.getShape(inds);
     if (ish.len != 2) return null;
     const nrows: c_int = ish[0];
@@ -998,7 +1010,7 @@ pub fn gatherQmvDownReduceRows(
     const rows: c_int = @divExact(32, DOWNRED_LPR);
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
+    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd };
     const downred_rows_cfg = blk: {
         if (downred_rows_cfgs.get(key)) |hit| break :blk hit[0];
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -1013,7 +1025,7 @@ pub fn gatherQmvDownReduceRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TOPK", topk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", kp));
         downred_rows_cfgs.put(key, .{cfg});
         break :blk cfg;
     };
@@ -1047,10 +1059,10 @@ pub const SUSHI_QMV_ROWS_SOURCE =
     \\const int in_vec_size = int(K_size);
     \\const int out_vec_size = int(N_size);
     \\constexpr int packs_per_thread = 2;
-    \\constexpr int pack_factor = BITS == 3 ? 8 : 32 / BITS;
-    \\constexpr int bytes_per_pack = BITS == 3 ? 3 : 4;
-    \\constexpr int values_per_thread = pack_factor * packs_per_thread;
-    \\constexpr int block_size = values_per_thread * 32;
+    \\const int pack_factor = BITS == 3 ? 8 : 32 / BITS;
+    \\const int bytes_per_pack = BITS == 3 ? 3 : 4;
+    \\const int values_per_thread = pack_factor * packs_per_thread;
+    \\const int block_size = values_per_thread * 32;
     \\const int scale_step_per_thread = GS / values_per_thread;
     \\const device uint8_t* ws = (const device uint8_t*)w_q;
     \\const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
@@ -1061,12 +1073,13 @@ pub const SUSHI_QMV_ROWS_SOURCE =
     \\const device T* biases_p = biases + out_row * in_vec_size_g + int(simd_lid) / scale_step_per_thread;
     \\const device T* xp = x + int(tg.z) * in_vec_size + int(simd_lid) * values_per_thread;
     \\device T* yp = y + int(tg.z) * out_vec_size + out_row;
-    \\thread U x_thread[values_per_thread];
+    \\thread U x_thread[16];
     \\thread U result[4] = {0, 0, 0, 0};
     \\for (int k = 0; k < in_vec_size; k += block_size) {
     \\  U sum = 0;
     \\  if (BITS == 3) {
-    \\    for (int i = 0; i < values_per_thread; i += 8) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < 16; i += 8) {
     \\      sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3] + xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
     \\      x_thread[i] = xp[i];
     \\      x_thread[i + 1] = xp[i + 1] / 8.0f;
@@ -1078,7 +1091,8 @@ pub const SUSHI_QMV_ROWS_SOURCE =
     \\      x_thread[i + 7] = xp[i + 7] / 32.0f;
     \\    }
     \\  } else if (BITS == 4) {
-    \\    for (int i = 0; i < values_per_thread; i += 4) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < 16; i += 4) {
     \\      sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3];
     \\      x_thread[i] = xp[i];
     \\      x_thread[i + 1] = xp[i + 1] / 16.0f;
@@ -1086,7 +1100,8 @@ pub const SUSHI_QMV_ROWS_SOURCE =
     \\      x_thread[i + 3] = xp[i + 3] / 4096.0f;
     \\    }
     \\  } else {
-    \\    for (int i = 0; i < values_per_thread; i++) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < 8; i++) {
     \\      sum += xp[i];
     \\      x_thread[i] = xp[i];
     \\    }
@@ -1097,7 +1112,8 @@ pub const SUSHI_QMV_ROWS_SOURCE =
     \\    U biv = biases_p[rr * in_vec_size_g];
     \\    U accum = 0;
     \\    if (BITS == 3) {
-    \\      for (int i = 0; i < values_per_thread / 8; i++) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int i = 0; i < 2; i++) {
     \\        const device uint8_t* w3 = wl + 3 * i;
     \\        thread U* x3 = x_thread + 8 * i;
     \\        accum += (w3[0] & 0x07) * x3[0];
@@ -1113,11 +1129,13 @@ pub const SUSHI_QMV_ROWS_SOURCE =
     \\      }
     \\    } else if (BITS == 4) {
     \\      const device uint16_t* w16 = (const device uint16_t*)wl;
-    \\      for (int i = 0; i < (values_per_thread / 4); i++) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int i = 0; i < 4; i++) {
     \\        accum += (x_thread[4 * i] * (w16[i] & 0x000f) + x_thread[4 * i + 1] * (w16[i] & 0x00f0) + x_thread[4 * i + 2] * (w16[i] & 0x0f00) + x_thread[4 * i + 3] * (w16[i] & 0xf000));
     \\      }
     \\    } else {
-    \\      for (int i = 0; i < values_per_thread; i++) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int i = 0; i < 8; i++) {
     \\        accum += x_thread[i] * wl[i];
     \\      }
     \\    }
