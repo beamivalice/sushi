@@ -1784,6 +1784,82 @@ pub fn atBottom(visible_max_y: f64, doc_height: f64) bool {
     return visible_max_y >= doc_height - 24;
 }
 
+// ── Multi-monitor display placement ──────────────────────────────────────
+
+/// Where `sushibar` draws in the menu bar: a standard `NSStatusItem` when only one monitor carries a menu bar, or
+/// a status-level panel pinned exclusively to the primary monitor when multiple monitors have separate menu bars.
+pub const BarMode = enum { status_item, main_window };
+
+pub fn barMode(screen_count: usize, separate_spaces: bool) BarMode {
+    return if (screen_count > 1 and separate_spaces) .main_window else .status_item;
+}
+
+pub const Rect = struct { x: f64, y: f64, w: f64, h: f64 };
+
+/// Computes the Cocoa screen frame of the main-monitor-only panel on `main` (`NSScreen.screens[0]`), placed just
+/// left of the leftmost existing right-side menu bar status item (`occupied_x` in CG screen coordinates relative to
+/// `main.x == 0`) while keeping clear of `aux_right` (MacBook Pro notch area) when present. Returns null when the
+/// menu bar is hidden (e.g., auto-hide retracted or full-screen Space).
+pub fn mainBarFrame(
+    main: Rect,
+    aux_right: Rect,
+    bar_h: f64,
+    occupied_x: []const f64,
+    item_w: f64,
+    bar_visible: bool,
+) ?Rect {
+    if (!bar_visible or main.w <= 0 or bar_h <= 0 or item_w <= 0) return null;
+    const has_notch = aux_right.w > 0;
+    const min_zone = if (has_notch) aux_right.x - 1.0 else main.w * 0.25;
+    var left_edge = main.w - 8.0;
+    for (occupied_x) |ox| {
+        if (ox >= min_zone and ox < left_edge) left_edge = ox;
+    }
+    var x = left_edge - item_w - 4.0;
+    if (has_notch) {
+        const safe_left = aux_right.x + 2.0;
+        if (x < safe_left) x = safe_left;
+    } else {
+        if (x < 0) x = 0;
+    }
+    if (x + item_w > main.w) x = @max(0.0, main.w - item_w);
+    return .{
+        .x = main.x + x,
+        .y = main.y + main.h - bar_h,
+        .w = item_w,
+        .h = bar_h,
+    };
+}
+
+test "multimonitor: status_item on one screen or unified Spaces, main_window when multiple displays have separate Spaces" {
+    try std.testing.expectEqual(BarMode.status_item, barMode(1, true));
+    try std.testing.expectEqual(BarMode.status_item, barMode(1, false));
+    try std.testing.expectEqual(BarMode.status_item, barMode(2, false));
+    try std.testing.expectEqual(BarMode.status_item, barMode(3, false));
+    try std.testing.expectEqual(BarMode.main_window, barMode(2, true));
+    try std.testing.expectEqual(BarMode.main_window, barMode(3, true));
+}
+
+test "multimonitor: mainBarFrame places left of existing status items, respects notch, and hides when bar is hidden" {
+    const ext = Rect{ .x = 0, .y = 0, .w = 2560, .h = 1440 };
+    const no_notch = Rect{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    const placed = mainBarFrame(ext, no_notch, 24, &.{ 2400, 2150, 2280 }, 80, true).?;
+    try std.testing.expectEqual(@as(f64, 2150 - 80 - 4), placed.x);
+    try std.testing.expectEqual(@as(f64, 1440 - 24), placed.y);
+    try std.testing.expectEqual(@as(f64, 80), placed.w);
+    try std.testing.expectEqual(@as(f64, 24), placed.h);
+
+    // Notched built-in display: clamps right of the notch if status items crowd close to it.
+    const mbp = Rect{ .x = 0, .y = 0, .w = 1728, .h = 1117 };
+    const aux = Rect{ .x = 956, .y = 1085, .w = 772, .h = 32 };
+    const notched = mainBarFrame(mbp, aux, 33, &.{ 1007, 1593 }, 80, true).?;
+    try std.testing.expectEqual(@as(f64, 958), notched.x);
+    try std.testing.expectEqual(@as(f64, 1117 - 33), notched.y);
+
+    // Hidden menu bar (auto-hide / full-screen) returns null so the panel orders out.
+    try std.testing.expect(mainBarFrame(ext, no_notch, 24, &.{2400}, 80, false) == null);
+}
+
 test "ports: an explicit --port beats the saved one, which beats the default" {
     try std.testing.expectEqual(@as(u16, 18801), choosePort(18801, 18802, 9000));
     try std.testing.expectEqual(@as(u16, 18802), choosePort(null, 18802, 9000));

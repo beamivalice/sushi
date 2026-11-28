@@ -315,8 +315,8 @@ pub fn create(color_icon: id, outline_icon: id, click_target: id, top_menu: id) 
     return view;
 }
 
-/// What the card draws, to skip a redraw that would change nothing.
-fn signature() u64 {
+/// What the card's text and tiles draw (excluding sparkline points), so a sliding sparkline does not trigger a fade.
+fn textSignature() u64 {
     var w = std.hash.Wyhash.init(0);
     for ([_][]const u8{ shown.version.get(), shown.version_tail.get(), shown.pill_label.get(), shown.line1.get(), shown.pack_line.get(), shown.line2.get(), shown.caption.get() }) |part| {
         w.update(part);
@@ -327,14 +327,20 @@ fn signature() u64 {
         w.update(l.get());
     }
     w.update(std.mem.asBytes(&.{ @intFromEnum(shown.pill_tone), @intFromBool(shown.show_stats), @intFromBool(shown.line1_link) }));
+    return w.final();
+}
+
+fn sparkSignature() u64 {
+    var w = std.hash.Wyhash.init(0);
     for (shown.spark[0..shown.spark_n]) |pt| w.update(std.mem.asBytes(&[_]u32{ @bitCast(pt.x), @bitCast(pt.v), @intFromBool(pt.gap) }));
     return w.final();
 }
 
-var shown_sig: ?u64 = null;
+var shown_text_sig: ?u64 = null;
+var shown_spark_sig: ?u64 = null;
 
-/// Copies `h` and the sparkline in and, when something changed, redraws with a short cross-fade; the view keeps no
-/// pointer into the caller's memory.
+/// Copies `h` and the sparkline in and, when something changed, redraws (with a short cross-fade only when the text
+/// or layout changed, never when only the sparkline slid). The view keeps no pointer into the caller's memory.
 pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
     shown.version.set(h.version[0 .. h.version.len - h.version_tail.len]);
     shown.version_tail.set(h.version_tail);
@@ -360,16 +366,21 @@ pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
         msg(void, image_view, "setImage:", .{if (h.color_icon) icon_color else icon_outline});
         msg(void, image_view, "setContentTintColor:", .{if (h.color_icon) @as(id, null) else color("labelColor")});
     }
-    const sig = signature();
-    if (shown_sig == sig) return;
-    if (shown_sig != null) objc.fadeNext(view, 0.2);
-    shown_sig = sig;
-    const want_h = shownHeight();
-    msg(void, view, "setFrameSize:", .{objc.NSSize{ .width = width, .height = want_h }});
-    msg(void, view, "setAccessibilityLabel:", .{str(h.a11y)});
+    const tsig = textSignature();
+    const ssig = sparkSignature();
+    if (shown_text_sig == tsig and shown_spark_sig == ssig) return;
+    const text_changed = shown_text_sig != tsig;
+    if (shown_text_sig != null and text_changed) objc.fadeNext(view, 0.2);
+    shown_text_sig = tsig;
+    shown_spark_sig = ssig;
+    if (text_changed) {
+        const want_h = shownHeight();
+        msg(void, view, "setFrameSize:", .{objc.NSSize{ .width = width, .height = want_h }});
+        msg(void, view, "setAccessibilityLabel:", .{str(h.a11y)});
+        const win = msg(id, view, "window", .{});
+        if (win != null) msg(void, win, "invalidateCursorRectsForView:", .{view});
+    }
     msg(void, view, "setNeedsDisplay:", .{true});
-    const win = msg(id, view, "window", .{});
-    if (win != null) msg(void, win, "invalidateCursorRectsForView:", .{view});
 }
 
 /// Renders the header at 2x for `dark` or light appearance into a PNG at `path`; false when it could not.

@@ -339,6 +339,8 @@ fn sushibarModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     if (macos_sdk_frameworks) |fw_path| mod.addFrameworkPath(.{ .cwd_relative = fw_path });
     mod.linkFramework("AppKit", .{});
     mod.linkFramework("Foundation", .{});
+    mod.linkFramework("CoreGraphics", .{});
+    mod.linkFramework("CoreFoundation", .{});
     return mod;
 }
 

@@ -198,6 +198,16 @@ fn pushButton(title: [*:0]const u8, frame: NSRect, selector: [*:0]const u8) id {
     return b;
 }
 
+var on_close: ?*const fn () void = null;
+
+pub fn setOnClose(cb: *const fn () void) void {
+    on_close = cb;
+}
+
+fn windowWillClose(_: id, _: objc.SEL, _: id) callconv(.c) void {
+    if (on_close) |cb| cb();
+}
+
 fn build() void {
     if (window != null) return;
     controller = objc.defineClass("SushiBarLogController", &.{
@@ -207,10 +217,12 @@ fn build() void {
         .{ .selector = "revealLog:", .imp = @ptrCast(&revealAction), .types = "v@:@" },
         .{ .selector = "newLines:", .imp = @ptrCast(&newLinesAction), .types = "v@:@" },
         .{ .selector = "findLog:", .imp = @ptrCast(&findAction), .types = "v@:@" },
+        .{ .selector = "windowWillClose:", .imp = @ptrCast(&windowWillClose), .types = "v@:@" },
     });
     controller = objc.new(controller);
     const style: usize = 1 | 2 | 4 | 8;
     window = msg(id, msg(id, objc.class("NSWindow"), "alloc", .{}), "initWithContentRect:styleMask:backing:defer:", .{ NSRect{ .x = 0, .y = 0, .w = win_w, .h = win_h }, style, @as(usize, 2), false });
+    msg(void, window, "setDelegate:", .{controller});
     msg(void, window, "setReleasedWhenClosed:", .{false});
     msg(void, window, "setMinSize:", .{NSSize{ .width = 420, .height = 240 }});
     msg(void, window, "center", .{});

@@ -12,6 +12,8 @@ const port_field = @import("sushibar/port_field.zig");
 const button_row = @import("sushibar/button_row.zig");
 const log_view = @import("sushibar/log_view.zig");
 const port_row = @import("sushibar/port_row.zig");
+const http_local = @import("sushibar/http_local.zig");
+const main_bar = @import("sushibar/main_bar.zig");
 
 const usage =
     \\usage: sushibar [--port <n>]
@@ -89,6 +91,9 @@ fn ticked(ms: i64) i64 {
 }
 
 fn readTestSeams() void {
+    if (env("SUSHIBAR_TEST_MULTIMONITOR")) |v| {
+        if (std.mem.eql(u8, v, "1")) main_bar.setForceMainWindow(true);
+    }
     test_polls = std.fmt.parseInt(u32, env("SUSHIBAR_TEST_POLLS") orelse "", 10) catch 0;
     if (test_polls > 0) {
         const t = std.fmt.parseInt(u32, env("SUSHIBAR_TEST_TICK_MS") orelse "", 10) catch tick_ms;
@@ -177,6 +182,8 @@ const Shared = struct {
     note_at_ms: i64 = 0,
     props_url: Str(160) = .{},
     busy: logic.Busy = .none,
+    /// A manual Check requested while a startup auto-check is already in flight runs immediately afterward.
+    manual_check_queued: bool = false,
     check_failed: bool = false,
     /// Where the watched port's server writes its log; stale once the watched port changes (`port`).
     log_kind: logic.LogKind = .standard,
@@ -235,33 +242,34 @@ fn port() u16 {
 
 // ── HTTP ──
 
-const Reply = struct { status: u16, body: []const u8 };
+const Reply = http_local.Reply;
 
 const poll_timeout_s = 4;
 const models_timeout_s = 1;
 
+/// Wakes the main thread to re-render when `test_polls == 0` (production is event-driven, not 1 Hz polled).
+fn notifyMain() void {
+    if (test_polls == 0 and menu_target != null) {
+        objc.msg(void, menu_target, "performSelectorOnMainThread:withObject:waitUntilDone:", .{ objc.sel("refreshNow:"), @as(objc.id, null), false });
+    }
+}
+
 /// A server that accepts and never answers is offline after `timeout_s`, not a stalled poll thread.
-fn request(a: std.mem.Allocator, p: u16, method: std.http.Method, url: []const u8, origin: ?[]const u8) ?Reply {
+fn request(a: std.mem.Allocator, p: u16, method: http_local.Method, url: []const u8, origin: ?[]const u8) ?Reply {
     return requestWithin(a, p, method, url, origin, poll_timeout_s, "");
 }
 
 /// `p` is the port `url` names: only the watched server's own key is sent, and only to it.
-fn requestWithin(a: std.mem.Allocator, p: u16, method: std.http.Method, url: []const u8, origin: ?[]const u8, timeout_s: i64, payload: []const u8) ?Reply {
+fn requestOutcome(a: std.mem.Allocator, p: u16, method: http_local.Method, url: []const u8, origin: ?[]const u8, timeout_s: i64, payload: []const u8) http_local.Outcome {
     var auth_buf: [600]u8 = undefined;
     const auth = authFor(&auth_buf, p);
-    const U = union(enum) { got: ?Reply, timer: std.Io.Cancelable!void };
-    var buf: [2]U = undefined;
-    var sel = std.Io.Select(U).init(g_io, &buf);
-    sel.concurrent(.got, fetchNow, .{ a, method, url, origin, auth, payload }) catch return fetchNow(a, method, url, origin, auth, payload);
-    sel.concurrent(.timer, std.Io.sleep, .{ g_io, std.Io.Duration.fromSeconds(timeout_s), .awake }) catch {};
-    const first = sel.await() catch {
-        while (sel.cancel()) |_| {}
-        return null;
-    };
-    while (sel.cancel()) |_| {}
-    return switch (first) {
-        .got => |r| r,
-        .timer => null,
+    return http_local.fetch(a, method, url, origin, auth, payload, timeout_s * 1000);
+}
+
+fn requestWithin(a: std.mem.Allocator, p: u16, method: http_local.Method, url: []const u8, origin: ?[]const u8, timeout_s: i64, payload: []const u8) ?Reply {
+    return switch (requestOutcome(a, p, method, url, origin, timeout_s, payload)) {
+        .reply => |r| r,
+        .conn_refused, .failed => null,
     };
 }
 
@@ -275,31 +283,6 @@ fn authFor(buf: []u8, p: u16) []const u8 {
     defer unlock();
     if (shared.key_port != p or shared.api_key.len == 0) return "";
     return std.fmt.bufPrint(buf, "Bearer {s}", .{shared.api_key.get()}) catch "";
-}
-
-fn fetchNow(a: std.mem.Allocator, method: std.http.Method, url: []const u8, origin: ?[]const u8, auth: []const u8, payload: []const u8) ?Reply {
-    var client: std.http.Client = .{ .allocator = a, .io = g_io };
-    defer client.deinit();
-    var body: std.Io.Writer.Allocating = .init(a);
-    var hdr: [2]std.http.Header = undefined;
-    var hn: usize = 0;
-    if (origin) |o| {
-        hdr[hn] = .{ .name = "origin", .value = o };
-        hn += 1;
-    }
-    const res = client.fetch(.{
-        .location = .{ .url = url },
-        .method = method,
-        .payload = if (method == .POST) payload else null,
-        .headers = .{
-            .content_type = if (payload.len > 0) .{ .override = "application/json" } else .default,
-            .authorization = if (auth.len > 0) .{ .override = auth } else .default,
-        },
-        .extra_headers = hdr[0..hn],
-        .keep_alive = false,
-        .response_writer = &body.writer,
-    }) catch return null;
-    return .{ .status = @intFromEnum(res.status), .body = body.written() };
 }
 
 const origin_cap = 64;
@@ -355,12 +338,13 @@ fn modelsWorker(p: u16) void {
         }
     }
     lock();
-    defer unlock();
     const c = cacheSlot(p);
     c.port = p;
     c.known = known;
     c.busy = false;
     c.model.set(name);
+    unlock();
+    notifyMain();
 }
 
 /// The Port submenu is about to be read: ask the listed ports' listeners for their models, in parallel. This is the
@@ -461,8 +445,9 @@ fn setProblem(text: []const u8) void {
 /// A note about the update flow: a finished check replaces it.
 fn setUpdateNote(text: []const u8, problem: bool) void {
     lock();
-    defer unlock();
     putNote(text, problem, .update, 0);
+    unlock();
+    notifyMain();
 }
 
 /// A problem with the server on `p`: it stays until a server answers there again or Start is pressed.
@@ -654,48 +639,62 @@ const WorkerKind = enum { auto_check, check, update };
 fn worker(kind: WorkerKind) void {
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
-    const a = arena_state.allocator();
     const p = port();
-    switch (kind) {
-        .auto_check, .check => {
-            const ok = cliCheck(a, kind == .check);
-            lock();
-            shared.check_failed = !ok;
-            if (kind == .check) {
-                shared.manual_result = if (!ok) .failed else if (shared.available) .none else .up_to_date;
-                shared.manual_at_ms = io_util.nowMs(g_io);
-            }
+    var current = kind;
+    while (true) {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        switch (current) {
+            .auto_check, .check => {
+                const ok = cliCheck(a, current == .check);
+                lock();
+                shared.check_failed = !ok;
+                if (current == .check) {
+                    shared.manual_result = if (!ok) .failed else if (shared.available) .none else .up_to_date;
+                    shared.manual_at_ms = io_util.nowMs(g_io);
+                }
+                unlock();
+            },
+            .update => {
+                lock();
+                const ask: logic.UpdateAsk = .{
+                    .available = shared.available,
+                    .link = shared.view.link,
+                    .server_command = shared.props_command.len > 0,
+                    .sibling_brew = g_sibling_brew,
+                };
+                unlock();
+                switch (logic.updatePath(ask)) {
+                    .none => setUpdateNote("Nothing to update", false),
+                    .brew => setUpdateNote("Homebrew install: use the Upgrade button", false),
+                    .server => updateViaServer(a, p),
+                    .cli => updateViaCli(a),
+                }
+            },
+        }
+        lock();
+        if (current == .auto_check and shared.manual_check_queued) {
+            shared.manual_check_queued = false;
             unlock();
-        },
-        .update => {
-            lock();
-            const ask: logic.UpdateAsk = .{
-                .available = shared.available,
-                .link = shared.view.link,
-                .server_command = shared.props_command.len > 0,
-                .sibling_brew = g_sibling_brew,
-            };
-            unlock();
-            switch (logic.updatePath(ask)) {
-                .none => setUpdateNote("Nothing to update", false),
-                .brew => setUpdateNote("Homebrew install: use the Upgrade button", false),
-                .server => updateViaServer(a, p),
-                .cli => updateViaCli(a),
-            }
-        },
+            current = .check;
+            continue;
+        }
+        shared.busy = .none;
+        unlock();
+        break;
     }
-    lock();
-    shared.busy = .none;
-    unlock();
+    notifyMain();
 }
 
 fn startWorker(kind: WorkerKind) void {
     lock();
     if (shared.busy != .none) {
+        if (kind == .check and shared.busy == .checking) shared.manual_check_queued = true;
         unlock();
         return;
     }
     shared.busy = if (kind == .update) .updating else .checking;
+    shared.manual_check_queued = false;
     unlock();
     if (kind == .update) pollSoon();
     const t = std.Thread.spawn(.{}, worker, .{kind}) catch {
@@ -722,11 +721,57 @@ fn pollSoon() void {
     g_wake.set(g_io);
 }
 
+/// Digest of the fields `refresh()` renders while closed or open, so `pollLoop()` only wakes the main thread when
+/// something actually changed. Caller holds `shared.mu`.
+fn publishedSignature() u64 {
+    var w = std.hash.Wyhash.init(0);
+    w.update(std.mem.asBytes(&shared.port));
+    w.update(std.mem.asBytes(&@intFromEnum(shared.view.link)));
+    w.update(std.mem.asBytes(&.{ @intFromBool(shared.view.decoding), @intFromBool(shared.view.prefilling), @intFromBool(shared.sushi_listening), @intFromBool(shared.lan_listening), @intFromBool(shared.port_taken), @intFromBool(shared.available), @intFromBool(shared.relaunch), @intFromBool(shared.note_problem) }));
+    if (shared.view.read) |r| {
+        const step = logic.readingStep(r.fraction);
+        w.update(std.mem.asBytes(&.{ r.percent, @as(u8, @intCast(step)) }));
+    } else w.update("R");
+    if (shared.view.live) |v| {
+        const tenths: i64 = @intFromFloat(@round(v * 10.0));
+        w.update(std.mem.asBytes(&tenths));
+    } else w.update("L");
+    if (shared.view.last) |v| {
+        const tenths: i64 = @intFromFloat(@round(v * 10.0));
+        w.update(std.mem.asBytes(&tenths));
+    } else w.update("S");
+    w.update(shared.model.get());
+    w.update("\x00");
+    w.update(shared.model_loading.get());
+    w.update("\x00");
+    w.update(shared.pack_latest.get());
+    w.update("\x00");
+    w.update(shared.server_version.get());
+    w.update("\x00");
+    w.update(shared.bar_version.get());
+    w.update("\x00");
+    w.update(shared.latest.get());
+    w.update("\x00");
+    w.update(shared.note.get());
+    w.update("\x00");
+    w.update(std.mem.asBytes(&.{ @intFromEnum(shared.busy), @intFromEnum(shared.manual_result) }));
+    w.update(std.mem.asBytes(&shared.listing_n));
+    for (shared.listings[0..shared.listing_n]) |l| {
+        w.update(std.mem.asBytes(&l.port));
+        w.update(std.mem.asBytes(&l.pid));
+        w.update(l.model.get());
+    }
+    w.update(std.mem.asBytes(&shared.hist_n));
+    w.update(std.mem.asBytes(&shared.answered_n));
+    return w.final();
+}
+
 fn pollLoop() void {
     var tracker: logic.Tracker = .{};
     var tracked_port: u16 = 0;
     var last_check_ms: i64 = 0;
     var last_ok = true;
+    var last_pushed_sig: ?u64 = null;
     var iter: u32 = 0;
     var log_pid: i32 = 0;
     var log_port: u16 = 0;
@@ -769,7 +814,12 @@ fn pollLoop() void {
         var url_buf: [url_cap + 32]u8 = undefined;
         var again_buf: [url_cap + 32]u8 = undefined;
         var url = metricsUrl(&url_buf, p, tracker.since_ms);
-        var reply = get(a, p, url);
+        const initial_outcome = requestOutcome(a, p, .GET, url, null, poll_timeout_s, "");
+        var reply: ?Reply = switch (initial_outcome) {
+            .reply => |r| r,
+            .conn_refused, .failed => null,
+        };
+        const loopback_refused = initial_outcome == .conn_refused and std.mem.startsWith(u8, url, "http://127.0.0.1:");
         var reached = logic.linkFor(if (reply) |r| r.status else null);
 
         since_scan += 1;
@@ -851,8 +901,9 @@ fn pollLoop() void {
             models_ready = false;
             models_loading = false;
         }
-        const taken = sample.link == .offline and !sushi_listening and proc.portInUse(p);
+        const taken = sample.link == .offline and !sushi_listening and !loopback_refused and proc.portInUse(p);
 
+        var published = false;
         if (p == port()) {
             lock();
             shared.port = p;
@@ -893,10 +944,9 @@ fn pollLoop() void {
             shared.port_taken = taken;
             shared.log_kind = log_src.kind;
             shared.log_path.set(log_src.path);
+            published = true;
             unlock();
         }
-        // Someone is looking: the menu shows this answer now, not at its next tick.
-        if (woken and test_polls == 0) objc.msg(void, menu_target, "performSelectorOnMainThread:withObject:waitUntilDone:", .{ objc.sel("refreshNow:"), @as(objc.id, null), false });
 
         iter += 1;
         if (iter % props_every == 1 and answers) refreshProps(a, p);
@@ -923,6 +973,18 @@ fn pollLoop() void {
                 shared.available = shared.props_available;
                 shared.latest.set(shared.props_latest.get());
                 unlock();
+            }
+        }
+
+        // Compute the digest after refreshProps / checkDue so update dots, server versions, and relaunches land
+        // on the main thread in this same poll cycle rather than waiting for the next idle poll.
+        if (test_polls == 0 and published) {
+            lock();
+            const pub_sig = publishedSignature();
+            unlock();
+            if (woken or menu_open or last_pushed_sig == null or pub_sig != last_pushed_sig.?) {
+                last_pushed_sig = pub_sig;
+                notifyMain();
             }
         }
 
@@ -958,6 +1020,7 @@ fn readDefaultPort() u16 {
 fn setPort(p: u16) void {
     if (p == port()) return;
     g_port.store(p, .release);
+    invalidateOwnCache();
     pollSoon();
     g_saved.add(p, g_default_port);
     writeSaved(p);
@@ -989,15 +1052,38 @@ fn serverPidPath(buf: []u8, p: u16) []const u8 {
     return std.fmt.bufPrint(buf, "{s}/.sushi/{s}{d}.pid", .{ g_home, logic.server_pid_prefix, p }) catch "";
 }
 
+var own_cache_valid = false;
+var own_cache_port: u16 = 0;
+var own_cache_entry: ?logic.PidEntry = null;
+
+fn invalidateOwnCache() void {
+    own_cache_valid = false;
+}
+
 fn ownServer() ?logic.PidEntry {
+    const p = port();
+    if (test_polls == 0 and own_cache_valid and own_cache_port == p) {
+        if (own_cache_entry) |e| {
+            if (proc.pidExists(e.pid)) return e;
+            own_cache_valid = false;
+        } else return null;
+    }
     var pb: [std.fs.max_path_bytes]u8 = undefined;
-    const e = proc.verifiedPid(g_io, serverPidPath(&pb, port()), server_exe, true) orelse return null;
-    return if (e.port == port()) e else null;
+    const e = proc.verifiedPid(g_io, serverPidPath(&pb, p), server_exe, true);
+    own_cache_valid = true;
+    own_cache_port = p;
+    own_cache_entry = if (e != null and e.?.port == p) e else null;
+    return own_cache_entry;
 }
 
 /// Servers this process spawned: each is reaped by its own pid, and one that exits before it ever answered is a
 /// failed start.
 var started: [8]logic.Started = @splat(.{});
+
+fn hasStartingChild() bool {
+    for (started) |st| if (st.pid != 0 and !st.answered) return true;
+    return false;
+}
 
 fn reapStarted() void {
     for (&started) |*st| {
@@ -1005,8 +1091,12 @@ fn reapStarted() void {
         var status: c_int = 0;
         const got = std.c.waitpid(st.pid, &status, std.c.W.NOHANG);
         // An adopted server another sushibar started is not ours to wait for.
-        if (got == -1 and std.posix.errno(got) == .CHILD) st.* = .{};
+        if (got == -1 and std.posix.errno(got) == .CHILD) {
+            st.* = .{};
+            invalidateOwnCache();
+        }
         if (got != st.pid) continue;
+        invalidateOwnCache();
         if (!st.stopping) {
             var nb: [160]u8 = undefined;
             const how = logic.exitOf(@bitCast(status));
@@ -1097,6 +1187,7 @@ fn startServer() void {
     };
     var pb: [std.fs.max_path_bytes]u8 = undefined;
     proc.writePid(g_io, g_home, serverPidPath(&pb, p), .{ .pid = pid, .port = p }) catch {};
+    invalidateOwnCache();
 }
 
 const ModelOp = struct { port: u16, unload: bool, model: Str(logic.max_model) };
@@ -1120,6 +1211,7 @@ fn modelOpWorker(job: ModelOp) void {
     defer {
         (if (job.unload) &g_unload_port else &g_load_port).store(0, .release);
         pollSoon();
+        notifyMain();
     }
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -1211,6 +1303,7 @@ var g_stop_sent: logic.StopSent = .{};
 var g_stuck_noted = false;
 
 fn noteStopped(p: u16, pid: i32) void {
+    invalidateOwnCache();
     pollSoon();
     g_stop_pid = pid;
     g_stopping_port = p;
@@ -1303,7 +1396,6 @@ fn quit() void {
 
 // ── Menu bar ──
 
-var status_item: objc.id = null;
 var header_mi: objc.id = null;
 var port_mi: objc.id = null;
 var lan_mi: objc.id = null;
@@ -1328,24 +1420,38 @@ var menu_target: objc.id = null;
 var top_menu: objc.id = null;
 var port_field_mi: objc.id = null;
 var note_mi: objc.id = null;
-var icons: [std.enums.values(logic.Icon).len]objc.id = @splat(null);
+
+/// Template outline icon (drawn by NSButton for system menu-bar tinting) + transparent spacer for colored icons.
+var outline_icon: objc.id = null;
+var blank_icon: objc.id = null;
+/// Pre-rasterized 2x NSBitmapImageReps for colored icons; loading/reading/dim frames are rasterized lazily on first use.
+var static_reps: [std.enums.values(logic.Icon).len]objc.id = @splat(null);
+var loading_reps: [logic.loading_frames]objc.id = @splat(null);
+var loading_reps_ready = false;
+var reading_reps: [logic.reading_steps + 1]objc.id = @splat(null);
+var generating_dim_rep: objc.id = null;
+var icon_view: objc.id = null;
+var icon_layer: objc.id = null;
+var placed_icon_rect: ?objc.NSRect = null;
+var button_uses_blank = false;
 var shown_icon: ?logic.Icon = null;
-var loading_icons: [logic.loading_frames]objc.id = @splat(null);
-var reading_icons: [logic.reading_steps + 1]objc.id = @splat(null);
-/// The ready icon with its slot dim: the off beat of the generating blink.
-var generating_dim: objc.id = null;
-var blink_timer: objc.id = null;
-var blink_button: objc.id = null;
-var blink_lit = true;
 /// The reading frame shown, while a prompt read shows; `showIcon` clears it.
 var shown_reading: ?usize = null;
-var loading_frame: usize = 0;
-var loading_timer: objc.id = null;
-var loading_button: objc.id = null;
+const LayerAnim = enum { none, loading, blink };
+var active_anim: LayerAnim = .none;
+var want_blink = false;
+
+var ui_timer: objc.id = null;
+var log_timer: objc.id = null;
+var last_link: ?logic.Link = null;
 var tick_count: u32 = 0;
 var readout_buf: [2 * logic.readout_max + 8]u8 = undefined;
 var shown_readout: [2 * logic.readout_max + 8]u8 = undefined;
 var shown_readout_len: usize = std.math.maxInt(usize);
+var shown_readout_visible: ?bool = null;
+var shown_caption: Str(16) = .{};
+var shown_tooltip: Str(200) = .{};
+var shown_tooltip_set = false;
 var readout_caption: objc.id = null;
 var readout_value: objc.id = null;
 var port_sig: [1536]u8 = undefined;
@@ -1355,68 +1461,164 @@ fn setText(setter_target: objc.id, selector: [*:0]const u8, text: []const u8) vo
     objc.msg(void, setter_target, selector, .{objc.nsText(text)});
 }
 
+fn setButtonToolTip(button: objc.id, text: []const u8) void {
+    if (shown_tooltip_set and std.mem.eql(u8, shown_tooltip.get(), text)) return;
+    shown_tooltip.set(text);
+    shown_tooltip_set = true;
+    setText(button, "setToolTip:", text);
+}
+
 fn symbol(name: []const u8) objc.id {
     return objc.msg(objc.id, objc.class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ objc.nsText(name), @as(objc.id, null) });
+}
+
+fn ensureLoadingReps() void {
+    if (loading_reps_ready) return;
+    var buf: [4096]u8 = undefined;
+    for (&loading_reps, 0..) |*rep, i| {
+        const svg = logic.loadingSvg(&buf, @embedFile("sushibar/icon-loading.svg"), i) catch |e| std.debug.panic("loading icon frame {d}: {t}", .{ i, e });
+        rep.* = objc.rasterizeSvgRep(svg, icon_w, icon_h);
+    }
+    loading_reps_ready = true;
+}
+
+fn ensureGeneratingDimRep() objc.id {
+    if (generating_dim_rep == null) {
+        var buf: [4096]u8 = undefined;
+        const dim = logic.generatingSvg(&buf, @embedFile("sushibar/icon-online.svg"), false) catch |e| std.debug.panic("generating icon: {t}", .{e});
+        generating_dim_rep = objc.rasterizeSvgRep(dim, icon_w, icon_h);
+    }
+    return generating_dim_rep;
+}
+
+fn ensureReadingRep(step: usize) objc.id {
+    if (reading_reps[step] == null) {
+        var buf: [4096]u8 = undefined;
+        const svg = logic.readingSvg(&buf, @embedFile("sushibar/icon-online.svg"), step) catch |e| std.debug.panic("reading icon step {d}: {t}", .{ step, e });
+        reading_reps[step] = objc.rasterizeSvgRep(svg, icon_w, icon_h);
+    }
+    return reading_reps[step];
+}
+
+fn makeIconView(button: objc.id) void {
+    icon_view = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{objc.NSRect{ .x = 0, .y = 0, .w = icon_w, .h = icon_h }});
+    objc.msg(void, icon_view, "setWantsLayer:", .{true});
+    icon_layer = objc.msg(objc.id, icon_view, "layer", .{});
+    objc.msg(void, icon_layer, "setContentsScale:", .{@as(f64, 2.0)});
+    objc.msg(void, icon_layer, "setContentsGravity:", .{objc.nsString("resizeAspect")});
+    objc.disableContentsAction(icon_layer);
+    objc.msg(void, icon_view, "setHidden:", .{true});
+    objc.msg(void, button, "addSubview:", .{icon_view});
+    objc.release(icon_view);
+    placed_icon_rect = null;
+    button_uses_blank = false;
+    active_anim = .none;
+}
+
+fn placeIconView(button: objc.id) void {
+    if (icon_view == null or button == null) return;
+    const bounds = objc.msg(objc.NSRect, button, "bounds", .{});
+    if (bounds.w <= 0 or bounds.h <= 0) return;
+    const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{bounds});
+    const want = objc.NSRect{
+        .x = r.x + (r.w - icon_w) / 2.0,
+        .y = r.y + (r.h - icon_h) / 2.0,
+        .w = icon_w,
+        .h = icon_h,
+    };
+    if (placed_icon_rect) |cur| {
+        if (cur.x == want.x and cur.y == want.y and cur.w == want.w and cur.h == want.h) return;
+    }
+    placed_icon_rect = want;
+    objc.msg(void, icon_view, "setFrame:", .{want});
+}
+
+fn placeDots(button: objc.id) void {
+    if (button == null) return;
+    const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
+    const flipped = objc.msg(bool, button, "isFlipped", .{});
+    if (shown_badge and badge_view != null) {
+        objc.msg(void, badge_view, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - badge_size + 1, .y = if (flipped) r.y + r.h - badge_size + 2 else r.y - 2 }});
+    }
+    if (shown_update_dot and update_dot != null) {
+        objc.msg(void, update_dot, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - update_dot_size + 1, .y = if (flipped) r.y - 1 else r.y + r.h - update_dot_size + 1 }});
+    }
+}
+
+fn syncIconAnimation() void {
+    const want: LayerAnim = if (objc.reduceMotion()) .none else if (shown_reading != null) .none else if (shown_icon == .loading) .loading else if (shown_icon == .ready and want_blink) .blink else .none;
+    if (want == active_anim) return;
+    objc.stopLayerAnimation(icon_layer, "iconAnim");
+    active_anim = want;
+    switch (want) {
+        .none => {},
+        .loading => {
+            ensureLoadingReps();
+            var cgs: [logic.loading_frames]objc.id = undefined;
+            for (loading_reps, 0..) |rep, i| cgs[i] = objc.repCgImage(rep);
+            objc.startContentsAnimation(icon_layer, "iconAnim", &cgs, @as(f64, @floatFromInt(logic.loading_frames)) * logic.loading_frame_s);
+        },
+        .blink => {
+            const cgs = [_]objc.id{
+                objc.repCgImage(static_reps[@intFromEnum(logic.Icon.ready)]),
+                objc.repCgImage(ensureGeneratingDimRep()),
+            };
+            objc.startContentsAnimation(icon_layer, "iconAnim", &cgs, 2.0 * logic.generating_blink_s);
+        },
+    }
+}
+
+fn ensureBlankButtonImage(button: objc.id) void {
+    if (!button_uses_blank) {
+        objc.msg(void, button, "setImage:", .{blank_icon});
+        button_uses_blank = true;
+        placeIconView(button);
+    }
 }
 
 fn showIcon(button: objc.id, icon: logic.Icon) void {
     if (shown_icon == icon and shown_reading == null) return;
     shown_reading = null;
-    blinkGenerating(button, false);
-    if (shown_icon != null) objc.fadeNext(button, 0.3);
+    if (icon != .ready) want_blink = false;
+    const was_outline = shown_icon == .outline;
+    if (shown_icon != null) objc.fadeNext(if (was_outline or icon == .outline) button else icon_view, 0.3);
     shown_icon = icon;
-    objc.msg(void, button, "setImage:", .{icons[@intFromEnum(icon)]});
-    animateLoading(button, icon == .loading);
+    if (icon == .outline) {
+        objc.stopLayerAnimation(icon_layer, "iconAnim");
+        active_anim = .none;
+        objc.msg(void, icon_view, "setHidden:", .{true});
+        objc.msg(void, button, "setImage:", .{outline_icon});
+        button_uses_blank = false;
+        return;
+    }
+    ensureBlankButtonImage(button);
+    objc.msg(void, icon_layer, "setContents:", .{objc.repCgImage(static_reps[@intFromEnum(icon)])});
+    objc.msg(void, icon_view, "setHidden:", .{false});
+    placeIconView(button);
+    syncIconAnimation();
 }
 
 /// The reading icon at `step`: the ready sushi's fish filled green that far. A model reading a prompt is ready, so
 /// it replaces the ready icon, and `showIcon` puts that back when the read ends.
 fn showReading(button: objc.id, step: usize) void {
     if (shown_reading == step) return;
-    if (shown_reading == null) objc.fadeNext(button, 0.3);
-    animateLoading(button, false);
-    blinkGenerating(button, false);
+    if (shown_reading == null) objc.fadeNext(icon_view, 0.3);
+    want_blink = false;
     shown_reading = step;
     shown_icon = .ready;
-    objc.msg(void, button, "setImage:", .{reading_icons[step]});
+    ensureBlankButtonImage(button);
+    objc.stopLayerAnimation(icon_layer, "iconAnim");
+    active_anim = .none;
+    objc.msg(void, icon_layer, "setContents:", .{objc.repCgImage(ensureReadingRep(step))});
+    objc.msg(void, icon_view, "setHidden:", .{false});
+    placeIconView(button);
 }
 
 /// Blinks the ready icon's slot while a reply generates; under Reduce motion the slot stays lit.
-fn blinkGenerating(button: objc.id, on: bool) void {
-    if (on and blink_timer != null) return;
-    if (blink_timer != null) objc.msg(void, blink_timer, "invalidate", .{});
-    blink_timer = null;
-    if (!blink_lit) objc.msg(void, button, "setImage:", .{icons[@intFromEnum(logic.Icon.ready)]});
-    blink_lit = true;
-    if (!on or objc.reduceMotion()) return;
-    blink_button = button;
-    blink_timer = objc.addTimer(logic.generating_blink_s, menu_target, "blinkTick:");
-}
-
-fn blinkTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    if (objc.reduceMotion()) return blinkGenerating(blink_button, false);
-    blink_lit = !blink_lit;
-    objc.msg(void, blink_button, "setImage:", .{if (blink_lit) icons[@intFromEnum(logic.Icon.ready)] else generating_dim});
-}
-
-/// Runs the loading icon's frames while it shows; under Reduce motion it stays the static icon.
-fn animateLoading(button: objc.id, on: bool) void {
-    if (loading_timer != null) objc.msg(void, loading_timer, "invalidate", .{});
-    loading_timer = null;
-    if (!on or objc.reduceMotion()) return;
-    loading_button = button;
-    loading_frame = 0;
-    loading_timer = objc.addTimer(logic.loading_frame_s, menu_target, "loadingTick:");
-}
-
-fn loadingTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    if (objc.reduceMotion()) {
-        objc.msg(void, loading_button, "setImage:", .{icons[@intFromEnum(logic.Icon.loading)]});
-        animateLoading(loading_button, false);
-        return;
-    }
-    loading_frame = (loading_frame + 1) % logic.loading_frames;
-    objc.msg(void, loading_button, "setImage:", .{loading_icons[loading_frame]});
+fn blinkGenerating(_: objc.id, on: bool) void {
+    if (want_blink == on) return;
+    want_blink = on;
+    syncIconAnimation();
 }
 
 /// The title that reserves the readout's room while it shows: as wide as `readout_max - 1` digits of the value font,
@@ -1439,6 +1641,8 @@ fn makeReadout(button: objc.id) void {
     objc.msg(void, button, "addSubview:", .{readout_caption});
     objc.msg(void, button, "addSubview:", .{readout_value});
     shown_readout_len = std.math.maxInt(usize);
+    shown_readout_visible = null;
+    shown_caption = .{};
 }
 
 fn readoutLabel(f: objc.id) objc.id {
@@ -1456,16 +1660,45 @@ fn setReadout(button: objc.id, r: logic.Readout) void {
     shown_readout_len = n;
     @memcpy(shown_readout[0..n], k);
     const shown = r.caption.len > 0;
-    const title = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsText(if (shown) readout_spacer else ""), header_view.readoutSpacerAttributes() });
-    defer objc.release(title);
-    objc.msg(void, button, "setAttributedTitle:", .{title});
-    objc.msg(void, readout_caption, "setHidden:", .{!shown});
-    objc.msg(void, readout_value, "setHidden:", .{!shown});
-    objc.msg(void, readout_caption, "setStringValue:", .{objc.nsText(r.caption)});
-    objc.msg(void, readout_value, "setStringValue:", .{objc.nsText(r.value)});
-    objc.msg(void, readout_caption, "sizeToFit", .{});
-    objc.msg(void, readout_value, "sizeToFit", .{});
-    placeReadout(button);
+    const vis_changed = shown_readout_visible == null or shown_readout_visible.? != shown;
+    if (vis_changed) {
+        shown_readout_visible = shown;
+        // Only mutate NSStatusBarButton's attributedTitle when visibility toggles, not on every digit change:
+        // setAttributedTitle triggers _adjustLength and an FBSScene XPC round-trip to ControlCenter on macOS 26.
+        const title = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsText(if (shown) readout_spacer else ""), header_view.readoutSpacerAttributes() });
+        defer objc.release(title);
+        objc.msg(void, button, "setAttributedTitle:", .{title});
+        objc.msg(void, readout_caption, "setHidden:", .{!shown});
+        objc.msg(void, readout_value, "setHidden:", .{!shown});
+    }
+    if (shown) {
+        if (!std.mem.eql(u8, shown_caption.get(), r.caption)) {
+            shown_caption.set(r.caption);
+            objc.msg(void, readout_caption, "setStringValue:", .{objc.nsText(r.caption)});
+        }
+        objc.msg(void, readout_value, "setStringValue:", .{objc.nsText(r.value)});
+        if (vis_changed) {
+            // Size both labels once on show with fixed width wide enough for readout_max chars, so subsequent
+            // value ticks only call setStringValue: without triggering view geometry changes or ControlCenter XPC.
+            objc.msg(void, readout_caption, "sizeToFit", .{});
+            objc.msg(void, readout_value, "sizeToFit", .{});
+            const cf = objc.msg(objc.NSRect, readout_caption, "frame", .{});
+            const vf = objc.msg(objc.NSRect, readout_value, "frame", .{});
+            const fixed_w = @max(42.0, @max(cf.w, vf.w) + 4.0);
+            objc.msg(void, readout_caption, "setFrameSize:", .{objc.NSSize{ .width = fixed_w, .height = cf.h }});
+            objc.msg(void, readout_value, "setFrameSize:", .{objc.NSSize{ .width = fixed_w, .height = vf.h }});
+            if (main_bar.mode() == .main_window) {
+                main_bar.setContentWidth(icon_w + readout_gap + fixed_w + 10.0);
+            }
+            placeReadout(button);
+        }
+    } else if (vis_changed and main_bar.mode() == .main_window) {
+        main_bar.setContentWidth(30.0);
+    }
+    if (vis_changed) {
+        placeIconView(button);
+        placeDots(button);
+    }
 }
 
 /// The two lines stacked in the title's room, the pair centred on the bar's height a half point low.
@@ -1484,6 +1717,24 @@ fn placeReadout(button: objc.id) void {
     const x = t.x + readout_gap;
     objc.msg(void, readout_value, "setFrameOrigin:", .{objc.NSPoint{ .x = x, .y = at(flipped, bounds.h, bottom, vf.h) }});
     objc.msg(void, readout_caption, "setFrameOrigin:", .{objc.NSPoint{ .x = x, .y = at(flipped, bounds.h, bottom + vf.h - readout_overlap, cf.h) }});
+}
+
+/// Attaches the icon layer, badge, update dot, and readout subviews onto `button` (used at startup and when
+/// switching between `NSStatusItem` and the main-monitor-only panel on display hotplug).
+fn attachBarButton(button: objc.id) void {
+    shown_icon = null;
+    shown_reading = null;
+    shown_badge = false;
+    shown_update_dot = false;
+    shown_tooltip_set = false;
+    want_blink = false;
+    active_anim = .none;
+    button_uses_blank = false;
+    makeIconView(button);
+    showIcon(button, .outline);
+    makeBadge(button);
+    makeUpdateDot(button);
+    makeReadout(button);
 }
 
 fn newItem(label: [*:0]const u8, action: ?[*:0]const u8, tag: isize, key: [*:0]const u8, sym: ?[]const u8) objc.id {
@@ -1588,6 +1839,7 @@ fn makeUpdateDot(button: objc.id) void {
     objc.msg(void, layer, "setCornerRadius:", .{update_dot_size / 2});
     objc.msg(void, update_dot, "setHidden:", .{true});
     objc.msg(void, button, "addSubview:", .{update_dot});
+    objc.release(update_dot);
     shown_update_dot = false;
 }
 
@@ -1611,6 +1863,7 @@ fn makeBadge(button: objc.id) void {
     objc.msg(void, layer, "setCornerRadius:", .{badge_size / 2});
     objc.msg(void, badge_view, "setHidden:", .{true});
     objc.msg(void, button, "addSubview:", .{badge_view});
+    objc.release(badge_view);
 }
 
 var why_mi: objc.id = null;
@@ -1687,6 +1940,19 @@ fn applyPortText() void {
 fn take(buf: []u8, s: anytype) []const u8 {
     @memcpy(buf[0..s.len], s.get());
     return buf[0..s.len];
+}
+
+fn syncTimers(now: i64) void {
+    const menu_open = g_menu_open.load(.acquire);
+    const copied_active = copied_what != .none and logic.copiedNow(copied_at_ms, now);
+    const need_ui = test_polls > 0 or menu_open or stopping_until_ms > now or copied_active or hasStartingChild();
+    if (need_ui and ui_timer == null) {
+        const secs = @as(f64, @floatFromInt(if (test_polls > 0) test_tick_ms else tick_ms)) / 1000.0;
+        ui_timer = objc.addTimer(secs, menu_target, "tick:");
+    } else if (!need_ui and ui_timer != null) {
+        objc.msg(void, ui_timer, "invalidate", .{});
+        ui_timer = null;
+    }
 }
 
 fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
@@ -1795,6 +2061,10 @@ fn refresh() void {
         if (logic.recoveryClearsNote(shared.note_kind, shared.note_port, recovered)) clearNote();
         unlock();
     }
+    if (last_link != view.link) {
+        last_link = view.link;
+        invalidateOwnCache();
+    }
     const own = ownServer();
     const ours_alive = own != null;
     if (!logic.stillStopping(stopping_until_ms, now, view.link, stopping_until_ms > now and sushiAlive(g_stop_pid))) stopping_until_ms = 0;
@@ -1811,9 +2081,6 @@ fn refresh() void {
         setServerProblem(logic.stuckNote(&sb, p), p);
     }
     g_stuck_noted = g_stop_stuck;
-    var started_b: [started.len + 1]u16 = undefined;
-    g_started_count = startedPorts(&started_b).len;
-    applyQuitLook();
     const state: logic.Server = .{
         .link = view.link,
         .model = if (model.len > 0) model else null,
@@ -1826,6 +2093,40 @@ fn refresh() void {
         .stop_stuck = g_stop_stuck,
         .stopping = stopping,
     };
+
+    // Between Load and the model's row turning to loading, the model Load asked for is already the one loading.
+    const asked = g_load_port.load(.acquire) == p and view.link == .up and model.len == 0 and loading_id.len == 0;
+    const loading_name = if (loading_id.len > 0) loading_id else if (asked) g_last_model.get() else "";
+
+    // Always update the visible menu bar button (icon, readout, badge, update dot, tooltip).
+    var tv = view;
+    tv.update_waiting = uv_base.available;
+    const shown = logic.readout(&readout_buf, tv);
+    const button = main_bar.button();
+    const icon = logic.iconFor(view.link, .{ .ready = model.len > 0, .loading = loading_name.len > 0 });
+    if (icon == .ready and view.read != null) {
+        showReading(button, logic.readingStep(view.read.?.fraction));
+    } else {
+        showIcon(button, icon);
+        blinkGenerating(button, icon == .ready and view.decoding);
+    }
+    showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
+    setReadout(button, shown);
+    showUpdateDot(button, uv_base.available);
+    var status_buf: [200]u8 = undefined;
+    const status = logic.statusLine(&status_buf, state);
+    setButtonToolTip(button, status);
+
+    if (relaunch) relaunchSelf(p);
+    syncTimers(now);
+
+    // Skip all menu-interior AppKit updates while the menu is closed (rebuilt right before opening in menuWillOpen:).
+    const need_menu = g_menu_open.load(.acquire) or test_polls > 0;
+    if (!need_menu) return;
+
+    var started_b: [started.len + 1]u16 = undefined;
+    g_started_count = startedPorts(&started_b).len;
+    applyQuitLook();
     const on = logic.enabled(state);
     const tg = logic.toggle(state, stopping);
     var uv = uv_base;
@@ -1840,9 +2141,6 @@ fn refresh() void {
     // The header card, then everything else it owns the numbers of.
     var arena_buf: [8192]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&arena_buf);
-    // Between Load and the model's row turning to loading, the model Load asked for is already the one loading.
-    const asked = g_load_port.load(.acquire) == p and view.link == .up and model.len == 0 and loading_id.len == 0;
-    const loading_name = if (loading_id.len > 0) loading_id else if (asked) g_last_model.get() else "";
     const header = logic.buildHeader(fba.allocator(), .{
         .link = view.link,
         .port = p,
@@ -1869,25 +2167,8 @@ fn refresh() void {
         .lan = lan_bound,
     }) catch unreachable;
     var spark: [160]logic.SparkPoint = undefined;
-    header_view.update(header, logic.sparkPoints(&spark, hist[0..hist_n], now, header_view.spark_window_ms));
-
-    var tv = view;
-    tv.update_waiting = uv.available;
-    const shown = logic.readout(&readout_buf, tv);
-    const button = objc.msg(objc.id, status_item, "button", .{});
-    const icon = logic.iconFor(view.link, .{ .ready = model.len > 0, .loading = loading_name.len > 0 });
-    if (icon == .ready and view.read != null) {
-        showReading(button, logic.readingStep(view.read.?.fraction));
-    } else {
-        showIcon(button, icon);
-        blinkGenerating(button, icon == .ready and view.decoding);
-    }
-    showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
-    setReadout(button, shown);
-    showUpdateDot(button, uv.available);
-    var status_buf: [200]u8 = undefined;
-    const status = logic.statusLine(&status_buf, state);
-    setText(button, "setToolTip:", status);
+    const spark_now = @divFloor(now, 2000) * 2000;
+    header_view.update(header, logic.sparkPoints(&spark, hist[0..hist_n], spark_now, header_view.spark_window_ms));
 
     button_row.setStart(.{ .label = tg.label, .symbol = tg.symbol, .tip = tg.tip, .enabled = tg.enabled, .closes_menu = tg.action != .start });
     var model_tip: [160]u8 = undefined;
@@ -1932,8 +2213,6 @@ fn refresh() void {
     objc.msg(void, pack_mi, "setHidden:", .{pack_update == null});
     setText(pack_mi, "setTitle:", if (pack_copied) "Copied Pull Command" else "Copy Pull Command");
     setText(pack_mi, "setToolTip:", pack_tip);
-
-    if (relaunch) relaunchSelf(p);
 
     if (test_polls > 0) {
         var ports_buf: [256]u8 = undefined;
@@ -2135,6 +2414,7 @@ fn removeRowAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
 fn menuWillOpen(_: objc.id, _: objc.SEL, opening: objc.id) callconv(.c) void {
     if (opening != top_menu) return refreshModels(null);
     g_menu_open.store(true, .release);
+    invalidateOwnCache();
     g_wake.set(g_io);
     g_default_port = readDefaultPort();
     const now = io_util.nowMs(g_io);
@@ -2151,8 +2431,40 @@ fn menuWillOpen(_: objc.id, _: objc.SEL, opening: objc.id) callconv(.c) void {
 fn menuDidClose(_: objc.id, _: objc.SEL, closing: objc.id) callconv(.c) void {
     if (closing != top_menu) return;
     g_menu_open.store(false, .release);
+    main_bar.setHighlight(false);
     if (g_flags_timer != null) objc.msg(void, g_flags_timer, "invalidate", .{});
     g_flags_timer = null;
+    syncTimers(io_util.nowMs(g_io));
+}
+
+fn popupMenuAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    main_bar.popupMenu();
+}
+
+fn realignBarSubviews() void {
+    const btn = main_bar.button();
+    if (btn == null) return;
+    placeIconView(btn);
+    placeDots(btn);
+    if (shown_readout_visible == true) placeReadout(btn);
+}
+
+fn screensChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    if (main_bar.syncScreens()) {
+        attachBarButton(main_bar.button());
+        refresh();
+    } else if (main_bar.mode() == .main_window) {
+        realignBarSubviews();
+    }
+}
+
+fn spaceChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    main_bar.reposition();
+    if (main_bar.mode() == .main_window) realignBarSubviews();
+}
+
+fn accessibilityChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    syncIconAnimation();
 }
 
 fn refreshNow(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
@@ -2170,14 +2482,24 @@ fn watchedLog(buf: *[1024]u8) logic.LogSource {
     return .{ .kind = shared.log_kind, .path = buf[0..path.len] };
 }
 
+fn stopLogTimer() void {
+    if (log_timer != null) objc.msg(void, log_timer, "invalidate", .{});
+    log_timer = null;
+}
+
+fn onLogClosed() void {
+    stopLogTimer();
+}
+
 fn showLogAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     var buf: [1024]u8 = undefined;
     log_view.open(port(), watchedLog(&buf));
+    if (log_timer == null) log_timer = objc.addTimer(0.5, menu_target, "logTick:");
 }
 
-/// Follows the log while its window is open, and the watched port when it changes.
+/// Follows the log while its window is open, and stops itself once the window closes.
 fn logTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    if (!log_view.isVisible()) return;
+    if (!log_view.isVisible()) return stopLogTimer();
     var buf: [1024]u8 = undefined;
     log_view.sync(port(), watchedLog(&buf));
 }
@@ -2186,21 +2508,11 @@ const icon_w = 22;
 const icon_h = 18;
 
 fn loadIcons() void {
-    icons[@intFromEnum(logic.Icon.outline)] = objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, icon_w, icon_h);
-    icons[@intFromEnum(logic.Icon.empty)] = objc.loadSvg(@embedFile("sushibar/icon-empty.svg"), false, icon_w, icon_h);
-    icons[@intFromEnum(logic.Icon.loading)] = objc.loadSvg(@embedFile("sushibar/icon-loading.svg"), false, icon_w, icon_h);
-    icons[@intFromEnum(logic.Icon.ready)] = objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, icon_w, icon_h);
-    var buf: [4096]u8 = undefined;
-    for (&loading_icons, 0..) |*frame, i| {
-        const svg = logic.loadingSvg(&buf, @embedFile("sushibar/icon-loading.svg"), i) catch |e| std.debug.panic("loading icon frame {d}: {t}", .{ i, e });
-        frame.* = objc.loadSvg(svg, false, icon_w, icon_h);
-    }
-    const dim = logic.generatingSvg(&buf, @embedFile("sushibar/icon-online.svg"), false) catch |e| std.debug.panic("generating icon: {t}", .{e});
-    generating_dim = objc.loadSvg(dim, false, icon_w, icon_h);
-    for (&reading_icons, 0..) |*frame, i| {
-        const svg = logic.readingSvg(&buf, @embedFile("sushibar/icon-online.svg"), i) catch |e| std.debug.panic("reading icon step {d}: {t}", .{ i, e });
-        frame.* = objc.loadSvg(svg, false, icon_w, icon_h);
-    }
+    outline_icon = objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, icon_w, icon_h);
+    blank_icon = objc.makeBlankImage(icon_w, icon_h);
+    static_reps[@intFromEnum(logic.Icon.empty)] = objc.rasterizeSvgRep(@embedFile("sushibar/icon-empty.svg"), icon_w, icon_h);
+    static_reps[@intFromEnum(logic.Icon.loading)] = objc.rasterizeSvgRep(@embedFile("sushibar/icon-loading.svg"), icon_w, icon_h);
+    static_reps[@intFromEnum(logic.Icon.ready)] = objc.rasterizeSvgRep(@embedFile("sushibar/icon-online.svg"), icon_w, icon_h);
 }
 
 const find_show_interface: isize = 1;
@@ -2240,15 +2552,7 @@ fn setMainMenu(app: objc.id) void {
 fn runMenuBar() noreturn {
     const app = objc.msg(objc.id, objc.class("NSApplication"), "sharedApplication", .{});
     objc.msg(void, app, "setActivationPolicy:", .{@as(isize, 1)});
-    const bar = objc.msg(objc.id, objc.class("NSStatusBar"), "systemStatusBar", .{});
-    status_item = objc.msg(objc.id, bar, "statusItemWithLength:", .{@as(f64, -1)});
-    const button = objc.msg(objc.id, status_item, "button", .{});
     loadIcons();
-    objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
-    showIcon(button, .outline);
-    makeBadge(button);
-    makeUpdateDot(button);
-    makeReadout(button);
 
     const cls = objc.defineClass("SushiBarTarget", &.{
         .{ .selector = "tick:", .imp = @ptrCast(&tick), .types = "v@:@" },
@@ -2260,7 +2564,6 @@ fn runMenuBar() noreturn {
         .{ .selector = "flagsTick:", .imp = @ptrCast(&flagsTick), .types = "v@:@" },
         .{ .selector = "pickPort:", .imp = @ptrCast(&pickPortAction), .types = "v@:@" },
         .{ .selector = "lanToggle:", .imp = @ptrCast(&lanToggleAction), .types = "v@:@" },
-        .{ .selector = "blinkTick:", .imp = @ptrCast(&blinkTick), .types = "v@:@" },
         .{ .selector = "pickRow:", .imp = @ptrCast(&pickRowAction), .types = "v@:@" },
         .{ .selector = "removeRow:", .imp = @ptrCast(&removeRowAction), .types = "v@:@" },
         .{ .selector = "applyPort:", .imp = @ptrCast(&applyPortAction), .types = "v@:@" },
@@ -2268,13 +2571,16 @@ fn runMenuBar() noreturn {
         .{ .selector = "updateButton:", .imp = @ptrCast(&updateButtonAction), .types = "v@:@" },
         .{ .selector = "showLog:", .imp = @ptrCast(&showLogAction), .types = "v@:@" },
         .{ .selector = "logTick:", .imp = @ptrCast(&logTick), .types = "v@:@" },
-        .{ .selector = "loadingTick:", .imp = @ptrCast(&loadingTick), .types = "v@:@" },
         .{ .selector = "openModels:", .imp = @ptrCast(&openModelsAction), .types = "v@:@" },
         .{ .selector = "openRelease:", .imp = @ptrCast(&openReleaseNotes), .types = "v@:@" },
         .{ .selector = "copyPack:", .imp = @ptrCast(&copyPackAction), .types = "v@:@" },
         .{ .selector = "menuWillOpen:", .imp = @ptrCast(&menuWillOpen), .types = "v@:@" },
         .{ .selector = "menuDidClose:", .imp = @ptrCast(&menuDidClose), .types = "v@:@" },
         .{ .selector = "refreshNow:", .imp = @ptrCast(&refreshNow), .types = "v@:@" },
+        .{ .selector = "popupMenu:", .imp = @ptrCast(&popupMenuAction), .types = "v@:@" },
+        .{ .selector = "screensChanged:", .imp = @ptrCast(&screensChanged), .types = "v@:@" },
+        .{ .selector = "spaceChanged:", .imp = @ptrCast(&spaceChanged), .types = "v@:@" },
+        .{ .selector = "accessibilityChanged:", .imp = @ptrCast(&accessibilityChanged), .types = "v@:@" },
     });
     menu_target = objc.new(cls);
     setMainMenu(app);
@@ -2282,6 +2588,31 @@ fn runMenuBar() noreturn {
     top_menu = menu;
     objc.msg(void, menu, "setDelegate:", .{menu_target});
     objc.msg(void, menu, "setAutoenablesItems:", .{false});
+
+    const button = main_bar.init(menu_target, menu);
+    attachBarButton(button);
+    log_view.setOnClose(&onLogClosed);
+
+    const nc = objc.msg(objc.id, objc.class("NSNotificationCenter"), "defaultCenter", .{});
+    objc.msg(void, nc, "addObserver:selector:name:object:", .{
+        menu_target,
+        objc.sel("screensChanged:"),
+        objc.nsString("NSApplicationDidChangeScreenParametersNotification"),
+        @as(objc.id, null),
+    });
+    const ws_nc = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSWorkspace"), "sharedWorkspace", .{}), "notificationCenter", .{});
+    objc.msg(void, ws_nc, "addObserver:selector:name:object:", .{
+        menu_target,
+        objc.sel("spaceChanged:"),
+        objc.nsString("NSWorkspaceActiveSpaceDidChangeNotification"),
+        @as(objc.id, null),
+    });
+    objc.msg(void, ws_nc, "addObserver:selector:name:object:", .{
+        menu_target,
+        objc.sel("accessibilityChanged:"),
+        objc.nsString("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification"),
+        @as(objc.id, null),
+    });
 
     header_mi = objc.new(objc.class("NSMenuItem"));
     objc.msg(void, header_mi, "setView:", .{header_view.create(
@@ -2333,9 +2664,7 @@ fn runMenuBar() noreturn {
     // The Quit button is the visible row; this item only keeps ⌘Q.
     const quit_mi = addItem(menu, "Quit sushibar", "quit:", 0, "q", null);
     objc.msg(void, quit_mi, "setHidden:", .{true});
-    objc.msg(void, status_item, "setMenu:", .{menu});
-    _ = objc.addTimer(@as(f64, @floatFromInt(test_tick_ms)) / 1000.0, menu_target, "tick:");
-    _ = objc.addTimer(0.5, menu_target, "logTick:");
+    syncTimers(io_util.nowMs(g_io));
 
     _ = std.Thread.spawn(.{}, pollLoop, .{}) catch fail("cannot start the poll thread", .{});
     objc.msg(void, app, "run", .{});
@@ -2458,7 +2787,16 @@ fn renderBadge(dir: []const u8) void {
         const button = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 4, .y = 0, .w = 160, .h = 24 }});
         objc.msg(void, button, "setBordered:", .{false});
         objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
-        objc.msg(void, button, "setImage:", .{if (c.reading) |step| reading_icons[step] else if (c.dim) generating_dim else icons[@intFromEnum(c.icon)]});
+        const render_img = if (c.reading) |step|
+            objc.imageFromRep(ensureReadingRep(step), icon_w, icon_h)
+        else if (c.dim)
+            objc.imageFromRep(ensureGeneratingDimRep(), icon_w, icon_h)
+        else if (c.icon == .outline)
+            outline_icon
+        else
+            objc.imageFromRep(static_reps[@intFromEnum(c.icon)], icon_w, icon_h);
+        defer if (render_img != outline_icon) objc.release(render_img);
+        objc.msg(void, button, "setImage:", .{render_img});
         // The status bar draws a template image in the bar's text colour; a plain button would draw it dimmed.
         objc.msg(void, button, "setContentTintColor:", .{objc.color("labelColor")});
         makeReadout(button);

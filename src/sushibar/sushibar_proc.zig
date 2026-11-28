@@ -121,15 +121,31 @@ pub fn kill(pid: i32) void {
     _ = std.c.kill(pid, .KILL);
 }
 
+/// Fast existence check for a previously verified pid (avoids re-reading pid files and KERN_PROCARGS2).
+pub fn pidExists(pid: i32) bool {
+    if (pid <= 0) return false;
+    const rc = std.c.kill(pid, @enumFromInt(0));
+    return rc == 0 or std.posix.errno(rc) == .PERM;
+}
+
 const prox_fdtype_socket = 2;
 const proc_all_pids = 1;
 const proc_pidlistfds = 1;
 const proc_pidfdsocketinfo = 3;
 const sockinfo_tcp = 2;
+const kern_proc = 14;
+const kern_proc_uid = 5;
+// Verified macOS arm64 `struct kinfo_proc` layout (<sys/sysctl.h>, <sys/proc.h>):
+// sizeof = 648, kp_proc.p_pid at +40 (i32), kp_proc.p_comm at +243 ([17]u8, MAXCOMLEN = 16).
+const kinfo_proc_size = 648;
+const kinfo_off_pid = 40;
+const kinfo_off_comm = 243;
+const kinfo_comm_len = 16;
 
 extern fn proc_listpids(kind: u32, info: u32, buffer: ?*anyopaque, size: c_int) c_int;
 extern fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, size: c_int) c_int;
 extern fn proc_pidfdinfo(pid: c_int, fd: c_int, flavor: c_int, buffer: ?*anyopaque, size: c_int) c_int;
+extern "c" fn getuid() u32;
 
 const FdInfo = extern struct { fd: i32, fd_type: u32 };
 
@@ -165,29 +181,111 @@ fn listeningSocket(pid: i32, fd: i32) ?Bound {
     return .{ .port = port, .addr = addr };
 }
 
+fn commMatches(comm_field: []const u8, want: []const u8) bool {
+    const end = std.mem.indexOfScalar(u8, comm_field, 0) orelse comm_field.len;
+    const comm = comm_field[0..end];
+    return std.mem.eql(u8, comm, want[0..@min(want.len, kinfo_comm_len)]);
+}
+
+fn scanPidListeners(pid: i32, out: []logic.Listener, n: *usize, fds: *[2048]FdInfo) void {
+    const got = proc_pidinfo(pid, proc_pidlistfds, 0, fds, @sizeOf(@TypeOf(fds.*)));
+    if (got <= 0) return;
+    for (fds[0 .. @as(usize, @intCast(got)) / @sizeOf(FdInfo)]) |f| {
+        if (f.fd_type != prox_fdtype_socket) continue;
+        const bound = listeningSocket(pid, f.fd) orelse continue;
+        if (n.* == out.len) return;
+        out[n.*] = .{ .pid = pid, .port = bound.port, .addr = bound.addr };
+        n.* += 1;
+    }
+}
+
+var kinfo_lock = std.atomic.Value(bool).init(false);
+var kinfo_buf: []u8 = &.{};
+
+fn fetchUidProcs(out_got: *usize) ?[]const u8 {
+    while (kinfo_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    const mib = [_]c_int{ ctl_kern, kern_proc, kern_proc_uid, @intCast(getuid()) };
+    if (kinfo_buf.len == 0) {
+        var sz: usize = 0;
+        if (std.c.sysctl(&mib, mib.len, null, &sz, null, 0) != 0 or sz < kinfo_proc_size) {
+            kinfo_lock.store(false, .release);
+            return null;
+        }
+        const cap = @max(sz + sz / 2, 512 * 1024);
+        kinfo_buf = std.heap.page_allocator.alloc(u8, cap) catch {
+            kinfo_lock.store(false, .release);
+            return null;
+        };
+    }
+    var got: usize = kinfo_buf.len;
+    if (std.c.sysctl(&mib, mib.len, kinfo_buf.ptr, &got, null, 0) != 0) {
+        // Buffer too small (process count grew): re-size once and retry.
+        var sz: usize = 0;
+        if (std.c.sysctl(&mib, mib.len, null, &sz, null, 0) != 0 or sz < kinfo_proc_size) {
+            kinfo_lock.store(false, .release);
+            return null;
+        }
+        const cap = sz + sz / 2;
+        std.heap.page_allocator.free(kinfo_buf);
+        kinfo_buf = std.heap.page_allocator.alloc(u8, cap) catch {
+            kinfo_buf = &.{};
+            kinfo_lock.store(false, .release);
+            return null;
+        };
+        got = kinfo_buf.len;
+        if (std.c.sysctl(&mib, mib.len, kinfo_buf.ptr, &got, null, 0) != 0) {
+            kinfo_lock.store(false, .release);
+            return null;
+        }
+    }
+    out_got.* = got;
+    return kinfo_buf;
+}
+
+fn releaseUidProcs() void {
+    kinfo_lock.store(false, .release);
+}
+
 /// Every process listening on a TCP port (own user's only), optionally only those whose executable is `only_exe`.
+/// Uses one `sysctl(KERN_PROC_UID)` snapshot into a reused buffer to filter by `p_comm` in memory before touching
+/// `proc_pidpath` or `PROC_PIDLISTFDS`, cutting hundreds of per-PID syscalls down to ~1 on an idle system.
 pub fn listeners(out: []logic.Listener, only_exe: ?[]const u8) []logic.Listener {
-    var pids: [8192]i32 = undefined;
-    const bytes = proc_listpids(proc_all_pids, 0, &pids, @sizeOf(@TypeOf(pids)));
-    if (bytes <= 0) return out[0..0];
     var n: usize = 0;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     var fds: [2048]FdInfo = undefined;
+
+    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+        var got: usize = 0;
+        if (fetchUidProcs(&got)) |buf| {
+            defer releaseUidProcs();
+            const count = got / kinfo_proc_size;
+            for (0..count) |i| {
+                const row = buf[i * kinfo_proc_size ..][0..kinfo_proc_size];
+                const pid = std.mem.readInt(i32, row[kinfo_off_pid..][0..4], .little);
+                if (pid <= 0) continue;
+                if (only_exe) |want| {
+                    if (!commMatches(row[kinfo_off_comm..][0 .. kinfo_comm_len + 1], want)) continue;
+                    const exe = exeOfPid(pid, &exe_buf) orelse continue;
+                    if (!std.mem.eql(u8, std.fs.path.basename(exe), want)) continue;
+                }
+                scanPidListeners(pid, out, &n, &fds);
+                if (n == out.len) return out[0..n];
+            }
+            return out[0..n];
+        }
+    }
+
+    var pids: [8192]i32 = undefined;
+    const bytes = proc_listpids(proc_all_pids, 0, &pids, @sizeOf(@TypeOf(pids)));
+    if (bytes <= 0) return out[0..0];
     for (pids[0 .. @as(usize, @intCast(bytes)) / @sizeOf(i32)]) |pid| {
         if (pid <= 0) continue;
         if (only_exe) |want| {
             const exe = exeOfPid(pid, &exe_buf) orelse continue;
             if (!std.mem.eql(u8, std.fs.path.basename(exe), want)) continue;
         }
-        const got = proc_pidinfo(pid, proc_pidlistfds, 0, &fds, @sizeOf(@TypeOf(fds)));
-        if (got <= 0) continue;
-        for (fds[0 .. @as(usize, @intCast(got)) / @sizeOf(FdInfo)]) |f| {
-            if (f.fd_type != prox_fdtype_socket) continue;
-            const bound = listeningSocket(pid, f.fd) orelse continue;
-            if (n == out.len) return out[0..n];
-            out[n] = .{ .pid = pid, .port = bound.port, .addr = bound.addr };
-            n += 1;
-        }
+        scanPidListeners(pid, out, &n, &fds);
+        if (n == out.len) return out[0..n];
     }
     return out[0..n];
 }

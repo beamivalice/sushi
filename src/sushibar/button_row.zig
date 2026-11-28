@@ -3,6 +3,7 @@
 //! the app's target, closing the menu first unless the button says it stays open. What each button says and does
 //! is decided in `sushibar_logic.zig` (`updateButton`, `toggle`, `modelButton`). Single instance: its state is
 //! module-level.
+const std = @import("std");
 const objc = @import("objc.zig");
 
 const msg = objc.msg;
@@ -43,6 +44,7 @@ const Btn = struct {
     wheel: id = null,
     hover: bool = false,
     pressed: bool = false,
+    look_sig: ?u64 = null,
 };
 
 const log_i = 0;
@@ -228,10 +230,25 @@ pub fn createServerRow() id {
     });
 }
 
+fn lookSignature(look: Look) u64 {
+    var w = std.hash.Wyhash.init(0);
+    w.update(look.label);
+    w.update("\x00");
+    w.update(look.symbol);
+    w.update("\x00");
+    w.update(look.tip);
+    w.update("\x00");
+    w.update(std.mem.asBytes(&.{ @intFromBool(look.accent), @intFromBool(look.enabled), @intFromBool(look.spinner) }));
+    return w.final();
+}
+
 fn set(i: usize, look: Look) void {
     const b = &btns[i];
     b.closes_menu = look.closes_menu;
     b.action = look.selector;
+    const sig = lookSignature(look);
+    if (b.look_sig == sig) return;
+    b.look_sig = sig;
     const new_text = @intFromBool(objc.keepText(&b.label, look.label)) | @intFromBool(objc.keepText(&b.symbol, look.symbol)) | @intFromBool(objc.keepText(&b.tip, look.tip));
     if (new_text == 0 and b.accent == look.accent and b.enabled == look.enabled and b.spinner == look.spinner) return;
     b.accent = look.accent;

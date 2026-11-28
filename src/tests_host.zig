@@ -123,6 +123,7 @@ test {
     _ = @import("prefetch_plan.zig");
     _ = @import("sushibar/sushibar_logic.zig");
     _ = @import("sushibar/sushibar_proc.zig");
+    _ = @import("sushibar/http_local.zig");
     _ = @import("fill_marks.zig");
     _ = @import("ledger.zig");
     _ = @import("static_bill.zig");

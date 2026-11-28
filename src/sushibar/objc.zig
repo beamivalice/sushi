@@ -1,6 +1,8 @@
 //! The Objective-C runtime from Zig, with no Objective-C source: `msg` types each `objc_msgSend` call, and a
 //! class whose methods are Zig `callconv(.c)` functions is registered at run time.
 
+const std = @import("std");
+
 pub const id = ?*anyopaque;
 pub const SEL = ?*anyopaque;
 
@@ -32,6 +34,7 @@ pub fn msg(comptime R: type, target: id, selector: [*:0]const u8, args: anytype)
         3 => *const fn (id, SEL, T[0], T[1], T[2]) callconv(.c) R,
         4 => *const fn (id, SEL, T[0], T[1], T[2], T[3]) callconv(.c) R,
         5 => *const fn (id, SEL, T[0], T[1], T[2], T[3], T[4]) callconv(.c) R,
+        10 => *const fn (id, SEL, T[0], T[1], T[2], T[3], T[4], T[5], T[6], T[7], T[8], T[9]) callconv(.c) R,
         else => @compileError("objc.msg: more arguments than a sushibar call uses"),
     };
     const f: F = @ptrCast(&objc_msgSend);
@@ -87,8 +90,10 @@ pub fn new(cls: id) id {
 }
 
 /// Calls `[target selector:timer]` every `seconds` on the main run loop, menu tracking included; `invalidate` stops it.
+/// Sets a 20% timer tolerance so macOS can coalesce wakeups across processes.
 pub fn addTimer(seconds: f64, target: id, selector: [*:0]const u8) id {
     const timer = msg(id, class("NSTimer"), "timerWithTimeInterval:target:selector:userInfo:repeats:", .{ seconds, target, sel_registerName(selector), @as(id, null), true });
+    msg(void, timer, "setTolerance:", .{seconds * 0.2});
     msg(void, msg(id, class("NSRunLoop"), "mainRunLoop", .{}), "addTimer:forMode:", .{ timer, NSRunLoopCommonModes });
     return timer;
 }
@@ -110,6 +115,83 @@ pub fn loadSvg(svg: []const u8, template: bool, w: f64, h: f64) id {
     msg(void, image, "setSize:", .{NSSize{ .width = w, .height = h }});
     msg(void, image, "setTemplate:", .{template});
     return image;
+}
+
+/// Rasterizes SVG bytes once into a retained 2x Retina `NSBitmapImageRep` (`w` x `h` points).
+/// Retaining the rep keeps its backing `[rep CGImage]` valid for GPU `CALayer.contents` without re-parsing SVG.
+pub fn rasterizeSvgRep(svg: []const u8, w: f64, h: f64) id {
+    const img = loadSvg(svg, false, w, h);
+    defer release(img);
+    const px_w: isize = @intFromFloat(@round(w * 2.0));
+    const px_h: isize = @intFromFloat(@round(h * 2.0));
+    const rep = msg(id, msg(id, class("NSBitmapImageRep"), "alloc", .{}), "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:", .{
+        @as(?*anyopaque, null),
+        px_w,
+        px_h,
+        @as(isize, 8),
+        @as(isize, 4),
+        true,
+        false,
+        nsString("NSCalibratedRGBColorSpace"),
+        @as(isize, 0),
+        @as(isize, 0),
+    });
+    if (rep == null) return null;
+    msg(void, rep, "setSize:", .{NSSize{ .width = w, .height = h }});
+    const gc_cls = class("NSGraphicsContext");
+    msg(void, gc_cls, "saveGraphicsState", .{});
+    const ctx = msg(id, gc_cls, "graphicsContextWithBitmapImageRep:", .{rep});
+    if (ctx != null) {
+        msg(void, gc_cls, "setCurrentContext:", .{ctx});
+        const zero = NSRect{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        msg(void, img, "drawInRect:fromRect:operation:fraction:", .{ NSRect{ .x = 0, .y = 0, .w = w, .h = h }, zero, @as(usize, 2), @as(f64, 1.0) });
+    }
+    msg(void, gc_cls, "restoreGraphicsState", .{});
+    return rep;
+}
+
+/// Returns the `CGImage` owned by a retained `NSBitmapImageRep`.
+pub fn repCgImage(rep: id) id {
+    return if (rep != null) msg(id, rep, "CGImage", .{}) else null;
+}
+
+/// Wraps a rasterized `NSBitmapImageRep` in an `NSImage` of logical size `w` x `h` (e.g. for `renderBadge`).
+pub fn imageFromRep(rep: id, w: f64, h: f64) id {
+    const img = msg(id, msg(id, class("NSImage"), "alloc", .{}), "initWithSize:", .{NSSize{ .width = w, .height = h }});
+    if (rep != null) msg(void, img, "addRepresentation:", .{rep});
+    return img;
+}
+
+/// A transparent `w` x `h` `NSImage` that holds layout space on `NSStatusBarButton` while a `CALayer` draws the icon.
+pub fn makeBlankImage(w: f64, h: f64) id {
+    return msg(id, msg(id, class("NSImage"), "alloc", .{}), "initWithSize:", .{NSSize{ .width = w, .height = h }});
+}
+
+/// Runs a discrete repeating `CAKeyframeAnimation` on `layer.contents` entirely inside WindowServer's GPU compositor
+/// (zero app timers, zero CPU wakeups, zero `NSStatusBarButton` redraws).
+pub fn startContentsAnimation(layer: id, key: [*:0]const u8, cg_images: []const id, duration: f64) void {
+    if (layer == null or cg_images.len == 0) return;
+    const arr = msg(id, class("NSArray"), "arrayWithObjects:count:", .{ cg_images.ptr, cg_images.len });
+    const anim = msg(id, class("CAKeyframeAnimation"), "animationWithKeyPath:", .{nsString("contents")});
+    msg(void, anim, "setValues:", .{arr});
+    msg(void, anim, "setDuration:", .{duration});
+    msg(void, anim, "setCalculationMode:", .{nsString("discrete")});
+    msg(void, anim, "setRepeatCount:", .{std.math.inf(f32)});
+    msg(void, anim, "setRemovedOnCompletion:", .{false});
+    msg(void, layer, "addAnimation:forKey:", .{ anim, nsString(key) });
+}
+
+pub fn stopLayerAnimation(layer: id, key: [*:0]const u8) void {
+    if (layer == null) return;
+    msg(void, layer, "removeAnimationForKey:", .{nsString(key)});
+}
+
+/// Disables implicit Core Animation transitions on `layer.contents` so manual frame steps snap cleanly.
+pub fn disableContentsAction(layer: id) void {
+    if (layer == null) return;
+    const null_val = msg(id, class("NSNull"), "null", .{});
+    const dict = msg(id, class("NSDictionary"), "dictionaryWithObject:forKey:", .{ null_val, nsString("contents") });
+    msg(void, layer, "setActions:", .{dict});
 }
 
 /// The user asked the system for less motion (Accessibility > Display > Reduce motion).
