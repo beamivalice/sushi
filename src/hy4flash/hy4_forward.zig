@@ -2685,6 +2685,8 @@ test "hy4 recall on Sushi Cooler's stream: the shared score and top-k kernels gi
     defer scope.end();
     const exact = mlx.engine.exactF32();
     defer exact.end();
+    // The top-k widths this GPU grants, as a load finds them.
+    try hy4_index.probeTopk(es);
     const saved = select_kernels_on;
     defer select_kernels_on = saved;
     const g: IndexerGeometry = .{ .heads = 16, .dim = 128, .rope = 64, .ratio = 4, .group_topk = 8, .theta = 1e7, .eps = 1e-6 };

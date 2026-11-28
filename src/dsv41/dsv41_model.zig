@@ -1420,7 +1420,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     if (opts.dspark) try initDspark(m, weights);
     if (c.engram.n > 0) try initEngram(m, weights, dir_path);
     if (mlx.streamIsGpu(s)) try kernels.probeHc(gpa, s, c.hc_mult, c.dim, c.hc_iters);
-    if (mlx.streamIsGpu(s)) try kernels.probeTopk(gpa, s);
+    if (mlx.streamIsGpu(s)) try kernels.probeTopk(s);
     setWideArms(m);
     m.ced_split = c.cedSplit();
     if (opts.on_engine) _ = try m.ensurePlaceholder();

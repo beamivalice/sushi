@@ -3763,33 +3763,8 @@ pub fn hcExpandPerColumn(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
     return sc.keep(try hck.expand(sc.s, x, y, post, comb, false));
 }
 
-/// Launches the top-k kernels (one threadgroup a row, chunked, and cut at each row's length) at `topk_tg` threads, halving
-/// it until they run.
-pub fn probeTopk(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
-    defer mlx.expected_refusal = null;
-    const widest = sel.topk_tg;
-    while (true) {
-        // The floor's refusal is the load's error, logged as one.
-        mlx.expected_refusal = if (sel.topk_tg > 32) "Thread group size" else null;
-        probeTopkOnce(gpa, s) catch |e| {
-            if (e != error.MlxError or sel.topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
-            sel.topk_tg /= 2;
-            continue;
-        };
-        if (sel.topk_tg < widest) log.info("[dsv41] top-k kernels run {d} threads a group on this GPU (widest {d})\n", .{ sel.topk_tg, widest });
-        return;
-    }
-}
-
-fn probeTopkOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
-    var sc = Scope.plain(gpa, s);
-    defer sc.deinit();
-    const x = try sc.zeros(&.{ 1, 64 }, .float32);
-    const one = try topkIndicesSplit(&sc, x, 4, 1);
-    const split = try topkIndicesSplit(&sc, x, 4, 2);
-    const below = try topkIndicesBelow(&sc, x, 1, 4, try sc.ints(&.{64}, &.{ 1, 1 }));
-    try sc_mod.evalAll(&.{ one, split, below });
-}
+/// The top-k kernels at a width this GPU grants (`sparse_select.probeTopk`): the load runs it.
+pub const probeTopk = sel.probeTopk;
 
 /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1, M2): launches every hyper-connection
 /// kernel once at `hc_tg` threads and halves it until they run, then checks `hcExpandFused` against the chain.
@@ -4374,6 +4349,8 @@ test "dsv41 topk: the picks are the k largest in index order, ties to the lower 
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
+    // The width this GPU grants, as a load finds it: no load ran in a process that runs this alone.
+    try probeTopk(sc.s);
     const n = 1500;
     const k = 512;
     const x = try randn(&sc, &.{ 3, n }, .float32, 51, 1.0);
@@ -4397,6 +4374,8 @@ test "dsv41 topk below: the picks under each row's length, -1 elsewhere, are the
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
+    // The width this GPU grants, as a load finds it: no load ran in a process that runs this alone.
+    try probeTopk(sc.s);
     for ([_]struct { n: usize, k: usize }{ .{ .n = 1500, .k = 512 }, .{ .n = 300, .k = 64 }, .{ .n = 40, .k = 40 } }) |case| for ([_]usize{ 1, 3 }) |L| {
         const x = try randn(&sc, &.{ ci(L), ci(case.n) }, .float32, 71, 1.0);
         var lens: [3]i32 = .{ ci(case.n), ci(case.n / 2), 7 };
@@ -4412,7 +4391,7 @@ test "dsv41 topk: the picks do not depend on the threadgroup width" {
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
-    try probeTopk(sc.a, sc.s);
+    try probeTopk(sc.s);
     const widest = sel.topk_tg;
     defer sel.topk_tg = widest;
     const k = 100;
@@ -4431,6 +4410,8 @@ test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long 
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
+    // The width this GPU grants, as a load finds it: no load ran in a process that runs this alone.
+    try probeTopk(sc.s);
     const k = 512;
     var prng = std.Random.DefaultPrng.init(0x70b1);
     const rnd = prng.random();
@@ -5583,6 +5564,8 @@ test "dsv41 kernels: a new row count, pick count, split count or context width c
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
+    // The width this GPU grants, as a load finds it: no load ran in a process that runs this alone.
+    try probeTopk(sc.s);
     const keys = mlx.kernel_keys;
     _ = keys.trackForTest();
     const freqs = try ropeFreqs(&sc);
@@ -5667,7 +5650,7 @@ test "dsv41 topk: the load's probe launches every top-k kernel, so one the GPU g
         mlx.engine.kernel.grant_cap_name = name;
         const scope = mlx.engine.enter(mlx.engine.stream());
         defer scope.end();
-        try probeTopk(testing.allocator, mlx.engine.stream());
+        try probeTopk(mlx.engine.stream());
         try testing.expectEqual(@as(usize, 512), sel.topk_tg);
     }
 }

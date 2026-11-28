@@ -6,6 +6,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const metal_def = @import("metal_def.zig");
 const nax_gate = @import("nax_gate.zig");
+const log = @import("log.zig");
 
 const A = mlx.mlx_array;
 const Def = metal_def.Def;
@@ -480,8 +481,52 @@ pub const IDX_TILE_NAX_SOURCE =
 ;
 var idx_tile_nax_def = Def{ .name = "dsv41_index_tile_nax", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_TILE_NAX_SOURCE, .header = metal_def.NAX_HEADER };
 
-/// Threads a top-k threadgroup runs; an arch's probe halves it where the GPU caps the kernel lower.
+/// Threads a top-k threadgroup runs; `probeTopk` halves it where the GPU caps a kernel lower.
 pub var topk_tg: usize = 1024;
+
+/// Launches the top-k kernels (one threadgroup a row, chunked and merged, cut at each row's length) at `topk_tg`
+/// threads, halving it until they run: Metal grants them fewer than 1024 threads a group on some GPUs (M1, M2). Every
+/// arch whose forward launches one runs this at its load, before a plan records a launch; all four are launched, so
+/// the width is the GPU's, whichever arch loads first.
+pub fn probeTopk(s: mlx.mlx_stream) !void {
+    defer mlx.expected_refusal = null;
+    const widest = topk_tg;
+    while (true) {
+        // The floor's refusal is the load's error, logged as one.
+        mlx.expected_refusal = if (topk_tg > 32) "Thread group size" else null;
+        probeTopkOnce(s) catch |e| {
+            if (e != error.MlxError or topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            topk_tg /= 2;
+            continue;
+        };
+        if (topk_tg < widest) log.info("[engine] top-k kernels run {d} threads a group on this GPU (widest {d})\n", .{ topk_tg, widest });
+        return;
+    }
+}
+
+fn probeTopkOnce(s: mlx.mlx_stream) !void {
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    const zeros: [64]f32 = @splat(0);
+    const x = try mlx.newData(&zeros, &.{ 1, 64 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const lens = try mlx.newData(&[_]i32{64}, &.{ 1, 1 }, .int32);
+    defer _ = mlx.mlx_array_free(lens);
+    var outs: [3]A = undefined;
+    var made: usize = 0;
+    defer for (outs[0..made]) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    outs[0] = try topkIndicesSplit(s, x, 4, 1);
+    made = 1;
+    outs[1] = try topkIndicesSplit(s, x, 4, 2);
+    made = 2;
+    outs[2] = try topkIndicesBelow(s, x, 1, 4, lens);
+    made = 3;
+    const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+}
 
 /// Chunks a row of `n` scores splits into for its top-k. Past these sizes one threadgroup a row leaves the GPU idle;
 /// below them, or at a wide k, the merge costs what the split saves (`sushi-ubench run dsv41.topk`).

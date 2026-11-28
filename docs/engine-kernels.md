@@ -341,6 +341,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   answer at every rung (`sampler_draw`; the hyper-connection kernels keep `hc_tg`'s own halving, and Hy4's
   one-threadgroup mixes halve per pipeline, `hy4_hc.applyNarrow`). A load that records its plans settles each rung first
   (`sampler_draw.settle`, `Model.probeWide`): a recording keeps the rung it met, so a later step-down misses the plan.
+- **A width one arch's load settles is not settled for another**: the shared top-k kernels launch at `topk_tg`, which
+  every arch that launches them settles at its own load through the one probe (`sparse_select.probeTopk`; Hy4 adds its
+  pick, `hy4_index.probeTopk`). A test that launches one outside a load settles it first, or it passes only after a
+  neighbour's load: only a real chip shows its grants (an M1 Max: 576 to 640 threads a group).
 - **A probe that provokes a size refusal declares it** (`mlx.expected_refusal`): MLX's raise is logged at debug, and the
   probe names the rung it settled on in one info line; only the last rung's refusal logs as an error.
 - The name is MLX's: `MLX_METAL_GPU_ARCH` when set, else the system GPU's, so the profile and MLX's dispatch agree.
