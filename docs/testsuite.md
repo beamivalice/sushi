@@ -351,6 +351,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   that matches nothing is stale and fails, so the list only shrinks; an entry without a reason fails naming the line.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its
   allowlist entries.
+- A rule reads any file that parses: one of no token, one comment, or one that opens with its `test`. Its token scans
+  count up with `while`, never a range that starts past token 0 ([Zig](engine-mlx-gotchas.md#zig)).
 
 ## Characterization tapes
 
