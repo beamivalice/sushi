@@ -62,9 +62,7 @@ fn nsData(bytes: []const u8) id {
     return null;
 }
 
-fn color(name: [*:0]const u8) id {
-    return objc.color(name);
-}
+const color = objc.color;
 
 fn control(comptime cls: [*:0]const u8, frame: NSRect) id {
     return msg(id, msg(id, objc.class(cls), "alloc", .{}), "initWithFrame:", .{frame});
@@ -466,17 +464,10 @@ pub fn renderPng(path: [*:0]const u8, dark: bool, shown: ?struct { port: u16, sr
         has_file = s.has_file;
         showFileButtons();
     }
-    const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
-    msg(void, window, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
+    objc.setAppearance(window, dark);
     // The frame view carries the title bar and the window background the content view does not draw itself.
     const content = msg(id, msg(id, window, "contentView", .{}), "superview", .{});
     msg(void, content, "layoutSubtreeIfNeeded", .{});
     msg(void, msg(id, text_view, "layoutManager", .{}), "ensureLayoutForTextContainer:", .{msg(id, text_view, "textContainer", .{})});
-    const bounds = msg(NSRect, content, "bounds", .{});
-    const rep = msg(id, content, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
-    if (rep == null) return false;
-    msg(void, content, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
-    const data = msg(id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(id, null) });
-    if (data == null) return false;
-    return msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(path), true });
+    return objc.writeViewPng(content, msg(NSRect, content, "bounds", .{}), path);
 }

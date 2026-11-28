@@ -17,9 +17,7 @@ var hint: id = null;
 var opaque_bg = false;
 var invalid_shown = false;
 
-fn color(name: [*:0]const u8) id {
-    return objc.color(name);
-}
+const color = objc.color;
 
 fn systemFont(size: f64, mono_digits: bool) id {
     return if (mono_digits)
@@ -124,13 +122,5 @@ pub fn isInvalid() bool {
 pub fn renderPng(view: id, path: [*:0]const u8, dark: bool) bool {
     opaque_bg = true;
     defer opaque_bg = false;
-    const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
-    msg(void, view, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
-    const bounds = NSRect{ .x = 0, .y = 0, .w = width, .h = height };
-    const rep = msg(id, view, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
-    if (rep == null) return false;
-    msg(void, view, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
-    const data = msg(id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(id, null) });
-    if (data == null) return false;
-    return msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(path), true });
+    return objc.renderViewPng(view, .{ .x = 0, .y = 0, .w = width, .h = height }, path, dark);
 }

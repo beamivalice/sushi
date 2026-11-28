@@ -329,12 +329,5 @@ pub fn renderPng(row: id, path: [*:0]const u8, dark: bool, hover: ?usize, presse
         msg(void, label, "setFont:", .{msg(id, objc.class("NSFont"), "menuFontOfSize:", .{@as(f64, 12)})});
         msg(void, host, "addSubview:", .{label});
     }
-    const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
-    msg(void, host, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
-    const rep = msg(id, host, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
-    if (rep == null) return false;
-    msg(void, host, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
-    const data = msg(id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(id, null) });
-    if (data == null) return false;
-    return msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(path), true });
+    return objc.renderViewPng(host, bounds, path, dark);
 }

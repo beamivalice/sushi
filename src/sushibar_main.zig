@@ -1,19 +1,24 @@
 //! `sushibar`: the menu bar item for a sushi server. It links no MLX and no server module: the title reads
 //! `/metrics.json` over HTTP, Start and Stop run the `sushi` beside this binary, updates go through sushi's own
-//! updater. AppKit is called only from the main thread; a poll thread publishes a snapshot that a main-run-loop
-//! timer renders.
+//! updater. This entry file owns CLI startup/locking, local server lifecycle, menu wiring, and AppKit callbacks
+//! (strictly main thread); cross-thread polling/workers live in `sushibar/poller.zig`, bar visuals in
+//! `sushibar/bar_button.zig`, and the PNG design harness in `sushibar/render_gallery.zig`.
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const logic = @import("sushibar/sushibar_logic.zig");
 const proc = @import("sushibar/sushibar_proc.zig");
 const objc = @import("sushibar/objc.zig");
-const io_util = @import("io_util.zig");
 const header_view = @import("sushibar/header_view.zig");
 const port_field = @import("sushibar/port_field.zig");
 const button_row = @import("sushibar/button_row.zig");
 const log_view = @import("sushibar/log_view.zig");
 const port_row = @import("sushibar/port_row.zig");
-const http_local = @import("sushibar/http_local.zig");
 const main_bar = @import("sushibar/main_bar.zig");
+const bar_button = @import("sushibar/bar_button.zig");
+const poller = @import("sushibar/poller.zig");
+const render_gallery = @import("sushibar/render_gallery.zig");
+
+const Str = logic.FixedStr;
 
 const usage =
     \\usage: sushibar [--port <n>]
@@ -30,14 +35,9 @@ const usage =
     \\
 ;
 
-const tick_ms = 1000;
-const server_exe = "sushi";
-const bar_exe = "sushibar";
 const bar_pid_name = "sushibar.pid";
 const saved_name = "sushibar.json";
 const lock_name = "sushibar.lock";
-const max_listings = 8;
-const props_every = 5;
 
 fn out(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
@@ -53,27 +53,6 @@ fn env(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
-/// A note holds a server's refusal whole (a load's memory refusal runs to about 1 KB): the menu shows its start, the
-/// tooltip all of it.
-const note_cap = 2048;
-
-fn Str(comptime N: usize) type {
-    return struct {
-        buf: [N]u8 = undefined,
-        len: usize = 0,
-
-        fn set(self: *@This(), s: []const u8) void {
-            self.len = @min(s.len, N);
-            while (self.len < s.len and self.len > 0 and (s[self.len] & 0xC0) == 0x80) self.len -= 1;
-            @memcpy(self.buf[0..self.len], s[0..self.len]);
-        }
-
-        fn get(self: *const @This()) []const u8 {
-            return self.buf[0..self.len];
-        }
-    };
-}
-
 // ── Test seams: SUSHIBAR_TEST_POLLS, SUSHIBAR_TEST_ACTIONS, SUSHIBAR_TEST_TICK_MS (docs/envvar.md) ──
 
 const ActionKind = enum { start, stop, load, unload, confirm, check, update, port, typed, models, remove, lan };
@@ -83,12 +62,7 @@ var test_actions: [12]Action = undefined;
 var test_action_n: usize = 0;
 var test_confirm = false;
 /// The menu's tick under test: every poll interval shrinks by `test_tick_ms / tick_ms`.
-var test_tick_ms: u32 = tick_ms;
-
-/// `ms` of the poll schedule at the test tick.
-fn ticked(ms: i64) i64 {
-    return @divTrunc(ms * test_tick_ms, tick_ms);
-}
+var test_tick_ms: u32 = poller.tick_ms;
 
 fn readTestSeams() void {
     if (env("SUSHIBAR_TEST_MULTIMONITOR")) |v| {
@@ -96,8 +70,8 @@ fn readTestSeams() void {
     }
     test_polls = std.fmt.parseInt(u32, env("SUSHIBAR_TEST_POLLS") orelse "", 10) catch 0;
     if (test_polls > 0) {
-        const t = std.fmt.parseInt(u32, env("SUSHIBAR_TEST_TICK_MS") orelse "", 10) catch tick_ms;
-        test_tick_ms = std.math.clamp(t, 10, tick_ms);
+        const t = std.fmt.parseInt(u32, env("SUSHIBAR_TEST_TICK_MS") orelse "", 10) catch poller.tick_ms;
+        test_tick_ms = std.math.clamp(t, 10, poller.tick_ms);
     }
     var it = std.mem.tokenizeScalar(u8, env("SUSHIBAR_TEST_ACTIONS") orelse "", ',');
     while (it.next()) |item| {
@@ -124,82 +98,9 @@ fn readTestSeams() void {
     }
 }
 
-// ── State shared by the poll thread, the update worker and the main thread ──
+// ── Main-thread process & menu state ──
 
-const Listing = struct { port: u16 = 0, pid: i32 = 0, model: Str(96) = .{}, known: logic.ModelsKnown = .unknown };
-
-/// What a foreign listener's `/v1/models` last said; fetched only when the Port submenu opens.
-const ModelCache = struct { port: u16 = 0, known: logic.ModelsKnown = .unknown, busy: bool = false, model: Str(96) = .{} };
-
-const Shared = struct {
-    mu: std.Io.Mutex = .init,
-    /// The port the data below belongs to; stale once the watched port changes.
-    port: u16 = 0,
-    view: logic.View = .{ .link = .offline },
-    model: Str(logic.max_model) = .{},
-    /// The byte length of the ready model's id as the server sent it, which `model` cuts to `max_model`.
-    model_full_len: usize = 0,
-    listings: [max_listings]Listing = undefined,
-    listing_n: usize = 0,
-    /// The sushi listeners of the last scan with the address each is bound to (`originFor`).
-    bound: [max_listings]logic.Listener = undefined,
-    bound_n: usize = 0,
-    models: [16]ModelCache = @splat(.{}),
-    sushi_listening: bool = false,
-    /// The watched port's sushi listener is bound to a LAN address (`lanBound`).
-    lan_listening: bool = false,
-    port_taken: bool = false,
-    /// Started servers still to be asked whether they answer (`started`), and the ports that did.
-    probe_ports: [8]u16 = undefined,
-    probe_n: usize = 0,
-    answered_ports: [8]u16 = undefined,
-    answered_n: usize = 0,
-    model_loading: Str(96) = .{},
-    /// The ready model's `meta.pack_update`; empty `pack_latest` means none.
-    pack_current: Str(32) = .{},
-    pack_latest: Str(32) = .{},
-    pack_command: Str(96) = .{},
-    mem_mb: ?u64 = null,
-    gpu_mhz: ?u64 = null,
-    gpu_pct: ?u64 = null,
-    last_prefill: ?f64 = null,
-    hist: [200]logic.Hist = undefined,
-    hist_n: usize = 0,
-    bar_version: Str(32) = .{},
-    server_version: Str(32) = .{},
-    /// What the running server's `/props.update` says.
-    props_latest: Str(32) = .{},
-    props_available: bool = false,
-    props_command: Str(80) = .{},
-    latest: Str(32) = .{},
-    available: bool = false,
-    note: Str(note_cap) = .{},
-    /// The note says something went wrong: it is drawn orange and opens the Log window.
-    note_problem: bool = false,
-    note_kind: logic.NoteKind = .other,
-    /// The port a `.server` note is about.
-    note_port: u16 = 0,
-    note_at_ms: i64 = 0,
-    props_url: Str(160) = .{},
-    busy: logic.Busy = .none,
-    /// A manual Check requested while a startup auto-check is already in flight runs immediately afterward.
-    manual_check_queued: bool = false,
-    check_failed: bool = false,
-    /// Where the watched port's server writes its log; stale once the watched port changes (`port`).
-    log_kind: logic.LogKind = .standard,
-    log_path: Str(1024) = .{},
-    relaunch: bool = false,
-    /// How the last check the user asked for ended, and when; shown on the Update button.
-    manual_result: logic.CheckResult = .none,
-    manual_at_ms: i64 = 0,
-    /// The key the watched server's argv gives it (`--api-key`, `--api-key-env`), sent only to `key_port`.
-    api_key: Str(512) = .{},
-    key_port: u16 = 0,
-};
-
-var shared: Shared = .{};
 var g_io: std.Io = undefined;
-var g_port = std.atomic.Value(u16).init(logic.default_port);
 /// The port the menu lists first and never lets go: `server.port` of the settings file, re-read as the menu opens.
 var g_default_port: u16 = logic.default_port;
 /// The ports the user added; the menu and the Port field are the main thread's.
@@ -213,791 +114,20 @@ var g_sibling_brew = false;
 var g_self_exe: [:0]const u8 = "";
 var g_bar_pid_path: []const u8 = "";
 var g_saved_path: []const u8 = "";
-var g_capture_seq = std.atomic.Value(u32).init(0);
-var g_launched_version: Str(32) = .{};
 /// The model the watched server last had loaded (`sushibar.json`): Load brings it back.
 var g_last_model: Str(logic.max_model) = .{};
 /// The ready model's id was past `max_model`, so it was not stored and the note said so.
 var g_model_too_long = false;
-/// The port a server is being asked to load `g_last_model` on, 0 when none is.
-var g_load_port = std.atomic.Value(u16).init(0);
-/// The port a server is being asked to unload `g_last_model` on, 0 when none is.
-var g_unload_port = std.atomic.Value(u16).init(0);
 /// The model the running load or unload names; `g_last_model` follows the watched port and may differ.
 var g_op_model: Str(logic.max_model) = .{};
 /// A server the user's own Stop is ending, so its going away is no news.
 var g_stop_port: u16 = 0;
 var g_stop_at_ms: i64 = 0;
 
-fn lock() void {
-    shared.mu.lockUncancelable(g_io);
-}
-fn unlock() void {
-    shared.mu.unlock(g_io);
-}
-
-fn port() u16 {
-    return g_port.load(.acquire);
-}
-
-// ── HTTP ──
-
-const Reply = http_local.Reply;
-
-const poll_timeout_s = 4;
-const models_timeout_s = 1;
-
 /// Wakes the main thread to re-render when `test_polls == 0` (production is event-driven, not 1 Hz polled).
 fn notifyMain() void {
     if (test_polls == 0 and menu_target != null) {
         objc.msg(void, menu_target, "performSelectorOnMainThread:withObject:waitUntilDone:", .{ objc.sel("refreshNow:"), @as(objc.id, null), false });
-    }
-}
-
-/// A server that accepts and never answers is offline after `timeout_s`, not a stalled poll thread.
-fn request(a: std.mem.Allocator, p: u16, method: http_local.Method, url: []const u8, origin: ?[]const u8) ?Reply {
-    return requestWithin(a, p, method, url, origin, poll_timeout_s, "");
-}
-
-/// `p` is the port `url` names: only the watched server's own key is sent, and only to it.
-fn requestOutcome(a: std.mem.Allocator, p: u16, method: http_local.Method, url: []const u8, origin: ?[]const u8, timeout_s: i64, payload: []const u8) http_local.Outcome {
-    var auth_buf: [600]u8 = undefined;
-    const auth = authFor(&auth_buf, p);
-    return http_local.fetch(a, method, url, origin, auth, payload, timeout_s * 1000);
-}
-
-fn requestWithin(a: std.mem.Allocator, p: u16, method: http_local.Method, url: []const u8, origin: ?[]const u8, timeout_s: i64, payload: []const u8) ?Reply {
-    return switch (requestOutcome(a, p, method, url, origin, timeout_s, payload)) {
-        .reply => |r| r,
-        .conn_refused, .failed => null,
-    };
-}
-
-fn get(a: std.mem.Allocator, p: u16, url: []const u8) ?Reply {
-    return request(a, p, .GET, url, null);
-}
-
-/// `Bearer <key>` when `p` is the watched port and its server's argv gave it a key, else "".
-fn authFor(buf: []u8, p: u16) []const u8 {
-    lock();
-    defer unlock();
-    if (shared.key_port != p or shared.api_key.len == 0) return "";
-    return std.fmt.bufPrint(buf, "Bearer {s}", .{shared.api_key.get()}) catch "";
-}
-
-const origin_cap = 64;
-const url_cap = 128;
-
-/// `http://host:port` of the server on `p`: the address its listener is bound to, else loopback.
-fn originFor(buf: []u8, p: u16) []const u8 {
-    lock();
-    defer unlock();
-    return logic.originOf(buf, shared.bound[0..shared.bound_n], p);
-}
-
-fn urlFor(buf: []u8, p: u16, comptime path: []const u8) []const u8 {
-    var origin: [origin_cap]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s}" ++ path, .{originFor(&origin, p)}) catch unreachable;
-}
-
-fn modelsOf(a: std.mem.Allocator, p: u16) logic.ModelState {
-    var b: [url_cap]u8 = undefined;
-    const r = get(a, p, urlFor(&b, p, "/v1/models")) orelse return .{};
-    if (r.status != 200) return .{};
-    return logic.parseModelState(a, r.body) catch .{};
-}
-
-fn cacheSlot(p: u16) *ModelCache {
-    var free: ?*ModelCache = null;
-    for (&shared.models) |*c| {
-        if (c.port == p) return c;
-        if (c.port == 0 and free == null) free = c;
-    }
-    return free orelse &shared.models[p % shared.models.len];
-}
-
-fn metricsUrl(buf: []u8, p: u16, since_ms: i64) []const u8 {
-    var origin: [origin_cap]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s}/metrics.json?since={d}", .{ originFor(&origin, p), since_ms }) catch unreachable;
-}
-
-/// One foreign listener's models, with a short timeout, off the poll thread.
-fn modelsWorker(p: u16) void {
-    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    var b: [url_cap]u8 = undefined;
-    var known: logic.ModelsKnown = .failed;
-    var name: []const u8 = "";
-    if (requestWithin(a, p, .GET, urlFor(&b, p, "/v1/models"), null, models_timeout_s, "")) |r| {
-        if (r.status == 200) {
-            if (logic.parseModelState(a, r.body)) |m| {
-                known = .answered;
-                name = m.ready orelse "";
-            } else |_| {}
-        }
-    }
-    lock();
-    const c = cacheSlot(p);
-    c.port = p;
-    c.known = known;
-    c.busy = false;
-    c.model.set(name);
-    unlock();
-    notifyMain();
-}
-
-/// The Port submenu is about to be read: ask the listed ports' listeners for their models, in parallel. This is the
-/// only time sushibar talks to a server it is not watching, and never to one the menu does not list.
-fn refreshModels(only: ?u16) void {
-    var ports: [max_listings]u16 = undefined;
-    var n: usize = 0;
-    lock();
-    for (shared.listings[0..shared.listing_n]) |l| {
-        if (l.port == port() or (only != null and only.? != l.port)) continue;
-        if (l.port != g_default_port and !g_saved.has(l.port)) continue;
-        const c = cacheSlot(l.port);
-        if (c.busy) continue;
-        if (c.port != l.port) {
-            c.port = l.port;
-            c.known = .unknown;
-            c.model.set("");
-        }
-        c.busy = true;
-        ports[n] = l.port;
-        n += 1;
-    }
-    unlock();
-    for (ports[0..n]) |p| {
-        const t = std.Thread.spawn(.{}, modelsWorker, .{p}) catch {
-            lock();
-            cacheSlot(p).busy = false;
-            unlock();
-            continue;
-        };
-        t.detach();
-    }
-}
-
-// ── Version and update (poll thread and worker) ──
-
-const path_cap = std.fs.max_path_bytes + 1;
-
-/// `name` beside this binary, resolved now: a Homebrew upgrade replaces the keg under a running sushibar, so the
-/// path found at launch may be gone. Falls back to brew's stable `opt` link.
-fn siblingNow(buf: *[path_cap]u8, name: []const u8) ?[:0]const u8 {
-    var real: [std.fs.max_path_bytes]u8 = undefined;
-    var cand: [std.fs.max_path_bytes]u8 = undefined;
-    if (proc.realPath(&real, g_self_exe)) |r| {
-        if (logic.siblingPath(&cand, r, name)) |c| if (reachable(c)) return sentinel(buf, c);
-        if (logic.brewOptPath(&cand, r, name)) |c| if (reachable(c)) return sentinel(buf, c);
-    }
-    if (logic.siblingPath(&cand, g_self_exe, name)) |c| if (reachable(c)) return sentinel(buf, c);
-    return null;
-}
-
-fn reachable(path: []const u8) bool {
-    std.Io.Dir.cwd().access(g_io, path, .{ .execute = true }) catch return false;
-    return true;
-}
-
-fn sentinel(buf: *[path_cap]u8, s: []const u8) ?[:0]const u8 {
-    if (s.len >= buf.len) return null;
-    @memcpy(buf[0..s.len], s);
-    buf[s.len] = 0;
-    return buf[0..s.len :0];
-}
-
-const Captured = struct { code: ?u8, text: []const u8 };
-
-/// Runs `argv` to its end; its output goes to a file of its own, so concurrent callers never share one.
-fn capture(a: std.mem.Allocator, argv: []const [*:0]const u8) Captured {
-    var pb: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&pb, "{s}/.sushi/sushibar-capture-{d}-{d}.txt", .{ g_home, proc.selfPid(), g_capture_seq.fetchAdd(1, .monotonic) }, 0) catch return .{ .code = null, .text = "" };
-    const code = proc.runCapture(argv, path.ptr);
-    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, a, .limited(64 * 1024)) catch "";
-    std.Io.Dir.cwd().deleteFile(g_io, path) catch {};
-    return .{ .code = code, .text = text };
-}
-
-fn refreshBarVersion(a: std.mem.Allocator) void {
-    var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return;
-    const got = capture(a, &.{ sushi.ptr, "--version" });
-    if (got.code != 0) return;
-    const v = logic.parseVersionOutput(got.text) orelse return;
-    lock();
-    if (g_launched_version.len == 0) g_launched_version.set(v);
-    shared.bar_version.set(v);
-    // Whatever replaced the sibling (our update, a terminal `sushi update`, a server's /v1/update) restarts us.
-    if (logic.relaunchNeeded(g_launched_version.get(), v)) shared.relaunch = true;
-    unlock();
-}
-
-fn setNote(text: []const u8) void {
-    lock();
-    defer unlock();
-    putNote(text, false, .other, 0);
-}
-
-fn setProblem(text: []const u8) void {
-    lock();
-    defer unlock();
-    putNote(text, true, .other, 0);
-}
-
-/// A note about the update flow: a finished check replaces it.
-fn setUpdateNote(text: []const u8, problem: bool) void {
-    lock();
-    putNote(text, problem, .update, 0);
-    unlock();
-    notifyMain();
-}
-
-/// A problem with the server on `p`: it stays until a server answers there again or Start is pressed.
-fn setServerProblem(text: []const u8, p: u16) void {
-    lock();
-    defer unlock();
-    putNote(text, true, .server, p);
-}
-
-/// Holding the lock.
-fn putNote(text: []const u8, problem: bool, kind: logic.NoteKind, p: u16) void {
-    shared.note.set(text);
-    shared.note_problem = problem;
-    shared.note_kind = kind;
-    shared.note_port = p;
-    shared.note_at_ms = io_util.nowMs(g_io);
-}
-
-/// Holding the lock.
-fn clearNote() void {
-    putNote("", false, .other, 0);
-}
-
-/// Folds a check's answer into what the menu shows. False when it was a failure.
-fn applyCheck(result: logic.Check, manual: bool) bool {
-    lock();
-    defer unlock();
-    switch (result) {
-        .available => |v| {
-            shared.latest.set(v);
-            shared.available = true;
-            if (logic.checkReplacesNote(shared.note_kind)) clearNote();
-        },
-        .up_to_date => {
-            shared.available = false;
-            if (logic.checkReplacesNote(shared.note_kind)) clearNote();
-        },
-        .failed => |line| {
-            if (manual) putNote(line, true, .update, 0);
-            return false;
-        },
-    }
-    return true;
-}
-
-/// A daily check answered from sushi's own cache while it is under a day old, so a bar launch asks no one.
-fn cachedCheck(a: std.mem.Allocator) ?logic.Check {
-    var pb: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&pb, "{s}/.sushi/update-check.json", .{g_home}) catch return null;
-    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, a, .limited(64 * 1024)) catch return null;
-    lock();
-    const bar = a.dupe(u8, shared.bar_version.get()) catch "";
-    unlock();
-    return logic.cachedCheck(a, text, io_util.nowSecs(g_io), bar);
-}
-
-/// Whether `model-settings.json` leaves the automatic check on.
-fn autoCheckEnabled(a: std.mem.Allocator) bool {
-    var pb: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&pb, "{s}/.sushi/model-settings.json", .{g_home}) catch return true;
-    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, a, .limited(1 << 20)) catch return true;
-    return logic.autoCheckOn(a, text);
-}
-
-/// `sushi update --check`, recorded in sushi's own cache like the daily check. False when it gave no answer. The
-/// automatic one reuses a cache under a day old; the menu's own "Check for updates" always asks.
-fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
-    // Both an explicit and a daily check end in the header's "up to date" or "available"; only failures are worded.
-    var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return false;
-    refreshBarVersion(a);
-    if (!manual) if (cachedCheck(a)) |hit| return applyCheck(hit, false);
-    const got = capture(a, &.{ sushi.ptr, "update", "--check" });
-    if (got.code == null) {
-        if (manual) setUpdateNote("could not run sushi", true);
-        return false;
-    }
-    return applyCheck(logic.parseCheck(got.text), manual);
-}
-
-fn refreshProps(a: std.mem.Allocator, p: u16) void {
-    var b: [url_cap]u8 = undefined;
-    const r = get(a, p, urlFor(&b, p, "/props")) orelse return;
-    if (r.status != 200) return;
-    const u = (logic.parseProps(a, r.body) catch return) orelse return;
-    lock();
-    // The watch moved while this was asked: the answer is another server's.
-    if (port() != p) return unlock();
-    const changed = shared.server_version.len > 0 and !std.mem.eql(u8, shared.server_version.get(), u.current);
-    shared.server_version.set(u.current);
-    shared.props_latest.set(u.latest orelse "");
-    shared.props_available = u.available;
-    shared.props_command.set(u.command orelse "");
-    shared.props_url.set(u.url orelse "");
-    unlock();
-    if (changed) refreshBarVersion(a);
-}
-
-fn finishUpdate(a: std.mem.Allocator, ok_note: []const u8) void {
-    refreshBarVersion(a);
-    lock();
-    defer unlock();
-    shared.available = false;
-    putNote(ok_note, false, .update, 0);
-}
-
-/// `error.message` of a server's JSON error body, or "".
-fn errorMessage(a: std.mem.Allocator, body: []const u8) []const u8 {
-    const E = struct { @"error": ?struct { message: []const u8 = "" } = null };
-    const e = std.json.parseFromSliceLeaky(E, a, body, .{ .ignore_unknown_fields = true }) catch return "";
-    return (e.@"error" orelse return "").message;
-}
-
-fn updateViaServer(a: std.mem.Allocator, p: u16) void {
-    var url: [url_cap]u8 = undefined;
-    var origin: [origin_cap]u8 = undefined;
-    const origin_s = originFor(&origin, p);
-    var from_buf: [32]u8 = undefined;
-    lock();
-    var from: []const u8 = from_buf[0..shared.server_version.len];
-    @memcpy(from_buf[0..from.len], shared.server_version.get());
-    unlock();
-    // Asked before the first /props of a newly watched port: without the version it runs, any answer reads as updated.
-    if (from.len == 0) {
-        var vb: [url_cap]u8 = undefined;
-        if (get(a, p, urlFor(&vb, p, "/props"))) |pr| if (logic.parseProps(a, pr.body) catch null) |u| {
-            from = from_buf[0..@min(u.current.len, from_buf.len)];
-            @memcpy(from_buf[0..from.len], u.current[0..from.len]);
-        };
-    }
-    if (from.len == 0) return setUpdateNote("Update failed: the server did not say which version it runs", true);
-    const r = request(a, p, .POST, urlFor(&url, p, "/v1/update"), origin_s) orelse return setUpdateNote("Update failed: the server did not answer", true);
-    if (r.status != 202) {
-        const why = errorMessage(a, r.body);
-        return setUpdateNote(std.fmt.allocPrint(a, "Update refused: {s}", .{if (why.len > 0) why else "the server did not accept it"}) catch "Update refused", true);
-    }
-    setUpdateNote("Updating…", false);
-    var poll_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer poll_arena.deinit();
-    var down = false;
-    var i: u32 = 0;
-    while (i < update_wait_polls) : (i += 1) {
-        std.Io.sleep(g_io, .fromMilliseconds(500), .real) catch {};
-        if (port() != p) return setUpdateNote("Update started; no longer followed after the port change", false);
-        _ = poll_arena.reset(.retain_capacity);
-        const pa = poll_arena.allocator();
-        var hb: [url_cap]u8 = undefined;
-        const alive = if (get(pa, p, urlFor(&hb, p, "/health"))) |h| h.status == 200 else false;
-        if (!alive) {
-            down = true;
-            continue;
-        }
-        if (down) break;
-        var pb: [url_cap]u8 = undefined;
-        const props = get(pa, p, urlFor(&pb, p, "/props")) orelse continue;
-        const u = (logic.parseProps(pa, props.body) catch null) orelse continue;
-        if (!std.mem.eql(u8, u.current, from)) break;
-    }
-    var pb: [url_cap]u8 = undefined;
-    const props = get(a, p, urlFor(&pb, p, "/props"));
-    const u = if (props) |pr| (logic.parseProps(a, pr.body) catch null) else null;
-    refreshProps(a, p);
-    if (u) |up| if (!std.mem.eql(u8, up.current, from)) {
-        var msg: [64]u8 = undefined;
-        return finishUpdate(a, std.fmt.bufPrint(&msg, "Updated to sushi {s}", .{up.current}) catch "Updated");
-    };
-    const why = if (u) |up| up.err orelse "sushi restarted on the version it had" else "the server did not come back";
-    setUpdateNote(std.fmt.allocPrint(a, "Update failed: {s}", .{why}) catch "Update failed", true);
-}
-
-/// Two minutes of half-second polls: past that the update is reported as failed instead of locking the menu.
-const update_wait_polls = 240;
-
-fn updateViaCli(a: std.mem.Allocator) void {
-    var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return setUpdateNote("could not find sushi beside sushibar", true);
-    setUpdateNote("Updating…", false);
-    const got = capture(a, &.{ sushi.ptr, "update" });
-    if (got.code == 0) {
-        var msg: [64]u8 = undefined;
-        refreshBarVersion(a);
-        lock();
-        const v = shared.bar_version.get();
-        const text = std.fmt.bufPrint(&msg, "Updated to sushi {s}", .{v}) catch "Updated";
-        unlock();
-        return finishUpdate(a, text);
-    }
-    setUpdateNote(std.fmt.allocPrint(a, "Update failed: {s}", .{logic.failureLine(got.text)}) catch "Update failed", true);
-}
-
-const WorkerKind = enum { auto_check, check, update };
-
-fn worker(kind: WorkerKind) void {
-    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const p = port();
-    var current = kind;
-    while (true) {
-        _ = arena_state.reset(.retain_capacity);
-        const a = arena_state.allocator();
-        switch (current) {
-            .auto_check, .check => {
-                const ok = cliCheck(a, current == .check);
-                lock();
-                shared.check_failed = !ok;
-                if (current == .check) {
-                    shared.manual_result = if (!ok) .failed else if (shared.available) .none else .up_to_date;
-                    shared.manual_at_ms = io_util.nowMs(g_io);
-                }
-                unlock();
-            },
-            .update => {
-                lock();
-                const ask: logic.UpdateAsk = .{
-                    .available = shared.available,
-                    .link = shared.view.link,
-                    .server_command = shared.props_command.len > 0,
-                    .sibling_brew = g_sibling_brew,
-                };
-                unlock();
-                switch (logic.updatePath(ask)) {
-                    .none => setUpdateNote("Nothing to update", false),
-                    .brew => setUpdateNote("Homebrew install: use the Upgrade button", false),
-                    .server => updateViaServer(a, p),
-                    .cli => updateViaCli(a),
-                }
-            },
-        }
-        lock();
-        if (current == .auto_check and shared.manual_check_queued) {
-            shared.manual_check_queued = false;
-            unlock();
-            current = .check;
-            continue;
-        }
-        shared.busy = .none;
-        unlock();
-        break;
-    }
-    notifyMain();
-}
-
-fn startWorker(kind: WorkerKind) void {
-    lock();
-    if (shared.busy != .none) {
-        if (kind == .check and shared.busy == .checking) shared.manual_check_queued = true;
-        unlock();
-        return;
-    }
-    shared.busy = if (kind == .update) .updating else .checking;
-    shared.manual_check_queued = false;
-    unlock();
-    if (kind == .update) pollSoon();
-    const t = std.Thread.spawn(.{}, worker, .{kind}) catch {
-        lock();
-        shared.busy = .none;
-        unlock();
-        return;
-    };
-    t.detach();
-}
-
-// ── Poll thread ──
-
-/// Wakes the poll thread before its wait is over: the menu opened, or the user started something.
-var g_wake: std.Io.Event = .unset;
-var g_menu_open = std.atomic.Value(bool).init(false);
-/// Until then the poll runs every second: a start, stop, port switch or update the user just asked for.
-var g_fast_until_ms = std.atomic.Value(i64).init(0);
-const fast_after_action_ms = 30_000;
-
-/// Polls at once and then every second for a while: the user just changed something.
-fn pollSoon() void {
-    g_fast_until_ms.store(io_util.nowMs(g_io) + fast_after_action_ms, .release);
-    g_wake.set(g_io);
-}
-
-/// Digest of the fields `refresh()` actually acts on while the menu is closed (bar icon, rendered readout,
-/// reading-fill step, badge, update dot, tooltip, model persistence, probe completion, listener PIDs for child
-/// reaping, and self-relaunch). Open menus wake unconditionally via `menu_open`, so closed-menu-only fields like
-/// `hist_n`, versions, or notes never cause idle AppKit wakeups.
-/// Caller holds `shared.mu`.
-fn publishedSignature() u64 {
-    var w = std.hash.Wyhash.init(0);
-    w.update(std.mem.asBytes(&shared.port));
-    w.update(std.mem.asBytes(&@intFromEnum(shared.view.link)));
-    w.update(std.mem.asBytes(&.{ @intFromBool(shared.view.decoding), @intFromBool(shared.view.prefilling), @intFromBool(shared.sushi_listening), @intFromBool(shared.port_taken), @intFromBool(shared.available), @intFromBool(shared.relaunch) }));
-    var rb: [2 * logic.readout_max + 8]u8 = undefined;
-    const ro = logic.readout(&rb, shared.view);
-    w.update(ro.caption);
-    w.update("\x00");
-    w.update(ro.value);
-    w.update("\x00");
-    if (shared.view.read) |r| {
-        const step: u8 = @intCast(logic.readingStep(r.fraction));
-        w.update(std.mem.asBytes(&step));
-    } else w.update("R");
-    w.update(shared.model.get());
-    w.update("\x00");
-    w.update(std.mem.asBytes(&shared.model_full_len));
-    w.update(shared.model_loading.get());
-    w.update("\x00");
-    w.update(std.mem.asBytes(&shared.answered_n));
-    var pids_xor: u64 = 0;
-    for (shared.listings[0..shared.listing_n]) |l| {
-        var lw = std.hash.Wyhash.init(0);
-        lw.update(std.mem.asBytes(&l.port));
-        lw.update(std.mem.asBytes(&l.pid));
-        pids_xor ^= lw.final();
-    }
-    w.update(std.mem.asBytes(&shared.listing_n));
-    w.update(std.mem.asBytes(&pids_xor));
-    return w.final();
-}
-
-fn pollLoop() void {
-    var tracker: logic.Tracker = .{};
-    var tracked_port: u16 = 0;
-    var last_check_ms: i64 = 0;
-    var last_ok = true;
-    var last_pushed_sig: ?u64 = null;
-    var iter: u32 = 0;
-    var log_pid: i32 = 0;
-    var log_port: u16 = 0;
-    var log_buf: [1024]u8 = undefined;
-    var log_src: logic.LogSource = .{ .kind = .standard };
-    // The scan and the models answer are kept between the polls that skip them.
-    var listings: [max_listings]Listing = undefined;
-    var n: usize = 0;
-    var sushi_listening = false;
-    var watched_lan = false;
-    var since_scan: u32 = logic.scan_every;
-    var since_models: u32 = 0;
-    var models_ready = false;
-    var models_loading = false;
-    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    {
-        _ = arena_state.reset(.retain_capacity);
-        refreshBarVersion(arena_state.allocator());
-    }
-    pollSoon();
-    while (true) {
-        const woken = g_wake.isSet();
-        g_wake.reset();
-        _ = arena_state.reset(.retain_capacity);
-        const a = arena_state.allocator();
-        const now = io_util.nowMs(g_io);
-        const p = port();
-        if (p != tracked_port) {
-            tracker = .{};
-            tracked_port = p;
-            since_scan = logic.scan_every;
-            models_ready = false;
-            lock();
-            shared.hist_n = 0;
-            shared.last_prefill = null;
-            unlock();
-        }
-        const menu_open = g_menu_open.load(.acquire);
-        var url_buf: [url_cap + 32]u8 = undefined;
-        var again_buf: [url_cap + 32]u8 = undefined;
-        var url = metricsUrl(&url_buf, p, tracker.since_ms);
-        const initial_outcome = requestOutcome(a, p, .GET, url, null, poll_timeout_s, "");
-        var reply: ?Reply = switch (initial_outcome) {
-            .reply => |r| r,
-            .conn_refused, .failed => null,
-        };
-        const loopback_refused = initial_outcome == .conn_refused and std.mem.startsWith(u8, url, "http://127.0.0.1:");
-        var reached = logic.linkFor(if (reply) |r| r.status else null);
-
-        since_scan += 1;
-        if (logic.scanDue(since_scan, reached, menu_open)) {
-            since_scan = 0;
-            var lbuf: [16]logic.Listener = undefined;
-            var bound: [max_listings]logic.Listener = undefined;
-            n = 0;
-            sushi_listening = false;
-            watched_lan = false;
-            for (proc.listeners(&lbuf, server_exe)) |l| {
-                if (l.port == p) {
-                    sushi_listening = true;
-                    if (logic.lanBound(l.addr)) watched_lan = true;
-                }
-                const dup = for (listings[0..n]) |x| {
-                    if (x.port == l.port) break true;
-                } else false;
-                if (dup or n == max_listings) continue;
-                listings[n] = .{ .port = l.port, .pid = l.pid };
-                bound[n] = l;
-                n += 1;
-            }
-            lock();
-            shared.bound = bound;
-            shared.bound_n = n;
-            unlock();
-            probeStarted(a, listings[0..n], p);
-            // A server bound to a non-loopback address was asked on 127.0.0.1 above: ask where it listens.
-            if (reply == null) {
-                const again = metricsUrl(&again_buf, p, tracker.since_ms);
-                if (!std.mem.eql(u8, again, url)) {
-                    url = again;
-                    reply = get(a, p, url);
-                    reached = logic.linkFor(if (reply) |r| r.status else null);
-                }
-            }
-        }
-
-        // The server's own argv says where it logs and which key it wants; read again only when its pid changes.
-        var server_pid: i32 = 0;
-        for (listings[0..n]) |l| if (l.port == p) {
-            server_pid = l.pid;
-        };
-        if (server_pid != log_pid or p != log_port) {
-            log_pid = server_pid;
-            log_port = p;
-            const args = a.alloc(u8, proc.args_cap) catch null;
-            const read = if (server_pid != 0 and args != null) proc.argsOfPid(server_pid, args.?) else null;
-            log_src = logic.logSource(&log_buf, g_home, p, read);
-            const key = if (read) |r| logic.argsApiKey(r) orelse "" else "";
-            lock();
-            shared.api_key.set(key);
-            shared.key_port = p;
-            unlock();
-            // A key found just now answers the 401 it explains in this poll, not in the next.
-            if (reached == .unauthorized and key.len > 0) {
-                reply = get(a, p, url);
-                reached = logic.linkFor(if (reply) |r| r.status else null);
-            }
-        }
-
-        var sample: logic.Sample = .{ .link = reached };
-        if (reached == .up) sample = logic.parseMetrics(a, reply.?.body) catch logic.unreadable(reached);
-        // A sushi that holds the port and does not answer is not a stopped one.
-        if (sample.link == .offline and sushi_listening) sample.link = .silent;
-        tracker.observe(now, sample);
-
-        var models: logic.ModelState = .{};
-        const answers = sample.link == .up or sample.link == .metrics_off;
-        since_models += 1;
-        const fetch_models = answers and logic.modelsDue(since_models, models_ready, models_loading);
-        if (fetch_models) {
-            models = modelsOf(a, p);
-            since_models = 0;
-            models_ready = models.ready != null;
-            models_loading = models.loading != null;
-        } else if (!answers) {
-            models_ready = false;
-            models_loading = false;
-        }
-        const taken = sample.link == .offline and !sushi_listening and !loopback_refused and proc.portInUse(p);
-
-        var published = false;
-        if (p == port()) {
-            lock();
-            shared.port = p;
-            shared.view = tracker.view(sample.link);
-            if (fetch_models or !answers) {
-                shared.model.set(models.ready orelse "");
-                shared.model_full_len = if (models.ready) |m| m.len else 0;
-                shared.model_loading.set(models.loading orelse "");
-                const pu = models.pack_update orelse logic.PackUpdate{};
-                shared.pack_current.set(pu.current);
-                shared.pack_latest.set(pu.latest);
-                shared.pack_command.set(pu.command);
-            }
-            for (listings[0..n]) |*l| {
-                if (l.port != p) continue;
-                l.model.set(shared.model.get());
-                l.known = if (answers) .answered else if (sample.link == .silent) .failed else .unknown;
-            }
-            if (sample.link == .up) {
-                shared.mem_mb = sample.mem_mb;
-                shared.gpu_mhz = sample.gpu_mhz;
-                shared.gpu_pct = sample.gpu_pct;
-                shared.last_prefill = tracker.last_prefill;
-                for (sample.hist) |h| {
-                    if (shared.hist_n > 0 and h.t_ms <= shared.hist[shared.hist_n - 1].t_ms) continue;
-                    if (shared.hist_n == shared.hist.len) {
-                        std.mem.copyForwards(logic.Hist, shared.hist[0 .. shared.hist.len - 1], shared.hist[1..]);
-                        shared.hist_n -= 1;
-                    }
-                    shared.hist[shared.hist_n] = h;
-                    shared.hist_n += 1;
-                }
-            }
-            shared.listings = listings;
-            shared.listing_n = n;
-            shared.sushi_listening = sushi_listening;
-            shared.lan_listening = if (sushi_listening) watched_lan else false;
-            shared.port_taken = taken;
-            shared.log_kind = log_src.kind;
-            shared.log_path.set(log_src.path);
-            published = true;
-            unlock();
-        }
-
-        iter += 1;
-        if (iter % props_every == 1 and answers) refreshProps(a, p);
-
-        lock();
-        if (shared.check_failed) {
-            last_ok = false;
-            shared.check_failed = false;
-        }
-        const link = shared.view.link;
-        const known = shared.props_latest.len > 0;
-        const busy = shared.busy != .none;
-        unlock();
-        if (logic.checkDue(last_check_ms, now, last_ok)) {
-            if (link == .offline) {
-                last_check_ms = now;
-                last_ok = true;
-                if (autoCheckEnabled(a)) startWorker(.auto_check);
-            } else if (known) {
-                last_check_ms = now;
-                last_ok = true;
-                refreshBarVersion(a);
-                lock();
-                shared.available = shared.props_available;
-                shared.latest.set(shared.props_latest.get());
-                unlock();
-            }
-        }
-
-        // Compute the digest after refreshProps / checkDue so update dots, server versions, and relaunches land
-        // on the main thread in this same poll cycle rather than waiting for the next idle poll.
-        if (test_polls == 0 and published) {
-            lock();
-            const pub_sig = publishedSignature();
-            unlock();
-            if (woken or menu_open or last_pushed_sig == null or pub_sig != last_pushed_sig.?) {
-                last_pushed_sig = pub_sig;
-                notifyMain();
-            }
-        }
-
-        const activity: logic.Activity = .{
-            .link = sample.link,
-            .decoding = tracker.decoding or tracker.prefilling,
-            .menu_open = menu_open,
-            .changing = now < g_fast_until_ms.load(.acquire) or models_loading or busy or g_load_port.load(.acquire) != 0 or g_unload_port.load(.acquire) != 0,
-        };
-        const spent = io_util.nowMs(g_io) - now;
-        const wait = ticked(logic.pollWaitMs(activity)) - spent;
-        if (wait > 0) g_wake.waitTimeout(g_io, .{ .duration = .{ .raw = .fromMilliseconds(wait), .clock = .awake } }) catch {};
     }
 }
 
@@ -1019,21 +149,23 @@ fn readDefaultPort() u16 {
 }
 
 fn setPort(p: u16) void {
-    if (p == port()) return;
-    lock();
-    shared.port = 0;
-    shared.view = .{ .link = .offline };
-    shared.model.set("");
-    shared.model_full_len = 0;
-    shared.server_version.set("");
-    shared.props_latest.set("");
-    shared.props_available = false;
-    shared.props_command.set("");
-    shared.props_url.set("");
-    unlock();
-    g_port.store(p, .release);
+    if (p == poller.port()) return;
+    // Clear port-scoped shared state before publishing `p` and waking `pollLoop`, so a fast loopback poll for
+    // `p` can never be clobbered by this reset after `writeSaved(p)`.
+    poller.lock();
+    poller.shared.port = 0;
+    poller.shared.view = .{ .link = .offline };
+    poller.shared.model.set("");
+    poller.shared.model_full_len = 0;
+    poller.shared.server_version.set("");
+    poller.shared.props_latest.set("");
+    poller.shared.props_available = false;
+    poller.shared.props_command.set("");
+    poller.shared.props_url.set("");
+    poller.unlock();
+    poller.storePort(p);
     invalidateOwnCache();
-    pollSoon();
+    poller.pollSoon();
     g_saved.add(p, g_default_port);
     writeSaved(p);
 }
@@ -1043,8 +175,9 @@ fn setPort(p: u16) void {
 fn removePort(p: u16) void {
     if (p == g_default_port) return;
     g_saved.remove(p);
-    const to = logic.afterRemove(port(), p, g_default_port);
-    if (to != port()) setPort(to) else writeSaved(port());
+    const cur = poller.port();
+    const to = logic.afterRemove(cur, p, g_default_port);
+    if (to != cur) setPort(to) else writeSaved(cur);
 }
 
 // ── Start and Stop ──
@@ -1063,7 +196,7 @@ fn invalidateOwnCache() void {
 }
 
 fn ownServer() ?logic.PidEntry {
-    const p = port();
+    const p = poller.port();
     if (test_polls == 0 and own_cache_valid and own_cache_port == p) {
         if (own_cache_entry) |e| {
             if (proc.pidExists(e.pid)) return e;
@@ -1071,7 +204,7 @@ fn ownServer() ?logic.PidEntry {
         } else return null;
     }
     var pb: [std.fs.max_path_bytes]u8 = undefined;
-    const e = proc.verifiedPid(g_io, serverPidPath(&pb, p), server_exe, true);
+    const e = proc.verifiedPid(g_io, serverPidPath(&pb, p), poller.server_exe, true);
     own_cache_valid = true;
     own_cache_port = p;
     own_cache_entry = if (e != null and e.?.port == p) e else null;
@@ -1102,7 +235,7 @@ fn reapStarted() void {
         if (!st.stopping) {
             var nb: [160]u8 = undefined;
             const how = logic.exitOf(@bitCast(status));
-            setServerProblem(logic.startedExitNote(&nb, st.*, how), st.port);
+            poller.setServerProblem(logic.startedExitNote(&nb, st.*, how), st.port);
             if (st.answered) g_watch.reaped(st.port, io_util.nowMs(g_io));
         }
         st.* = .{};
@@ -1122,7 +255,7 @@ fn adoptStarted() void {
         if (slot == started.len) break;
         const p = logic.serverPidPort(entry.name) orelse continue;
         var fb: [std.fs.max_path_bytes]u8 = undefined;
-        const e = proc.verifiedPid(g_io, serverPidPath(&fb, p), server_exe, true) orelse continue;
+        const e = proc.verifiedPid(g_io, serverPidPath(&fb, p), poller.server_exe, true) orelse continue;
         started[slot] = .{ .pid = e.pid, .port = p, .answered = true };
         slot += 1;
     }
@@ -1133,34 +266,12 @@ fn adoptStarted() void {
 fn syncProbes() void {
     var pend: [started.len]u16 = undefined;
     const ports = logic.unansweredPorts(&started, &pend);
-    lock();
-    defer unlock();
-    for (shared.answered_ports[0..shared.answered_n]) |ap| logic.markAnswered(&started, ap);
-    shared.answered_n = 0;
-    shared.probe_n = ports.len;
-    @memcpy(shared.probe_ports[0..ports.len], ports);
-}
-
-fn probeStarted(a: std.mem.Allocator, listings: []const Listing, watched: u16) void {
-    var ports: [started.len]u16 = undefined;
-    lock();
-    const n = shared.probe_n;
-    @memcpy(ports[0..n], shared.probe_ports[0..n]);
-    unlock();
-    for (ports[0..n]) |q| {
-        if (q == watched) continue;
-        for (listings) |l| if (l.port == q) {
-            var b: [url_cap]u8 = undefined;
-            if (requestWithin(a, q, .GET, urlFor(&b, q, "/health"), null, models_timeout_s, "") == null) break;
-            lock();
-            if (shared.answered_n < shared.answered_ports.len) {
-                shared.answered_ports[shared.answered_n] = q;
-                shared.answered_n += 1;
-            }
-            unlock();
-            break;
-        };
-    }
+    poller.lock();
+    defer poller.unlock();
+    for (poller.shared.answered_ports[0..poller.shared.answered_n]) |ap| logic.markAnswered(&started, ap);
+    poller.shared.answered_n = 0;
+    poller.shared.probe_n = ports.len;
+    @memcpy(poller.shared.probe_ports[0..ports.len], ports);
 }
 
 fn markStopping(pid: i32) void {
@@ -1170,18 +281,18 @@ fn markStopping(pid: i32) void {
 }
 
 fn startServer() void {
-    var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return setProblem("could not find sushi beside sushibar");
+    var sb: [poller.path_cap]u8 = undefined;
+    const sushi = poller.siblingNow(&sb, poller.server_exe) orelse return poller.setProblem("could not find sushi beside sushibar");
     if (ownServer() != null) return;
     var port_buf: [8:0]u8 = undefined;
-    const p = port();
+    const p = poller.port();
     const port_z = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{p}, 0) catch return;
     const argv_loopback = [_][*:0]const u8{ sushi.ptr, "--serve", "--port", port_z.ptr };
     const argv_lan = [_][*:0]const u8{ sushi.ptr, "--serve", "--port", port_z.ptr, "--host", logic.lan_host };
     const argv: []const [*:0]const u8 = if (g_lan) &argv_lan else &argv_loopback;
-    const pid = proc.spawnDetached(argv, false) catch return setProblem("could not start sushi");
-    setNote("");
-    pollSoon();
+    const pid = proc.spawnDetached(argv, false) catch return poller.setProblem("could not start sushi");
+    poller.setNote("");
+    poller.pollSoon();
     g_watch.started(p);
     for (&started) |*st| if (st.pid == 0) {
         st.* = .{ .pid = pid, .port = p };
@@ -1192,53 +303,12 @@ fn startServer() void {
     invalidateOwnCache();
 }
 
-const ModelOp = struct { port: u16, unload: bool, model: Str(logic.max_model) };
-
-const load_timeout_s = 1800;
-
 /// Load or unload `g_last_model` on the watched server, the only model either button acts on. The button offers
 /// neither before the server answers, so a Start never loads.
 fn startModelOp(unload: bool) void {
-    const p = port();
-    if (g_load_port.load(.acquire) != 0 or g_unload_port.load(.acquire) != 0 or g_last_model.len == 0) return;
-    const slot = if (unload) &g_unload_port else &g_load_port;
-    if (slot.cmpxchgStrong(0, p, .acq_rel, .acquire) != null) return;
-    g_op_model = g_last_model;
-    const t = std.Thread.spawn(.{}, modelOpWorker, .{ModelOp{ .port = p, .unload = unload, .model = g_last_model }}) catch return slot.store(0, .release);
-    t.detach();
-    pollSoon();
-}
-
-fn modelOpWorker(job: ModelOp) void {
-    defer {
-        (if (job.unload) &g_unload_port else &g_load_port).store(0, .release);
-        pollSoon();
-        notifyMain();
+    if (poller.startModelOp(unload, g_last_model.get())) {
+        g_op_model = g_last_model;
     }
-    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    var url: [url_cap]u8 = undefined;
-    var origin: [origin_cap]u8 = undefined;
-    const origin_s = originFor(&origin, job.port);
-    var body: [logic.max_model * 6 + 40]u8 = undefined;
-    const target = if (job.unload) urlFor(&url, job.port, "/v1/unload-model") else urlFor(&url, job.port, "/v1/load-model");
-    const payload = if (job.unload) logic.unloadModelBody(&body, job.model.get()) else logic.loadModelBody(&body, job.model.get());
-    const reply = requestWithin(a, job.port, .POST, target, origin_s, load_timeout_s, payload);
-    const verb = if (job.unload) "unload" else "load";
-    if (reply) |r| if (r.status == 200) {
-        lock();
-        if (shared.port == job.port) {
-            shared.model.set(if (job.unload) "" else job.model.get());
-            shared.model_full_len = shared.model.len;
-        }
-        unlock();
-        return;
-    };
-    // A server that was stopped under the request is reported by its own exit note.
-    if (get(a, job.port, urlFor(&url, job.port, "/health")) == null) return;
-    const why = if (reply) |r| errorMessage(a, r.body) else "";
-    setProblem(std.fmt.allocPrint(a, "Port {d}: could not {s} {s}: {s}", .{ job.port, verb, job.model.get(), if (why.len > 0) why else if (reply == null) "no answer" else "the server refused" }) catch "Could not load or unload the model");
 }
 
 const Tm = extern struct { sec: c_int, min: c_int, hour: c_int, mday: c_int, mon: c_int, year: c_int, wday: c_int, yday: c_int, isdst: c_int, gmtoff: c_long, zone: ?[*:0]const u8 };
@@ -1250,8 +320,6 @@ fn stoppedAtNote(buf: []u8, p: u16) []const u8 {
     if (localtime_r(&t, &tm) == null) return logic.stoppedNote(buf, p, 0, 0);
     return logic.stoppedNote(buf, p, @intCast(tm.hour), @intCast(tm.min));
 }
-
-const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
 
 const alert_first = 1000;
 const alert_third = 1002;
@@ -1287,7 +355,7 @@ fn confirmUpdate() bool {
     var m: [96]u8 = undefined;
     var i: [160]u8 = undefined;
     const text = std.fmt.bufPrint(&m, "Update sushi to {s}?", .{confirm_latest.get()}) catch return false;
-    const info = logic.updateConfirmInfo(&i, port(), confirm_model.get());
+    const info = logic.updateConfirmInfo(&i, poller.port(), confirm_model.get());
     const answer = runAlert(text, info, "Update", "Cancel", "Release Notes", null);
     if (answer == alert_third) openReleaseNotes(null, null, null);
     return answer == alert_first;
@@ -1306,7 +374,7 @@ var g_stuck_noted = false;
 
 fn noteStopped(p: u16, pid: i32) void {
     invalidateOwnCache();
-    pollSoon();
+    poller.pollSoon();
     g_stop_pid = pid;
     g_stopping_port = p;
     stopping_until_ms = io_util.nowMs(g_io) + stopping_ms;
@@ -1317,10 +385,10 @@ fn noteStopped(p: u16, pid: i32) void {
 
 /// SIGKILL, only to the pid the Stop signalled while it is still the sushi on the watched port.
 fn forceStop() void {
-    const p = port();
+    const p = poller.port();
     var lbuf: [16]logic.Listener = undefined;
     const ours = ownServer();
-    const pid = switch (logic.planStop(if (ours) |e| e.pid else null, p, proc.listeners(&lbuf, server_exe))) {
+    const pid = switch (logic.planStop(if (ours) |e| e.pid else null, p, proc.listeners(&lbuf, poller.server_exe))) {
         .now, .confirm => |pid| pid,
         .none => return,
     };
@@ -1332,10 +400,10 @@ fn forceStop() void {
 
 /// A sushibar-started server stops at once; any other sushi on the port only after a confirm, re-verified.
 fn stopServer() void {
-    const p = port();
+    const p = poller.port();
     var lbuf: [16]logic.Listener = undefined;
     const ours = ownServer();
-    switch (logic.planStop(if (ours) |e| e.pid else null, p, proc.listeners(&lbuf, server_exe))) {
+    switch (logic.planStop(if (ours) |e| e.pid else null, p, proc.listeners(&lbuf, poller.server_exe))) {
         .none => {},
         .now => |pid| {
             markStopping(pid);
@@ -1345,7 +413,7 @@ fn stopServer() void {
         .confirm => |pid| {
             if (!confirmStop(p, pid)) return;
             var again: [16]logic.Listener = undefined;
-            switch (logic.planStop(null, p, proc.listeners(&again, server_exe))) {
+            switch (logic.planStop(null, p, proc.listeners(&again, poller.server_exe))) {
                 .confirm => |same| if (same == pid) {
                     proc.terminate(pid);
                     noteStopped(p, pid);
@@ -1365,12 +433,12 @@ fn startedPorts(ports: []u16) []u16 {
         cand[cn] = st.port;
         cn += 1;
     };
-    cand[cn] = port();
+    cand[cn] = poller.port();
     cn += 1;
     for (cand[0..cn]) |p| {
         if (n == ports.len or std.mem.indexOfScalar(u16, ports[0..n], p) != null) continue;
         var pb: [std.fs.max_path_bytes]u8 = undefined;
-        if (proc.verifiedPid(g_io, serverPidPath(&pb, p), server_exe, true) == null) continue;
+        if (proc.verifiedPid(g_io, serverPidPath(&pb, p), poller.server_exe, true) == null) continue;
         ports[n] = p;
         n += 1;
     }
@@ -1382,7 +450,7 @@ fn quitStop() void {
     var ports: [started.len + 1]u16 = undefined;
     for (startedPorts(&ports)) |p| {
         var pb: [std.fs.max_path_bytes]u8 = undefined;
-        const e = proc.verifiedPid(g_io, serverPidPath(&pb, p), server_exe, true) orelse continue;
+        const e = proc.verifiedPid(g_io, serverPidPath(&pb, p), poller.server_exe, true) orelse continue;
         markStopping(e.pid);
         proc.terminate(e.pid);
     }
@@ -1390,7 +458,7 @@ fn quitStop() void {
 }
 
 fn quit() void {
-    if (proc.verifiedPid(g_io, g_bar_pid_path, bar_exe, false)) |e| {
+    if (proc.verifiedPid(g_io, g_bar_pid_path, poller.bar_exe, false)) |e| {
         if (e.pid == proc.selfPid()) proc.removePid(g_io, g_bar_pid_path);
     }
     objc.msg(void, objc.msg(objc.id, objc.class("NSApplication"), "sharedApplication", .{}), "terminate:", .{@as(objc.id, null)});
@@ -1405,8 +473,6 @@ var port_menu: objc.id = null;
 var open_mis: [4]objc.id = .{ null, null, null, null };
 var button_action: logic.ButtonAction = .none;
 var pack_mi: objc.id = null;
-var badge_view: objc.id = null;
-var shown_badge: ?bool = null;
 var g_watch: logic.Watch = .{};
 /// What was copied to the clipboard last, and when: the button and the pack item say Copied for a few seconds.
 var copied_what: enum { none, upgrade, pack } = .none;
@@ -1416,337 +482,30 @@ var button_command: Str(80) = .{};
 var confirm_needed = false;
 var confirm_model: Str(96) = .{};
 var confirm_latest: Str(32) = .{};
-var shown_note_sig: [2 * note_cap + 8]u8 = undefined;
-var shown_note_sig_len: usize = std.math.maxInt(usize);
+var shown_note_sig: ?u64 = null;
+var shown_port_sig: ?u64 = null;
 var menu_target: objc.id = null;
 var top_menu: objc.id = null;
 var port_field_mi: objc.id = null;
 var note_mi: objc.id = null;
-
-/// Template outline icon (drawn by NSButton for system menu-bar tinting) + transparent spacer for colored icons.
-var outline_icon: objc.id = null;
-var blank_icon: objc.id = null;
-/// Pre-rasterized 2x NSBitmapImageReps for colored icons; loading/reading/dim frames are rasterized lazily on first use.
-var static_reps: [std.enums.values(logic.Icon).len]objc.id = @splat(null);
-var loading_reps: [logic.loading_frames]objc.id = @splat(null);
-var loading_reps_ready = false;
-var reading_reps: [logic.reading_steps + 1]objc.id = @splat(null);
-var generating_dim_rep: objc.id = null;
-var icon_view: objc.id = null;
-var icon_layer: objc.id = null;
-var placed_icon_rect: ?objc.NSRect = null;
-var button_uses_blank = false;
-var shown_icon: ?logic.Icon = null;
-/// The reading frame shown, while a prompt read shows; `showIcon` clears it.
-var shown_reading: ?usize = null;
-const LayerAnim = enum { none, loading, blink };
-var active_anim: LayerAnim = .none;
-var want_blink = false;
 
 var ui_timer: objc.id = null;
 var log_timer: objc.id = null;
 var last_link: ?logic.Link = null;
 var tick_count: u32 = 0;
 var readout_buf: [2 * logic.readout_max + 8]u8 = undefined;
-var shown_readout: [2 * logic.readout_max + 8]u8 = undefined;
-var shown_readout_len: usize = std.math.maxInt(usize);
-var shown_readout_visible: ?bool = null;
-var shown_caption: Str(16) = .{};
-var shown_tooltip: Str(200) = .{};
-var shown_tooltip_set = false;
-var readout_caption: objc.id = null;
-var readout_value: objc.id = null;
-var port_sig: [1536]u8 = undefined;
-var port_sig_len: usize = std.math.maxInt(usize);
+
+var why_mi: objc.id = null;
+var shown_why: []const u8 = "";
+/// What the Load/Unload button does at the next click, from the last refresh.
+var model_action: logic.ModelAction = .none;
 
 fn setText(setter_target: objc.id, comptime selector: [*:0]const u8, text: []const u8) void {
     objc.msg(void, setter_target, selector, .{objc.nsText(text)});
 }
 
-fn setButtonToolTip(button: objc.id, text: []const u8) void {
-    if (shown_tooltip_set and std.mem.eql(u8, shown_tooltip.get(), text)) return;
-    shown_tooltip.set(text);
-    shown_tooltip_set = true;
-    setText(button, "setToolTip:", text);
-}
-
 fn symbol(name: []const u8) objc.id {
     return objc.msg(objc.id, objc.class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ objc.nsText(name), @as(objc.id, null) });
-}
-
-fn ensureLoadingReps() void {
-    if (loading_reps_ready) return;
-    var buf: [4096]u8 = undefined;
-    for (&loading_reps, 0..) |*rep, i| {
-        const svg = logic.loadingSvg(&buf, @embedFile("sushibar/icon-loading.svg"), i) catch |e| std.debug.panic("loading icon frame {d}: {t}", .{ i, e });
-        rep.* = objc.rasterizeSvgRep(svg, icon_w, icon_h);
-    }
-    loading_reps_ready = true;
-}
-
-fn ensureGeneratingDimRep() objc.id {
-    if (generating_dim_rep == null) {
-        var buf: [4096]u8 = undefined;
-        const dim = logic.generatingSvg(&buf, @embedFile("sushibar/icon-online.svg"), false) catch |e| std.debug.panic("generating icon: {t}", .{e});
-        generating_dim_rep = objc.rasterizeSvgRep(dim, icon_w, icon_h);
-    }
-    return generating_dim_rep;
-}
-
-fn ensureReadingRep(step: usize) objc.id {
-    if (reading_reps[step] == null) {
-        var buf: [4096]u8 = undefined;
-        const svg = logic.readingSvg(&buf, @embedFile("sushibar/icon-online.svg"), step) catch |e| std.debug.panic("reading icon step {d}: {t}", .{ step, e });
-        reading_reps[step] = objc.rasterizeSvgRep(svg, icon_w, icon_h);
-    }
-    return reading_reps[step];
-}
-
-fn makeIconView(button: objc.id) void {
-    icon_view = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{objc.NSRect{ .x = 0, .y = 0, .w = icon_w, .h = icon_h }});
-    objc.msg(void, icon_view, "setWantsLayer:", .{true});
-    icon_layer = objc.msg(objc.id, icon_view, "layer", .{});
-    objc.msg(void, icon_layer, "setContentsScale:", .{@as(f64, 2.0)});
-    objc.msg(void, icon_layer, "setContentsGravity:", .{objc.nsString("resizeAspect")});
-    objc.disableContentsAction(icon_layer);
-    objc.msg(void, icon_view, "setHidden:", .{true});
-    objc.msg(void, button, "addSubview:", .{icon_view});
-    objc.release(icon_view);
-    placed_icon_rect = null;
-    button_uses_blank = false;
-    active_anim = .none;
-}
-
-fn placeIconView(button: objc.id) void {
-    if (icon_view == null or button == null) return;
-    const bounds = objc.msg(objc.NSRect, button, "bounds", .{});
-    if (bounds.w <= 0 or bounds.h <= 0) return;
-    const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{bounds});
-    const want = objc.NSRect{
-        .x = r.x + (r.w - icon_w) / 2.0,
-        .y = r.y + (r.h - icon_h) / 2.0,
-        .w = icon_w,
-        .h = icon_h,
-    };
-    if (placed_icon_rect) |cur| {
-        if (cur.x == want.x and cur.y == want.y and cur.w == want.w and cur.h == want.h) return;
-    }
-    placed_icon_rect = want;
-    objc.msg(void, icon_view, "setFrame:", .{want});
-}
-
-fn placeDots(button: objc.id) void {
-    if (button == null) return;
-    if (shown_badge != true and shown_update_dot != true) return;
-    const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
-    const flipped = objc.msg(bool, button, "isFlipped", .{});
-    if (shown_badge == true and badge_view != null) {
-        objc.msg(void, badge_view, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - badge_size + 1, .y = if (flipped) r.y + r.h - badge_size + 2 else r.y - 2 }});
-    }
-    if (shown_update_dot == true and update_dot != null) {
-        objc.msg(void, update_dot, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - update_dot_size + 1, .y = if (flipped) r.y - 1 else r.y + r.h - update_dot_size + 1 }});
-    }
-}
-
-fn syncIconAnimation() void {
-    const want: LayerAnim = if (objc.reduceMotion()) .none else if (shown_reading != null) .none else if (shown_icon == .loading) .loading else if (shown_icon == .ready and want_blink) .blink else .none;
-    if (want == active_anim) return;
-    objc.stopLayerAnimation(icon_layer, "iconAnim");
-    active_anim = want;
-    switch (want) {
-        .none => {},
-        .loading => {
-            ensureLoadingReps();
-            var cgs: [logic.loading_frames]objc.id = undefined;
-            for (loading_reps, 0..) |rep, i| cgs[i] = objc.repCgImage(rep);
-            objc.startContentsAnimation(icon_layer, "iconAnim", &cgs, @as(f64, @floatFromInt(logic.loading_frames)) * logic.loading_frame_s);
-        },
-        .blink => {
-            const cgs = [_]objc.id{
-                objc.repCgImage(static_reps[@intFromEnum(logic.Icon.ready)]),
-                objc.repCgImage(ensureGeneratingDimRep()),
-            };
-            objc.startContentsAnimation(icon_layer, "iconAnim", &cgs, 2.0 * logic.generating_blink_s);
-        },
-    }
-}
-
-fn ensureBlankButtonImage(button: objc.id) void {
-    if (!button_uses_blank) {
-        objc.msg(void, button, "setImage:", .{blank_icon});
-        button_uses_blank = true;
-        placeIconView(button);
-    }
-}
-
-fn showIcon(button: objc.id, icon: logic.Icon) void {
-    if (shown_icon == icon and shown_reading == null) return;
-    shown_reading = null;
-    if (icon != .ready) want_blink = false;
-    const was_outline = shown_icon == .outline;
-    if (shown_icon != null) objc.fadeNext(if (was_outline or icon == .outline) button else icon_view, 0.3);
-    shown_icon = icon;
-    if (icon == .outline) {
-        objc.stopLayerAnimation(icon_layer, "iconAnim");
-        active_anim = .none;
-        objc.msg(void, icon_view, "setHidden:", .{true});
-        objc.msg(void, button, "setImage:", .{outline_icon});
-        button_uses_blank = false;
-        return;
-    }
-    ensureBlankButtonImage(button);
-    objc.msg(void, icon_layer, "setContents:", .{objc.repCgImage(static_reps[@intFromEnum(icon)])});
-    objc.msg(void, icon_view, "setHidden:", .{false});
-    placeIconView(button);
-    syncIconAnimation();
-}
-
-/// The reading icon at `step`: the ready sushi's fish filled green that far. A model reading a prompt is ready, so
-/// it replaces the ready icon, and `showIcon` puts that back when the read ends.
-fn showReading(button: objc.id, step: usize) void {
-    if (shown_reading == step) return;
-    const was_outline = shown_icon == .outline;
-    if (shown_reading == null and shown_icon != null) objc.fadeNext(if (was_outline) button else icon_view, 0.3);
-    want_blink = false;
-    shown_reading = step;
-    shown_icon = .ready;
-    ensureBlankButtonImage(button);
-    objc.stopLayerAnimation(icon_layer, "iconAnim");
-    active_anim = .none;
-    objc.msg(void, icon_layer, "setContents:", .{objc.repCgImage(ensureReadingRep(step))});
-    objc.msg(void, icon_view, "setHidden:", .{false});
-    placeIconView(button);
-}
-
-/// Blinks the ready icon's slot while a reply generates; under Reduce motion the slot stays lit.
-fn blinkGenerating(_: objc.id, on: bool) void {
-    if (want_blink == on) return;
-    want_blink = on;
-    syncIconAnimation();
-}
-
-/// The title that reserves the readout's room while it shows: as wide as `readout_max - 1` digits of the value font,
-/// so a number that changes never moves the icon.
-const readout_spacer = blk: {
-    var spaces: []const u8 = "";
-    for (0..logic.readout_max - 1) |_| spaces = spaces ++ "\u{2007}";
-    break :blk spaces;
-};
-/// How far the value's line rises into the caption's, so the pair fits the bar as diskglance's does.
-const readout_overlap: f64 = 2;
-/// The room between the icon and the readout, beyond the title's own.
-const readout_gap: f64 = 2;
-
-var readout_fixed_w: f64 = 44.0;
-
-/// The stacked readout right of the icon: two fixed-width labels sized once from prototype strings over a clear
-/// title spacer, shown only while there is a readout.
-fn makeReadout(button: objc.id) void {
-    readout_caption = readoutLabel(header_view.readoutCaptionFont());
-    readout_value = readoutLabel(header_view.readoutValueFont());
-    objc.msg(void, readout_caption, "setStringValue:", .{objc.nsString("TOK/S")});
-    objc.msg(void, readout_value, "setStringValue:", .{objc.nsString("00000")});
-    objc.msg(void, readout_caption, "sizeToFit", .{});
-    objc.msg(void, readout_value, "sizeToFit", .{});
-    const cf = objc.msg(objc.NSRect, readout_caption, "frame", .{});
-    const vf = objc.msg(objc.NSRect, readout_value, "frame", .{});
-    readout_fixed_w = @max(44.0, @max(cf.w, vf.w) + 4.0);
-    objc.msg(void, readout_caption, "setFrameSize:", .{objc.NSSize{ .width = readout_fixed_w, .height = cf.h }});
-    objc.msg(void, readout_value, "setFrameSize:", .{objc.NSSize{ .width = readout_fixed_w, .height = vf.h }});
-    objc.msg(void, readout_caption, "setStringValue:", .{objc.nsString("")});
-    objc.msg(void, readout_value, "setStringValue:", .{objc.nsString("")});
-    objc.msg(void, readout_caption, "setHidden:", .{true});
-    objc.msg(void, readout_value, "setHidden:", .{true});
-    objc.msg(void, button, "addSubview:", .{readout_caption});
-    objc.msg(void, button, "addSubview:", .{readout_value});
-    shown_readout_len = std.math.maxInt(usize);
-    shown_readout_visible = null;
-    shown_caption = .{};
-}
-
-fn readoutLabel(f: objc.id) objc.id {
-    const l = objc.msg(objc.id, objc.class("NSTextField"), "labelWithString:", .{objc.nsString("")});
-    objc.msg(void, l, "setFont:", .{f});
-    objc.msg(void, l, "setTextColor:", .{objc.color("labelColor")});
-    return l;
-}
-
-fn setReadout(button: objc.id, r: logic.Readout) void {
-    const n = r.caption.len + 1 + r.value.len;
-    var key: [shown_readout.len]u8 = undefined;
-    const k = std.fmt.bufPrint(&key, "{s}\n{s}", .{ r.caption, r.value }) catch return;
-    if (shown_readout_len == n and std.mem.eql(u8, shown_readout[0..n], k)) return;
-    shown_readout_len = n;
-    @memcpy(shown_readout[0..n], k);
-    const shown = r.caption.len > 0;
-    const vis_changed = shown_readout_visible == null or shown_readout_visible.? != shown;
-    if (vis_changed) {
-        shown_readout_visible = shown;
-        // Only mutate NSStatusBarButton's attributedTitle when visibility toggles, not on every digit change:
-        // setAttributedTitle triggers _adjustLength and an FBSScene XPC round-trip to ControlCenter on macOS 26.
-        const title = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsText(if (shown) readout_spacer else ""), header_view.readoutSpacerAttributes() });
-        defer objc.release(title);
-        objc.msg(void, button, "setAttributedTitle:", .{title});
-        objc.msg(void, readout_caption, "setHidden:", .{!shown});
-        objc.msg(void, readout_value, "setHidden:", .{!shown});
-    }
-    if (shown) {
-        if (!std.mem.eql(u8, shown_caption.get(), r.caption)) {
-            shown_caption.set(r.caption);
-            objc.msg(void, readout_caption, "setStringValue:", .{objc.nsText(r.caption)});
-        }
-        objc.msg(void, readout_value, "setStringValue:", .{objc.nsText(r.value)});
-        if (vis_changed) {
-            if (main_bar.mode() == .main_window) {
-                main_bar.setContentWidth(icon_w + readout_gap + readout_fixed_w + 10.0);
-            }
-            placeReadout(button);
-        }
-    } else if (vis_changed and main_bar.mode() == .main_window) {
-        main_bar.setContentWidth(30.0);
-    }
-    if (vis_changed) {
-        placeIconView(button);
-        placeDots(button);
-    }
-}
-
-/// The two lines stacked in the title's room, the pair centred on the bar's height a half point low.
-fn placeReadout(button: objc.id) void {
-    const bounds = objc.msg(objc.NSRect, button, "bounds", .{});
-    const t = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "titleRectForBounds:", .{bounds});
-    const cf = objc.msg(objc.NSRect, readout_caption, "frame", .{});
-    const vf = objc.msg(objc.NSRect, readout_value, "frame", .{});
-    const bottom = (bounds.h - (vf.h + cf.h - readout_overlap)) / 2 - 0.5;
-    const flipped = objc.msg(bool, button, "isFlipped", .{});
-    const at = struct {
-        fn y(fl: bool, h: f64, from_bottom: f64, height: f64) f64 {
-            return if (fl) h - from_bottom - height else from_bottom;
-        }
-    }.y;
-    const x = t.x + readout_gap;
-    objc.msg(void, readout_value, "setFrameOrigin:", .{objc.NSPoint{ .x = x, .y = at(flipped, bounds.h, bottom, vf.h) }});
-    objc.msg(void, readout_caption, "setFrameOrigin:", .{objc.NSPoint{ .x = x, .y = at(flipped, bounds.h, bottom + vf.h - readout_overlap, cf.h) }});
-}
-
-/// Attaches the icon layer, badge, update dot, and readout subviews onto `button` (used at startup and when
-/// switching between `NSStatusItem` and the main-monitor-only panel on display hotplug).
-fn attachBarButton(button: objc.id) void {
-    shown_icon = null;
-    shown_reading = null;
-    shown_badge = null;
-    shown_update_dot = null;
-    shown_tooltip_set = false;
-    want_blink = false;
-    active_anim = .none;
-    button_uses_blank = false;
-    makeIconView(button);
-    // Display the outline until the first refresh without setting `shown_icon`, so a hotplug rebuild + refresh
-    // snaps straight to the live icon instead of cross-fading from offline.
-    objc.msg(void, button, "setImage:", .{outline_icon});
-    makeBadge(button);
-    makeUpdateDot(button);
-    makeReadout(button);
 }
 
 fn newItem(label: [*:0]const u8, action: ?[*:0]const u8, tag: isize, key: [*:0]const u8, sym: ?[]const u8) objc.id {
@@ -1772,17 +531,15 @@ fn addSeparator(menu: objc.id) void {
 
 /// Rebuilds the Port submenu only when its entries changed, so an open menu is not disturbed.
 fn syncPortMenu(entries: []const logic.PortEntry) void {
-    var sig: [1536]u8 = undefined;
-    var n: usize = 0;
+    var w = std.hash.Wyhash.init(0);
     var lb: [96]u8 = undefined;
     for (entries) |e| {
-        const l = logic.portLabel(&lb, e);
-        const piece = std.fmt.bufPrint(sig[n..], "{s}{d}{d}\n", .{ l, @intFromBool(e.checked), @intFromBool(e.removable) }) catch break;
-        n += piece.len;
+        w.update(logic.portLabel(&lb, e));
+        w.update(std.mem.asBytes(&.{ @intFromBool(e.checked), @intFromBool(e.removable), @as(u8, 0) }));
     }
-    if (n == port_sig_len and std.mem.eql(u8, sig[0..n], port_sig[0..n])) return;
-    port_sig_len = n;
-    @memcpy(port_sig[0..n], sig[0..n]);
+    const sig = w.final();
+    if (shown_port_sig == sig) return;
+    shown_port_sig = sig;
     // The submenu ends with a separator, the Listen on LAN item, another separator and the port field, which
     // stay; only the port rows above them change.
     port_row.reset();
@@ -1810,7 +567,7 @@ fn watchTransition(p: u16, fresh: bool, link: logic.Link, now: i64) void {
     const mine = g_stop_port == p and now < g_stop_at_ms + 45_000;
     if (g_watch.observe(p, link, now, mine)) {
         var nb: [96]u8 = undefined;
-        setServerProblem(stoppedAtNote(&nb, p), p);
+        poller.setServerProblem(stoppedAtNote(&nb, p), p);
     }
     if (link == .offline and mine) g_stop_port = 0;
 }
@@ -1820,68 +577,8 @@ fn sushiAlive(pid: i32) bool {
     if (pid <= 0) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe = proc.exeOfPid(pid, &buf) orelse return false;
-    return std.mem.eql(u8, std.fs.path.basename(exe), server_exe);
+    return std.mem.eql(u8, std.fs.path.basename(exe), poller.server_exe);
 }
-
-/// The orange dot on the menu bar icon, at its lower right: it sits on the colour icon where the sushi does not hide it.
-fn showBadge(button: objc.id, on: bool) void {
-    if (shown_badge == on) return;
-    if (shown_badge != null) objc.fadeNext(button, 0.25);
-    shown_badge = on;
-    if (on) {
-        const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
-        const flipped = objc.msg(bool, button, "isFlipped", .{});
-        objc.msg(void, badge_view, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - badge_size + 1, .y = if (flipped) r.y + r.h - badge_size + 2 else r.y - 2 }});
-    }
-    objc.msg(void, badge_view, "setHidden:", .{!on});
-}
-
-const badge_size: f64 = 7;
-
-var update_dot: objc.id = null;
-var shown_update_dot: ?bool = null;
-const update_dot_size: f64 = 6;
-
-/// The blue dot on the menu bar icon's upper right while an update waits.
-fn makeUpdateDot(button: objc.id) void {
-    update_dot = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{objc.NSRect{ .x = 0, .y = 0, .w = update_dot_size, .h = update_dot_size }});
-    objc.msg(void, update_dot, "setWantsLayer:", .{true});
-    const layer = objc.msg(objc.id, update_dot, "layer", .{});
-    objc.msg(void, layer, "setBackgroundColor:", .{objc.msg(objc.id, objc.color("systemBlueColor"), "CGColor", .{})});
-    objc.msg(void, layer, "setCornerRadius:", .{update_dot_size / 2});
-    objc.msg(void, update_dot, "setHidden:", .{true});
-    objc.msg(void, button, "addSubview:", .{update_dot});
-    objc.release(update_dot);
-    shown_update_dot = null;
-}
-
-fn showUpdateDot(button: objc.id, on: bool) void {
-    if (shown_update_dot == on) return;
-    if (shown_update_dot != null) objc.fadeNext(button, 0.25);
-    shown_update_dot = on;
-    if (on) {
-        const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
-        const flipped = objc.msg(bool, button, "isFlipped", .{});
-        objc.msg(void, update_dot, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - update_dot_size + 1, .y = if (flipped) r.y - 1 else r.y + r.h - update_dot_size + 1 }});
-    }
-    objc.msg(void, update_dot, "setHidden:", .{!on});
-}
-
-fn makeBadge(button: objc.id) void {
-    badge_view = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{objc.NSRect{ .x = 0, .y = 0, .w = badge_size, .h = badge_size }});
-    objc.msg(void, badge_view, "setWantsLayer:", .{true});
-    const layer = objc.msg(objc.id, badge_view, "layer", .{});
-    objc.msg(void, layer, "setBackgroundColor:", .{objc.msg(objc.id, objc.color("systemOrangeColor"), "CGColor", .{})});
-    objc.msg(void, layer, "setCornerRadius:", .{badge_size / 2});
-    objc.msg(void, badge_view, "setHidden:", .{true});
-    objc.msg(void, button, "addSubview:", .{badge_view});
-    objc.release(badge_view);
-}
-
-var why_mi: objc.id = null;
-var shown_why: []const u8 = "";
-/// What the Load/Unload button does at the next click, from the last refresh.
-var model_action: logic.ModelAction = .none;
 
 /// The inert line under the two buttons that says why Load is off; hidden when nothing needs saying.
 fn showWhy(why: []const u8) void {
@@ -1894,11 +591,14 @@ fn showWhy(why: []const u8) void {
 /// The note item: grey and inert for news, orange and a click to the Log window for a problem. The menu keeps its
 /// width by drawing `title`; the tooltip has the whole `full` text.
 fn showNote(title: []const u8, full: []const u8, problem: bool) void {
-    var sig: [2 * note_cap + 8]u8 = undefined;
-    const key = std.fmt.bufPrint(&sig, "{s}\x00{s}\x00{d}", .{ title, full, @intFromBool(problem) }) catch return;
-    if (key.len == shown_note_sig_len and std.mem.eql(u8, key, shown_note_sig[0..key.len])) return;
-    shown_note_sig_len = key.len;
-    @memcpy(shown_note_sig[0..key.len], key);
+    var w = std.hash.Wyhash.init(0);
+    w.update(title);
+    w.update("\x00");
+    w.update(full);
+    w.update(std.mem.asBytes(&@intFromBool(problem)));
+    const sig = w.final();
+    if (shown_note_sig == sig) return;
+    shown_note_sig = sig;
     objc.msg(void, note_mi, "setHidden:", .{title.len == 0});
     if (title.len == 0) return;
     setText(note_mi, "setTitle:", title);
@@ -1919,14 +619,14 @@ fn runAction(act: Action) void {
         .load => if (model_action == .load) startModelOp(false),
         .unload => if (model_action == .unload) startModelOp(true),
         .confirm => {},
-        .models => refreshModels(@intCast(act.value)),
+        .models => poller.refreshModels(@intCast(act.value), g_default_port, &g_saved),
         .check => {
-            lock();
-            shared.manual_result = .none;
-            unlock();
-            startWorker(.check);
+            poller.lock();
+            poller.shared.manual_result = .none;
+            poller.unlock();
+            poller.startWorker(.check);
         },
-        .update => startWorker(.update),
+        .update => poller.startWorker(.update),
         .port => setPort(@intCast(act.value)),
         .remove => removePort(@intCast(act.value)),
         .lan => toggleLan(),
@@ -1955,11 +655,11 @@ fn take(buf: []u8, s: anytype) []const u8 {
 }
 
 fn syncTimers(now: i64) void {
-    const menu_open = g_menu_open.load(.acquire);
+    const open_now = poller.menu_open.load(.acquire);
     const copied_active = copied_what != .none and logic.copiedNow(copied_at_ms, now);
-    const need_ui = test_polls > 0 or menu_open or stopping_until_ms > now or copied_active or hasStartingChild();
+    const need_ui = test_polls > 0 or open_now or stopping_until_ms > now or copied_active or hasStartingChild();
     if (need_ui and ui_timer == null) {
-        const secs = @as(f64, @floatFromInt(if (test_polls > 0) test_tick_ms else tick_ms)) / 1000.0;
+        const secs = @as(f64, @floatFromInt(if (test_polls > 0) test_tick_ms else poller.tick_ms)) / 1000.0;
         ui_timer = objc.addTimer(secs, menu_target, "tick:");
     } else if (!need_ui and ui_timer != null) {
         objc.msg(void, ui_timer, "invalidate", .{});
@@ -1977,7 +677,7 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 fn refresh() void {
     // Before the snapshot is read: an exit is reported as such before the poll can report the port gone.
     reapStarted();
-    const p = port();
+    const p = poller.port();
     const now = io_util.nowMs(g_io);
     var model_b: [logic.max_model]u8 = undefined;
     var loading_b: [96]u8 = undefined;
@@ -1985,32 +685,33 @@ fn refresh() void {
     var srv_b: [32]u8 = undefined;
     var latest_b: [32]u8 = undefined;
     var cmd_b: [80]u8 = undefined;
-    var note_b: [note_cap]u8 = undefined;
-    var listings: [max_listings]logic.Listing = undefined;
-    var list_models: [max_listings][96]u8 = undefined;
+    var note_b: [poller.note_cap]u8 = undefined;
+    var listings: [poller.max_listings]logic.Listing = undefined;
+    var list_models: [poller.max_listings][96]u8 = undefined;
     var hist: [200]logic.Hist = undefined;
 
-    lock();
-    const fresh = shared.port == p;
-    const view: logic.View = if (fresh) shared.view else .{ .link = .offline };
-    const model = if (fresh) take(&model_b, &shared.model) else "";
-    const loading_id = if (fresh) take(&loading_b, &shared.model_loading) else "";
+    poller.lock();
+    const sh = &poller.shared;
+    const fresh = sh.port == p;
+    const view: logic.View = if (fresh) sh.view else .{ .link = .offline };
+    const model = if (fresh) take(&model_b, &sh.model) else "";
+    const loading_id = if (fresh) take(&loading_b, &sh.model_loading) else "";
     var pack_cur_b: [32]u8 = undefined;
     var pack_new_b: [32]u8 = undefined;
     var pack_cmd_b: [96]u8 = undefined;
-    const pack_update: ?logic.PackUpdate = if (fresh and shared.pack_latest.len > 0) .{
-        .current = take(&pack_cur_b, &shared.pack_current),
-        .latest = take(&pack_new_b, &shared.pack_latest),
-        .command = take(&pack_cmd_b, &shared.pack_command),
+    const pack_update: ?logic.PackUpdate = if (fresh and sh.pack_latest.len > 0) .{
+        .current = take(&pack_cur_b, &sh.pack_current),
+        .latest = take(&pack_new_b, &sh.pack_latest),
+        .command = take(&pack_cmd_b, &sh.pack_command),
     } else null;
     var ln: usize = 0;
-    for (shared.listings[0..shared.listing_n]) |l| {
+    for (sh.listings[0..sh.listing_n]) |l| {
         var known = l.known;
         var name: []const u8 = l.model.get();
         if (l.port != p) {
             known = .unknown;
             name = "";
-            for (&shared.models) |*c| if (c.port == l.port) {
+            for (&sh.models) |*c| if (c.port == l.port) {
                 known = c.known;
                 name = c.model.get();
             };
@@ -2020,34 +721,34 @@ fn refresh() void {
         listings[ln] = .{ .port = l.port, .pid = l.pid, .model = if (m.len > 0) m else null, .models = known };
         ln += 1;
     }
-    const sushi_listening = fresh and shared.sushi_listening;
-    const port_taken = fresh and shared.port_taken;
-    const mem_mb = if (fresh) shared.mem_mb else null;
-    const gpu_mhz = if (fresh) shared.gpu_mhz else null;
-    const gpu_pct = if (fresh) shared.gpu_pct else null;
-    const lan_bound = fresh and shared.lan_listening;
-    const last_prefill = if (fresh) shared.last_prefill else null;
-    const hist_n = if (fresh) shared.hist_n else 0;
-    @memcpy(hist[0..hist_n], shared.hist[0..hist_n]);
-    const bar_version = take(&bar_b, &shared.bar_version);
-    const server_version = if (fresh) take(&srv_b, &shared.server_version) else "";
-    const server_command = shared.props_command.len > 0;
-    const cmd_len = shared.props_command.len;
-    @memcpy(cmd_b[0..cmd_len], shared.props_command.get());
+    const sushi_listening = fresh and sh.sushi_listening;
+    const port_taken = fresh and sh.port_taken;
+    const mem_mb = if (fresh) sh.mem_mb else null;
+    const gpu_mhz = if (fresh) sh.gpu_mhz else null;
+    const gpu_pct = if (fresh) sh.gpu_pct else null;
+    const lan_bound = fresh and sh.lan_listening;
+    const last_prefill = if (fresh) sh.last_prefill else null;
+    const hist_n = if (fresh) sh.hist_n else 0;
+    @memcpy(hist[0..hist_n], sh.hist[0..hist_n]);
+    const bar_version = take(&bar_b, &sh.bar_version);
+    const server_version = if (fresh) take(&srv_b, &sh.server_version) else "";
+    const server_command = sh.props_command.len > 0;
+    const cmd_len = sh.props_command.len;
+    @memcpy(cmd_b[0..cmd_len], sh.props_command.get());
     const uv_base: logic.UpdateView = .{
         .bar_version = bar_version,
         .server_version = server_version,
-        .latest = take(&latest_b, &shared.latest),
-        .available = shared.available,
+        .latest = take(&latest_b, &sh.latest),
+        .available = sh.available,
         .command = if (g_sibling_brew and cmd_len == 0) "brew upgrade sushi" else cmd_b[0..cmd_len],
-        .note = take(&note_b, &shared.note),
-        .busy = shared.busy,
-        .checked = shared.manual_result,
+        .note = take(&note_b, &sh.note),
+        .busy = sh.busy,
+        .checked = sh.manual_result,
     };
-    const relaunch = shared.relaunch;
-    const note_problem = shared.note_problem;
-    const model_full_len = if (fresh) shared.model_full_len else 0;
-    unlock();
+    const relaunch = sh.relaunch;
+    const note_problem = sh.note_problem;
+    const model_full_len = if (fresh) sh.model_full_len else 0;
+    poller.unlock();
 
     if (view.link == .up or view.link == .metrics_off) logic.markAnswered(&started, p);
     syncProbes();
@@ -2060,7 +761,7 @@ fn refresh() void {
         .too_long => if (!g_model_too_long) {
             g_model_too_long = true;
             var nb: [128]u8 = undefined;
-            setProblem(logic.modelTooLongNote(&nb, p));
+            poller.setProblem(logic.modelTooLongNote(&nb, p));
         },
         .keep => if (model.len > 0) {
             g_model_too_long = false;
@@ -2069,9 +770,9 @@ fn refresh() void {
     watchTransition(p, fresh, view.link, now);
     const recovered = g_watch.takeRecovered();
     if (recovered != 0) {
-        lock();
-        if (logic.recoveryClearsNote(shared.note_kind, shared.note_port, recovered)) clearNote();
-        unlock();
+        poller.lock();
+        if (logic.recoveryClearsNote(poller.shared.note_kind, poller.shared.note_port, recovered)) poller.clearNote();
+        poller.unlock();
     }
     if (last_link != view.link) {
         last_link = view.link;
@@ -2090,7 +791,7 @@ fn refresh() void {
     g_stop_stuck = logic.stopStuck(g_stop_sent, p, now, serving_pid);
     if (g_stop_stuck and !g_stuck_noted) {
         var sb: [96]u8 = undefined;
-        setServerProblem(logic.stuckNote(&sb, p), p);
+        poller.setServerProblem(logic.stuckNote(&sb, p), p);
     }
     g_stuck_noted = g_stop_stuck;
     const state: logic.Server = .{
@@ -2107,7 +808,7 @@ fn refresh() void {
     };
 
     // Between Load and the model's row turning to loading, the model Load asked for is already the one loading.
-    const asked = g_load_port.load(.acquire) == p and view.link == .up and model.len == 0 and loading_id.len == 0;
+    const asked = poller.load_port.load(.acquire) == p and view.link == .up and model.len == 0 and loading_id.len == 0;
     const loading_name = if (loading_id.len > 0) loading_id else if (asked) g_last_model.get() else "";
 
     // Always update the visible menu bar button (icon, readout, badge, update dot, tooltip).
@@ -2117,23 +818,23 @@ fn refresh() void {
     const button = main_bar.button();
     const icon = logic.iconFor(view.link, .{ .ready = model.len > 0, .loading = loading_name.len > 0 });
     if (icon == .ready and view.read != null) {
-        showReading(button, logic.readingStep(view.read.?.fraction));
+        bar_button.showReading(button, logic.readingStep(view.read.?.fraction));
     } else {
-        showIcon(button, icon);
-        blinkGenerating(button, icon == .ready and view.decoding);
+        bar_button.showIcon(button, icon);
+        bar_button.setGeneratingBlink(icon == .ready and view.decoding);
     }
-    showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
-    setReadout(button, shown);
-    showUpdateDot(button, uv_base.available);
+    bar_button.showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
+    bar_button.setReadout(button, shown);
+    bar_button.showUpdateDot(button, uv_base.available);
     var status_buf: [200]u8 = undefined;
     const status = logic.statusLine(&status_buf, state);
-    setButtonToolTip(button, status);
+    bar_button.setToolTip(button, status);
 
     if (relaunch) relaunchSelf(p);
     syncTimers(now);
 
     // Skip all menu-interior AppKit updates while the menu is closed (rebuilt right before opening in menuWillOpen:).
-    const need_menu = g_menu_open.load(.acquire) or test_polls > 0;
+    const need_menu = poller.menu_open.load(.acquire) or test_polls > 0;
     if (!need_menu) return;
 
     var started_b: [started.len + 1]u16 = undefined;
@@ -2184,16 +885,18 @@ fn refresh() void {
 
     button_row.setStart(.{ .label = tg.label, .symbol = tg.symbol, .tip = tg.tip, .enabled = tg.enabled, .closes_menu = tg.action != .start });
     var model_tip: [160]u8 = undefined;
-    const op_port = if (g_load_port.load(.acquire) != 0) g_load_port.load(.acquire) else g_unload_port.load(.acquire);
+    const load_p = poller.load_port.load(.acquire);
+    const unload_p = poller.unload_port.load(.acquire);
+    const op_port = if (load_p != 0) load_p else unload_p;
     const mb = logic.modelButton(&model_tip, .{
-        .other = if (op_port != 0 and op_port != p) .{ .port = op_port, .unload = g_unload_port.load(.acquire) != 0, .model = g_op_model.get() } else .{},
+        .other = if (op_port != 0 and op_port != p) .{ .port = op_port, .unload = unload_p != 0, .model = g_op_model.get() } else .{},
         .link = view.link,
         .connecting = !fresh,
         .starting = starting,
         .model = if (model.len > 0) model else null,
         .last_model = g_last_model.get(),
-        .loading = g_load_port.load(.acquire) == p or (loading_id.len > 0 and model.len == 0),
-        .unloading = g_unload_port.load(.acquire) == p,
+        .loading = load_p == p or (loading_id.len > 0 and model.len == 0),
+        .unloading = unload_p == p,
     });
     model_action = mb.action;
     button_row.setLoad(.{ .label = mb.label, .symbol = mb.symbol, .tip = mb.tip, .enabled = mb.enabled, .closes_menu = false, .spinner = mb.spinner });
@@ -2207,7 +910,7 @@ fn refresh() void {
         "Start servers on every interface (0.0.0.0) so devices on the LAN can reach them. A running server keeps its current bind.");
     for (open_mis) |mi| objc.msg(void, mi, "setEnabled:", .{logic.openEnabled(view.link)});
 
-    var entries: [max_listings + logic.max_saved + 2]logic.PortEntry = undefined;
+    var entries: [poller.max_listings + logic.max_saved + 2]logic.PortEntry = undefined;
     const port_entries = logic.portEntries(&entries, p, g_default_port, g_saved.items(), listings[0..ln]);
     syncPortMenu(port_entries);
 
@@ -2244,10 +947,10 @@ fn refresh() void {
         std.debug.print("sushibar: poll {d} readout=\"{s} status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" note=\"{s}\" problem={d} pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" tip=\"{s}\" removable=\"{s}\" badge={d} models_link={d} last_model=\"{s}\" load=\"{s}\" load_on={d} why=\"{s}\" stats=\"{s}|{s}|{s}\" a11y=\"{s}\" lan={d}\n", .{
             tick_count,                 readout_text,          status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
-            @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         note_shown,
+            @tagName(bar_button.shownIcon().?), ports_buf[0..pn], header.version,      note_shown,
             @intFromBool(note_problem and note_shown.len > 0), header.pill.label, header.line1, header.line2,
             tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_tip,
-            update_button.label,        update_button.tip,     removable_buf[0..rn],   @intFromBool(shown_badge == true),
+            update_button.label,        update_button.tip,     removable_buf[0..rn],   @intFromBool(bar_button.shownBadge()),
             @intFromBool(header.line1_models), g_last_model.get(), mb.label, @intFromBool(mb.enabled), mb.why,
             header.stats[0].label,      header.stats[1].label, header.stats[2].label,  header.a11y,
             @intFromBool(g_lan),
@@ -2258,17 +961,19 @@ fn refresh() void {
 
 /// The sibling's version changed: run the new sushibar in this process, on the same port.
 fn relaunchSelf(p: u16) void {
-    lock();
-    shared.relaunch = false;
-    unlock();
+    poller.lock();
+    poller.shared.relaunch = false;
+    poller.unlock();
     var port_z: [8:0]u8 = undefined;
     const pz = std.fmt.bufPrintSentinel(&port_z, "{d}", .{p}, 0) catch return;
-    var sb: [path_cap]u8 = undefined;
+    var sb: [poller.path_cap]u8 = undefined;
     // The path sushibar was started by, so a Homebrew link lands on the new keg; brew's opt link if that is gone.
-    const exe = if (reachable(g_self_exe)) g_self_exe else siblingNow(&sb, bar_exe) orelse g_self_exe;
+    const exe = if (poller.reachable(g_self_exe)) g_self_exe else poller.siblingNow(&sb, poller.bar_exe) orelse g_self_exe;
     proc.execReplace(&.{ exe.ptr, "--port", pz.ptr });
-    setProblem("Updated, but sushibar could not restart itself: quit and run it again");
+    poller.setProblem("Updated, but sushibar could not restart itself: quit and run it again");
 }
+
+// ── ObjC menu actions & notifications ──
 
 fn openUrl(url: []const u8) void {
     const ns_url = objc.msg(objc.id, objc.class("NSURL"), "URLWithString:", .{objc.nsText(url)});
@@ -2276,9 +981,9 @@ fn openUrl(url: []const u8) void {
 }
 
 fn openWebPage(page: logic.Page) void {
-    var origin: [origin_cap]u8 = undefined;
-    var url_buf: [url_cap]u8 = undefined;
-    openUrl(logic.pageUrl(&url_buf, originFor(&origin, port()), page));
+    var origin: [poller.origin_cap]u8 = undefined;
+    var url_buf: [poller.url_cap]u8 = undefined;
+    openUrl(logic.pageUrl(&url_buf, poller.originFor(&origin, poller.port()), page));
 }
 
 fn openPage(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
@@ -2290,28 +995,28 @@ fn openModelsAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 }
 
 fn openReleaseNotes(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    lock();
+    poller.lock();
     var b: [160]u8 = undefined;
-    const url = take(&b, &shared.props_url);
-    unlock();
+    const url = take(&b, &poller.shared.props_url);
+    poller.unlock();
     openUrl(logic.releaseNotesUrl(url));
 }
 
 /// Start or Stop, whichever the item reads.
 fn toggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     const ours_alive = ownServer() != null;
-    lock();
+    poller.lock();
     const state: logic.Server = .{
-        .link = shared.view.link,
+        .link = poller.shared.view.link,
         .ours_alive = ours_alive,
         .sushi_found = g_sushi_found,
-        .port = port(),
-        .sushi_listening = shared.sushi_listening,
-        .port_taken = shared.port_taken,
+        .port = poller.port(),
+        .sushi_listening = poller.shared.sushi_listening,
+        .port_taken = poller.shared.port_taken,
         .stop_stuck = g_stop_stuck,
     };
-    unlock();
-    switch (logic.toggle(state, stopping_until_ms > io_util.nowMs(g_io) and g_stopping_port == port()).action) {
+    poller.unlock();
+    switch (logic.toggle(state, stopping_until_ms > io_util.nowMs(g_io) and g_stopping_port == poller.port()).action) {
         .start => startServer(),
         .stop => stopServer(),
         .force_stop => forceStop(),
@@ -2363,9 +1068,9 @@ fn pickPortAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
 /// switch applies to the next Start.
 fn toggleLan() void {
     g_lan = !g_lan;
-    writeSaved(port());
+    writeSaved(poller.port());
     var nb: [128]u8 = undefined;
-    setNote(logic.lanNote(&nb, g_lan));
+    poller.setNote(logic.lanNote(&nb, g_lan));
     refresh();
 }
 
@@ -2404,10 +1109,10 @@ fn copyUpgrade() void {
 
 fn copyPackAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     var cmd: [97]u8 = undefined;
-    lock();
-    const n = shared.pack_command.len;
-    @memcpy(cmd[0..n], shared.pack_command.get());
-    unlock();
+    poller.lock();
+    const n = poller.shared.pack_command.len;
+    @memcpy(cmd[0..n], poller.shared.pack_command.get());
+    poller.unlock();
     cmd[n] = 0;
     if (n == 0) return;
     objc.copyText(@ptrCast(&cmd));
@@ -2424,16 +1129,16 @@ fn removeRowAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
 
 /// The top menu re-reads the default port and polls at once; the Port submenu asks its listeners for their models.
 fn menuWillOpen(_: objc.id, _: objc.SEL, opening: objc.id) callconv(.c) void {
-    if (opening != top_menu) return refreshModels(null);
-    g_menu_open.store(true, .release);
+    if (opening != top_menu) return poller.refreshModels(null, g_default_port, &g_saved);
+    poller.menu_open.store(true, .release);
     invalidateOwnCache();
-    g_wake.set(g_io);
+    poller.wake.set(g_io);
     g_default_port = readDefaultPort();
     const now = io_util.nowMs(g_io);
-    lock();
-    shared.manual_result = logic.shownResult(shared.manual_result, shared.manual_at_ms, now);
-    if (!logic.noteKept(shared.note_problem, shared.note_at_ms, now)) shared.note.set("");
-    unlock();
+    poller.lock();
+    poller.shared.manual_result = logic.shownResult(poller.shared.manual_result, poller.shared.manual_at_ms, now);
+    if (!logic.noteKept(poller.shared.note_problem, poller.shared.note_at_ms, now)) poller.shared.note.set("");
+    poller.unlock();
     g_option = false;
     flagsTick(null, null, null);
     if (g_flags_timer == null) g_flags_timer = objc.addTimer(0.1, menu_target, "flagsTick:");
@@ -2442,7 +1147,7 @@ fn menuWillOpen(_: objc.id, _: objc.SEL, opening: objc.id) callconv(.c) void {
 
 fn menuDidClose(_: objc.id, _: objc.SEL, closing: objc.id) callconv(.c) void {
     if (closing != top_menu) return;
-    g_menu_open.store(false, .release);
+    poller.menu_open.store(false, .release);
     main_bar.setHighlight(false);
     if (g_flags_timer != null) objc.msg(void, g_flags_timer, "invalidate", .{});
     g_flags_timer = null;
@@ -2453,29 +1158,21 @@ fn popupMenuAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     main_bar.popupMenu();
 }
 
-fn realignBarSubviews() void {
-    const btn = main_bar.button();
-    if (btn == null) return;
-    placeIconView(btn);
-    placeDots(btn);
-    if (shown_readout_visible == true) placeReadout(btn);
-}
-
 fn screensChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     if (main_bar.syncScreens()) {
-        attachBarButton(main_bar.button());
+        bar_button.attach(main_bar.button());
         refresh();
     } else if (main_bar.mode() == .main_window) {
-        realignBarSubviews();
+        bar_button.realign(main_bar.button());
     }
 }
 
 fn spaceChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    if (main_bar.reposition()) realignBarSubviews();
+    if (main_bar.reposition()) bar_button.realign(main_bar.button());
 }
 
 fn accessibilityChanged(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    syncIconAnimation();
+    bar_button.syncAnimation();
 }
 
 fn refreshNow(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
@@ -2484,13 +1181,13 @@ fn refreshNow(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 
 /// The watched port's log: what its server's argv said, or the default file while that is not known yet.
 fn watchedLog(buf: *[1024]u8) logic.LogSource {
-    const p = port();
-    lock();
-    defer unlock();
-    if (shared.port != p) return logic.logSource(buf, g_home, p, null);
-    const path = shared.log_path.get();
+    const p = poller.port();
+    poller.lock();
+    defer poller.unlock();
+    if (poller.shared.port != p) return logic.logSource(buf, g_home, p, null);
+    const path = poller.shared.log_path.get();
     @memcpy(buf[0..path.len], path);
-    return .{ .kind = shared.log_kind, .path = buf[0..path.len] };
+    return .{ .kind = poller.shared.log_kind, .path = buf[0..path.len] };
 }
 
 fn stopLogTimer() void {
@@ -2504,7 +1201,7 @@ fn onLogClosed() void {
 
 fn showLogAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     var buf: [1024]u8 = undefined;
-    log_view.open(port(), watchedLog(&buf));
+    log_view.open(poller.port(), watchedLog(&buf));
     if (log_timer == null) log_timer = objc.addTimer(0.5, menu_target, "logTick:");
 }
 
@@ -2512,19 +1209,10 @@ fn showLogAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 fn logTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     if (!log_view.isVisible()) return stopLogTimer();
     var buf: [1024]u8 = undefined;
-    log_view.sync(port(), watchedLog(&buf));
+    log_view.sync(poller.port(), watchedLog(&buf));
 }
 
-const icon_w = 22;
-const icon_h = 18;
-
-fn loadIcons() void {
-    outline_icon = objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, icon_w, icon_h);
-    blank_icon = objc.makeBlankImage(icon_w, icon_h);
-    static_reps[@intFromEnum(logic.Icon.empty)] = objc.rasterizeSvgRep(@embedFile("sushibar/icon-empty.svg"), icon_w, icon_h);
-    static_reps[@intFromEnum(logic.Icon.loading)] = objc.rasterizeSvgRep(@embedFile("sushibar/icon-loading.svg"), icon_w, icon_h);
-    static_reps[@intFromEnum(logic.Icon.ready)] = objc.rasterizeSvgRep(@embedFile("sushibar/icon-online.svg"), icon_w, icon_h);
-}
+// ── App & menu construction ──
 
 const find_show_interface: isize = 1;
 
@@ -2563,7 +1251,7 @@ fn setMainMenu(app: objc.id) void {
 fn runMenuBar() noreturn {
     const app = objc.msg(objc.id, objc.class("NSApplication"), "sharedApplication", .{});
     objc.msg(void, app, "setActivationPolicy:", .{@as(isize, 1)});
-    loadIcons();
+    bar_button.loadIcons();
 
     const cls = objc.defineClass("SushiBarTarget", &.{
         .{ .selector = "tick:", .imp = @ptrCast(&tick), .types = "v@:@" },
@@ -2601,7 +1289,7 @@ fn runMenuBar() noreturn {
     objc.msg(void, menu, "setAutoenablesItems:", .{false});
 
     const button = main_bar.init(menu_target, menu);
-    attachBarButton(button);
+    bar_button.attach(button);
     log_view.setOnClose(&onLogClosed);
 
     const nc = objc.msg(objc.id, objc.class("NSNotificationCenter"), "defaultCenter", .{});
@@ -2684,315 +1372,9 @@ fn runMenuBar() noreturn {
     objc.msg(void, quit_mi, "setHidden:", .{true});
     syncTimers(io_util.nowMs(g_io));
 
-    _ = std.Thread.spawn(.{}, pollLoop, .{}) catch fail("cannot start the poll thread", .{});
+    poller.startPollThread() catch fail("cannot start the poll thread", .{});
     objc.msg(void, app, "run", .{});
     std.process.exit(0);
-}
-
-/// `SUSHIBAR_RENDER_HEADER=<dir>`: draws the header card for fixed sample states, light and dark, at 2x into PNGs
-/// in `dir`, and exits. For checking the design without a screen.
-fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
-    _ = objc.msg(objc.id, objc.class("NSApplication"), "sharedApplication", .{});
-    _ = header_view.create(
-        objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, 34, 28),
-        objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, 34, 28),
-        null,
-        null,
-    );
-    io_util.makeDirPath(g_io, dir) catch {};
-    const t0: i64 = 1_700_000_000_000;
-    // A busy session with a gap; one history for the card with a short outage in it, one without.
-    var hist: [150]logic.Hist = undefined;
-    var hist_gap: [150]logic.Hist = undefined;
-    var n: usize = 0;
-    var n_gap: usize = 0;
-    var gen: u64 = 0;
-    for (0..150) |i| {
-        const f: f64 = @floatFromInt(i);
-        const rate: f64 = if (i >= 25) 95 + 20 * @sin(f * 0.7) + 10 * @sin(f * 0.23) else 0;
-        gen += @intFromFloat(rate * 2);
-        const sample: logic.Hist = .{ .t_ms = t0 - @as(i64, @intCast(149 - i)) * 2000, .gen = gen };
-        hist[n] = sample;
-        n += 1;
-        if (i >= 100 and i < 103) continue;
-        hist_gap[n_gap] = sample;
-        n_gap += 1;
-    }
-    const States = struct { name: []const u8, in: logic.HeaderIn, sparkline: bool = false, outage: bool = false };
-    const deep = "Example-Flash-1017-Sushi-STQ-1.75bpw";
-    const states = [_]States{
-        .{ .name = "stopped", .in = .{ .link = .offline, .port = 12345, .bar_version = "1.5.0-dev1" } },
-        .{ .name = "stopped-last-model", .in = .{ .link = .offline, .port = 12345, .bar_version = "1.5.0-dev1", .last_model = deep } },
-        .{ .name = "port-taken", .in = .{ .link = .offline, .port = 8080, .bar_version = "1.5.0-dev1", .port_taken = true } },
-        .{ .name = "no-sushi", .in = .{ .link = .offline, .port = 12345, .bar_version = "1.5.0-dev1", .sushi_found = false } },
-        .{ .name = "starting", .in = .{ .link = .offline, .port = 12345, .bar_version = "1.5.0-dev1", .starting = true, .last_model = deep } },
-        .{ .name = "connecting", .in = .{ .link = .offline, .port = 18803, .bar_version = "1.5.0-dev1", .connecting = true } },
-        .{ .name = "silent", .in = .{ .link = .silent, .port = 12345, .bar_version = "1.5.0-dev1" } },
-        .{ .name = "ready-to-load", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .last_model = deep, .gpu_mhz = 0 } },
-        .{ .name = "loading", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .loading = true, .model = deep, .mem_mb = 12000 } },
-        .{ .name = "no-model", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .gpu_mhz = 0 } },
-        .{ .name = "generating", .sparkline = true, .outage = true, .in = .{
-            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0-dev1",
-            .decoding = true, .live = 105.27, .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
-        } },
-        .{ .name = "key-needed", .in = .{ .link = .unauthorized, .port = 12345, .bar_version = "1.5.0-dev1" } },
-        .{ .name = "update", .sparkline = true, .in = .{
-            .link = .up, .port = 12345, .model = "Example-Flash-Next-Sushi-STQ-2.75bpw", .mem_mb = 31200, .bar_version = "1.5.0",
-            .update_available = true, .latest = "1.5.1", .last = 142.6, .last_prefill = 3120, .gpu_mhz = 1380, .gpu_pct = 8,
-        } },
-        .{ .name = "pack-update", .sparkline = true, .in = .{
-            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0",
-            .pack_update = .{ .current = "1.0", .latest = "2.0", .command = "sushi pull example-pack" },
-            .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
-        } },
-    };
-    for (states) |st| {
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        defer arena.deinit();
-        const h = logic.buildHeader(arena.allocator(), st.in) catch continue;
-        var spark: [160]logic.SparkPoint = undefined;
-        const pts = if (st.sparkline) logic.sparkPoints(&spark, if (st.outage) hist_gap[0..n_gap] else hist[0..n], t0, header_view.spark_window_ms) else spark[0..0];
-        header_view.update(h, pts);
-        for ([_]bool{ false, true }) |dark| {
-            var path: [std.fs.max_path_bytes:0]u8 = undefined;
-            const pz = std.fmt.bufPrintSentinel(&path, "{s}/header-{s}-{s}.png", .{ dir, st.name, if (dark) "dark" else "light" }, 0) catch continue;
-            if (!header_view.renderPng(pz.ptr, dark)) std.debug.print("sushibar: could not render {s}\n", .{pz});
-        }
-    }
-    const field = port_field.create(null);
-    for ([_][]const u8{ "empty", "invalid" }) |state| {
-        if (std.mem.eql(u8, state, "invalid")) {
-            port_field.setText("99999");
-            port_field.showInvalid();
-        }
-        for ([_]bool{ false, true }) |dark| {
-            var path: [std.fs.max_path_bytes:0]u8 = undefined;
-            const pz = std.fmt.bufPrintSentinel(&path, "{s}/portfield-{s}-{s}.png", .{ dir, state, if (dark) "dark" else "light" }, 0) catch continue;
-            if (!port_field.renderPng(field, pz.ptr, dark)) std.debug.print("sushibar: could not render {s}\n", .{pz});
-        }
-    }
-    renderButtonsAndLog(dir);
-    renderBadge(dir);
-    std.process.exit(0);
-}
-
-/// The menu bar item in its states, on a plain button of the status button's shape over a menu-bar-like fill.
-fn renderBadge(dir: []const u8) void {
-    loadIcons();
-    const Case = struct { name: []const u8, icon: logic.Icon, readout: logic.Readout = logic.readout_none, badge: bool = false, update: bool = false, reading: ?usize = null, dim: bool = false };
-    const cases = [_]Case{
-        .{ .name = "live", .icon = .ready, .readout = .{ .caption = "TOK/S", .value = "105" } },
-        .{ .name = "live-slow", .icon = .ready, .readout = .{ .caption = "TOK/S", .value = "40.0" } },
-        .{ .name = "idle", .icon = .ready },
-        .{ .name = "update-waiting", .icon = .ready, .update = true },
-        .{ .name = "update-waiting-live", .icon = .ready, .update = true, .readout = .{ .caption = "TOK/S", .value = "40.0" } },
-        .{ .name = "reading", .icon = .ready, .reading = logic.reading_steps * 3 / 5, .readout = .{ .caption = "READ", .value = "12s" } },
-        .{ .name = "reading-start", .icon = .ready, .reading = logic.reading_steps / 10, .readout = .{ .caption = "READ", .value = logic.readout_pending } },
-        .{ .name = "reading-minutes", .icon = .ready, .reading = logic.reading_steps / 4, .readout = .{ .caption = "READ", .value = "59:59" } },
-        .{ .name = "generating-dim", .icon = .ready, .dim = true, .readout = .{ .caption = "TOK/S", .value = "105" } },
-        .{ .name = "badge", .icon = .ready, .badge = true },
-        .{ .name = "no-model", .icon = .empty },
-        .{ .name = "loading", .icon = .loading },
-        .{ .name = "key-needed", .icon = .empty, .badge = true },
-        .{ .name = "offline", .icon = .outline },
-    };
-    for (cases) |c| for ([_]bool{ false, true }) |dark| {
-        const box = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSBox"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = 168, .h = 24 }});
-        defer objc.release(box);
-        objc.msg(void, box, "setBoxType:", .{@as(isize, 4)});
-        objc.msg(void, box, "setBorderWidth:", .{@as(f64, 0)});
-        objc.msg(void, box, "setContentViewMargins:", .{objc.NSSize{ .width = 0, .height = 0 }});
-        objc.msg(void, box, "setFillColor:", .{objc.msg(objc.id, objc.class("NSColor"), "colorWithWhite:alpha:", .{ @as(f64, if (dark) 0.16 else 0.92), @as(f64, 1) })});
-        const button = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 4, .y = 0, .w = 160, .h = 24 }});
-        objc.msg(void, button, "setBordered:", .{false});
-        objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
-        const render_img = if (c.reading) |step|
-            objc.imageFromRep(ensureReadingRep(step), icon_w, icon_h)
-        else if (c.dim)
-            objc.imageFromRep(ensureGeneratingDimRep(), icon_w, icon_h)
-        else if (c.icon == .outline)
-            outline_icon
-        else
-            objc.imageFromRep(static_reps[@intFromEnum(c.icon)], icon_w, icon_h);
-        defer if (render_img != outline_icon) objc.release(render_img);
-        objc.msg(void, button, "setImage:", .{render_img});
-        // The status bar draws a template image in the bar's text colour; a plain button would draw it dimmed.
-        objc.msg(void, button, "setContentTintColor:", .{objc.color("labelColor")});
-        // Clear non-owning dot pointers before `setReadout` -> `placeDots` and before `box` is released, so
-        // deallocated subviews from the previous iteration are never dereferenced.
-        badge_view = null;
-        update_dot = null;
-        shown_badge = null;
-        shown_update_dot = null;
-        defer {
-            badge_view = null;
-            update_dot = null;
-            readout_caption = null;
-            readout_value = null;
-            shown_badge = null;
-            shown_update_dot = null;
-        }
-        makeReadout(button);
-        setReadout(button, c.readout);
-        makeUpdateDot(button);
-        showUpdateDot(button, c.update);
-        makeBadge(button);
-        showBadge(button, c.badge);
-        objc.msg(void, box, "addSubview:", .{button});
-        objc.release(button);
-        const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
-        objc.msg(void, box, "setAppearance:", .{objc.msg(objc.id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
-        const bounds = objc.msg(NSRect, box, "bounds", .{});
-        const rep = objc.msg(objc.id, box, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
-        if (rep == null) return;
-        objc.msg(void, box, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
-        const data = objc.msg(objc.id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(objc.id, null) });
-        var path: [std.fs.max_path_bytes:0]u8 = undefined;
-        const pz = std.fmt.bufPrintSentinel(&path, "{s}/menubar-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch return;
-        _ = objc.msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(pz.ptr), true });
-    };
-}
-
-fn renderButtonsAndLog(dir: []const u8) void {
-    const row = button_row.createFooter();
-    const Case = struct { name: []const u8, uv: logic.UpdateView = .{}, hover: ?usize = null, pressed: ?usize = null };
-    const cases = [_]Case{
-        .{ .name = "normal" },
-        .{ .name = "hover-log", .hover = 0 },
-        .{ .name = "pressed-quit", .hover = 2, .pressed = 2 },
-        .{ .name = "update", .uv = .{ .available = true, .latest = "1.5.1", .path = .server } },
-        .{ .name = "update-hover", .uv = .{ .available = true, .latest = "1.5.1", .path = .server }, .hover = 1 },
-        .{ .name = "update-pressed", .uv = .{ .available = true, .latest = "1.5.1", .path = .server }, .pressed = 1 },
-        .{ .name = "brew", .uv = .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi" } },
-        .{ .name = "brew-copied", .uv = .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi", .copied = true } },
-        .{ .name = "checking", .uv = .{ .busy = .checking } },
-        .{ .name = "up-to-date", .uv = .{ .checked = .up_to_date } },
-        .{ .name = "failed", .uv = .{ .checked = .failed } },
-        .{ .name = "failed-hover", .uv = .{ .checked = .failed }, .hover = 1 },
-    };
-    var tip_b: [160]u8 = undefined;
-    for (cases) |c| {
-        var tip: [160]u8 = undefined;
-        const b = logic.updateButton(&tip, c.uv);
-        button_row.setUpdate(buttonLook(b));
-        for ([_]bool{ false, true }) |dark| {
-            var path: [std.fs.max_path_bytes:0]u8 = undefined;
-            const pz = std.fmt.bufPrintSentinel(&path, "{s}/buttons-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;
-            if (!button_row.renderPng(row, pz.ptr, dark, c.hover, c.pressed, "")) std.debug.print("sushibar: could not render {s}\n", .{pz});
-        }
-    }
-    button_row.setUpdate(buttonLook(logic.updateButton(&tip_b, .{})));
-    g_option = true;
-    g_started_count = 1;
-    applyQuitLook();
-    for ([_]bool{ false, true }) |dark| {
-        var path: [std.fs.max_path_bytes:0]u8 = undefined;
-        const pz = std.fmt.bufPrintSentinel(&path, "{s}/buttons-quit-stop-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch continue;
-        if (!button_row.renderPng(row, pz.ptr, dark, 2, null, "")) std.debug.print("sushibar: could not render {s}\n", .{pz});
-    }
-    renderServerRow(dir);
-    renderPortRows(dir);
-    const sample =
-        \\2026-11-04 09:12:01 [info] Logging to /Users/me/.sushi/logs/sushi-11250.log (rotates at 100 MB)
-        \\2026-11-04 09:12:02 [info] sushi 1.5.0 serving on http://127.0.0.1:11250
-        \\2026-11-04 09:12:04 [info] [kv-cache] affine8 KV, context 262144
-        \\2026-11-04 09:12:09 [info] Loaded Example-Flash-Next-Sushi-STQ-2.75bpw in 4.8 s
-        \\2026-11-04 09:13:20 [info] <- 412+0 tokens (chat, stream)
-        \\2026-11-04 09:13:20 [warn] [admission] prefill chunk lowered to 2048 for the free memory
-        \\2026-11-04 09:13:31 [info] [spec-stats] accepted 2.31 of 3 drafted
-        \\2026-11-04 09:13:34 [info] -> 288 tokens, 142.6 tok/s decode
-        \\2026-11-04 09:14:02 [error] [load] chat template: line 1 column 12: unsupported filter 'tojson_pretty'
-        \\2026-11-04 09:14:40 [info] [hot-cache] kept 3 entries, 1.2 GB
-        \\
-    ;
-    const std_path = "/Users/me/.sushi/logs/sushi-11250.log";
-    for ([_]bool{ false, true }) |dark| {
-        var path: [std.fs.max_path_bytes:0]u8 = undefined;
-        const pz = std.fmt.bufPrintSentinel(&path, "{s}/log-window-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch continue;
-        if (!log_view.renderPng(pz.ptr, dark, .{ .port = 11250, .src = .{ .kind = .standard, .path = std_path }, .sample = sample })) std.debug.print("sushibar: could not render {s}\n", .{pz});
-    }
-    var nb: [600]u8 = undefined;
-    const notice = logic.logNotice(&nb, 11250, .{ .kind = .standard, .path = std_path });
-    var path: [std.fs.max_path_bytes:0]u8 = undefined;
-    if (std.fmt.bufPrintSentinel(&path, "{s}/log-window-missing-light.png", .{dir}, 0)) |pz| {
-        if (!log_view.renderPng(pz.ptr, false, .{ .port = 11250, .src = .{ .kind = .standard, .path = std_path }, .sample = notice, .has_file = false })) std.debug.print("sushibar: could not render {s}\n", .{pz});
-    } else |_| {}
-    renderFollowedLog(dir);
-}
-
-/// Start/Stop beside Load/Unload for each state the pair can be in, with the line under them.
-fn renderServerRow(dir: []const u8) void {
-    const row = button_row.createServerRow();
-    const m = "Example-Flash-1017-Sushi-STQ-1.75bpw";
-    const Case = struct { name: []const u8, s: logic.Server, m: logic.ModelIn, stopping: bool = false, hover: ?usize = null, pressed: ?usize = null };
-    const cases = [_]Case{
-        .{ .name = "stopped", .s = .{ .link = .offline }, .m = .{ .link = .offline, .last_model = m } },
-        .{ .name = "stopped-no-last", .s = .{ .link = .offline }, .m = .{ .link = .offline } },
-        .{ .name = "starting", .s = .{ .link = .offline, .ours_alive = true }, .m = .{ .link = .offline, .starting = true, .last_model = m } },
-        .{ .name = "ready-to-load", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .last_model = m } },
-        .{ .name = "ready-hover-load", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .last_model = m }, .hover = 4 },
-        .{ .name = "no-last-model", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up } },
-        .{ .name = "loading", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .last_model = m, .loading = true } },
-        .{ .name = "loaded", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m } },
-        .{ .name = "loaded-hover-unload", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m }, .hover = 4 },
-        .{ .name = "loaded-pressed-stop", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m }, .hover = 3, .pressed = 3 },
-        .{ .name = "unloading", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m, .unloading = true } },
-        .{ .name = "stopping", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m }, .stopping = true },
-    };
-    for (cases) |c| {
-        const tg = logic.toggle(c.s, c.stopping);
-        var tip: [160]u8 = undefined;
-        const mb = logic.modelButton(&tip, c.m);
-        button_row.setStart(.{ .label = tg.label, .symbol = tg.symbol, .tip = tg.tip, .enabled = tg.enabled, .closes_menu = false });
-        button_row.setLoad(.{ .label = mb.label, .symbol = mb.symbol, .tip = mb.tip, .enabled = mb.enabled, .closes_menu = false, .spinner = mb.spinner });
-        for ([_]bool{ false, true }) |dark| {
-            var path: [std.fs.max_path_bytes:0]u8 = undefined;
-            const pz = std.fmt.bufPrintSentinel(&path, "{s}/serverrow-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;
-            if (!button_row.renderPng(row, pz.ptr, dark, c.hover, c.pressed, mb.why)) std.debug.print("sushibar: could not render {s}\n", .{pz});
-        }
-    }
-}
-
-/// The Port submenu's rows: the default (not removable), then added ports.
-fn renderPortRows(dir: []const u8) void {
-    const rows = [_]port_row.Row{
-        .{ .port = 12345, .label = "12345 — Example-Flash-Next-Sushi-STQ-2.75bpw", .checked = true, .removable = false },
-        .{ .port = 18803, .label = "18803 — not running", .checked = false, .removable = true },
-        .{ .port = 18802, .label = "18802 — Example-Flash-1017", .checked = false, .removable = true },
-        .{ .port = 7000, .label = "7000 — no model", .checked = false, .removable = true },
-    };
-    const Case = struct { name: []const u8, hover: ?usize = null, x_hover: bool = false };
-    for ([_]Case{ .{ .name = "normal" }, .{ .name = "hover-default", .hover = 0 }, .{ .name = "hover-added", .hover = 1 }, .{ .name = "hover-remove", .hover = 2, .x_hover = true } }) |c| {
-        for ([_]bool{ false, true }) |dark| {
-            var path: [std.fs.max_path_bytes:0]u8 = undefined;
-            const pz = std.fmt.bufPrintSentinel(&path, "{s}/portrows-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;
-            if (!port_row.renderPng(&rows, pz.ptr, dark, c.hover, c.x_hover)) std.debug.print("sushibar: could not render {s}\n", .{pz});
-        }
-    }
-}
-
-/// The window reading a real file: its last lines on open, then what the file grew by while the reader was scrolled
-/// up, which the New lines pill announces.
-fn renderFollowedLog(dir: []const u8) void {
-    var path: [std.fs.max_path_bytes:0]u8 = undefined;
-    const file = std.fmt.bufPrint(&path, "{s}/followed.log", .{dir}) catch return;
-    var text: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-    defer text.deinit();
-    const w = &text.writer;
-    for (1..3001) |i| w.print("line {d} of the first read\n", .{i}) catch return;
-    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = file, .data = text.written() }) catch return;
-    const src: logic.LogSource = .{ .kind = .given, .path = file };
-    log_view.sync(11250, src);
-    log_view.scrollToTop();
-    for (3001..3006) |i| w.print("line {d} appended later\n", .{i}) catch return;
-    w.writeAll("a line still being writ") catch return;
-    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = file, .data = text.written() }) catch return;
-    log_view.sync(11250, src);
-    for ([_]bool{ false, true }) |dark| {
-        var png: [std.fs.max_path_bytes:0]u8 = undefined;
-        const pz = std.fmt.bufPrintSentinel(&png, "{s}/log-window-new-lines-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch return;
-        if (!log_view.renderPng(pz.ptr, dark, null)) std.debug.print("sushibar: could not render {s}\n", .{pz});
-    }
 }
 
 // ── Launch ──
@@ -3022,9 +1404,9 @@ fn detach(gpa: std.mem.Allocator, args: []const []const u8, self_exe: [:0]const 
     const child = proc.spawnDetached(argv.items, test_polls > 0) catch fail("cannot start the detached copy", .{});
     var waited: u32 = 0;
     while (waited < 100) : (waited += 1) {
-        if (proc.verifiedPid(g_io, g_bar_pid_path, bar_exe, false)) |e| {
+        if (proc.verifiedPid(g_io, g_bar_pid_path, poller.bar_exe, false)) |e| {
             if (e.pid == child) {
-                out(g_io, "sushibar started (pid {d}), watching port {d}\n", .{ child, port() });
+                out(g_io, "sushibar started (pid {d}), watching port {d}\n", .{ child, poller.port() });
                 std.process.exit(0);
             }
             out(g_io, "sushibar is already running (pid {d})\n", .{e.pid});
@@ -3032,7 +1414,7 @@ fn detach(gpa: std.mem.Allocator, args: []const []const u8, self_exe: [:0]const 
         }
         if (std.c.waitpid(child, null, std.c.W.NOHANG) == child) {
             // A copy that lost the race for the single-instance lock exits at once; the winner's pid file explains it.
-            if (proc.verifiedPid(g_io, g_bar_pid_path, bar_exe, false)) |e| {
+            if (proc.verifiedPid(g_io, g_bar_pid_path, poller.bar_exe, false)) |e| {
                 out(g_io, "sushibar is already running (pid {d})\n", .{e.pid});
                 std.process.exit(0);
             }
@@ -3072,7 +1454,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .run => |p| explicit = p,
     }
-    if (env("SUSHIBAR_RENDER_HEADER")) |dir| renderHeaders(gpa, dir);
+    if (env("SUSHIBAR_RENDER_HEADER")) |dir| render_gallery.run(g_io, gpa, dir);
     if (!logic.guiSession(env("SSH_CONNECTION"), env("SSH_TTY")))
         fail("no GUI session (this is an ssh login): run sushibar from the Mac's desktop session", .{});
 
@@ -3089,12 +1471,12 @@ pub fn main(init: std.process.Init) !void {
     g_saved = saved.ports;
     g_lan = saved.lan;
     g_last_model.set(saved.model());
-    g_port.store(logic.choosePort(explicit, saved.port, g_default_port), .release);
+    poller.storePort(logic.choosePort(explicit, saved.port, g_default_port));
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const self_exe = selfPath(&exe_buf) orelse fail("cannot resolve its own path", .{});
     g_self_exe = try gpa.dupeSentinel(u8, self_exe, 0);
-    if (proc.verifiedPid(g_io, g_bar_pid_path, bar_exe, false)) |e| {
+    if (proc.verifiedPid(g_io, g_bar_pid_path, poller.bar_exe, false)) |e| {
         if (e.pid != proc.selfPid()) {
             out(g_io, "sushibar is already running (pid {d})\n", .{e.pid});
             return;
@@ -3110,12 +1492,21 @@ pub fn main(init: std.process.Init) !void {
         out(g_io, "sushibar is already running\n", .{});
         return;
     }
-    try proc.writePid(g_io, g_home, g_bar_pid_path, .{ .pid = proc.selfPid(), .port = port() });
-    var sb: [path_cap]u8 = undefined;
-    if (siblingNow(&sb, server_exe)) |sushi| {
+    try proc.writePid(g_io, g_home, g_bar_pid_path, .{ .pid = proc.selfPid(), .port = poller.port() });
+    poller.init(.{
+        .io = g_io,
+        .home = g_home,
+        .self_exe = g_self_exe,
+        .test_polls = test_polls,
+        .test_tick_ms = test_tick_ms,
+        .notify_main = &notifyMain,
+    });
+    var sb: [poller.path_cap]u8 = undefined;
+    if (poller.siblingNow(&sb, poller.server_exe)) |sushi| {
         g_sushi_found = true;
         var real: [std.fs.max_path_bytes]u8 = undefined;
         g_sibling_brew = logic.isBrewKeg(proc.realPath(&real, sushi) orelse sushi);
+        poller.setSiblingBrew(g_sibling_brew);
     }
     adoptStarted();
     runMenuBar();
@@ -3129,14 +1520,14 @@ fn testToolTip(view: objc.id) []const u8 {
 
 test "the note of a refused load keeps its whole text in the tooltip, a character across the old 255-byte cut included" {
     const pad: [183]u8 = @splat('x');
-    var msg: [note_cap]u8 = undefined;
+    var msg: [poller.note_cap]u8 = undefined;
     const full = try std.fmt.bufPrint(&msg, "Port 8080: could not load Pack-{s}: Not enough memory to load this model.\u{2014} It needs 20.0 GB, and only 12.0 GB of RAM is free right now. To load it:\n- Quit other apps or unload another model to free about 8.0 GB, then retry.\n- Use a smaller pack of this model.", .{&pad});
     try std.testing.expect(full.len > 300 and std.mem.indexOf(u8, full, "\u{2014}").? < 255 and std.mem.indexOf(u8, full, "\u{2014}").? + 3 > 255);
     note_mi = objc.new(objc.class("NSMenuItem"));
     defer {
         objc.release(note_mi);
         note_mi = null;
-        shown_note_sig_len = std.math.maxInt(usize);
+        shown_note_sig = null;
     }
     var fit_b: [logic.note_title_max + 4]u8 = undefined;
     showNote(logic.fitNote(&fit_b, full, logic.note_title_max), full, true);
@@ -3168,10 +1559,10 @@ test "a server's error body gives its error.message, and anything else gives not
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("no room", errorMessage(a, "{\"error\":{\"message\":\"no room\",\"type\":\"x\"}}"));
-    try std.testing.expectEqualStrings("", errorMessage(a, "{\"error\":{\"type\":\"x\"}}"));
-    try std.testing.expectEqualStrings("", errorMessage(a, "{\"error\":null}"));
-    try std.testing.expectEqualStrings("", errorMessage(a, "{\"error\":\"no room\"}"));
-    try std.testing.expectEqualStrings("", errorMessage(a, "{}"));
-    try std.testing.expectEqualStrings("", errorMessage(a, "not json"));
+    try std.testing.expectEqualStrings("no room", poller.errorMessage(a, "{\"error\":{\"message\":\"no room\",\"type\":\"x\"}}"));
+    try std.testing.expectEqualStrings("", poller.errorMessage(a, "{\"error\":{\"type\":\"x\"}}"));
+    try std.testing.expectEqualStrings("", poller.errorMessage(a, "{\"error\":null}"));
+    try std.testing.expectEqualStrings("", poller.errorMessage(a, "{\"error\":\"no room\"}"));
+    try std.testing.expectEqualStrings("", poller.errorMessage(a, "{}"));
+    try std.testing.expectEqualStrings("", poller.errorMessage(a, "not json"));
 }

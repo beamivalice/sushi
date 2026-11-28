@@ -264,6 +264,28 @@ pub fn symbolImage(name: id, c: id) id {
     return msg(id, img, "imageWithSymbolConfiguration:", .{cfg});
 }
 
+/// Applies light or dark Aqua appearance to a view or window.
+pub fn setAppearance(target: id, dark: bool) void {
+    const name: [*:0]const u8 = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
+    msg(void, target, "setAppearance:", .{msg(id, class("NSAppearance"), "appearanceNamed:", .{nsString(name)})});
+}
+
+/// Captures `view` at `bounds` into a PNG at `path` without altering its appearance.
+pub fn writeViewPng(view: id, bounds: NSRect, path: [*:0]const u8) bool {
+    const rep = msg(id, view, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
+    if (rep == null) return false;
+    msg(void, view, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
+    const data = msg(id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(id, null) });
+    if (data == null) return false;
+    return msg(bool, data, "writeToFile:atomically:", .{ nsString(path), true });
+}
+
+/// Applies `dark` or light Aqua appearance to `view`, captures `bounds`, and writes a PNG to `path`.
+pub fn renderViewPng(view: id, bounds: NSRect, path: [*:0]const u8, dark: bool) bool {
+    setAppearance(view, dark);
+    return writeViewPng(view, bounds, path);
+}
+
 /// Follows the pointer from a mouse-down in `view` to the button release, as a control does, calling `moved(view,
 /// inside)` as it goes. True when the release was inside the view.
 pub fn trackClick(view: id, moved: *const fn (id, bool) void) bool {

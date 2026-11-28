@@ -264,13 +264,5 @@ pub fn renderPng(list: []const Row, path: [*:0]const u8, dark: bool, hover: ?usi
         st.x_hover = st.hover and x_hover;
         showX(st);
     }
-    const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
-    msg(void, stack, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
-    const bounds = NSRect{ .x = 0, .y = 0, .w = w, .h = total };
-    const rep = msg(id, stack, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
-    if (rep == null) return false;
-    msg(void, stack, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
-    const data = msg(id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(id, null) });
-    if (data == null) return false;
-    return msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(path), true });
+    return objc.renderViewPng(stack, .{ .x = 0, .y = 0, .w = w, .h = total }, path, dark);
 }

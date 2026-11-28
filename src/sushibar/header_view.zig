@@ -71,9 +71,7 @@ fn str(s: []const u8) id {
     return objc.nsText(s);
 }
 
-fn color(name: [*:0]const u8) id {
-    return objc.color(name);
-}
+const color = objc.color;
 
 fn font(size: f64, weight: f64, mono_digits: bool) id {
     return if (mono_digits)
@@ -379,16 +377,7 @@ pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
 pub fn renderPng(path: [*:0]const u8, dark: bool) bool {
     opaque_bg = true;
     defer opaque_bg = false;
-    const h = shownHeight();
-    const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
-    msg(void, view, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
-    const bounds = NSRect{ .x = 0, .y = 0, .w = width, .h = h };
-    const rep = msg(id, view, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
-    if (rep == null) return false;
-    msg(void, view, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
-    const data = msg(id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(id, null) });
-    if (data == null) return false;
-    return msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(path), true });
+    return objc.renderViewPng(view, .{ .x = 0, .y = 0, .w = width, .h = shownHeight() }, path, dark);
 }
 
 /// The attributes of a problem note in the menu: the menu font in orange.
