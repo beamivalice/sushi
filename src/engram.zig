@@ -405,15 +405,16 @@ pub const Table = struct {
         return job.readRange(0, n, readParts(n));
     }
 
-    /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (the caller frees).
-    pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    /// The first `n` rows of `raw` dequantized to `dt`: `[n, head_dim]` (the caller frees).
+    pub fn dequantAs(self: *const Table, raw: Raw, n: usize, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
         const rows: c_int = @intCast(n);
         if (self.sdim == 0) {
             const va = try mlx.newData(raw.w.ptr, &[_]c_int{ rows, @intCast(self.head_dim) }, .bfloat16);
+            if (dt == .bfloat16) return va;
             defer _ = mlx.mlx_array_free(va);
             var wide = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(wide);
-            try mlx.check(mlx.mlx_astype(&wide, va, .float32, s));
+            try mlx.check(mlx.mlx_astype(&wide, va, dt, s));
             return wide;
         }
         const wa = try mlx.newData(raw.w.ptr, &[_]c_int{ rows, @intCast(self.head_dim / 4) }, .uint32);
@@ -422,15 +423,25 @@ pub const Table = struct {
         defer _ = mlx.mlx_array_free(sa);
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_dequantize(&out, wa, sa, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        try mlx.check(mlx.mlx_dequantize(&out, wa, sa, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{ .ctx = null }, .{ .value = dt, .has_value = true }, s));
         return out;
+    }
+
+    /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (the caller frees).
+    pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+        return self.dequantAs(raw, n, .float32, s);
+    }
+
+    /// Rows `ids`, dequantized to `dt`: `[ids.len, head_dim]` (the caller frees).
+    pub fn gatherAs(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+        const raw = try self.read(gpa, ids);
+        defer raw.deinit(gpa);
+        return self.dequantAs(raw, ids.len, dt, s);
     }
 
     /// Rows `ids`, dequantized: f32 `[ids.len, head_dim]` (the caller frees).
     pub fn gather(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
-        const raw = try self.read(gpa, ids);
-        defer raw.deinit(gpa);
-        return self.dequant(raw, ids.len, s);
+        return self.gatherAs(gpa, ids, .float32, s);
     }
 
     /// Asks the kernel to read every `stride`-th of `ids` from `first` into the page cache now
@@ -897,6 +908,8 @@ pub const Prefetch = struct {
     thread: ?std.Thread = null,
     pool: ?*ReadPool = null,
     next: ?*Prefetch = null,
+    item_mu: std.Io.Mutex = .init,
+    item_cv: std.Io.Condition = .init,
 
     /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
     pub const Spec = struct { at: usize, len: usize, ids: []const u32 };
@@ -961,13 +974,18 @@ pub const Prefetch = struct {
     }
 
     fn runBody(self: *Prefetch) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
         for (self.grids) |*g| {
             const n_spans = g.items.len / self.tables.len;
             for (self.tables, 0..) |table, layer| for (0..n_spans) |k| {
                 if (self.stop.load(.acquire)) return;
                 const item = &g.items[layer * n_spans + k];
-                item.raw = self.readSpan(g, table, layer, k) catch null;
-                item.state.store(if (item.raw != null) done else failed, .release);
+                const raw = self.readSpan(g, table, layer, k) catch null;
+                self.item_mu.lockUncancelable(io);
+                item.raw = raw;
+                item.state.store(if (raw != null) done else failed, .release);
+                self.item_cv.broadcast(io);
+                self.item_mu.unlock(io);
             };
         }
     }
@@ -1003,7 +1021,12 @@ pub const Prefetch = struct {
     pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !Table.Raw {
         for (self.grids) |*g| if (g.at == at) {
             const item = &g.items[layer * (g.items.len / self.tables.len) + k];
-            while (item.state.load(.acquire) == pending) std.Thread.yield() catch {};
+            if (item.state.load(.acquire) == pending) {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                self.item_mu.lockUncancelable(io);
+                while (item.state.load(.acquire) == pending) self.item_cv.wait(io, &self.item_mu) catch {};
+                self.item_mu.unlock(io);
+            }
             const raw = item.raw orelse return error.EngramRead;
             item.raw = null;
             return raw;
@@ -1097,6 +1120,20 @@ test "engram: the table is found by the index, or by the headers when there is n
         try testing.expectEqual(@as(f32, 0.5), v[63]);
         try testing.expectEqual(@as(f32, 1), v[64]);
         try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
+        if (indexed) {
+            const bf = try t.gatherAs(testing.allocator, &.{ 3, 0 }, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(bf);
+            var cast = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cast);
+            try mlx.check(mlx.mlx_astype(&cast, rows, .bfloat16, s));
+            try mlx.check(mlx.mlx_array_eval(bf));
+            try mlx.check(mlx.mlx_array_eval(cast));
+            try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(bf));
+            const n = mlx.mlx_array_size(bf);
+            const got_u16: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(bf).?);
+            const want_u16: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(cast).?);
+            try testing.expectEqualSlices(u16, want_u16[0..n], got_u16[0..n]);
+        }
     }
 }
 

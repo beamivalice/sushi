@@ -699,6 +699,24 @@ const static_specs = [_]KernelSpec{
         },
         .filter = indexTileFilter,
     },
+    .{
+        .name = "dsv41_index_tile_nax",
+        .nax = true,
+        .header = if (custom.is_codegen) metal_def.NAX_HEADER else "",
+        .source = if (custom.is_codegen) sparse.IDX_TILE_NAX_SOURCE else "",
+        .inputs = &.{
+            .{ .name = "q", .ty = fix(.bfloat16) },
+            .{ .name = "keys", .ty = fix(.bfloat16) },
+            .{ .name = "w", .ty = par("WDT") },
+            .{ .name = "meta", .ty = fix(.int32) },
+            .{ .name = "wsc", .ty = fix(.float32) },
+        },
+        .outputs = &.{.{ .name = "scores", .ty = fix(.float32) }},
+        .params = &.{
+            .{ .name = "IT", .kind = .ct_int, .ints = &.{4} },
+            .{ .name = "WDT", .kind = .io_dtype, .dtypes = &.{ .float32, .bfloat16 } },
+        },
+    },
 
     // ── src/sampler_draw.zig (1 kernel) ──
     .{

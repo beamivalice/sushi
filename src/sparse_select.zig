@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const metal_def = @import("metal_def.zig");
+const nax_gate = @import("nax_gate.zig");
 
 const A = mlx.mlx_array;
 const Def = metal_def.Def;
@@ -30,62 +31,110 @@ fn ints(vals: []const i32) !A {
 /// the chunks' candidates (ascending in the row's index, so a tie still goes to the lower index). A variant defines
 /// `n`, `xr`, `ELEM(i)` (the key of element i) and `EMIT(p, i)` (pick p is element i).
 pub const TOPK_BODY =
-    \\threadgroup atomic_uint hist[256];
-    \\threadgroup uint t_sel[2], t_part[32];
+    \\threadgroup atomic_uint hist[8][256];
+    \\threadgroup uint t_sel[3], t_gt[32], t_eq[32];
     \\const uint K = uint(kk[0]);
+    \\const uint bank = sg & 7u;
     \\uint prefix = 0, krem = K;
+    \\bool exact_cut = false;
     \\for (int pass = 0; pass < 4; ++pass) {
     \\  const int shift = 24 - 8 * pass;
     \\  const uint hmask = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
-    \\  for (uint b = tid; b < 256; b += TG) atomic_store_explicit(&hist[b], 0u, metal::memory_order_relaxed);
+    \\  for (uint b = tid; b < 8u * 256u; b += uint(TG)) atomic_store_explicit(&hist[b >> 8][b & 255u], 0u, metal::memory_order_relaxed);
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = int(tid); i < n; i += TG) {
-    \\    const uint key = ELEM(i);
-    \\    if ((key & hmask) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, metal::memory_order_relaxed);
+    \\  for (int base = int(sg) * 32; base < n; base += TG) {
+    \\    const int i = base + int(lane);
+    \\    const bool valid = i < n;
+    \\    const uint key = valid ? ELEM(i) : 0u;
+    \\    const bool m = valid && ((key & hmask) == prefix);
+    \\    const uint m_mask = uint(static_cast<metal::simd_vote::vote_t>(metal::simd_ballot(m)));
+    \\    if (m_mask != 0u) {
+    \\      const uint b = (key >> shift) & 255u;
+    \\      const uint lead0 = metal::ctz(m_mask);
+    \\      const uint b0 = metal::simd_broadcast(b, ushort(lead0));
+    \\      const uint h0 = uint(static_cast<metal::simd_vote::vote_t>(metal::simd_ballot(m && b == b0)));
+    \\      if (lane == lead0) atomic_fetch_add_explicit(&hist[bank][b0], metal::popcount(h0), metal::memory_order_relaxed);
+    \\      const uint rem = m_mask & ~h0;
+    \\      if (rem != 0u) {
+    \\        const uint lead1 = metal::ctz(rem);
+    \\        const uint b1 = metal::simd_broadcast(b, ushort(lead1));
+    \\        const uint h1 = uint(static_cast<metal::simd_vote::vote_t>(metal::simd_ballot(((rem & (1u << lane)) != 0u) && b == b1)));
+    \\        if (lane == lead1) atomic_fetch_add_explicit(&hist[bank][b1], metal::popcount(h1), metal::memory_order_relaxed);
+    \\        if (((rem & ~h1) & (1u << lane)) != 0u) atomic_fetch_add_explicit(&hist[bank][b], 1u, metal::memory_order_relaxed);
+    \\      }
+    \\    }
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (sg == 0) {
+    \\  if (sg == 0u) {
     \\    uint c[8], tot = 0;
-    \\    for (int j = 0; j < 8; ++j) { c[j] = atomic_load_explicit(&hist[255 - (lane * 8 + j)], metal::memory_order_relaxed); tot += c[j]; }
+    \\    for (int j = 0; j < 8; ++j) {
+    \\      const uint idx_b = 255u - (lane * 8u + uint(j));
+    \\      uint sum_b = 0u;
+    \\      #pragma clang loop unroll(full)
+    \\      for (uint bk = 0u; bk < 8u; ++bk) sum_b += atomic_load_explicit(&hist[bk][idx_b], metal::memory_order_relaxed);
+    \\      c[j] = sum_b;
+    \\      tot += sum_b;
+    \\    }
     \\    const uint before = metal::simd_prefix_exclusive_sum(tot);
     \\    const bool mine = before < krem && before + tot >= krem;
     \\    if (mine) {
     \\      uint acc = before;
     \\      int j = 0;
     \\      for (; j < 8; ++j) { if (acc + c[j] >= krem) break; acc += c[j]; }
-    \\      t_sel[0] = prefix | (uint(255 - (lane * 8 + j)) << shift);
+    \\      t_sel[0] = prefix | (uint(255u - (lane * 8u + uint(j))) << shift);
     \\      t_sel[1] = krem - acc;
+    \\      t_sel[2] = (acc + c[j] == krem) ? 1u : 0u;
     \\    }
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  prefix = t_sel[0];
     \\  krem = t_sel[1];
+    \\  exact_cut = t_sel[2] != 0u;
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (exact_cut) break;
     \\}
-    \\const int C = (n + TG - 1) / TG, i0 = int(tid) * C, i1 = metal::min(n, i0 + C);
-    \\uint gt = 0, eq = 0;
-    \\for (int i = i0; i < i1; ++i) { const uint key = ELEM(i); gt += key > prefix; eq += key == prefix; }
-    \\uint s = metal::simd_prefix_exclusive_sum(eq);
-    \\if (lane == 31) t_part[sg] = s + eq;
+    \\const int nsg = TG / 32;
+    \\const int sc = (n + nsg - 1) / nsg;
+    \\const int s0 = int(sg) * sc, s1 = metal::min(n, s0 + sc);
+    \\uint sg_gt = 0u, sg_eq = 0u;
+    \\for (int base = s0; base < s1; base += 32) {
+    \\  const int i = base + int(lane);
+    \\  const bool valid = i < s1;
+    \\  const uint key = valid ? ELEM(i) : 0u;
+    \\  const bool is_gt = valid && (exact_cut ? (key >= prefix) : (key > prefix));
+    \\  const bool is_eq = valid && !exact_cut && (key == prefix);
+    \\  sg_gt += metal::popcount(uint(static_cast<metal::simd_vote::vote_t>(metal::simd_ballot(is_gt))));
+    \\  sg_eq += metal::popcount(uint(static_cast<metal::simd_vote::vote_t>(metal::simd_ballot(is_eq))));
+    \\}
+    \\if (lane == 0u) { t_gt[sg] = sg_gt; t_eq[sg] = sg_eq; }
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\uint off = 0;
-    \\for (uint g = 0; g < sg; ++g) off += t_part[g];
-    \\const uint eq_before = s + off;
-    \\const uint take = eq_before >= krem ? 0u : metal::min(eq, krem - eq_before);
-    \\const uint sel = gt + take;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\s = metal::simd_prefix_exclusive_sum(sel);
-    \\if (lane == 31) t_part[sg] = s + sel;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\off = 0;
-    \\for (uint g = 0; g < sg; ++g) off += t_part[g];
-    \\uint pos = s + off, taken = 0;
-    \\for (int i = i0; i < i1; ++i) {
-    \\  const uint key = ELEM(i);
-    \\  if (key > prefix || (key == prefix && taken < take)) {
-    \\    taken += key == prefix;
-    \\    EMIT(pos, i);
-    \\    ++pos;
+    \\uint eq_before = 0u, pos = 0u;
+    \\for (uint g = 0u; g < sg; ++g) {
+    \\  const uint geq = t_eq[g];
+    \\  const uint gtake = eq_before >= krem ? 0u : metal::min(geq, krem - eq_before);
+    \\  eq_before += geq;
+    \\  pos += t_gt[g] + gtake;
+    \\}
+    \\const uint take_sg = eq_before >= krem ? 0u : metal::min(sg_eq, krem - eq_before);
+    \\if (sg_gt + take_sg > 0u) {
+    \\  uint taken = 0u;
+    \\  for (int base = s0; base < s1; base += 32) {
+    \\    const int i = base + int(lane);
+    \\    const bool valid = i < s1;
+    \\    const uint key = valid ? ELEM(i) : 0u;
+    \\    const bool is_gt = valid && (exact_cut ? (key >= prefix) : (key > prefix));
+    \\    const bool is_eq = valid && !exact_cut && (key == prefix);
+    \\    const uint eq_m = uint(static_cast<metal::simd_vote::vote_t>(metal::simd_ballot(is_eq)));
+    \\    const uint eq_before_lane = metal::popcount(eq_m & ((1u << lane) - 1u));
+    \\    const bool take_me = is_eq && (taken + eq_before_lane < take_sg);
+    \\    const bool pick = is_gt || take_me;
+    \\    const uint pk_m = uint(static_cast<metal::simd_vote::vote_t>(metal::simd_ballot(pick)));
+    \\    if (pick) {
+    \\      const uint off_lane = metal::popcount(pk_m & ((1u << lane) - 1u));
+    \\      EMIT(pos + off_lane, i);
+    \\    }
+    \\    pos += metal::popcount(pk_m);
+    \\    taken += metal::popcount(eq_m);
     \\  }
     \\}
 ;
@@ -286,6 +335,129 @@ var topk_merge_def = Def{ .name = "dsv41_topk_merge", .ins = &.{ "x", "ids", "kk
 var idx_score_def = Def{ .name = "dsv41_index_scores", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_SCORE_SOURCE };
 var idx_tile_def = Def{ .name = "dsv41_index_tile", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_TILE_SOURCE };
 
+/// `IDX_TILE_SOURCE` on the matrix units (`dsv41_nax_mma<16, 32>`) for IH=32, IHD=128, bf16 operands: 8 query rows
+/// per threadgroup (1 per simdgroup) share each cooperatively loaded 32-key tile in transposed threadgroup memory,
+/// keeping every query head in registers across IT=4 steps (128 keys) and reducing all 32 heads via 3 register
+/// shuffles with zero threadgroup scratch and zero reduction barriers.
+pub const IDX_TILE_NAX_SOURCE =
+    \\using B4 = metal::vec<bfloat, 4>;
+    \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const int L = q_shape[0], nb = keys_shape[0];
+    \\const int l0 = threadgroup_position_in_grid.y * 8;
+    \\const int l = l0 + int(sg);
+    \\const int l_max = metal::min(l0 + 7, L - 1);
+    \\const int tile0 = threadgroup_position_in_grid.x * (IT * 32);
+    \\const int max_seen = (meta[0] + l_max + 1) / meta[1] - meta[2];
+    \\if (tile0 >= max_seen) {
+    \\  const int end = metal::min(nb, tile0 + IT * 32);
+    \\  for (int rr = l0; rr <= l_max; ++rr)
+    \\    for (int n = tile0 + int(tid); n < end; n += 256) scores[size_t(rr) * nb + n] = -INFINITY;
+    \\  return;
+    \\}
+    \\const int seen = l < L ? ((meta[0] + l + 1) / meta[1] - meta[2]) : 0;
+    \\const short r0 = dsv41_nax_r(lane, 0), cb = dsv41_nax_c(lane, 0);
+    \\bfloat a[4][2][16];
+    \\float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f, w3 = 0.0f;
+    \\if (l < L) {
+    \\  const float sc = wsc[0];
+    \\  const size_t wb = size_t(l) * 32;
+    \\  w0 = float(w[wb + r0]) * sc;
+    \\  w1 = float(w[wb + r0 + 8]) * sc;
+    \\  w2 = float(w[wb + r0 + 16]) * sc;
+    \\  w3 = float(w[wb + r0 + 24]) * sc;
+    \\  const device bfloat* qr = q + size_t(l) * 32 * 128;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int hh = 0; hh < 2; ++hh) {
+    \\    const device bfloat* qh0 = qr + (hh * 16 + r0) * 128;
+    \\    const device bfloat* qh1 = qr + (hh * 16 + r0 + 8) * 128;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int g = 0; g < 4; ++g) {
+    \\      const B4 v0 = *(const device B4*)(qh0 + g * 32 + cb);
+    \\      const B4 v1 = *(const device B4*)(qh1 + g * 32 + cb);
+    \\      const B4 v2 = *(const device B4*)(qh0 + g * 32 + 16 + cb);
+    \\      const B4 v3 = *(const device B4*)(qh1 + g * 32 + 16 + cb);
+    \\      a[g][hh][0] = v0[0]; a[g][hh][1] = v0[1]; a[g][hh][2] = v0[2]; a[g][hh][3] = v0[3];
+    \\      a[g][hh][4] = v1[0]; a[g][hh][5] = v1[1]; a[g][hh][6] = v1[2]; a[g][hh][7] = v1[3];
+    \\      a[g][hh][8] = v2[0]; a[g][hh][9] = v2[1]; a[g][hh][10] = v2[2]; a[g][hh][11] = v2[3];
+    \\      a[g][hh][12] = v3[0]; a[g][hh][13] = v3[1]; a[g][hh][14] = v3[2]; a[g][hh][15] = v3[3];
+    \\    }
+    \\  }
+    \\}
+    \\threadgroup bfloat kt[128 * 36];
+    \\const int k_local = int(tid) >> 3;
+    \\const int c_chunk = (int(tid) & 7) * 16;
+    \\for (int it = 0; it < IT; ++it) {
+    \\  const int n0 = tile0 + it * 32;
+    \\  if (n0 >= nb) break;
+    \\  if (n0 >= max_seen) {
+    \\    const int end = metal::min(nb, tile0 + IT * 32);
+    \\    for (int rr = l0; rr <= l_max; ++rr)
+    \\      for (int n = n0 + int(tid); n < end; n += 256) scores[size_t(rr) * nb + n] = -INFINITY;
+    \\    break;
+    \\  }
+    \\  const int kn = n0 + k_local;
+    \\  if (kn < nb) {
+    \\    const device B4* src = (const device B4*)(keys + size_t(kn) * 128 + c_chunk);
+    \\    #pragma clang loop unroll(full)
+    \\    for (int v = 0; v < 4; ++v) {
+    \\      const B4 vals = src[v];
+    \\      kt[(c_chunk + v * 4 + 0) * 36 + k_local] = vals[0];
+    \\      kt[(c_chunk + v * 4 + 1) * 36 + k_local] = vals[1];
+    \\      kt[(c_chunk + v * 4 + 2) * 36 + k_local] = vals[2];
+    \\      kt[(c_chunk + v * 4 + 3) * 36 + k_local] = vals[3];
+    \\    }
+    \\  } else {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int j = 0; j < 16; ++j) kt[(c_chunk + j) * 36 + k_local] = bfloat(0.0f);
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (l < L) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int u = 0; u < 2; ++u) {
+    \\      const int uoff = u * 16 + int(cb);
+    \\      float c0[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    \\      float c1[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    \\      #pragma clang loop unroll(full)
+    \\      for (int g = 0; g < 4; ++g) {
+    \\        bfloat b[16];
+    \\        const B4 b0 = *(const threadgroup B4*)(kt + (g * 32 + r0) * 36 + uoff);
+    \\        const B4 b1 = *(const threadgroup B4*)(kt + (g * 32 + r0 + 8) * 36 + uoff);
+    \\        const B4 b2 = *(const threadgroup B4*)(kt + (g * 32 + r0 + 16) * 36 + uoff);
+    \\        const B4 b3 = *(const threadgroup B4*)(kt + (g * 32 + r0 + 24) * 36 + uoff);
+    \\        b[0] = b0[0]; b[1] = b0[1]; b[2] = b0[2]; b[3] = b0[3];
+    \\        b[4] = b1[0]; b[5] = b1[1]; b[6] = b1[2]; b[7] = b1[3];
+    \\        b[8] = b2[0]; b[9] = b2[1]; b[10] = b2[2]; b[11] = b2[3];
+    \\        b[12] = b3[0]; b[13] = b3[1]; b[14] = b3[2]; b[15] = b3[3];
+    \\        dsv41_nax_mma<16, 32>(c0, a[g][0], b);
+    \\        dsv41_nax_mma<16, 32>(c1, a[g][1], b);
+    \\      }
+    \\      float s[4];
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < 4; ++j) {
+    \\        float acc = metal::max(c0[j], 0.0f) * w0
+    \\                  + metal::max(c0[4 + j], 0.0f) * w1
+    \\                  + metal::max(c1[j], 0.0f) * w2
+    \\                  + metal::max(c1[4 + j], 0.0f) * w3;
+    \\        acc += metal::simd_shuffle_xor(acc, ushort(2));
+    \\        acc += metal::simd_shuffle_xor(acc, ushort(4));
+    \\        acc += metal::simd_shuffle_xor(acc, ushort(16));
+    \\        s[j] = acc;
+    \\      }
+    \\      if (r0 == 0) {
+    \\        #pragma clang loop unroll(full)
+    \\        for (int j = 0; j < 4; ++j) {
+    \\          const int n = n0 + u * 16 + int(cb) + j;
+    \\          if (n < nb) scores[size_t(l) * nb + n] = n < seen ? s[j] : -INFINITY;
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+;
+var idx_tile_nax_def = Def{ .name = "dsv41_index_tile_nax", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_TILE_NAX_SOURCE, .header = metal_def.NAX_HEADER };
+
 /// Threads a top-k threadgroup runs; an arch's probe halves it where the GPU caps the kernel lower.
 pub var topk_tg: usize = 1024;
 
@@ -379,6 +551,14 @@ pub fn indexScoresTile(s: mlx.mlx_stream, q: A, keys: A, w: A, wscale: f32, p0: 
     const wsc = try mlx.newData(&[_]f32{wscale}, &.{1}, .float32);
     defer _ = mlx.mlx_array_free(wsc);
     var o: [1]A = undefined;
+    if (dt == .bfloat16 and dim(q, 1) == 32 and dim(keys, 1) == 128 and mlx.engine.isStream(s) and nax_gate.verifyQmmNaxAvailable()) {
+        const it: usize = 4;
+        const step = it * 32;
+        try launch(s, &idx_tile_nax_def, &.{ q, keys, w, meta, wsc }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + step - 1) / step * 256, (L + 7) / 8, 1 }, .{ 256, 1, 1 }, &.{
+            .{ .name = "IT", .v = ci(it) },
+        }, &.{}, &o);
+        return o[0];
+    }
     try launch(s, &idx_tile_def, &.{ q, keys, w, meta, wsc }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + kt - 1) / kt * 128, L, 1 }, .{ 128, 1, 1 }, &.{
         .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(q, 2)) }, .{ .name = "KT", .v = ci(kt) },
     }, &.{.{ .name = "T", .dt = dt }}, &o);
