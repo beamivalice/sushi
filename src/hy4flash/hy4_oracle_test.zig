@@ -474,6 +474,32 @@ test "hy4 cooler: the whole model on Sushi Cooler's stream prefills and decodes 
     };
 }
 
+test "hy4 cooler: where the GPU grants a top-k kernel fewer than 1,024 threads a group the load steps its width down, and the whole model answers the oracle's logits (HY4_BF16_TINY)" {
+    const sparse = @import("../sparse_select.zig");
+    const hy4_index = @import("hy4_index.zig");
+    const tg_was = sparse.topk_tg;
+    const pick_was = hy4_index.pick_tg;
+    defer {
+        sparse.topk_tg = tg_was;
+        hy4_index.pick_tg = pick_was;
+        mlx.engine.kernel.grant_cap = std.math.maxInt(usize);
+        mlx.engine.kernel.grant_cap_name = "";
+    }
+    for ([_][]const u8{ "dsv41_topk", "sushi_hy4_index_pick" }) |name| {
+        sparse.topk_tg = 1024;
+        hy4_index.pick_tg = null;
+        mlx.engine.kernel.grant_cap = 512;
+        mlx.engine.kernel.grant_cap_name = name;
+        coolerWhole() catch |e| {
+            if (e == error.SkipZigTest) return e;
+            var said: [512]u8 = undefined;
+            std.debug.print("\nthe Cooler run with {s} granted 512 threads failed ({t}): {s}\n", .{ name, e, mlx.takeError(&said) orelse "(no message)" });
+            return e;
+        };
+        try testing.expect((hy4_index.pick_tg orelse sparse.topk_tg) <= 512);
+    }
+}
+
 fn coolerWhole() !void {
     const hy4_model = @import("hy4_model.zig");
     try mlx.requireGpu();

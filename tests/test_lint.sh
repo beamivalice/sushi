@@ -569,6 +569,16 @@ printf '%s\n' 'fn handler() void {' '    _ = server_state.global_scheduler;' '}'
 printf '%s\n' 'detached-global-read src/q.zig:handler a connection thread the shutdown waits for' > "$TMP/t/allow"
 expect_green "a joined thread, an allowlisted handler, a test and a fixture after it"
 
+# A file of no token, and one whose first token is its test: the rule's scans start past token 0.
+tree
+: > "$TMP/t/src/p.zig"
+printf '%s\n' '// A note and no code.' > "$TMP/t/src/q.zig"
+expect_green "an empty file and a file of one comment"
+
+tree
+printf '%s\n' 'test "t" {' '    t.detach();' '}' 'fn worker() void {' '    _ = server_state.global_registry;' '}' > "$TMP/t/src/p.zig"
+expect_green "a file that opens with the test that detaches"
+
 # rule promise-active
 tree
 printf '%s\n' 'fn contextNow(c: *const C) u32 {' '    const active = gpu_mem.activeBytes();' '    return contextAt(c, active);' '}' > "$TMP/t/src/p.zig"

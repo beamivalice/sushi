@@ -18,8 +18,10 @@ pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !v
     if (rule.testFile(report.file) or std.mem.eql(u8, report.file, "src/server.zig")) return;
     const n = tree.tokens.len;
     var detaches = false;
-    for (1..n -| 1) |i| {
-        const t: u32 = @intCast(i);
+    // A range whose start is past its end is undefined, so both scans count up: a file may hold one token, or open
+    // with its test.
+    var t: u32 = 1;
+    while (t + 1 < n) : (t += 1) {
         if (tree.tokenTag(t) == .identifier and tree.tokenTag(t - 1) == .period and tree.tokenTag(t + 1) == .l_paren and std.mem.eql(u8, tree.tokenSlice(t), "detach")) detaches = true;
     }
     if (!detaches) return;
@@ -29,8 +31,8 @@ pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !v
         first_test = @intCast(i);
         break;
     };
-    for (2..first_test) |i| {
-        const t: u32 = @intCast(i);
+    t = 2;
+    while (t < first_test) : (t += 1) {
         if (tree.tokenTag(t) != .identifier or tree.tokenTag(t - 1) != .period or tree.tokenTag(t - 2) != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t - 2), "server_state")) continue;
         const field = tree.tokenSlice(t);

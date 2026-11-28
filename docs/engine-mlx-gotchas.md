@@ -219,6 +219,8 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
   use fills lives behind a mutable pointer or in a module global. The `const-write` rule of `zig build lint`
   ([testsuite](testsuite.md#lint)) fails on an `@constCast` rooted at a pointer-to-const param or a `const` local; a
   cast that only dispatches is allowlisted with its reason.
+- A `for (a..b)` whose start can pass its end (`for (1..n)` at `n` 0, `for (2..first)`) is ReleaseFast UB and a safe
+  build's `integer overflow`: guard the count, or count up with `while`.
 - `clearRetainingCapacity` poisons the cleared bytes (0xAA) in safe builds: never return `list.items` and clear it in a `defer`; drop the length with `items.len = 0`.
 - A test that aliases embedded bytes through an alignment cast is a coin flip per binary: copy fixtures to aligned
   storage (Debug builds catch what ReleaseFast hides).

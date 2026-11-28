@@ -571,8 +571,8 @@ pub fn wideScoresSg(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr, wscale: f32, p
     return out;
 }
 
-/// Probes `sparse.topk_tg` (shared with `sparse.topkIndices*`) and `pick_tg` (`sushi_hy4_index_pick`), halving each
-/// while Metal rejects the launch's threadgroup size on constrained GPUs (e.g. 576 cap on M1/M2).
+/// Probes `sparse.topk_tg` (`sparse.probeTopk`, the shared kernels') and `pick_tg` (`sushi_hy4_index_pick`), halving
+/// each while Metal rejects the launch's threadgroup size on constrained GPUs (e.g. 576 cap on M1/M2).
 pub fn probeTopk(s: mlx.mlx_stream) !void {
     const scope = mlx.engine.enter(s);
     defer scope.end();
@@ -583,16 +583,7 @@ pub fn probeTopk(s: mlx.mlx_stream) !void {
         sparse.topk_tg = widest;
         pick_tg = saved_pick_tg;
     }
-    while (true) {
-        mlx.expected_refusal = if (sparse.topk_tg > 32) "Thread group size" else null;
-        probeSparseTopkOnce(s) catch |e| {
-            if (e != error.MlxError or sparse.topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
-            sparse.topk_tg /= 2;
-            continue;
-        };
-        if (sparse.topk_tg < widest) log.info("[hy4] top-k kernels run {d} threads a group on this GPU (widest {d})\n", .{ sparse.topk_tg, widest });
-        break;
-    }
+    try sparse.probeTopk(s);
     var cur_pick = saved_pick_tg orelse sparse.topk_tg;
     const pick_widest = cur_pick;
     while (true) {
@@ -607,21 +598,6 @@ pub fn probeTopk(s: mlx.mlx_stream) !void {
         if (cur_pick == sparse.topk_tg) pick_tg = null;
         return;
     }
-}
-
-fn probeSparseTopkOnce(s: mlx.mlx_stream) !void {
-    var o: Ops = .{ .s = s };
-    defer o.deinit();
-    const zeros: [64]f32 = @splat(0);
-    const x = try o.own(try mlx.newData(&zeros, &[_]c_int{ 1, 64 }, .float32));
-    const lens_v = [_]i32{64};
-    const lens = try o.own(try mlx.newData(&lens_v, &[_]c_int{ 1, 1 }, .int32));
-    const one = try o.own(try sparse.topkIndicesSplit(s, x, 4, 1));
-    const split = try o.own(try sparse.topkIndicesSplit(s, x, 4, 2));
-    const below = try o.own(try sparse.topkIndicesBelow(s, x, 1, 4, lens));
-    try mlx.check(mlx.mlx_array_eval(one));
-    try mlx.check(mlx.mlx_array_eval(split));
-    try mlx.check(mlx.mlx_array_eval(below));
 }
 
 fn probePickOnce(s: mlx.mlx_stream) !void {
@@ -733,10 +709,14 @@ test "hy4 index: a decode row's group picks written as their key rows and keep m
     defer scope.end();
     const tg_was = pick_tg;
     defer pick_tg = tg_was;
+    // The widths this GPU grants, as a load finds them: one that grants fewer than 1,024 lanes runs the 256 alone.
+    try probeTopk(es);
+    const widest = pick_tg orelse sparse.topk_tg;
     const Case = struct { g: c_int, k: c_int, t: c_int };
     const cases = [_]Case{ .{ .g = 1024, .k = 511, .t = 1 }, .{ .g = 3750, .k = 511, .t = 1 }, .{ .g = 1001, .k = 511, .t = 3 }, .{ .g = 37, .k = 3, .t = 3 } };
     const ratio: c_int = 4;
     for ([_]usize{ 1024, 256 }) |tg| for (cases, 0..) |c, ci| {
+        if (tg > widest) continue;
         pick_tg = tg;
         var o: Ops = .{ .s = es };
         defer o.deinit();
