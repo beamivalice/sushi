@@ -269,6 +269,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   kernel is bound by its matrix-unit passes: P at two parts instead of three is 6.4% less prefill time a chunk. Dequantizing a kv8 key row inside the kernel
   costs more than its dot (a layer's 2,048 picks a row: 35 ms against 17): the store is read to bf16 once a layer
   and chunk (`hy4_latent.rangeBf16`) and picks index into that copy.
+- `hy4_absorb` wide-span FP32 `simdgroup_float8x8` kernels (`sushi_hy4_absorb_q_sg`, `v_sg`, `v_sg_gated`,
+  `v_sg_prepared_into`; `src/hy4flash/hy4_absorb.zig`, landed on `75a20f8b`) replace the composed wide-span
+  absorb GEMMs and separate gate + Hadamard-128 `W_o` prepare launches while keeping exact FP32 accumulation (an earlier
+  3-part bf16 NAX absorb failed the real-pack 8-category KLD gate on wikitext and was reverted).
+  `v_sg_prepared_into` runs a double-buffered `BM=64, BN=128, BK=16, WM=2, WN=4` tile (256 threads, 32 barriers/TG,
+  register-prefetched BF16 `kvb` loads, 2x less `kvb` traffic than single-buffered `BM=32`) with a 2-pass `32x128` 8-SG
+  parallel Hadamard-128 epilogue written directly into the chunk's `W_o` input buffer; warmed beside
+  `hy4_chain.gatedPreparedInto` in `warmSpanTails`, exact to the byte (`hy4_absorb` parity) and 9-digit identical on
+  8-category KLD.
+- **On M5 Ultra, SLC-resident small attention beats custom direct-BF16/KV8 drafter kernels**: a custom DFly2 attention
+  stack (`sushi_hy4_dfly_{scores,sink_softmax,values}`) tested against the served `sharedRows + concat + MLX steel_gemm`
+  regressed `draft_ms` (+0.2 to +0.3 ms) and prose acceptance (50.5% to 48.6%) because DFly2's 4.2 MB shared keys fit
+  entirely in the M5 Ultra's SLC (~68 us/layer total for attention vs ~2.86 ms for STQ K4/K6 linears and `lm_head`).
+  The custom DFly2 attention stack was not landed.
 - Both kernels take an `Epilogue` (`attnEpilogueFits`: head width a multiple of 256): the store does what `attnOut` did to the
   heads, in the same order, so the bytes are the op chain's: round to the activation dtype, the tail's inverse rotation
   (`ropeTail`'s math, `meta[4] + row` the position), the fp8 / 32 / ue8m0 round trip over each 32 channels (four lanes of

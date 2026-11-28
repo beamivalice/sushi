@@ -958,6 +958,61 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## Hy4-Flash STQ 4bpw N=1 resident round (`75a20f8b`, Landing 2 on M5 Ultra 256 GB)
+
+Apple M5 Ultra 256 GB, AC power, ReleaseFast, `taskpolicy -a`, GPU lock, warm `book-<hash>.bin` + `archive.bin` +
+parallel-compiled `sushi.metallib`, zero late compiles (`compiled=0`) and zero `PlanMiss` across every rung;
+`sushi bench` (`--tokens 256` on code, `128` on prose, 45 s cooldown between arms, `--kv-quant 8`, `MLX_ENABLE_TF32=0`,
+every routed expert resident). Baseline: `b18faea6` (v1.8.0-era; Spec OFF baseline covered code `4k, 32k, 128k`).
+Pre-rebase checkpoint: `a22fe330` (`opt/hy4-pre-rebase`, single-link `sushi.metallib`). Current: `75a20f8b` (Landing 2
+onto `422bf88f`, binary SHA-256 `b0eb1b544b072fe6`, `sushi.metallib` SHA-256 `f9cce5a200187d3a`): ports `gz = 1`
+all-heads direct BF16/KV8 steel attention (`NPART = 2`, `U2` loads for `H = 32`), `direct_sparse` (`t >= 2`), fused
+`sushi_hy4_front_into` / `sushi_hy4_front_into_kv8`, bit-exact FP32 `simdgroup_float8x8` wide absorb (`q_sg`, `v_sg`,
+`v_sg_gated`, double-buffered `BM=64xBN=128 v_sg_prepared_into` warmed in `warmSpanTails`), `hy4_index.wideScoresSg`,
+`copyArm` (`verify_rows_max = 8`) + `draftLimit` / `warmDrafter`, batched `attendDrafter`, `hy4_gemv.rowsStored`,
+Phase 1/2 `attn_held` release, and async `engram_prefetch` onto `origin/main` `48914633` + Landing 1 `422bf88f`.
+
+Warm repeat-load (`00c86d59` plan-book + binary archive):
+- **Spec ON (`dfly2`, `--kv-quant 8`)**: cold load `45.0 s` (`156` roots persisted to `book-c2e04fed5b049ad9.bin`,
+  `1,745` pipelines written to `archive.bin`); repeat warm load **`6.0 s`** (`6,029 ms`: `1,745` pipelines from
+  `archive.bin` in `310 ms`, `156` roots read from `book-<hash>.bin` in `58 ms`, `0 ms` warmup, `compiled=0`,
+  `PlanMiss=0` across `4k..128k` code + prose).
+- **Spec OFF (`--kv-quant 8 --no-mtp`)**: cold load `30.4 s` (`40` roots persisted to `book-4d9a3663f3cee0da.bin`,
+  `1,634` pipelines written to `archive.bin`); repeat warm load **`6.0 s`** (`5,999 ms`: `1,634` pipelines from
+  `archive.bin` in `294 ms`, `40` roots read from `book-<hash>.bin` in `29 ms`, `0 ms` warmup, `compiled=0`,
+  `PlanMiss=0` across `4k..128k` code + prose).
+
+Spec ON (`dfly2`), tok/s (prefill = window ending at rung, net of restore; decode = median of 3 samples):
+
+| rung | code prefill (`75a20f8b`) | `a22fe330` | `b18faea6` | prose prefill (`75a20f8b`) | `a22fe330` | `b18faea6` | code decode (`75a20f8b`) | `a22fe330` | `b18faea6` | prose decode (`75a20f8b`) | `a22fe330` | `b18faea6` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 1,981 | 2,022 | 1,931 | 1,753 | 1,838 | 1,702 | 175.4 | 176.6 | 142.6 | 74.9 | 75.4 | 68.9 |
+| 8k | 1,951 | 1,974 | 1,931 | 1,746 | 1,926 | 1,718 | 163.5 | 164.2 | 114.6 | 98.9 | 99.9 | 89.6 |
+| 16k | 1,939 | 1,938 | 1,898 | 1,848 | 1,928 | 1,817 | 128.2 | 129.9 | 116.1 | 66.7 | 69.8 | 67.0 |
+| 32k | 1,902 | 1,906 | 1,836 | 1,869 | 1,935 | 1,765 | 148.5 | 149.9 | 102.5 | 79.2 | 79.7 | 69.5 |
+| 64k | 1,830 | 1,832 | 1,710 | 1,818 | 1,844 | 1,691 | 107.6 | 108.8 | 72.6 | 65.7 | 65.3 | 63.3 |
+| 128k | 1,692 | 1,702 | 1,506 | 1,707 | 1,711 | 1,504 | 119.1 | 120.3 | 96.5 | 63.4 | 63.5 | 62.1 |
+
+Spec OFF (`--no-mtp`), tok/s (`75a20f8b` vs `a22fe330` and `b18faea6` code `4k/32k/128k`):
+
+| rung | code prefill (`75a20f8b`) | `a22fe330` | `b18faea6` | prose prefill (`75a20f8b`) | `a22fe330` | code decode (`75a20f8b`) | `a22fe330` | `b18faea6` | prose decode (`75a20f8b`) | `a22fe330` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 2,027 | 1,978 | 1,993 | 1,978 | 1,791 | 66.4 | 67.0 | 67.3 | 66.3 | 66.1 |
+| 8k | 1,972 | 1,963 | · | 1,934 | 1,714 | 66.1 | 66.9 | · | 66.3 | 66.9 |
+| 16k | 1,921 | 1,940 | · | 1,929 | 1,853 | 66.1 | 66.7 | · | 66.1 | 66.7 |
+| 32k | 1,907 | 1,907 | 1,843 | 1,930 | 1,880 | 65.6 | 66.1 | 66.2 | 65.4 | 66.1 |
+| 64k | 1,833 | 1,835 | · | 1,852 | 1,828 | 64.4 | 65.0 | · | 64.3 | 65.0 |
+| 128k | 1,705 | 1,705 | 1,511 | 1,723 | 1,715 | 62.1 | 62.7 | 62.6 | 60.5 | 62.8 |
+
+- Prefill (Spec ON): beats `b18faea6` on all 12 code and prose rungs (`+1.0%` to `+13.5%`; `code 128k` `1,692 tok/s`,
+  `+12.4%`; `prose 128k` `1,707 tok/s`, `+13.5%`). Spec OFF prefill reaches `2,027 tok/s` at `code 4k` (`TTFT 2.07 s`)
+  and `1,978 -> 1,723 tok/s` on prose at `Nominal` thermal pressure.
+- Spec ON (`dfly2`) decode beats `b18faea6` across all 6 code rungs (`+10.4%` to `+48.2%`, mean `140.4` vs `b18faea6`'s
+  `107.5 tok/s`) and 5 of 6 prose rungs (16k within `0.3 tok/s`).
+- 8-category 16x512 KLD (`--kv-quant 8 --no-mtp --ctx-size 8192`, `MLX_ENABLE_TF32=0`): `0.019938` (`0.019937937`) to
+  first EOS (`96.14%` top-1, bit-exact to `a22fe330`), `-3.00%` better than `b18faea6`'s M5 Ultra reading `0.020555`
+  ([quality-kld](quality-kld.md#hy4-eight-category)).
+
 ## v1.8.0 release context ladder
 
 [Version summary and per-model reports](bench/v1.8.0/summary.md), 2026-11-26, Apple M5 Ultra 256 GB, STQ packs only:

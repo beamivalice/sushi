@@ -345,6 +345,22 @@ resident, to the first EOS (7859 positions). M5 Max, `7c8d11d1`, 2026-11-26. KLD
 | Hy4-Flash-Sushi-STQ-4bpw | 0.019387 (96.30%) | 0.006021 | 0.005801 | 0.013732 | 0.016615 | 0.036889 | 0.016785 | 0.050044 | 0.007921 |
 | Hy4-Flash-Sushi-STQ-2.25bpw | 0.102246 (91.72%) | 0.028985 | 0.039940 | 0.087497 | 0.107893 | 0.080213 | 0.109945 | 0.325550 | 0.036802 |
 
+On M5 Ultra 256 GB (same fixture, `--kv-quant 8 --no-mtp --tokens 512 --ctx-size 8192`, `MLX_ENABLE_TF32=0`, 7859
+to-first-EOS positions, `taskpolicy -a`, GPU lock):
+
+| commit | pack | all (top-1) | code | math | reasoning | design | wikitext | multilingual | story | stem |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `b18faea6` (v1.8.0-era baseline) | Hy4-Flash-Sushi-STQ-4bpw | 0.020555 (96.28%) | · | · | · | · | · | · | · | · |
+| `a22fe330` (pre-rebase, SHA `872f9478`) | Hy4-Flash-Sushi-STQ-4bpw | 0.019938 (96.14%) | 0.006036 | 0.006133 | 0.013347 | 0.015785 | 0.041064 | 0.015505 | 0.051682 | 0.008143 |
+| `75a20f8b` (Landing 2, SHA `b0eb1b54`) | Hy4-Flash-Sushi-STQ-4bpw | 0.019938 (96.14%) | 0.006036 | 0.006133 | 0.013347 | 0.015785 | 0.041064 | 0.015505 | 0.051682 | 0.008143 |
+
+At `75a20f8b` (bit-exact to `a22fe330` to nine digits `0.019937937`), to-first-EOS mean KLD is
+`0.019938` (`-3.00%` below the M5 Ultra `b18faea6` reading `0.020555`; all-positions `0.020952`, top-1 `96.08%`, NLL
+`0.206099` to first EOS). A
+wide-span NAX absorb prototype (3-part bf16 `q_nope @ W_k` / `u_lat @ W_v^T`) passed synthetic parity tests
+but regressed wikitext KLD on this fixture and was replaced by the bit-exact FP32
+`simdgroup_float8x8` wide absorb kernels (`hy4_absorb.zig`).
+
 ## Teacher fixtures
 
 | fixture | model | notes |

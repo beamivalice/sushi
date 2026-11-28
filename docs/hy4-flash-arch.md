@@ -177,8 +177,9 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   - The hash is DeepSeek's `Hash` with two parameters, the seed and the id the multipliers are drawn with
     ([R2](#r2)).
   - The table is never resident. That is 126.7 GB BF16, or 63.4 GB as plain e4m3: read by row from SSD through DeepSeek's
-    `Table`, `RowCache` and `Prefetch`. The read covers the prompt's next chunk ahead, and a decode token's rows hide
-    behind the layers before layer 1.
+    `Table`, `RowCache` and `Prefetch`. `forwardSpliced` wires `engramRowsAfterWithPf` and `startEngramPrefetch`
+    (`75a20f8b`, paired with `engram.zig` condvar prefetch wait `3a5217ee`) so the prompt's next chunk reads from SSD
+    asynchronously while the GPU runs the current chunk, and a decode token's rows hide behind the layers before layer 1.
   - The gate chain is a new kernel of the `dsv41_engram` shape. Hy4's has biases, per-head lookup norms, `γ` and an
     additive per-stream scale where DeepSeek's has none of these.
   - The token map is the checkpoint's `lookup_table` tensor, not an embedded file.
@@ -226,18 +227,30 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
 - **Cooler**:
   - The projections are trunk linears; `W_qa`, `W_kva` and `W_g` read the same `x` and stack into one launch, as
     DeepSeek's `Layer.in_shared`.
-  - A decode row's BF16 linear (the STQ pack's `W_kva`, stored BF16) is one launch (`hy4_gemv.rowsThru`): the row
+  - A decode row's BF16 linear (the STQ pack's `W_kva`, stored BF16) is one launch (`hy4_gemv.rowsThru` / `rowsStored`,
+    `TM=2, NSG=2` with vectorized `X4` loads since `75a20f8b`): the row
     rounded to BF16 in the register, MLX's `gemv` tile over the BF16 operands, the sum rounded to BF16 and widened,
     not the casts around MLX's BF16 `gemv`. A verify block of 2 to 8 rows is one launch too, the weight read once
     and each row its one-row sums (3-row verify 21.68 to 21.41 ms a forward, 92d6397b, M5 Ultra, STQ 4bpw, A B B A).
-  - A decode row's attention past the window is a score, a softmax and a value launch (`hy4_chain.steelScores`,
-    `steelValues`): each sums in MLX's split-k or fused order (`steelPlan` mirrors the pinned mlx's choice), so the
-    bytes are the op chain's; the output gate rides the launch that reads `W_v` (`hy4_absorb.valueOutGated`) for a
+  - A decode or verify block's attention (`rows = 1..16` sliding range/ring, and `rows = 2..16` sparse picks) runs direct
+    BF16 and inline-KV8 steel kernels (`hy4_chain.steelDirectScores`, `steelDirectValues`, `75a20f8b`): they read the KV
+    ring and sparse cache once per block across all heads (`gz = 1`, `NPART = 2` dual-accumulator interleaving,
+    vectorized `U2` loads for `H = 32`, dequantizing affine-8 `c_lat` in registers for KV8) directly without
+    materializing `ringKeys` or `range` buffers, keeping exact FP32 accumulation (`steelPlan` mirrors MLX's
+    split-k/fused order). Single-row sparse decode (`t == 1`) stays on the zero-barrier SLC-resident
+    `hy4_latent.gather + steelScores + steelValues` path. The output gate
+    rides the launch that reads `W_v` (`hy4_absorb.valueOutGated`) for a
     span that returns its rows (a chunk's span, even of one row, writes into the chunk's block through `gatedInto`), and
     the absorbed query reads the queries before their rotation (`Projected.q_raw`), so the rope runs beside it. A row:
     15.45 to 14.84 ms, 1,618 to 1,378 dispatches (dbcca609, M5 Ultra, STQ 4bpw, kv8, 4,096 tokens, A B B A).
   - A decode row's absorbed products (`hy4_absorb`) read the query's nope part in place (template `QS`, the row's
-    width) and keep their launch configs; their grid's y takes a block's rows, each its one-row launch's bytes.
+    width, vectorized loads) and keep their launch configs; their grid's y takes a block's rows, each
+    its one-row launch's bytes. Wide prefill spans (`rows > 8`) run bit-exact FP32 `simdgroup_float8x8` absorb kernels
+    (`sushi_hy4_absorb_q_sg`, `v_sg`, `v_sg_gated`, `v_sg_prepared_into`; `75a20f8b`), reading BF16 `W_kvb`
+    directly without widening it to f32; `v_sg_prepared_into` fuses `u_lat @ W_v^T`, the output sigmoid gate, and the
+    Hadamard-128 `W_o` prepare directly into the chunk's `W_o` buffer using a double-buffered `BM=64 x BN=128, BK=16,
+    WM=2, WN=4` tile (256 threads, 32 barriers/TG, 2-pass `32x128` 8-SG parallel Hadamard-128 epilogue), warmed in
+    `warmSpanTails` beside `hy4_chain.gatedPreparedInto`.
   - The attention core of a wide span (more than 8 rows, on an M5) is `hy4_attn`, one launch a span on the matrix units
     ([R5](#r5)): the scores over the 576-wide key row, the sink softmax in f32, the value sum over its first 512
     channels. A decode row and a verify block (2..8 rows) never reach it: they keep the op chain's bytes.
@@ -381,7 +394,10 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   - An attention's latent norm and its `k_pe`'s rotation are one launch (`hy4_front`, seam `fwd.front_kernel_on`),
     a threadgroup a row: the latent normed as `hy4_norm.rows` does, then `k_pe` rotated as `tail` does. Both read
     `kv_a` alone; folding the query's rotation in too made them wait for `q_b`, a dependency level (a barrier) more a
-    layer, so it stays a launch of its own.
+    layer, so it stays a launch of its own. On `kv16` loads `hy4_front.runInto` (`sushi_hy4_front_into`, `75a20f8b`) writes
+    the normed latent and rotated `k_pe` directly into the KV cache slot in place; on `kv8` (group 64) loads
+    `sushi_hy4_front_into_kv8` fuses RMSNorm, affine-8 group-64 quantization (half-simdgroup shuffle min/max), and tail
+    RoPE directly into the KV8 ring (`t == 1`) or sparse `row_store` (all `t >= 1`).
 
 ### MoE (layers 1-41) and the dense layer 0
 
@@ -413,7 +429,10 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   - At 257 to 512 experts and top 16 or fewer the route selects instead of sorting whole (the keys are a total order, so
     the picks, their order and the sums are the sort's bytes): each simdgroup sorts its 32 keys by shuffles and keeps 16, one
     simdgroup merges four such lists by shuffles, and one merges those four. Two barriers, against the sort's 22
-    (`hy4_route.fast_barriers`, `sortBarriers`). The tiny models' 8 experts keep the sort.
+    (`hy4_route.fast_barriers`, `sortBarriers`). The tiny models' 8 experts keep the sort. Routing stays on
+    `fwd.routeMapped` (`hy4_row` + `hy4_route.pick`), which overlaps `lat_down` without a shared counter barrier
+    (a fused counted router prototype serialized router with `lat_down` via its shared device atomic counter and
+    regressed both `rows = 1` and `rows = 6`).
   - `--expert-cache-bias n` on a streamed STQ load: a decode-width route adds the layer's penalty (-n on each expert
     its cache lacks) to the bias row the launch reads (`fwd.cacheBiased`), in sigmoid units; on the tiny at 4 slots a
     layer it raises the decode's hit rate, and at n = 8 no decode route misses (`hy4_stq_test`). Lossy; KLD on the
@@ -1069,6 +1088,23 @@ resident; M5 Ultra, ReleaseFast, `taskpolicy -a`, GPU lock and QUIET, one run; t
 
 Code decodes faster than prose because DFly2's drafts are accepted more often on it. The 8-category KLD of the same
 tree (kv8, `--no-mtp`) is 0.022150 to the first EOS.
+
+The M5 Ultra ladder at `75a20f8b` (Landing 2 onto `422bf88f`, binary SHA-256 `b0eb1b544b072fe6`, warm `book-<hash>.bin`
++ `archive.bin` 6 s repeat load, `--tokens 256` on code / `128` on prose, kv8, every routed expert resident,
+`taskpolicy -a`, GPU lock, zero late compiles / zero `PlanMiss`, tok/s; full comparison against `a22fe330` and
+`b18faea6` in [perf-baselines](perf-baselines.md)):
+
+| rung | code prefill (Spec ON) | code decode (Spec ON) | prose prefill (Spec ON) | prose decode (Spec ON) | code decode (Spec OFF) | prose prefill (Spec OFF) |
+|---|---:|---:|---:|---:|---:|---:|
+| 4k | 1,981 | 175.4 | 1,753 | 74.9 | 66.4 | 1,978 |
+| 8k | 1,951 | 163.5 | 1,746 | 98.9 | 66.1 | 1,934 |
+| 16k | 1,939 | 128.2 | 1,848 | 66.7 | 66.1 | 1,929 |
+| 32k | 1,902 | 148.5 | 1,869 | 79.2 | 65.6 | 1,930 |
+| 64k | 1,830 | 107.6 | 1,818 | 65.7 | 64.4 | 1,852 |
+| 128k | 1,692 | 119.1 | 1,707 | 63.4 | 62.1 | 1,723 |
+
+8-category 16x512 KLD (`--kv-quant 8 --no-mtp`, `MLX_ENABLE_TF32=0`) at `75a20f8b`: `0.019938` (`0.019937937`) to first
+EOS (`96.14%` top-1, bit-exact to `a22fe330`, `-3.00%` below `b18faea6`'s M5 Ultra reading `0.020555`).
 
 A decode token at 8014b557 is about 31 ms of GPU work and the rest host time the GPU waits behind: the engine log's
 `GPU busy` against `idle between passes` over 256 tokens.
