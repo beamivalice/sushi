@@ -3423,11 +3423,15 @@ fn sortAndFinalize(out: *Resolved) bool {
         }
     }.lt);
     // Guard against duplicate FC slot indices across kernel params, Part A, and Part B.
-    for (1..out.n_flags) |i| {
-        if (out.flags[i].index == out.flags[i - 1].index) return false;
+    if (out.n_flags > 1) {
+        for (1..out.n_flags) |i| {
+            if (out.flags[i].index == out.flags[i - 1].index) return false;
+        }
     }
-    for (1..out.n_ints) |i| {
-        if (out.ints[i].index == out.ints[i - 1].index) return false;
+    if (out.n_ints > 1) {
+        for (1..out.n_ints) |i| {
+            if (out.ints[i].index == out.ints[i - 1].index) return false;
+        }
     }
     out.finalizeHash() catch return false;
     return true;

@@ -2029,8 +2029,8 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
 
     const assertDisjointFcs = struct {
         fn check(r: *const catalog.Resolved) !void {
-            for (1..r.n_ints) |i| try testing.expect(r.ints[i - 1].index < r.ints[i].index);
-            for (1..r.n_flags) |i| try testing.expect(r.flags[i - 1].index < r.flags[i].index);
+            if (r.n_ints > 1) for (1..r.n_ints) |i| try testing.expect(r.ints[i - 1].index < r.ints[i].index);
+            if (r.n_flags > 1) for (1..r.n_flags) |i| try testing.expect(r.flags[i - 1].index < r.flags[i].index);
         }
     }.check;
 
@@ -2499,6 +2499,64 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
             .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
         };
         try testing.expect(!catalog.resolve("sushi_rg_fold_down_pair1_w16_32x0_tr_mcg_w16_n32_32", &rg_down_tr_ins, &.{ .float16, .float32 }, &bad_rg_tr, &res));
+
+        // Zero-flag `sortAndFinalize` regression: `fz_mid`, `fz_mid_snax`, and `rg_mid_clamp*` emit `n_flags == 0`.
+        const fz_mid_ins = [_]catalog.RuntimeInput{
+            .{ .name = "ig", .dtype = .float32, .scalar = false },
+            .{ .name = "iu", .dtype = .float32, .scalar = false },
+            .{ .name = "svhg", .dtype = .float16, .scalar = false },
+            .{ .name = "svhu", .dtype = .float16, .scalar = false },
+            .{ .name = "suhd", .dtype = .float16, .scalar = false },
+            .{ .name = "slots", .dtype = .uint32, .scalar = false },
+            .{ .name = "s_ig", .dtype = .float16, .scalar = false },
+            .{ .name = "s_iu", .dtype = .float16, .scalar = false },
+            .{ .name = "s_svhg", .dtype = .float16, .scalar = false },
+            .{ .name = "s_svhu", .dtype = .float16, .scalar = false },
+            .{ .name = "s_suhd", .dtype = .float16, .scalar = false },
+            .{ .name = "s_slots", .dtype = .uint32, .scalar = false },
+        };
+        const fz_mid_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "IDIM", .value = .{ .int = 1536 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 2 } },
+            .{ .name = "S_ODIM", .value = .{ .int = 1536 } },
+            .{ .name = "S_CLAMP_LIMIT", .value = .{ .int = 10 } },
+            .{ .name = "FZ_AX", .value = .{ .int = 12 } },
+            .{ .name = "FZ_AY", .value = .{ .int = 8 } },
+            .{ .name = "FZ_BX", .value = .{ .int = 12 } },
+            .{ .name = "FZ_BY", .value = .{ .int = 1 } },
+            .{ .name = "FZ_NA", .value = .{ .int = 96 } },
+            .{ .name = "FZ_NB", .value = .{ .int = 12 } },
+            .{ .name = "FZ_B_FIRST", .value = .{ .int = 1 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_fz_mid_pair1_w16_sspec1_w15_n80_t37f72431_clamp10_tm", &fz_mid_ins, &.{ .float16, .float16 }, &fz_mid_targs, &res));
+        try testing.expectEqual(@as(usize, 0), res.n_flags);
+        try assertDisjointFcs(&res);
+        var fz_mid_snax_ins = fz_mid_ins;
+        fz_mid_snax_ins[6].dtype = .float32;
+        fz_mid_snax_ins[7].dtype = .float32;
+        const fz_mid_snax_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "IDIM", .value = .{ .int = 1536 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 2 } },
+            .{ .name = "S_IDIM", .value = .{ .int = 1536 } },
+            .{ .name = "S_NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "FZ_AX", .value = .{ .int = 12 } },
+            .{ .name = "FZ_AY", .value = .{ .int = 24 } },
+            .{ .name = "FZ_BX", .value = .{ .int = 12 } },
+            .{ .name = "FZ_BY", .value = .{ .int = 3 } },
+            .{ .name = "FZ_NA", .value = .{ .int = 288 } },
+            .{ .name = "FZ_NB", .value = .{ .int = 36 } },
+            .{ .name = "FZ_B_FIRST", .value = .{ .int = 1 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_fz_mid_pair1_w16_sspec1_w15_n80_t37f72431_clamp10_snax_tm", &fz_mid_snax_ins, &.{ .float16, .float16 }, &fz_mid_snax_targs, &res));
+        try testing.expectEqual(@as(usize, 0), res.n_flags);
+        try assertDisjointFcs(&res);
+        const rg_mid_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "IDIM", .value = .{ .int = 1536 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 2 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_rg_mid_clamp10", fz_mid_ins[0..6], &.{.float16}, &rg_mid_targs, &res));
+        try testing.expectEqual(@as(usize, 0), res.n_flags);
+        try assertDisjointFcs(&res);
     }
 
     // 2. Live GPU bit-for-bit decode verification on converted fused Part B (SIMD lane/one/shared_rows + NAX snax)
