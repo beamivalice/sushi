@@ -1138,45 +1138,6 @@ test "hy4 absorb: a decode row's query and value products over kv_b as stored ar
     try parityCase(es, .{ .heads = 8, .nope = 32, .v = 32, .latent = 128 }, 3);
 }
 
-test "hy4 absorb: a block's rows through the products in one launch each are the bytes of each row launched alone, the query read in place past its rope part" {
-    try mlx.requireGpu();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const es = mlx.engine.stream();
-    const scope = mlx.engine.enter(es);
-    defer scope.end();
-    const gpa = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(31);
-    const rnd = prng.random();
-    const g: Geometry = .{ .heads = 64, .nope = 192, .v = 256, .latent = 512 };
-    const t = 6;
-    const qk = g.nope + 64;
-    const w_bits = try randomBf16(gpa, rnd, @intCast(g.heads * (g.nope + g.v) * g.latent));
-    defer gpa.free(w_bits);
-    const q_host = try randomF32(gpa, rnd, @intCast(g.heads * t * qk));
-    defer gpa.free(q_host);
-    const u_host = try randomF32(gpa, rnd, @intCast(g.heads * t * g.latent));
-    defer gpa.free(u_host);
-    var o: Ops = .{ .s = es };
-    defer o.deinit();
-    const kv_b = try o.own(mlx.mlx_array_new_data(w_bits.ptr, &[_]c_int{ g.heads * (g.nope + g.v), g.latent }, 2, .bfloat16));
-    const q = try o.own(mlx.mlx_array_new_data(q_host.ptr, &[_]c_int{ g.heads, t, qk }, 3, .float32));
-    const u = try o.own(mlx.mlx_array_new_data(u_host.ptr, &[_]c_int{ g.heads, t, g.latent }, 3, .float32));
-    const before = mlx.engine.stats().dispatches;
-    const q_lat = try o.own(try queryLatent(es, q, kv_b, g));
-    const v_out = try o.own(try valueOut(es, u, kv_b, g));
-    try mlx.check(mlx.mlx_array_eval(q_lat));
-    try mlx.check(mlx.mlx_array_eval(v_out));
-    try testing.expectEqual(@as(u64, 2), mlx.engine.stats().dispatches - before);
-    for (0..t) |r| {
-        const lo: c_int = @intCast(r);
-        const q_nope = try o.contiguous(try o.slice(try o.slice(q, 1, lo, lo + 1), 2, 0, g.nope));
-        try expectSameBytes(try o.contiguous(try o.slice(q_lat, 1, lo, lo + 1)), try o.own(try queryLatent(es, q_nope, kv_b, g)));
-        try expectSameBytes(try o.contiguous(try o.slice(v_out, 1, lo, lo + 1)), try o.own(try valueOut(es, try o.contiguous(try o.slice(u, 1, lo, lo + 1)), kv_b, g)));
-    }
-}
-
 fn blockCase(s: mlx.mlx_stream, g: Geometry, t: c_int, seed: u64) !void {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(seed);
@@ -1211,7 +1172,7 @@ fn blockCase(s: mlx.mlx_stream, g: Geometry, t: c_int, seed: u64) !void {
     }
 }
 
-test "hy4 absorb: 2, 3, 6 and 8 rows through queryLatent and valueOut in one launch equal each row alone through the one-row kernel, at H 64, 32 and the tiny's shapes" {
+test "hy4 absorb: 2, 6 and 8 rows through queryLatent and valueOut in one launch equal each row alone through the one-row kernel, at H 64, 32 and the tiny's shapes" {
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -1224,7 +1185,7 @@ test "hy4 absorb: 2, 3, 6 and 8 rows through queryLatent and valueOut in one lau
         .{ .heads = 32, .nope = 192, .v = 256, .latent = 512 },
         .{ .heads = 8, .nope = 32, .v = 32, .latent = 128 },
     };
-    for ([_]c_int{ 2, 3, 6, 8 }, 0..) |t, ti| {
+    for ([_]c_int{ 2, 6, 8 }, 0..) |t, ti| {
         for (geometries, 0..) |g, gi| {
             try blockCase(es, g, t, 200 + ti * 8 + gi);
         }

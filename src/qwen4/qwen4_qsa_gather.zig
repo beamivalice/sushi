@@ -2016,22 +2016,13 @@ test "qsa packed FC: sushi_attn_qsa256_packed covers BITS {2,3,4,6,8}, GS {32,64
     const v2 = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kL, 256 }, s);
     defer _ = mlx.mlx_array_free(v2);
 
+    // BITS and GS are orthogonal in sushi_qsa_unpack8 ((c8*8)/gs vs 5-arm BITS leaf); cover all 5 BITS and all 3 GS at NSG=2.
     const combos = [_]struct { bits: u8, gs: u32 }{
         .{ .bits = 2, .gs = 32 },
-        .{ .bits = 2, .gs = 64 },
-        .{ .bits = 2, .gs = 128 },
-        .{ .bits = 3, .gs = 32 },
         .{ .bits = 3, .gs = 64 },
-        .{ .bits = 3, .gs = 128 },
-        .{ .bits = 4, .gs = 32 },
-        .{ .bits = 4, .gs = 64 },
         .{ .bits = 4, .gs = 128 },
         .{ .bits = 6, .gs = 32 },
-        .{ .bits = 6, .gs = 64 },
-        .{ .bits = 6, .gs = 128 },
-        .{ .bits = 8, .gs = 32 },
         .{ .bits = 8, .gs = 64 },
-        .{ .bits = 8, .gs = 128 },
     };
     const have_nax = verifyQmmNaxAvailable() and qsaNaxOsOk();
     const nax_packed_k: ?mlx.mlx_fast_metal_kernel = if (have_nax) try getQsaGatherPackedKernel(true) else null;

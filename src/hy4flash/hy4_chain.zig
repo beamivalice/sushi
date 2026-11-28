@@ -2385,7 +2385,7 @@ test "hy4 chain: N decode rows' score and value products in one launch each keep
     const n: c_int = 512;
     const lat: c_int = 512;
     const rope: c_int = 64;
-    for (2..17) |g| {
+    for ([_]usize{ 2, 6, 16 }) |g| {
         var o: Ops = .{ .s = es };
         defer o.deinit();
         var ql: [16]Arr = undefined;

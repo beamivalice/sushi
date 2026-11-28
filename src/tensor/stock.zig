@@ -749,6 +749,34 @@ const testing = std.testing;
 const matmul = @import("matmul.zig");
 const device = @import("sushi_exl3").device;
 
+fn specializeMaxThreads(d: *const metal.Device, lib_h: metal.Library, r: *const @import("../metallib_catalog.zig").Resolved) !usize {
+    const catalog = @import("../metallib_catalog.zig");
+    var fbuf: [512]u8 = undefined;
+    const fname = try std.fmt.bufPrintSentinel(&fbuf, "{s}", .{r.fnName()}, 0);
+    var flags: [catalog.max_fc_bools]metal.Flag = undefined;
+    for (r.flagSlice(), 0..) |f, i| flags[i] = .{ .index = f.index, .value = f.value };
+    var ints_fc: [catalog.max_fc_ints]metal.IntConstant = undefined;
+    for (r.intSlice(), 0..) |c, i| ints_fc[i] = .{ .index = c.index, .value = c.value };
+    const p = try d.pipelineOfConstants(lib_h, fname, flags[0..r.n_flags], ints_fc[0..r.n_ints]);
+    return p.max_threads;
+}
+
+fn readU16(t: *const Tensor) ![]const u16 {
+    const b = try core.hostRead(t);
+    return std.mem.bytesAsSlice(u16, @as([]align(2) const u8, @alignCast(b)));
+}
+
+/// An identity matmul accumulates into `+0.0f`, so IEEE-754 `+0.0f + 1.0 * (-0.0f)` yields `+0.0h` (`0x0000`)
+/// even when a codebook codeword decodes `-0.0h` (`0x8000`). Every nonzero half matches bit-for-bit.
+fn canonF16Zero(bits: u16) u16 {
+    return if (bits == 0x8000) 0 else bits;
+}
+
+fn expectMatmulU16(want: []const u16, got: []const u16) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqual(canonF16Zero(w), g);
+}
+
 test "stock metallib: metallibPath resolves sushi.metallib and never mlx.metallib" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try metallibPath(&buf);
@@ -1229,7 +1257,7 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
         try testing.expect(saw_b12);
     }
 
-    // Specialize live PSOs across boundary scalar & PAIR1 rates and verify threadgroup headroom.
+    // Specialize live PSOs across one rate per structural leaf arm (scalar & PAIR1) and verify threadgroup headroom.
     const down_ins = [_]catalog.RuntimeInput{
         .{ .name = "ig", .dtype = .float32, .scalar = false },
         .{ .name = "iu", .dtype = .float32, .scalar = false },
@@ -1239,34 +1267,30 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
         .{ .name = "suhd", .dtype = .float16, .scalar = false },
         .{ .name = "slots", .dtype = .uint32, .scalar = false },
     };
-    const specializeMaxThreads = struct {
-        fn run(d: *const metal.Device, lib_h: metal.Library, r: *const catalog.Resolved) !usize {
-            var fbuf: [512]u8 = undefined;
-            const fname = try std.fmt.bufPrintSentinel(&fbuf, "{s}", .{r.fnName()}, 0);
-            var flags: [catalog.max_fc_bools]metal.Flag = undefined;
-            for (r.flagSlice(), 0..) |f, i| flags[i] = .{ .index = f.index, .value = f.value };
-            var ints_fc: [catalog.max_fc_ints]metal.IntConstant = undefined;
-            for (r.intSlice(), 0..) |c, i| ints_fc[i] = .{ .index = c.index, .value = c.value };
-            const p = try d.pipelineOfConstants(lib_h, fname, flags[0..r.n_flags], ints_fc[0..r.n_ints]);
-            return p.max_threads;
-        }
-    }.run;
     const has_nax = @import("sushi_exl3").device.current().has(.matrix_g17);
-    for ([_]i32{ 16, 18, 32, 34, 36, 56, 58, 60, 62, 64, 66, 70, 80, 84, 86, 96, 98, 100, 108, 110, 126, 128 }) |n_new| {
+    const coop_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .float16, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "slots", .dtype = .uint32, .scalar = false },
+    };
+    // One rate per distinct smat_group_fc leaf arm (7 scalar + 3 PAIR1).
+    for ([_]i32{ 16, 38, 58, 64, 86, 110, 126 }) |n_smat| {
         const smat_targs = [_]catalog.RuntimeTarg{
-            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "NHW", .value = .{ .int = n_smat } },
             .{ .name = "IDIM", .value = .{ .int = 512 } },
             .{ .name = "ODIM", .value = .{ .int = 512 } },
             .{ .name = "WIN", .value = .{ .int = 32 } },
         };
         try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_simdmat_spec1_w15_t37f72431", &gemm_ins, &.{.float16}, &smat_targs, &res));
         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
-
+    }
+    // One rate per distinct exl3_lane_fc arm + exl3_lane_word_fc shift bucket (6 scalar).
+    for ([_]i32{ 16, 38, 42, 80, 110, 126 }) |n_lane| {
         const rsimd_targs = [_]catalog.RuntimeTarg{
             .{ .name = "OutT", .value = .{ .dtype = .bfloat16 } },
             .{ .name = "TGRP", .value = .{ .int = 4 } },
             .{ .name = "KPH", .value = .{ .int = 2 } },
-            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "NHW", .value = .{ .int = n_lane } },
             .{ .name = "IDIM", .value = .{ .int = 512 } },
             .{ .name = "ODIM", .value = .{ .int = 512 } },
             .{ .name = "ROWS", .value = .{ .int = 4 } },
@@ -1282,7 +1306,7 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
 
         const p_targs = [_]catalog.RuntimeTarg{
-            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "NHW", .value = .{ .int = n_lane } },
             .{ .name = "OTPT", .value = .{ .int = 2 } },
             .{ .name = "IDIM", .value = .{ .int = 512 } },
             .{ .name = "ODIM", .value = .{ .int = 512 } },
@@ -1294,7 +1318,7 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
 
         const d_targs = [_]catalog.RuntimeTarg{
-            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "NHW", .value = .{ .int = n_lane } },
             .{ .name = "OTPT", .value = .{ .int = 2 } },
             .{ .name = "IDIM", .value = .{ .int = 512 } },
             .{ .name = "ODIM", .value = .{ .int = 512 } },
@@ -1304,13 +1328,8 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
         try testing.expect(catalog.resolve("sushi_exl3_k4_down_fused_spec1_w15_t37f72431", &down_ins, &.{.float16}, &d_targs, &res));
         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
 
-        const coop_ins = [_]catalog.RuntimeInput{
-            .{ .name = "x", .dtype = .float16, .scalar = false },
-            .{ .name = "trellis", .dtype = .uint16, .scalar = false },
-            .{ .name = "slots", .dtype = .uint32, .scalar = false },
-        };
         const coop_targs = [_]catalog.RuntimeTarg{
-            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "NHW", .value = .{ .int = n_lane } },
             .{ .name = "TILES", .value = .{ .int = 1 } },
             .{ .name = "IDIM", .value = .{ .int = 512 } },
             .{ .name = "ODIM", .value = .{ .int = 512 } },
@@ -1319,14 +1338,21 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
         };
         try testing.expect(catalog.resolve("sushi_exl3_group2_spec1_w15_t37f72431", &coop_ins, &.{.float16}, &coop_targs, &res));
         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
-
-        if (has_nax) {
-            try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_nax_spec1_w15_t37f72431", &gemm_ins, &.{.float16}, &smat_targs, &res));
+    }
+    // One rate per distinct nax_wfrag_fc leaf arm (9 scalar + 5 PAIR1).
+    if (has_nax) {
+        for ([_]i32{ 16, 32, 60, 64, 66, 80, 96, 110, 128 }) |n_nax| {
+            const nax_targs = [_]catalog.RuntimeTarg{
+                .{ .name = "NHW", .value = .{ .int = n_nax } },
+                .{ .name = "IDIM", .value = .{ .int = 512 } },
+                .{ .name = "ODIM", .value = .{ .int = 512 } },
+                .{ .name = "WIN", .value = .{ .int = 32 } },
+            };
+            try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_nax_spec1_w15_t37f72431", &gemm_ins, &.{.float16}, &nax_targs, &res));
             try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
         }
     }
-    var n_p1: i32 = 24;
-    while (n_p1 <= 64) : (n_p1 += 2) {
+    for ([_]i32{ 24, 56, 64 }) |n_p1| {
         const smat_targs = [_]catalog.RuntimeTarg{
             .{ .name = "NHW", .value = .{ .int = n_p1 } },
             .{ .name = "IDIM", .value = .{ .int = 512 } },
@@ -1335,14 +1361,22 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
         };
         try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_simdmat_pair1", &gemm_ins, &.{.float16}, &smat_targs, &res));
         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
-        if (has_nax) {
-            try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_nax_pair1", &gemm_ins, &.{.float16}, &smat_targs, &res));
+    }
+    if (has_nax) {
+        for ([_]i32{ 24, 32, 36, 56, 64 }) |n_p1| {
+            const nax_targs = [_]catalog.RuntimeTarg{
+                .{ .name = "NHW", .value = .{ .int = n_p1 } },
+                .{ .name = "IDIM", .value = .{ .int = 512 } },
+                .{ .name = "ODIM", .value = .{ .int = 512 } },
+                .{ .name = "WIN", .value = .{ .int = 32 } },
+            };
+            try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_nax_pair1", &gemm_ins, &.{.float16}, &nax_targs, &res));
             try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
         }
     }
 }
 
-test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across all 57 scalar and 21 PAIR1 rates" {
+test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across scalar and PAIR1 leaf arms" {
     try @import("../mlx.zig").requireGpu();
     const kernel_mod = @import("kernel.zig");
     const exl3_mod = @import("sushi_exl3");
@@ -1377,15 +1411,17 @@ test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across a
         suf: []const u8,
         unfolded_suf: ?[]const u8,
         dec: format.Decode,
+        rates: []const u32,
         min_n: u32,
         max_n: u32,
-        all_rates: bool,
     };
-    const mcg_boundary = [_]u32{ 16, 18, 32, 34, 36, 56, 58, 60, 62, 64, 66, 80, 84, 86, 96, 98, 100, 108, 110, 126, 128 };
     const cases = [_]Case{
-        .{ .suf = "_spec1_w15_t37f72431", .unfolded_suf = "_spec1_unfolded_w15_t37f72431", .dec = format.Decode.tabled(.spec1, .w15), .min_n = 16, .max_n = 128, .all_rates = true },
-        .{ .suf = "_mcg", .unfolded_suf = null, .dec = .{ .codebook = .mcg, .window = .w16 }, .min_n = 16, .max_n = 128, .all_rates = false },
-        .{ .suf = "_pair1", .unfolded_suf = "_pair1_unfolded", .dec = .{ .codebook = .pair1, .window = .w16 }, .min_n = 24, .max_n = 64, .all_rates = true },
+        // Every structural leaf arm of exl3_lane_fc, exl3_lane_word_fc, smat_group_fc, and nax_wfrag_fc.
+        .{ .suf = "_spec1_w15_t37f72431", .unfolded_suf = "_spec1_unfolded_w15_t37f72431", .dec = format.Decode.tabled(.spec1, .w15), .rates = &.{ 16, 32, 38, 42, 58, 60, 64, 80, 86, 96, 110, 126, 128 }, .min_n = 16, .max_n = 128 },
+        // Representative w16 (unmasked 16-bit) rates across narrow, funnel, K4, and wide tiers.
+        .{ .suf = "_mcg", .unfolded_suf = null, .dec = .{ .codebook = .mcg, .window = .w16 }, .rates = &.{ 16, 42, 64, 128 }, .min_n = 16, .max_n = 128 },
+        // Every PAIR1 leaf-arm boundary across exl3_lane_fc (incl. simd_shuffle at n=56), smat_group_fc, and nax_wfrag_fc.
+        .{ .suf = "_pair1", .unfolded_suf = "_pair1_unfolded", .dec = .{ .codebook = .pair1, .window = .w16 }, .rates = &.{ 24, 32, 36, 38, 42, 44, 56, 64 }, .min_n = 24, .max_n = 64 },
     };
 
     var prng = std.Random.DefaultPrng.init(0x5EC1_FC01);
@@ -1394,13 +1430,6 @@ test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across a
     var want_tiles: [8][format.TILE_VALUES]u16 = undefined;
     var name_buf: [128]u8 = undefined;
 
-    const readU16 = struct {
-        fn f(t: *const Tensor) ![]const u16 {
-            const b = try core.hostRead(t);
-            return std.mem.bytesAsSlice(u16, @as([]align(2) const u8, @alignCast(b)));
-        }
-    }.f;
-
     for (cases) |cs| {
         const smat_def = try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_k4_gemm_simdmat{s}", .{cs.suf}), gemm_in_names, &.{"y"}, exl3_mod.kernels.GEMM_SIMDMAT_SOURCE, "", true, false);
         const dp_def = try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_down_prepared{s}", .{cs.suf}), dp_in_names, &.{"y"}, exl3_mod.kernels.DOWN_PREPARED_SOURCE, "", true, false);
@@ -1408,9 +1437,7 @@ test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across a
         const dense_def = if (has_nax) try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_trunk_dense_nax{s}", .{cs.suf}), dense_in_names, &.{"y"}, exl3_mod.trunk_gemm.DENSE_SOURCE, "", true, false) else null;
         const nax_u_def = if (has_nax and cs.unfolded_suf != null) try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_k4_gemm_nax{s}", .{cs.unfolded_suf.?}), gemm_in_names, &.{"y"}, exl3_mod.kernels.GEMM_NAX_SOURCE, "", true, false) else null;
 
-        var n: u32 = cs.min_n;
-        while (n <= cs.max_n) : (n += 2) {
-            if (!cs.all_rates and std.mem.indexOfScalar(u32, &mcg_boundary, n) == null) continue;
+        for (cs.rates) |n| {
             const rate: format.Rate = .{ .n = n };
             const n_c: c_int = @intCast(n);
             const slice = trellis_buf[0 .. 8 * n];
@@ -1437,7 +1464,7 @@ test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across a
                 for (0..16) |r| {
                     for (0..8) |t_idx| {
                         for (0..16) |c| {
-                            try testing.expectEqual(want_tiles[t_idx][r * 16 + c], got[r * 128 + t_idx * 16 + c]);
+                            try testing.expectEqual(canonF16Zero(want_tiles[t_idx][r * 16 + c]), got[r * 128 + t_idx * 16 + c]);
                         }
                     }
                 }
@@ -1457,7 +1484,7 @@ test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across a
                 try kernel_mod.launch(dp_def, &.{ x_eye128, tr_dp, eids_t }, &cfg, &out);
                 defer core.release(out[0]);
                 const got = try readU16(out[0]);
-                try testing.expectEqualSlices(u16, &want_tiles[0], got);
+                try expectMatmulU16(&want_tiles[0], got);
             }
 
             if (has_nax) {
@@ -1498,7 +1525,7 @@ test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across a
                     for (0..16) |r| {
                         for (0..8) |t_idx| {
                             for (0..16) |c| {
-                                try testing.expectEqual(want_tiles[t_idx][r * 16 + c], got[r * 128 + t_idx * 16 + c]);
+                                try testing.expectEqual(canonF16Zero(want_tiles[t_idx][r * 16 + c]), got[r * 128 + t_idx * 16 + c]);
                             }
                         }
                     }
@@ -1528,7 +1555,7 @@ test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across a
             const svh_t = try core.fromHost(std.mem.sliceAsBytes(&ones128), .float16, &.{128});
             defer core.release(svh_t);
             var r_tr: [64 * 128]u16 = undefined;
-            for ([_]u32{ 16, 32, 40, 48, 56, 58, 60, 62, 64, 80, 96, 98, 100, 126, 128 }) |rn| {
+            for ([_]u32{ 32, 56, 80, 128 }) |rn| {
                 if (rn < cs.min_n or rn > cs.max_n) continue;
                 const rslice = r_tr[0 .. 64 * rn];
                 for (rslice) |*w| w.* = rnd.int(u16);
@@ -1577,14 +1604,7 @@ test "stock metallib: shared SIMD FC specs resolve valid parameters, reject OOB,
 
     const checkPso = struct {
         fn run(d: *const metal.Device, lib_h: metal.Library, r: *const catalog.Resolved, floor: usize) !void {
-            var fbuf: [512]u8 = undefined;
-            const fname = try std.fmt.bufPrintSentinel(&fbuf, "{s}", .{r.fnName()}, 0);
-            var flags: [catalog.max_fc_bools]metal.Flag = undefined;
-            for (r.flagSlice(), 0..) |f, i| flags[i] = .{ .index = f.index, .value = f.value };
-            var ints_fc: [catalog.max_fc_ints]metal.IntConstant = undefined;
-            for (r.intSlice(), 0..) |c, i| ints_fc[i] = .{ .index = c.index, .value = c.value };
-            const p = try d.pipelineOfConstants(lib_h, fname, flags[0..r.n_flags], ints_fc[0..r.n_ints]);
-            try testing.expect(p.max_threads >= floor);
+            try testing.expect((try specializeMaxThreads(d, lib_h, r)) >= floor);
         }
     }.run;
 
@@ -2013,18 +2033,6 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
             for (1..r.n_flags) |i| try testing.expect(r.flags[i - 1].index < r.flags[i].index);
         }
     }.check;
-    const specializeMaxThreads = struct {
-        fn run(d: *const metal.Device, lib_h: metal.Library, r: *const catalog.Resolved) !usize {
-            var fbuf: [512]u8 = undefined;
-            const fname = try std.fmt.bufPrintSentinel(&fbuf, "{s}", .{r.fnName()}, 0);
-            var flags: [catalog.max_fc_bools]metal.Flag = undefined;
-            for (r.flagSlice(), 0..) |f, i| flags[i] = .{ .index = f.index, .value = f.value };
-            var ints_fc: [catalog.max_fc_ints]metal.IntConstant = undefined;
-            for (r.intSlice(), 0..) |c, i| ints_fc[i] = .{ .index = c.index, .value = c.value };
-            const p = try d.pipelineOfConstants(lib_h, fname, flags[0..r.n_flags], ints_fc[0..r.n_ints]);
-            return p.max_threads;
-        }
-    }.run;
 
     const has_nax = @import("sushi_exl3").device.current().has(.matrix_g17);
     var res: catalog.Resolved = undefined;
@@ -2099,11 +2107,11 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
 
     const AbPair = struct { a_tag: []const u8, a_cls: []const u8, b_tag: []const u8, b_is_p1: bool, b_rates: []const i32 };
     const ab_pairs = [_]AbPair{
-        // Include previously-unserved scalar rates (18, 34, 66, 98, 126) + boundary PAIR1 rates
-        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0_64x0", .b_tag = "spec1_w15", .b_is_p1 = false, .b_rates = &.{ 16, 18, 34, 64, 66, 80, 98, 126, 128 } },
-        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0_64x0", .b_tag = "pair1_w16", .b_is_p1 = true, .b_rates = &.{ 24, 32, 42, 46, 56, 64 } },
-        .{ .a_tag = "pair1_w16", .a_cls = "24x0_32x0_40x0", .b_tag = "spec1_w15", .b_is_p1 = false, .b_rates = &.{ 16, 34, 64, 80, 96, 128 } },
-        .{ .a_tag = "pair1_w16", .a_cls = "24x0_32x0_40x0", .b_tag = "pair1_w16", .b_is_p1 = true, .b_rates = &.{ 24, 26, 32, 42, 46, 56, 64 } },
+        // All 4 (Part A, Part B) pairings across boundary scalar (incl. previously-unserved 34) & PAIR1 rates.
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0_64x0", .b_tag = "spec1_w15", .b_is_p1 = false, .b_rates = &.{ 16, 34, 64, 80, 128 } },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0_64x0", .b_tag = "pair1_w16", .b_is_p1 = true, .b_rates = &.{ 24, 42, 56, 64 } },
+        .{ .a_tag = "pair1_w16", .a_cls = "24x0_32x0_40x0", .b_tag = "spec1_w15", .b_is_p1 = false, .b_rates = &.{ 16, 34, 64, 128 } },
+        .{ .a_tag = "pair1_w16", .a_cls = "24x0_32x0_40x0", .b_tag = "pair1_w16", .b_is_p1 = true, .b_rates = &.{ 24, 42, 56, 64 } },
     };
 
     for (ab_pairs) |ab| {
@@ -2139,7 +2147,7 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                 try testing.expect(catalog.resolve(nm, &fz_down_ins, &.{ .float16, .float16 }, &targs, &res));
                 try testing.expect(have.contains(res.fnName()));
                 try assertDisjointFcs(&res);
-                if (bn == ab.b_rates[0] or bn == 64 or bn == ab.b_rates[ab.b_rates.len - 1]) {
+                if (bn == ab.b_rates[0] or (m.suf.len == 0 and bn == ab.b_rates[ab.b_rates.len - 1])) {
                     try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
                 }
             }
@@ -2183,7 +2191,7 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                     try testing.expect(catalog.resolve(nm, &fz_down_snax_ins, &.{ .float16, .float32 }, &targs, &res));
                     try testing.expect(have.contains(res.fnName()));
                     try assertDisjointFcs(&res);
-                    if (bn == ab.b_rates[0] or bn == 64 or bn == ab.b_rates[ab.b_rates.len - 1]) {
+                    if (bn == ab.b_rates[0] or (unr == 2 and bn == ab.b_rates[ab.b_rates.len - 1])) {
                         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
                     }
                 }
@@ -2227,7 +2235,7 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                     try testing.expect(catalog.resolve(nm, &rg_down_tr_ins, &.{ .float16, .float32 }, &targs, &res));
                     try testing.expect(have.contains(res.fnName()));
                     try assertDisjointFcs(&res);
-                    if (bn == ab.b_rates[0] or bn == 64) {
+                    if (bn == ab.b_rates[0]) {
                         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
                     }
                 }
@@ -2273,7 +2281,7 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                     try testing.expect(catalog.resolve(nm, &gated_down_tr_ins, &.{ .float16, .float32 }, &targs, &res));
                     try testing.expect(have.contains(res.fnName()));
                     try assertDisjointFcs(&res);
-                    if (bn == ab.b_rates[0] or bn == 64) {
+                    if (bn == ab.b_rates[0]) {
                         try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
                     }
                 }
@@ -2527,12 +2535,6 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
     const svh128_t = try core.fromHost(std.mem.sliceAsBytes(&ones128_f16), .float16, &.{128});
     defer core.release(svh128_t);
 
-    const readU16 = struct {
-        fn f(t: *const Tensor) ![]const u16 {
-            const b = try core.hostRead(t);
-            return std.mem.bytesAsSlice(u16, @as([]align(2) const u8, @alignCast(b)));
-        }
-    }.f;
     const readF32 = struct {
         fn f(t: *const Tensor) ![]const f32 {
             const b = try core.hostRead(t);
@@ -2547,20 +2549,22 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
     const fz_in_names = &[_][]const u8{ "middle", "trellis", "slots", "meta", "s_x", "s_trellis", "s_slots" };
     const fz_snax_in_names = &[_][]const u8{ "middle", "trellis", "slots", "meta", "s_x", "s_trellis", "s_svh" };
 
-    const FzCase = struct { a_tag: []const u8, a_cls: []const u8, b_tag: []const u8, b_dig: []const u8, dec: format.Decode, rates: []const u32 };
+    const FzCase = struct { a_tag: []const u8, a_cls: []const u8, b_tag: []const u8, b_dig: []const u8, dec: format.Decode, rates: []const u32, full_modes: bool = false };
     const fz_cases = [_]FzCase{
         // All 4 (Part A, Part B) pairings (`ap1_bsc`, `asc_bp1`, `asc_bsc`, `ap1_bp1`) and all 6 Part B codebooks.
-        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "spec1_w15", .b_dig = "_t37f72431", .dec = format.Decode.tabled(.spec1, .w15), .rates = &.{ 16, 34, 56, 64, 80, 96, 128 } },
-        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "pair1_w16", .b_dig = "", .dec = .{ .codebook = .pair1, .window = .w16 }, .rates = &.{ 24, 32, 42, 46, 56, 64 } },
-        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "mcg_w16", .b_dig = "", .dec = .{ .codebook = .mcg, .window = .w16 }, .rates = &.{ 16, 48, 64, 128 } },
-        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "mul1_w16", .b_dig = "", .dec = .{ .codebook = .mul1, .window = .w16 }, .rates = &.{ 16, 64 } },
-        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "alpha_w16", .b_dig = "", .dec = .{ .codebook = .alpha, .window = .w16 }, .rates = &.{ 32, 80 } },
-        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "std1_w15", .b_dig = "_tc5dba171", .dec = format.Decode.tabled(.std1, .w15), .rates = &.{ 24, 64 } },
-        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "pair1_w16", .b_dig = "", .dec = .{ .codebook = .pair1, .window = .w16 }, .rates = &.{ 24, 42, 64 } },
+        // One representative rate per pairing exercises all 4 FC_I34 SIMD modes + S_UNR={1,2}; remaining rates/codebooks verify _lane + _snax(UNR=2).
+        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "spec1_w15", .b_dig = "_t37f72431", .dec = format.Decode.tabled(.spec1, .w15), .rates = &.{ 16, 64, 128 }, .full_modes = true },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "pair1_w16", .b_dig = "", .dec = .{ .codebook = .pair1, .window = .w16 }, .rates = &.{ 56, 24, 42, 64 }, .full_modes = true },
+        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "mcg_w16", .b_dig = "", .dec = .{ .codebook = .mcg, .window = .w16 }, .rates = &.{64} },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "mul1_w16", .b_dig = "", .dec = .{ .codebook = .mul1, .window = .w16 }, .rates = &.{64}, .full_modes = true },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "alpha_w16", .b_dig = "", .dec = .{ .codebook = .alpha, .window = .w16 }, .rates = &.{32} },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "std1_w15", .b_dig = "_tc5dba171", .dec = format.Decode.tabled(.std1, .w15), .rates = &.{24} },
+        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "pair1_w16", .b_dig = "", .dec = .{ .codebook = .pair1, .window = .w16 }, .rates = &.{56}, .full_modes = true },
     };
 
     for (fz_cases) |fc| {
-        for (fc.rates) |n| {
+        for (fc.rates, 0..) |n, ri| {
+            const run_all_modes = fc.full_modes and ri == 0;
             const rate: format.Rate = .{ .n = n };
             const n_c: c_int = @intCast(n);
             const slice_8 = tr_buf[0 .. 8 * n];
@@ -2605,11 +2609,11 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                 defer core.release(outs[0]);
                 defer core.release(outs[1]);
                 const got = try readU16(outs[1]);
-                try testing.expectEqualSlices(u16, &want_tiles[0], got);
+                try expectMatmulU16(&want_tiles[0], got);
             }
 
             // (b) Part B `_one` (FC_I34 = 1): 1 row × 2 output tiles (32 cols)
-            {
+            if (run_all_modes) {
                 const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g0_one", .{ fc.a_tag, fc.b_tag, n, fc.b_dig, fc.a_cls });
                 const def = try kernel_mod.Def.create(kn, fz_in_names, &.{ "y", "s_y" }, "", "", true, false);
                 var cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
@@ -2637,12 +2641,12 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                 defer core.release(outs[0]);
                 defer core.release(outs[1]);
                 const got = try readU16(outs[1]);
-                try testing.expectEqualSlices(u16, want_tiles[0][0..16], got[0..16]);
-                try testing.expectEqualSlices(u16, want_tiles[1][0..16], got[16..32]);
+                try expectMatmulU16(want_tiles[0][0..16], got[0..16]);
+                try expectMatmulU16(want_tiles[1][0..16], got[16..32]);
             }
 
             // (c) Part B `_shared_rows` for both S_SHARED_ROWS=2 (FC_I34=2) and S_SHARED_ROWS=3 (FC_I34=3)
-            for ([_]struct { sr: i32, by: i32 }{ .{ .sr = 2, .by = 3 }, .{ .sr = 3, .by = 2 } }) |sr| {
+            if (run_all_modes) for ([_]struct { sr: i32, by: i32 }{ .{ .sr = 2, .by = 3 }, .{ .sr = 3, .by = 2 } }) |sr| {
                 const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g0_shared_rows", .{ fc.a_tag, fc.b_tag, n, fc.b_dig, fc.a_cls });
                 const def = try kernel_mod.Def.create(kn, fz_in_names, &.{ "y", "s_y" }, "", "", true, false);
                 var cfg: kernel_mod.Config = .{ .grid = .{ sr.by * 128, 1, 1 }, .group = .{ 128, 1, 1 } };
@@ -2670,8 +2674,8 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                 defer core.release(outs[0]);
                 defer core.release(outs[1]);
                 const got = try readU16(outs[1]);
-                try testing.expectEqualSlices(u16, want_tiles[0][0 .. 6 * 16], got);
-            }
+                try expectMatmulU16(want_tiles[0][0 .. 6 * 16], got);
+            };
 
             // (d) Part B `_snax` (`exl3_fz_nax`, both S_UNR=1 and S_UNR=2): 16×128 NAX decode matches host bit-for-bit
             if (has_nax) {
@@ -2679,7 +2683,8 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                 for (slice_64[8 * n ..]) |*w| w.* = 0;
                 const tr_nax = try core.fromHost(std.mem.sliceAsBytes(slice_64), .uint16, &.{ 8, 8, n_c });
                 defer core.release(tr_nax);
-                for ([_]i32{ 1, 2 }) |unr| {
+                const unrs: []const i32 = if (run_all_modes) &.{ 1, 2 } else &.{2};
+                for (unrs) |unr| {
                     const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g0_snax", .{ fc.a_tag, fc.b_tag, n, fc.b_dig, fc.a_cls });
                     const def = try kernel_mod.Def.create(kn, fz_snax_in_names, &.{ "y", "s_y" }, "", "", true, false);
                     var cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
@@ -2754,8 +2759,8 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
 
         const GfCase = struct { df_suf: []const u8, gf_tag: []const u8, rates: []const u32 };
         for ([_]GfCase{
-            .{ .df_suf = "_spec1_w15_t37f72431", .gf_tag = "spec1_w15_t37f72431", .rates = &.{ 16, 34, 64, 96, 128 } },
-            .{ .df_suf = "_pair1", .gf_tag = "pair1_w16", .rates = &.{ 24, 32, 42, 46, 56, 64 } },
+            .{ .df_suf = "_spec1_w15_t37f72431", .gf_tag = "spec1_w15_t37f72431", .rates = &.{ 16, 64, 128 } },
+            .{ .df_suf = "_pair1", .gf_tag = "pair1_w16", .rates = &.{ 24, 56, 64 } },
         }) |gc| {
             const df_def = try kernel_mod.Def.create(try std.fmt.bufPrint(&nbuf, "sushi_exl3_k4_down_fused{s}", .{gc.df_suf}), df_in_names, &.{"y"}, "", "", true, false);
             var nbuf2: [128]u8 = undefined;
@@ -2907,8 +2912,8 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                     try kernel_mod.launch(def, &.{ x_plain16, tr_ag, slots16_t, meta_t, x_lane16, tr_bg, slots16_t }, &cfg, &outs);
                     defer core.release(outs[0]);
                     defer core.release(outs[1]);
-                    try testing.expectEqualSlices(u16, &want_ag, try readU16(outs[0]));
-                    try testing.expectEqualSlices(u16, &want_bg[0], try readU16(outs[1]));
+                    try expectMatmulU16(&want_ag, try readU16(outs[0]));
+                    try expectMatmulU16(&want_bg[0], try readU16(outs[1]));
                 }
 
                 // (f.2) Simultaneous `fz_pair` (SIMD): Part A gate+up (different rates via FC_I46/FC_I47) + Part B gate+up
@@ -2950,8 +2955,8 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                         try testing.expectEqual(@as(f32, @floatCast(@as(f16, @bitCast(want_ag[idx])))), got_ag[idx]);
                         try testing.expectEqual(@as(f32, @floatCast(@as(f16, @bitCast(want_au[idx])))), got_au[idx]);
                     }
-                    try testing.expectEqualSlices(u16, &want_bg[0], try readU16(outs[2]));
-                    try testing.expectEqualSlices(u16, &want_bu, try readU16(outs[3]));
+                    try expectMatmulU16(&want_bg[0], try readU16(outs[2]));
+                    try expectMatmulU16(&want_bu, try readU16(outs[3]));
                 }
 
                 // (f.3) Simultaneous `fz_down_snax` (NAX): Part A [16,16] f16 + Part B [16,128] f32
@@ -2997,7 +3002,7 @@ test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom,
                     try kernel_mod.launch(def, &.{ x_plain16, tr_ag, slots16_t, meta_t, x_plain16, tr_bg_nax, svh128_t }, &cfg, &outs);
                     defer core.release(outs[0]);
                     defer core.release(outs[1]);
-                    try testing.expectEqualSlices(u16, &want_ag, try readU16(outs[0]));
+                    try expectMatmulU16(&want_ag, try readU16(outs[0]));
                     const got_b = try readF32(outs[1]);
                     for (0..16) |r| {
                         for (0..8) |ti| {

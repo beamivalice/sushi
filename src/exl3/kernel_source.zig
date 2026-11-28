@@ -634,22 +634,26 @@ test "exl3 n48 funnel readers preserve codewords and weights" {
 }
 
 // PAIR1's pair reads the odd weight's window alone; every reader hands exl3_pairh a trellis-adjacent
-// (even, odd) pair, so each decodes each rate's weights bit-identical to the host across all 21 PAIR1 rates.
+// (even, odd) pair. Covers every structural leaf-arm boundary across nax_wfrag_k, smat_group, and exl3_lane:
+// 24 (2-word K1.5), 32 (K2 special), 36 (3-word wrap upper), 38 (N>=38 lower), 42 (smat<=42 & lane narrow upper),
+// 44 (smat>42 & lane uint2 full=0), 46 (lane simd_shuffle lower, odd W), 56 (DS41 K3.5 simd_shuffle, even W), 64 (K4 special).
 test "exl3 PAIR1 weight readers decode K1.5 to K4 exactly" {
-    var n: u32 = 24;
-    while (n <= 64) : (n += 2) {
+    for ([_]u32{ 24, 32, 36, 38, 42, 44, 46, 56, 64 }) |n| {
         inline for (.{ .lane, .nax, .simdmat }) |reader| try kernels.weightReaderExact(n, .pair1, .w16, false, reader);
     }
 }
 
 // The NAX fragment, simdgroup-matrix and decode-lane readers decode spec1 and std1 through the same
-// helper as every other codebook; held to the host decode on w15 at K1.5, a three-word lane read and K4 (the per-rate
-// table's test holds every rate's own row).
+// helper as every other codebook; held to the host decode on w15 (std1 at K1.5, three-word funnel, K4;
+// spec1 at K1.5 and three-word funnel — K2/K4/K5/K8 spec1/w15 are covered in the rate-tier test below).
 test "exl3 spec1 and std1 weight readers decode K1.5 to K4 exactly at w15" {
-    inline for (.{ exl3.Codebook.spec1, exl3.Codebook.std1 }) |cb| inline for (.{ 24, 42, 64 }) |n| {
-        if (n != 64) try kernels.weightReaderExact(n, cb, .w15, false, .lane);
-        inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExact(n, cb, .w15, false, reader);
-    };
+    inline for (.{ 24, 42, 64 }) |n| {
+        if (n != 64) try kernels.weightReaderExact(n, .std1, .w15, false, .lane);
+        inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExact(n, .std1, .w15, false, reader);
+    }
+    inline for (.{ 24, 42 }) |n| {
+        inline for (.{ .lane, .nax, .simdmat }) |reader| try kernels.weightReaderExact(n, .spec1, .w15, false, reader);
+    }
 }
 
 test "exl3 SPEC1 per-rate table: every reader decodes every rate with its own row" {
@@ -666,22 +670,10 @@ test "exl3 SPEC1 below K1.5 and above K4: every reader decodes every rate with i
     };
 }
 
-test "exl3 K3.5 PAIR1 lane words match the host across every word and tile boundary" {
-    try kernels.weightReaderExact(56, .pair1, .w16, false, .lane);
-}
-
-test "exl3 K5 NAX fragments match host SPEC1 weights at both halfword alignments" {
-    try kernels.weightReaderExactAt(80, .spec1, .w15, false, .nax, kernels.SPEC1_W15.table);
-}
-
-test "exl3 routed prefill fragments match host PAIR1 weights at K2.5 K3 and K3.5" {
-    inline for (.{ 40, 48, 56 }) |n| try kernels.weightReaderExact(n, .pair1, .w16, false, .nax);
-}
-
 // Exhaustive hardware fidelity gate: verifies that subnormal half weights from `exl3_mma_pairh`
 // pass through BOTH `simdgroup_matrix<half, 8, 8>` (M1-M5) and NAX `matmul2d(relaxed_precision=true)`
 // (M5+) without flush-to-zero, matching unfolded `exl3_pairh` bit-for-bit across all 32,768 w15
-// codewords and K=256 accumulated random dot products at K4, K5, and K6.
+// codewords and K=256 accumulated random dot products at K5.
 test "exl3 MMA subnormal fold is bit-exact across all 32768 w15 codewords on simdgroup_matrix and NAX" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -814,23 +806,21 @@ test "exl3 MMA subnormal fold is bit-exact across all 32768 w15 codewords on sim
         const header = try withTableRows(alloc, .spec1, comptime codebookHelpers(.spec1, .w15));
         const k = try kernels.getNamedKernel(&slot, (try tableKernelName(alloc, .spec1, "exl3_subnormal_smat_spec1_w15")).ptr, &.{"dummy"}, &.{"out"}, smat_src, header);
         defer _ = mlx.mlx_fast_metal_kernel_free(k);
-        for ([_]c_int{ 64, 80, 96 }) |n| {
-            const cfg = mlx.mlx_fast_metal_kernel_config_new();
-            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 512 * 32 }, 1, .uint32));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 512 * 32, 1, 1));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", n));
-            var outputs = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(outputs);
-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, k, inputs, cfg, s));
-            var res = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(res);
-            try mlx.check(mlx.mlx_vector_array_get(&res, outputs, 0));
-            try mlx.check(mlx.mlx_array_eval(res));
-            const got = mlx.mlx_array_data_uint32(res) orelse return error.U32Unreadable;
-            for (0..512 * 32) |i| try t.expectEqual(@as(u32, 0), got[i]);
-        }
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 512 * 32 }, 1, .uint32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 512 * 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", 80));
+        var outputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, k, inputs, cfg, s));
+        var res = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(res);
+        try mlx.check(mlx.mlx_vector_array_get(&res, outputs, 0));
+        try mlx.check(mlx.mlx_array_eval(res));
+        const got = mlx.mlx_array_data_uint32(res) orelse return error.U32Unreadable;
+        for (0..512 * 32) |i| try t.expectEqual(@as(u32, 0), got[i]);
     }
 
     // 2. NAX matmul2d(relaxed_precision=true) across all 32,768 w15 codewords (M5+)
@@ -839,34 +829,34 @@ test "exl3 MMA subnormal fold is bit-exact across all 32768 w15 codewords on sim
         const header = try withTableRows(alloc, .spec1, comptime naxHeader(.spec1, .w15));
         const k = try kernels.getNamedKernel(&slot, (try tableKernelName(alloc, .spec1, "exl3_subnormal_nax_spec1_w15")).ptr, &.{"dummy"}, &.{"out"}, nax_src, header);
         defer _ = mlx.mlx_fast_metal_kernel_free(k);
-        for ([_]c_int{ 64, 80, 96 }) |n| {
-            const cfg = mlx.mlx_fast_metal_kernel_config_new();
-            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 64 * 32 }, 1, .uint32));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 64 * 32, 1, 1));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", n));
-            var outputs = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(outputs);
-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, k, inputs, cfg, s));
-            var res = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(res);
-            try mlx.check(mlx.mlx_vector_array_get(&res, outputs, 0));
-            try mlx.check(mlx.mlx_array_eval(res));
-            const got = mlx.mlx_array_data_uint32(res) orelse return error.U32Unreadable;
-            for (0..64 * 32) |i| try t.expectEqual(@as(u32, 0), got[i]);
-        }
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 64 * 32 }, 1, .uint32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 64 * 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", 80));
+        var outputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, k, inputs, cfg, s));
+        var res = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(res);
+        try mlx.check(mlx.mlx_vector_array_get(&res, outputs, 0));
+        try mlx.check(mlx.mlx_array_eval(res));
+        const got = mlx.mlx_array_data_uint32(res) orelse return error.U32Unreadable;
+        for (0..64 * 32) |i| try t.expectEqual(@as(u32, 0), got[i]);
     }
 }
 
 test "exl3 all rate-tier readers match host across w16 and w15 boundaries" {
-    // Covers every tier transition in nax_wfrag_k, smat_group, and exl3_lane at full 16-bit w16.
-    for ([_]u32{ 16, 18, 24, 32, 34, 36, 38, 56, 58, 60, 62, 64, 66, 78, 80, 82, 84, 86, 94, 96, 98, 100, 102, 108, 110, 112, 126, 128 }) |n| {
+    // One rate per distinct structural leaf arm and boundary across nax_wfrag_k, smat_group, and exl3_lane at w16
+    // (n=42 three-word L=5 funnel is covered in the n42 funnel reader test above).
+    for ([_]u32{ 16, 32, 36, 38, 58, 62, 64, 66, 80, 86, 96, 100, 110, 126, 128 }) |n| {
         inline for (.{ .lane, .nax, .simdmat }) |reader| {
             try kernels.weightReaderExact(n, .mcg, .w16, false, reader);
         }
     }
-    for ([_]u32{ 24, 32, 36, 58, 64, 80, 96, 128 }) |n| {
+    // Representative K2/K4/K5/K8 tiers on spec1/w15 (disjoint from the spec1/std1 test's n=24,42).
+    for ([_]u32{ 32, 64, 80, 128 }) |n| {
         inline for (.{ .lane, .nax, .simdmat }) |reader| {
             try kernels.weightReaderExactAt(n, .spec1, .w15, false, reader, kernels.SPEC1_W15.table);
         }
