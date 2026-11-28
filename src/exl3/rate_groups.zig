@@ -501,6 +501,29 @@ fn mixedSource(alloc: std.mem.Allocator, kind: Kind, classes: []const RateClass,
     defer if (tile_major) alloc.free(body);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
+    if (kind == .pair_prepared) {
+        const pre = try replaceOnce(alloc, base[0..d], "uint split = uint(threadgroup_position_in_grid.z);", "const uint proj = uint(threadgroup_position_in_grid.z) & 1u;\nuint split = uint(threadgroup_position_in_grid.z) >> 1u;");
+        defer alloc.free(pre);
+        try out.appendSlice(alloc, pre);
+        try out.appendSlice(alloc, base[d + N_DECL.len .. a]);
+        try out.appendSlice(alloc, "switch (meta[eid * 8u + proj]) {\n");
+        var seen: [max_groups * 2]u32 = undefined;
+        var n_seen: usize = 0;
+        for (classes) |c| {
+            for ([_]u32{ c.gate, c.up }) |n| {
+                if (std.mem.indexOfScalar(u32, seen[0..n_seen], n) != null) continue;
+                seen[n_seen] = n;
+                n_seen += 1;
+                try out.print(alloc, "case {d}u: {{\n", .{n});
+                try caseHead(&out, alloc, n);
+                try out.appendSlice(alloc, body);
+                try out.appendSlice(alloc, "\n} break;\n");
+            }
+        }
+        try out.appendSlice(alloc, "default: break;\n}\n");
+        try out.appendSlice(alloc, base[z + 1 ..]);
+        return out.toOwnedSliceSentinel(alloc, 0);
+    }
     try out.appendSlice(alloc, base[0..d]);
     try out.appendSlice(alloc, base[d + N_DECL.len .. a]);
     try out.appendSlice(alloc, if (down) "switch (meta[eid * 8u + 2u]) {\n" else "switch (meta[eid * 8u] | (meta[eid * 8u + 1u] << 8u)) {\n");
@@ -578,19 +601,33 @@ fn mixedGroupedSource(alloc: std.mem.Allocator, kind: Kind, classes: []const Rat
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, base[0..d]);
+    if (!down) {
+        const mid_head = try replaceOnce(alloc, base[d + n_decl.len .. t], "const uint split = uint(threadgroup_position_in_grid.z);", "const uint proj = uint(threadgroup_position_in_grid.z) & 1u;\nconst uint split = uint(threadgroup_position_in_grid.z) >> 1u;");
+        defer alloc.free(mid_head);
+        try out.appendSlice(alloc, mid_head);
+        try out.appendSlice(alloc, "switch (meta[eid * 8u + proj]) {\n");
+        var seen: [max_groups * 2]u32 = undefined;
+        var n_seen: usize = 0;
+        for (classes) |c| {
+            for ([_]u32{ c.gate, c.up }) |n| {
+                if (std.mem.indexOfScalar(u32, seen[0..n_seen], n) != null) continue;
+                seen[n_seen] = n;
+                n_seen += 1;
+                try out.print(alloc, "case {d}u: {{\n", .{n});
+                try caseHead(&out, alloc, n);
+                try out.appendSlice(alloc, tail);
+                try out.appendSlice(alloc, "\n} break;\n");
+            }
+        }
+        try out.appendSlice(alloc, "default: break;\n}\n");
+        return out.toOwnedSliceSentinel(alloc, 0);
+    }
     try out.appendSlice(alloc, base[d + n_decl.len .. t]);
-    try out.appendSlice(alloc, if (down) "switch (meta[eid * 8u + 2u]) {\n" else "switch (meta[eid * 8u] | (meta[eid * 8u + 1u] << 8u)) {\n");
+    try out.appendSlice(alloc, "switch (meta[eid * 8u + 2u]) {\n");
     for (classes) |c| {
         try out.print(alloc, "case {d}u: {{\n", .{c.gate | c.up << 8});
-        if (down) {
-            try caseHead(&out, alloc, c.gate);
-            try out.appendSlice(alloc, tail);
-        } else for ([_]u32{ c.gate, c.up }, 0..) |n, proj| {
-            try out.print(alloc, "{{\nconstexpr uint proj = {d}u;\n", .{proj});
-            try caseHead(&out, alloc, n);
-            try out.appendSlice(alloc, tail);
-            try out.appendSlice(alloc, "\n}\n");
-        }
+        try caseHead(&out, alloc, c.gate);
+        try out.appendSlice(alloc, tail);
         try out.appendSlice(alloc, "\n} break;\n");
     }
     try out.appendSlice(alloc, "default: break;\n}\n");
@@ -661,7 +698,7 @@ fn mixedKernel(kind: Kind, classes: []const RateClass, limit: c_int, group: c_in
     return kernels.getNamedKernel(slot, @ptrCast(name.items.ptr), ins, outs, src, try header(alloc, dec));
 }
 
-const DecodeKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, down: bool, layout: kernels.GemvLayout, group: c_int = 0 };
+const DecodeKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, down: bool, layout: kernels.GemvLayout, group: c_int = 0, split_proj: bool = false };
 var decode_cfgs: kernel_src.CfgCache(DecodeKey, 16) = .{};
 
 /// The pair or down GEMV's launch: tiles of `layout.tiles` outputs across, a slot a row, a K split deep.
@@ -680,7 +717,7 @@ fn decodeLaunch(alloc: std.mem.Allocator, key: DecodeKey) !fuse.Launch {
         const sh = try alloc.dupe(c_int, &.{ key.nslots * nsplit, key.out_dim });
         outs[0] = .{ .shape = sh, .dtype = .float32 };
         outs[1] = .{ .shape = sh, .dtype = .float32 };
-        tgs = .{ tiles_x, key.nslots, nsplit };
+        tgs = .{ tiles_x, key.nslots, if (key.split_proj) nsplit * 2 else nsplit };
         try ints.append(alloc, .{ .name = "NSPLIT", .value = nsplit });
         try ints.append(alloc, .{ .name = "TOPK", .value = key.topk });
     }
@@ -748,7 +785,7 @@ fn downMixed(s: mlx.mlx_stream, inner: [2]mlx.mlx_array, rb: *const Ragged, slot
 /// x, 72 times a slot at DeepSeek's width): the planes `pairMixed` writes, byte for byte.
 fn pairPreparedMixed(s: mlx.mlx_stream, prep: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, topk: c_int, classes: []const RateClass, group: c_int) ![2]mlx.mlx_array {
     const nslots: c_int = @intCast(mlx.mlx_array_size(slots));
-    const cfg = try decodeConfig(.{ .in_dim = rb.hidden, .out_dim = rb.inter, .nslots = nslots, .topk = topk, .down = false, .layout = kernels.groupedLayout(kernels.gemvLayout(@divExact(rb.inter, 16)), group), .group = group });
+    const cfg = try decodeConfig(.{ .in_dim = rb.hidden, .out_dim = rb.inter, .nslots = nslots, .topk = topk, .down = false, .layout = kernels.groupedLayout(kernels.gemvLayout(@divExact(rb.inter, 16)), group), .group = group, .split_proj = true });
     const ov = try kernels.applyOuts(s, try mixedKernel(.pair_prepared, classes, 0, group, rb.tile_major), &.{ prep, rb.trellis[0], rb.trellis[1], slots, rb.meta }, cfg, 2);
     defer _ = mlx.mlx_vector_array_free(ov);
     const g = try getOut(ov, 0);
@@ -942,12 +979,12 @@ fn sharedNaxPairBody(alloc: std.mem.Allocator) ![]const u8 {
     const rep =
         \\const bool upper = (threadgroup_position_in_grid.z & 1u) != 0u;
         \\const uint split = uint(threadgroup_position_in_grid.z) >> 1u;
-        \\const device half *suh = upper ? suhu : suhg;
-        \\const device half *svh = suh;
+        \\const device half *x = upper ? xu : xg;
+        \\const device half *svh = x;
         \\const device ushort *trellis = upper ? tu : tg;
         \\device float *y = upper ? yu : yg;
     ;
-    const s0 = kernels.metalReplaceFound(project_rows.ROWS_NAX_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", rep);
+    const s0 = kernels.metalReplaceFound(project_rows.ROWS_NAX_PREPPED_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", rep);
     return std.mem.concat(alloc, u8, &.{ "typedef bfloat16_t OutT;\n", s0 });
 }
 
@@ -982,7 +1019,7 @@ fn routedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
             .outs = &.{"prep"},
         },
         .pair => return .{
-            .launch = try decodeLaunch(alloc, .{ .in_dim = k.hidden, .out_dim = k.inter, .nslots = k.nslots, .topk = k.topk, .down = false, .layout = .{ .funnel = k.funnel, .tiles = k.tiles }, .group = k.group }),
+            .launch = try decodeLaunch(alloc, .{ .in_dim = k.hidden, .out_dim = k.inter, .nslots = k.nslots, .topk = k.topk, .down = false, .layout = .{ .funnel = k.funnel, .tiles = k.tiles }, .group = k.group, .split_proj = true }),
             .body = try mixedText(alloc, .pair_prepared, classes, 0, k.group, k.tile_major),
             .ins = &.{ "prep", "tg", "tu", "slots", "meta" },
             .outs = &.{ "yg", "yu" },
@@ -1026,8 +1063,8 @@ fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
     const nsplit = k.shared_nsplit;
     switch (k.stage) {
         .prep => if (k.shared_nax) return .{
-            .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 32, .ints = &.{}, .outs = try outs2(alloc, try halfOut(alloc, 1, 1), try halfOut(alloc, 1, 1)) },
-            .body = "if (thread_index_in_threadgroup == 0u && threadgroup_position_in_grid.x == 0u && threadgroup_position_in_grid.y == 0u) { yg[0] = half(0); yu[0] = half(0); }",
+            .launch = .{ .tgs = .{ @divExact(k.hidden, 128), rows, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "IDIM", k.hidden }, .{ "TOPK", 1 } }), .outs = try outs2(alloc, try halfOut(alloc, rows, k.hidden), try halfOut(alloc, rows, k.hidden)) },
+            .body = SHARED_PREPARE_SOURCE,
             .ins = &.{ "x", "suhg", "suhu", "slots" },
             .outs = &.{ "yg", "yu" },
         } else return .{
@@ -1039,7 +1076,7 @@ fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
         .pair => if (k.shared_nax) return .{
             .launch = .{ .tgs = .{ @divExact(k.inter, 128), 1, 2 * nsplit }, .threads = 128, .ints = try sharedNaxInts(alloc, k.hidden, k.inter, rows, nsplit, n), .outs = try outs2(alloc, try typedOut(alloc, rows * nsplit, k.inter, .float32), try typedOut(alloc, rows * nsplit, k.inter, .float32)) },
             .body = try sharedNaxPairBody(alloc),
-            .ins = &.{ "x", "tg", "tu", "suhg", "suhu" },
+            .ins = &.{ "xg", "xu", "tg", "tu" },
             .outs = &.{ "yg", "yu" },
             .header = try std.mem.concat(alloc, u8, &.{ header_text, project_rows.ROWS_NAX_FRAGS }),
         } else return .{
@@ -1050,7 +1087,7 @@ fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
             .header = header_text,
         },
         .mid => if (k.shared_nax) {
-            const body = if (k.limit > 0) try clampSwiglu(alloc, kernels.DECODE_MID_SOURCE, k.limit) else try alloc.dupe(u8, kernels.DECODE_MID_SOURCE);
+            const body = if (k.limit > 0) try clampSwiglu(alloc, kernels.DECODE_MID_LINEAR_SOURCE, k.limit) else try alloc.dupe(u8, kernels.DECODE_MID_LINEAR_SOURCE);
             return .{
                 .launch = .{ .tgs = .{ @divExact(k.inter, 128), rows, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "IDIM", k.inter }, .{ "NSPLIT", nsplit } }), .outs = try outs1(alloc, try halfOut(alloc, rows, k.inter)) },
                 .body = body,
@@ -1438,11 +1475,9 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
     @memcpy(key.classes[0..pair.len], pair);
     key.class_count = pair.len;
     key.coop = sr.coop_pair and !shared_nax;
-    const pair_se_ins = if (shared_nax)
-        [_]mlx.mlx_array{ x, se.bank.gate.trellis, se.bank.up.trellis, se.bank.gate.suh, se.bank.up.suh }
-    else
-        [_]mlx.mlx_array{ sxg, sxu, se.bank.gate.trellis, se.bank.up.trellis, zeros };
-    const pair_ov = try applyStage(s, try stageFor(key), &.{ prep, rb.trellis[0], rb.trellis[1], slots, rb.meta }, &pair_se_ins, 4);
+    const pair_se_nax = [_]mlx.mlx_array{ sxg, sxu, se.bank.gate.trellis, se.bank.up.trellis };
+    const pair_se_simd = [_]mlx.mlx_array{ sxg, sxu, se.bank.gate.trellis, se.bank.up.trellis, zeros };
+    const pair_ov = try applyStage(s, try stageFor(key), &.{ prep, rb.trellis[0], rb.trellis[1], slots, rb.meta }, if (shared_nax) &pair_se_nax else &pair_se_simd, 4);
     defer _ = mlx.mlx_vector_array_free(pair_ov);
     const ig = try getOut(pair_ov, 0);
     defer _ = mlx.mlx_array_free(ig);
@@ -2259,6 +2294,303 @@ fn planeNames(comptime name: []const u8) [DIRECT_PLANES][*:0]const u8 {
     return out;
 }
 
+/// Multi-row (4 SGs x 8 rows = 32 rows/TG) `TOKEN_PAIR_PREPARE_SOURCE` caching `suhg`/`suhu` across
+/// consecutive sorted slots of the same expert; bit-exact with the 1-row body.
+pub const PREFILL_PAIR_PREP_SOURCE: [:0]const u8 =
+    \\const uint block = uint(threadgroup_position_in_grid.x);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const uint nslots = uint(slots_shape[0]);
+    \\const uint base = block * 128u;
+    \\const uint slot0 = uint(threadgroup_position_in_grid.y) * 32u + sg;
+    \\const float sc = 0.08838834764831845f;
+    \\uint prev_eid = 0xffffffffu;
+    \\float4 shg = 0.0f;
+    \\float4 shu = 0.0f;
+    \\for (uint r = 0u; r < 8u; r++) {
+    \\  const uint slot = slot0 + r * 4u;
+    \\  if (slot >= nslots) break;
+    \\  const uint eid = uint(slots[slot]);
+    \\  if (eid != prev_eid) {
+    \\    prev_eid = eid;
+    \\    const size_t sb = (size_t)eid * (size_t)(IDIM) + base;
+    \\    shg = float4(float(suhg[sb + lane]), float(suhg[sb + lane + 32u]), float(suhg[sb + lane + 64u]), float(suhg[sb + lane + 96u]));
+    \\    shu = float4(float(suhu[sb + lane]), float(suhu[sb + lane + 32u]), float(suhu[sb + lane + 64u]), float(suhu[sb + lane + 96u]));
+    \\  }
+    \\  const uint orig = uint(order[slot]);
+    \\  const uint row = orig / uint(TOPK);
+    \\  const size_t xb = (size_t)row * (size_t)(IDIM) + base;
+    \\  const size_t yb = (size_t)slot * (size_t)(IDIM) + base;
+    \\  const float x0 = float(x[xb + lane]);
+    \\  const float x1 = float(x[xb + lane + 32u]);
+    \\  const float x2 = float(x[xb + lane + 64u]);
+    \\  const float x3 = float(x[xb + lane + 96u]);
+    \\  float4 v = float4(x0 * shg.x, x1 * shg.y, x2 * shg.z, x3 * shg.w);
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  float s0 = v.x + v.y;
+    \\  float s1 = v.x - v.y;
+    \\  float s2 = v.z + v.w;
+    \\  float s3 = v.z - v.w;
+    \\  yg[yb + lane] = half((s0 + s2) * sc);
+    \\  yg[yb + lane + 32u] = half((s1 + s3) * sc);
+    \\  yg[yb + lane + 64u] = half((s0 - s2) * sc);
+    \\  yg[yb + lane + 96u] = half((s1 - s3) * sc);
+    \\  v = float4(x0 * shu.x, x1 * shu.y, x2 * shu.z, x3 * shu.w);
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  yu[yb + lane] = half((s0 + s2) * sc);
+    \\  yu[yb + lane + 32u] = half((s1 + s3) * sc);
+    \\  yu[yb + lane + 64u] = half((s0 - s2) * sc);
+    \\  yu[yb + lane + 96u] = half((s1 - s3) * sc);
+    \\}
+;
+
+pub const SHARED_PREFILL_PREP_SOURCE: [:0]const u8 = kernels.metalReplaceFound(PREFILL_PAIR_PREP_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;");
+
+/// Multi-row (4 SGs x 8 rows = 32 rows/TG) `MID_PLANES_SOURCE` caching `svhg`/`svhu`/`suhd` and
+/// plane pointers across consecutive sorted slots of the same expert; bit-exact with `MID_PLANES_SOURCE`.
+pub const MID_PLANES_MULTI_SOURCE: [:0]const u8 =
+    \\const uint block = uint(threadgroup_position_in_grid.x);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const uint nslots = uint(slots_shape[0]);
+    \\const uint base = block * 128u;
+    \\const uint slot0 = uint(threadgroup_position_in_grid.y) * 32u + sg;
+    \\const float sc = 0.08838834764831845f;
+    \\uint prev_eid = 0xffffffffu;
+    \\float4 shg = 0.0f;
+    \\float4 shu = 0.0f;
+    \\float4 shd = 0.0f;
+    \\const device half *ig = ig0;
+    \\const device half *iu = iu0;
+    \\for (uint r = 0u; r < 8u; r++) {
+    \\  const uint slot = slot0 + r * 4u;
+    \\  if (slot >= nslots) break;
+    \\  const uint eid = uint(slots[slot]);
+    \\  if (eid != prev_eid) {
+    \\    prev_eid = eid;
+    \\    const uint pg = meta[eid * 8u + 3u];
+    \\
+++ planePick("ig", "ig") ++ planePick("iu", "iu") ++
+    \\    const size_t sb = (size_t)eid * (size_t)(ODIM) + base;
+    \\    shg = float4(float(svhg[sb + lane]), float(svhg[sb + lane + 32u]), float(svhg[sb + lane + 64u]), float(svhg[sb + lane + 96u]));
+    \\    shu = float4(float(svhu[sb + lane]), float(svhu[sb + lane + 32u]), float(svhu[sb + lane + 64u]), float(svhu[sb + lane + 96u]));
+    \\    shd = float4(float(suhd[sb + lane]), float(suhd[sb + lane + 32u]), float(suhd[sb + lane + 64u]), float(suhd[sb + lane + 96u]));
+    \\  }
+    \\  const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
+    \\  float4 v = float4(float(ig[xb + lane]), float(ig[xb + lane + 32u]), float(ig[xb + lane + 64u]), float(ig[xb + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  float s0 = v.x + v.y;
+    \\  float s1 = v.x - v.y;
+    \\  float s2 = v.z + v.w;
+    \\  float s3 = v.z - v.w;
+    \\  float g0 = (s0 + s2) * sc * shg.x;
+    \\  float g1 = (s1 + s3) * sc * shg.y;
+    \\  float g2 = (s0 - s2) * sc * shg.z;
+    \\  float g3 = (s1 - s3) * sc * shg.w;
+    \\  v = float4(float(iu[xb + lane]), float(iu[xb + lane + 32u]), float(iu[xb + lane + 64u]), float(iu[xb + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  float u0 = (s0 + s2) * sc * shu.x;
+    \\  float u1 = (s1 + s3) * sc * shu.y;
+    \\  float u2 = (s0 - s2) * sc * shu.z;
+    \\  float u3 = (s1 - s3) * sc * shu.w;
+    \\  if constexpr (CLAMP_LIMIT > 0) {
+    \\    g0 = min(g0, float(CLAMP_LIMIT)); g1 = min(g1, float(CLAMP_LIMIT));
+    \\    g2 = min(g2, float(CLAMP_LIMIT)); g3 = min(g3, float(CLAMP_LIMIT));
+    \\    u0 = clamp(u0, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\    u1 = clamp(u1, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\    u2 = clamp(u2, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\    u3 = clamp(u3, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\  }
+    \\  const float ysig0 = 1 / (1 + exp(abs(g0)));
+    \\  const float ysig1 = 1 / (1 + exp(abs(g1)));
+    \\  const float ysig2 = 1 / (1 + exp(abs(g2)));
+    \\  const float ysig3 = 1 / (1 + exp(abs(g3)));
+    \\  const float sig0 = (g0 < 0) ? ysig0 : 1 - ysig0;
+    \\  const float sig1 = (g1 < 0) ? ysig1 : 1 - ysig1;
+    \\  const float sig2 = (g2 < 0) ? ysig2 : 1 - ysig2;
+    \\  const float sig3 = (g3 < 0) ? ysig3 : 1 - ysig3;
+    \\  const float silu0 = g0 * sig0;
+    \\  const float silu1 = g1 * sig1;
+    \\  const float silu2 = g2 * sig2;
+    \\  const float silu3 = g3 * sig3;
+    \\  const float h0 = silu0 * u0;
+    \\  const float h1 = silu1 * u1;
+    \\  const float h2 = silu2 * u2;
+    \\  const float h3 = silu3 * u3;
+    \\  v = float4(h0 * shd.x, h1 * shd.y, h2 * shd.z, h3 * shd.w);
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  yd[xb + lane] = half((s0 + s2) * sc);
+    \\  yd[xb + lane + 32u] = half((s1 + s3) * sc);
+    \\  yd[xb + lane + 64u] = half((s0 - s2) * sc);
+    \\  yd[xb + lane + 96u] = half((s1 - s3) * sc);
+    \\}
+;
+
+/// Multi-row (4 SGs x 8 rows = 32 rows/TG) `SHARED_MID_SOURCE` loading `svhg`/`svhu`/`suhd` once per SG.
+pub const SHARED_MID_MULTI_SOURCE: [:0]const u8 =
+    \\const uint block = uint(threadgroup_position_in_grid.x);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const uint nslots = uint(ig_shape[0]);
+    \\const uint base = block * 128u;
+    \\const uint slot0 = uint(threadgroup_position_in_grid.y) * 32u + sg;
+    \\const float sc = 0.08838834764831845f;
+    \\const float4 shg = float4(float(svhg[base + lane]), float(svhg[base + lane + 32u]), float(svhg[base + lane + 64u]), float(svhg[base + lane + 96u]));
+    \\const float4 shu = float4(float(svhu[base + lane]), float(svhu[base + lane + 32u]), float(svhu[base + lane + 64u]), float(svhu[base + lane + 96u]));
+    \\const float4 shd = float4(float(suhd[base + lane]), float(suhd[base + lane + 32u]), float(suhd[base + lane + 64u]), float(suhd[base + lane + 96u]));
+    \\for (uint r = 0u; r < 8u; r++) {
+    \\  const uint slot = slot0 + r * 4u;
+    \\  if (slot >= nslots) break;
+    \\  const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
+    \\  float4 v = float4(float(ig[xb + lane]), float(ig[xb + lane + 32u]), float(ig[xb + lane + 64u]), float(ig[xb + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  float s0 = v.x + v.y;
+    \\  float s1 = v.x - v.y;
+    \\  float s2 = v.z + v.w;
+    \\  float s3 = v.z - v.w;
+    \\  float g0 = float(bfloat16_t((s0 + s2) * sc * shg.x));
+    \\  float g1 = float(bfloat16_t((s1 + s3) * sc * shg.y));
+    \\  float g2 = float(bfloat16_t((s0 - s2) * sc * shg.z));
+    \\  float g3 = float(bfloat16_t((s1 - s3) * sc * shg.w));
+    \\  v = float4(float(iu[xb + lane]), float(iu[xb + lane + 32u]), float(iu[xb + lane + 64u]), float(iu[xb + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  float u0 = float(bfloat16_t((s0 + s2) * sc * shu.x));
+    \\  float u1 = float(bfloat16_t((s1 + s3) * sc * shu.y));
+    \\  float u2 = float(bfloat16_t((s0 - s2) * sc * shu.z));
+    \\  float u3 = float(bfloat16_t((s1 - s3) * sc * shu.w));
+    \\  if constexpr (CLAMP_LIMIT > 0) {
+    \\    g0 = min(g0, float(CLAMP_LIMIT)); g1 = min(g1, float(CLAMP_LIMIT));
+    \\    g2 = min(g2, float(CLAMP_LIMIT)); g3 = min(g3, float(CLAMP_LIMIT));
+    \\    u0 = clamp(u0, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\    u1 = clamp(u1, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\    u2 = clamp(u2, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\    u3 = clamp(u3, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\  }
+    \\  const float ysig0 = 1 / (1 + exp(abs(g0)));
+    \\  const float ysig1 = 1 / (1 + exp(abs(g1)));
+    \\  const float ysig2 = 1 / (1 + exp(abs(g2)));
+    \\  const float ysig3 = 1 / (1 + exp(abs(g3)));
+    \\  const float sig0 = (g0 < 0) ? ysig0 : 1 - ysig0;
+    \\  const float sig1 = (g1 < 0) ? ysig1 : 1 - ysig1;
+    \\  const float sig2 = (g2 < 0) ? ysig2 : 1 - ysig2;
+    \\  const float sig3 = (g3 < 0) ? ysig3 : 1 - ysig3;
+    \\  const float silu0 = g0 * sig0;
+    \\  const float silu1 = g1 * sig1;
+    \\  const float silu2 = g2 * sig2;
+    \\  const float silu3 = g3 * sig3;
+    \\  const float h0 = float(bfloat16_t(silu0 * u0));
+    \\  const float h1 = float(bfloat16_t(silu1 * u1));
+    \\  const float h2 = float(bfloat16_t(silu2 * u2));
+    \\  const float h3 = float(bfloat16_t(silu3 * u3));
+    \\  v = float4(h0 * shd.x, h1 * shd.y, h2 * shd.z, h3 * shd.w);
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  yd[xb + lane] = half((s0 + s2) * sc);
+    \\  yd[xb + lane + 32u] = half((s1 + s3) * sc);
+    \\  yd[xb + lane + 64u] = half((s0 - s2) * sc);
+    \\  yd[xb + lane + 96u] = half((s1 - s3) * sc);
+    \\}
+;
+
 /// `MID_SOURCE` reading the gate and up rows from the plane of the row's rate group (`ig0..`, `iu0..`) instead of a
 /// combined one.
 pub const MID_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
@@ -2308,14 +2640,14 @@ fn prefillParts(alloc: std.mem.Allocator, stage: PrefillStage, g: PrefillGeo) !s
             const tgs = @divExact(g.hidden, 128);
             return .{
                 .a = .{
-                    .launch = .{ .tgs = .{ tgs, g.n, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "IDIM", g.hidden }, .{ "TOPK", g.topk } }), .outs = try outs2(alloc, try halfOut(alloc, g.n, g.hidden), try halfOut(alloc, g.n, g.hidden)) },
-                    .body = kernels.TOKEN_PAIR_PREPARE_SOURCE,
+                    .launch = .{ .tgs = .{ tgs, @divFloor(g.n + 31, 32), 1 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "IDIM", g.hidden }, .{ "TOPK", g.topk } }), .outs = try outs2(alloc, try halfOut(alloc, g.n, g.hidden), try halfOut(alloc, g.n, g.hidden)) },
+                    .body = PREFILL_PAIR_PREP_SOURCE,
                     .ins = &.{ "x", "suhg", "suhu", "slots", "order" },
                     .outs = &.{ "yg", "yu" },
                 },
                 .b = .{
-                    .launch = .{ .tgs = .{ tgs, g.rows, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "IDIM", g.hidden }, .{ "TOPK", 1 } }), .outs = try outs2(alloc, try halfOut(alloc, g.rows, g.hidden), try halfOut(alloc, g.rows, g.hidden)) },
-                    .body = SHARED_PREPARE_SOURCE,
+                    .launch = .{ .tgs = .{ tgs, @divFloor(g.rows + 31, 32), 1 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "IDIM", g.hidden }, .{ "TOPK", 1 } }), .outs = try outs2(alloc, try halfOut(alloc, g.rows, g.hidden), try halfOut(alloc, g.rows, g.hidden)) },
+                    .body = SHARED_PREFILL_PREP_SOURCE,
                     .ins = &.{ "x", "suhg", "suhu", "slots" },
                     .outs = &.{ "yg", "yu" },
                 },
@@ -2325,14 +2657,14 @@ fn prefillParts(alloc: std.mem.Allocator, stage: PrefillStage, g: PrefillGeo) !s
             const tgs = @divExact(g.inter, 128);
             return .{
                 .a = .{
-                    .launch = .{ .tgs = .{ tgs, g.n, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "ODIM", g.inter }, .{ "CLAMP_LIMIT", g.limit } }), .outs = try outs1(alloc, try halfOut(alloc, g.n, g.inter)) },
-                    .body = MID_PLANES_SOURCE,
+                    .launch = .{ .tgs = .{ tgs, @divFloor(g.n + 31, 32), 1 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "ODIM", g.inter }, .{ "CLAMP_LIMIT", g.limit } }), .outs = try outs1(alloc, try halfOut(alloc, g.n, g.inter)) },
+                    .body = MID_PLANES_MULTI_SOURCE,
                     .ins = &MID_PLANES_INS,
                     .outs = &.{"yd"},
                 },
                 .b = .{
-                    .launch = .{ .tgs = .{ tgs, g.rows, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "ODIM", g.inter }, .{ "CLAMP_LIMIT", g.limit } }), .outs = try outs1(alloc, try halfOut(alloc, g.rows, g.inter)) },
-                    .body = SHARED_MID_SOURCE,
+                    .launch = .{ .tgs = .{ tgs, @divFloor(g.rows + 31, 32), 1 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "ODIM", g.inter }, .{ "CLAMP_LIMIT", g.limit } }), .outs = try outs1(alloc, try halfOut(alloc, g.rows, g.inter)) },
+                    .body = SHARED_MID_MULTI_SOURCE,
                     .ins = &.{ "ig", "iu", "svhg", "svhu", "suhd" },
                     .outs = &.{"yd"},
                 },

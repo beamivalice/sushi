@@ -184,8 +184,11 @@ fn renamePartB(
         } else if (std.mem.startsWith(u8, word, "exl3_") or std.mem.startsWith(u8, word, "EXL3_")) {
             try out.appendSlice(a, "sx_");
             try out.appendSlice(a, word);
-        } else if (for (io_names) |n| {
-            if (std.mem.eql(u8, n, word)) break true;
+        } else if (io_hit: for (io_names) |n| {
+            if (std.mem.eql(u8, n, word)) break :io_hit true;
+            inline for (.{ "_shape", "_strides", "_ndim" }) |suffix| {
+                if (std.mem.endsWith(u8, word, suffix) and std.mem.eql(u8, n, word[0 .. word.len - suffix.len])) break :io_hit true;
+            }
         } else false) {
             try out.appendSlice(a, "s_");
             try out.appendSlice(a, word);
@@ -795,17 +798,15 @@ fn buildNaxFragsFc(a: std.mem.Allocator) ![]u8 {
         \\        const uint pw = words[last == 0u ? W - 1u : last - 1u];
         \\        const uint lo = nax_funnel(words[last], pw, s);
         \\        return nax_quads_fc<Scaled>(N, nax_funnel(lo, pw >> s, W), lo, 0u, d, 0u);
-        \\      } else if (N >= 38u) {
-        \\        const uint pw = words[last - 1u];
-        \\        const uint lo = nax_funnel(words[last], pw, s);
-        \\        const uint hi = nax_funnel(pw, words[last == 1u ? W - 1u : last - 2u], s);
-        \\        return nax_quads_fc<Scaled>(N, nax_funnel(lo, hi, W), lo, 0u, d, 0u);
         \\      } else {
-        \\        const uint prev_i = last == 0u ? W - 1u : last - 1u;
+        \\        const uint prev_i = (N >= 38u) ? (last - 1u) : (last == 0u ? W - 1u : last - 1u);
+        \\        const uint w_last = words[last];
         \\        const uint pw = words[prev_i];
-        \\        const uint lo = nax_funnel(words[last], pw, s);
-        \\        const uint hi = nax_funnel(pw, words[prev_i == 0u ? W - 1u : prev_i - 1u], s);
-        \\        return nax_quads_fc<Scaled>(N, nax_funnel(lo, hi, W), lo, 0u, d, 0u);
+        \\        const uint p2 = words[prev_i == 0u ? W - 1u : prev_i - 1u];
+        \\        const uint lo = nax_funnel(w_last, pw, s);
+        \\        const bool small = (s + W) < 32u;
+        \\        const uint hi_w = nax_funnel(small ? w_last : pw, small ? pw : p2, (s + W) & 31u);
+        \\        return nax_quads_fc<Scaled>(N, hi_w, lo, 0u, d, 0u);
         \\      }
         \\    }
         \\  }
@@ -1290,6 +1291,26 @@ fn buildMixedRateBody(a: std.mem.Allocator, kind: RgKind, group: u32, is_pair1: 
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
+    if (kind == .pair_prepared) {
+        if (group == 0) {
+            const pre = try replaceOnceAlloc(a, base[0..d], "uint split = uint(threadgroup_position_in_grid.z);", "const uint proj = uint(threadgroup_position_in_grid.z) & 1u;\nuint split = uint(threadgroup_position_in_grid.z) >> 1u;");
+            try out.appendSlice(a, pre);
+            try out.appendSlice(a, base[d + n_decl.len .. anchor_pos]);
+        } else {
+            try out.appendSlice(a, base[0..d]);
+            const pre = try replaceOnceAlloc(a, base[d + n_decl.len .. anchor_pos], "const uint split = uint(threadgroup_position_in_grid.z);", "const uint proj = uint(threadgroup_position_in_grid.z) & 1u;\nconst uint split = uint(threadgroup_position_in_grid.z) >> 1u;");
+            try out.appendSlice(a, pre);
+        }
+        try out.appendSlice(a, "switch (meta[eid * 8u + proj]) {\n");
+        for (rates, 0..) |r, ri| {
+            try out.print(a, "case {d}u: if (((as_type<uint>(FC_I{d}) | as_type<uint>(FC_I{d})) & (1u << {d}u)) != 0u) {{\nconstexpr uint N = {d}u;\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n", .{ r, fc_rate_mask_g, fc_rate_mask_u, ri, r });
+            try out.appendSlice(a, body);
+            try out.appendSlice(a, "\n} break;\n");
+        }
+        try out.appendSlice(a, "default: break;\n}\n");
+        if (group == 0) try out.appendSlice(a, base[z + 1 ..]);
+        return out.toOwnedSlice(a);
+    }
     try out.appendSlice(a, base[0..d]);
     try out.appendSlice(a, base[d + n_decl.len .. anchor_pos]);
 
@@ -1441,14 +1462,14 @@ fn srcCombine(a: std.mem.Allocator, chained: usize) ![]const u8 {
 
 fn srcFzPrefillPrep(a: std.mem.Allocator, _: usize) ![]const u8 {
     const a_part: fuse.Part = .{
-        .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 32, .ints = &.{ .{ .name = "IDIM", .value = 0 }, .{ .name = "TOPK", .value = 0 } }, .outs = &.{} },
-        .body = kernels.TOKEN_PAIR_PREPARE_SOURCE,
+        .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 128, .ints = &.{ .{ .name = "IDIM", .value = 0 }, .{ .name = "TOPK", .value = 0 } }, .outs = &.{} },
+        .body = rate_groups.PREFILL_PAIR_PREP_SOURCE,
         .ins = &.{ "x", "suhg", "suhu", "slots", "order" },
         .outs = &.{ "yg", "yu" },
     };
     const b_part: fuse.Part = .{
-        .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 32, .ints = &.{ .{ .name = "IDIM", .value = 0 }, .{ .name = "TOPK", .value = 0 } }, .outs = &.{} },
-        .body = rate_groups.SHARED_PREPARE_SOURCE,
+        .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 128, .ints = &.{ .{ .name = "IDIM", .value = 0 }, .{ .name = "TOPK", .value = 0 } }, .outs = &.{} },
+        .body = rate_groups.SHARED_PREFILL_PREP_SOURCE,
         .ins = &.{ "x", "suhg", "suhu", "slots" },
         .outs = &.{ "yg", "yu" },
     };
@@ -1456,16 +1477,16 @@ fn srcFzPrefillPrep(a: std.mem.Allocator, _: usize) ![]const u8 {
 }
 
 fn srcFzPrefillMid(a: std.mem.Allocator, _: usize) ![]const u8 {
-    const a_body = try fcCleanSource(a, rate_groups.MID_PLANES_SOURCE);
-    const b_body = try fcCleanSource(a, rate_groups.SHARED_MID_SOURCE);
+    const a_body = try fcCleanSource(a, rate_groups.MID_PLANES_MULTI_SOURCE);
+    const b_body = try fcCleanSource(a, rate_groups.SHARED_MID_MULTI_SOURCE);
     const a_part: fuse.Part = .{
-        .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 32, .ints = &.{ .{ .name = "ODIM", .value = 0 }, .{ .name = "CLAMP_LIMIT", .value = 0 } }, .outs = &.{} },
+        .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 128, .ints = &.{ .{ .name = "ODIM", .value = 0 }, .{ .name = "CLAMP_LIMIT", .value = 0 } }, .outs = &.{} },
         .body = a_body,
         .ins = &rate_groups.MID_PLANES_INS,
         .outs = &.{"yd"},
     };
     const b_part: fuse.Part = .{
-        .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 32, .ints = &.{ .{ .name = "ODIM", .value = 0 }, .{ .name = "CLAMP_LIMIT", .value = 0 } }, .outs = &.{} },
+        .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 128, .ints = &.{ .{ .name = "ODIM", .value = 0 }, .{ .name = "CLAMP_LIMIT", .value = 0 } }, .outs = &.{} },
         .body = b_body,
         .ins = &.{ "ig", "iu", "svhg", "svhu", "suhd" },
         .outs = &.{"yd"},
@@ -1513,9 +1534,9 @@ fn srcFzPrepSnax(a: std.mem.Allocator, _: usize) ![]const u8 {
     return buildFusedSource(
         a,
         kernels.PAIR_PREP_SOURCE,
-        "if (thread_index_in_threadgroup == 0u && threadgroup_position_in_grid.x == 0u && threadgroup_position_in_grid.y == 0u) { yg[0] = half(0); yu[0] = half(0); }",
+        rate_groups.SHARED_PREPARE_SOURCE,
         &.{ "x", "suhg", "suhu", "slots", "yg", "yu" },
-        &.{},
+        &.{ "IDIM", "TOPK" },
     );
 }
 
@@ -1535,10 +1556,12 @@ fn srcFzMid(a: std.mem.Allocator, _: usize) ![]const u8 {
 fn srcFzMidSnax(a: std.mem.Allocator, _: usize) ![]const u8 {
     const a_clean = try fcCleanSource(a, kernels.DECODE_MID_SOURCE);
     const a_clamped = try addFcClamp(a, a_clean);
+    const b_clean = try fcCleanSource(a, kernels.DECODE_MID_LINEAR_SOURCE);
+    const b_clamped = try addFcClamp(a, b_clean);
     return buildFusedSource(
         a,
         a_clamped,
-        a_clamped,
+        b_clamped,
         &.{ "ig", "iu", "svhg", "svhu", "suhd", "slots", "prepared" },
         &.{ "IDIM", "NSPLIT" },
     );
@@ -1563,48 +1586,36 @@ fn srcFzSnaxStage(comptime is_down: bool, comptime group: u32, comptime a_pair1:
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             const a_body = try buildMixedRateBody(a, if (is_down) .down_prepared else .pair_prepared, group, a_pair1);
-            var tr_body: []u8 = undefined;
-            if (!is_down) {
-                const rep =
-                    \\const bool upper = (threadgroup_position_in_grid.z & 1u) != 0u;
-                    \\const uint split = uint(threadgroup_position_in_grid.z) >> 1u;
-                    \\const device half *suh = upper ? suhu : suhg;
-                    \\const device half *svh = suh;
-                    \\const device ushort *trellis = upper ? tu : tg;
-                    \\device float *y = upper ? yu : yg;
-                ;
-                const s0 = try replaceOnceAlloc(a, project_rows.ROWS_NAX_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", rep);
-                tr_body = try transformRowsSource(a, s0, true, false);
-                tr_body = try replaceAllAlloc(a, tr_body, "uint(KPH)", "1u");
-                tr_body = try replaceAllAlloc(a, tr_body, "KPH", "1");
-                tr_body = try replaceOnceAlloc(a, tr_body, "static_assert(UNR == 1 || 1 == 1, \"an unrolled walk steps whole chunks of one slice\");", "");
-                tr_body = try replaceOnceAlloc(a, tr_body, "nfrag wf[UNR][2];", "nfrag wf[2][2];");
-                tr_body = try replaceAllAlloc(a, tr_body, "for (uint u = 0u; u < uint(UNR); u++) {", "for (uint u = 0u; u < 2u; u++) { if (u >= uint(UNR)) break;");
-                tr_body = try replaceOnceAlloc(a, tr_body, "uint(ROW_CAP)", "16u");
-            } else {
-                var s = try replaceOnceAlloc(a, project_rows.ROWS_NAX_PREPPED_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", "const uint split = uint(threadgroup_position_in_grid.z);");
-                s = try replaceOnceAlloc(a, s, "static_assert(UNR == 1 || KPH == 1, \"an unrolled walk steps whole chunks of one slice\");", "");
-                s = try replaceOnceAlloc(a, s, "constexpr uint OT = uint(ODIM) / TILE;", "const uint OT = uint(ODIM) / TILE;");
-                s = try replaceOnceAlloc(a, s, "constexpr uint KT = uint(IDIM) / uint(NSPLIT) / TILE;", "const uint KT = uint(IDIM) / uint(NSPLIT) / TILE;");
-                s = try replaceOnceAlloc(a, s, "constexpr uint PART_F = uint(ROWS) * KPARTS * 128u;", "constexpr uint PART_F = 16u * KPARTS * 128u;");
-                s = try replaceOnceAlloc(a, s, "threadgroup float tgm[(FOLD || KPARTS > 1u) ? PART_F : 1u];", "threadgroup float tgm[1u];");
-                s = try replaceOnceAlloc(a, s, "rows_wfrag<N, R32, SW>(wp, lane)", "rows_wfrag<N>(wp, lane, uint(R32), uint(SW))");
-                s = try replaceOnceAlloc(a, s, "rows_wfrag<N, R32, SW>(wp + PACKED_W, lane)", "rows_wfrag<N>(wp + PACKED_W, lane, uint(R32), uint(SW))");
-                s = try replaceOnceAlloc(a, s, "nfrag wf[UNR][2];", "nfrag wf[2][2];");
-                s = try replaceAllAlloc(a, s, "for (uint u = 0u; u < uint(UNR); u++) {", "#pragma clang loop unroll(full)\n  for (uint u = 0u; u < 2u; u++) { if (u >= uint(UNR)) break;");
-                s = try replaceOnceAlloc(a, s, "if constexpr (FOLD || KPARTS > 1u) tgm[", "if constexpr (false) tgm[");
-                s = try replaceOnceAlloc(a, s, "if constexpr (FOLD) {", "if constexpr (false) {");
-                s = try replaceOnceAlloc(a, s, "} else if constexpr (KPARTS > 1u) {", "} else if constexpr (false) {");
-                s = try replaceAllAlloc(a, s, "uint(KPH)", "1u");
-                s = try replaceOptAlloc(a, s, "KPH", "1");
-                tr_body = s;
-            }
-            const tr_fc = try fcSingleRateNhw(a, tr_body);
+            const split_rep = if (!is_down)
+                \\const bool upper = (threadgroup_position_in_grid.z & 1u) != 0u;
+                \\const uint split = uint(threadgroup_position_in_grid.z) >> 1u;
+                \\const device half *x = upper ? xu : xg;
+                \\const device half *svh = x;
+                \\const device ushort *trellis = upper ? tu : tg;
+                \\device float *y = upper ? yu : yg;
+            else
+                "const uint split = uint(threadgroup_position_in_grid.z);";
+            var s = try replaceOnceAlloc(a, project_rows.ROWS_NAX_PREPPED_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", split_rep);
+            s = try replaceOnceAlloc(a, s, "static_assert(UNR == 1 || KPH == 1, \"an unrolled walk steps whole chunks of one slice\");", "");
+            s = try replaceOnceAlloc(a, s, "constexpr uint OT = uint(ODIM) / TILE;", "const uint OT = uint(ODIM) / TILE;");
+            s = try replaceOnceAlloc(a, s, "constexpr uint KT = uint(IDIM) / uint(NSPLIT) / TILE;", "const uint KT = uint(IDIM) / uint(NSPLIT) / TILE;");
+            s = try replaceOnceAlloc(a, s, "constexpr uint PART_F = uint(ROWS) * KPARTS * 128u;", "constexpr uint PART_F = 16u * KPARTS * 128u;");
+            s = try replaceOnceAlloc(a, s, "threadgroup float tgm[(FOLD || KPARTS > 1u) ? PART_F : 1u];", "threadgroup float tgm[1u];");
+            s = try replaceOnceAlloc(a, s, "rows_wfrag<N, R32, SW>(wp, lane)", "rows_wfrag<N>(wp, lane, uint(R32), uint(SW))");
+            s = try replaceOnceAlloc(a, s, "rows_wfrag<N, R32, SW>(wp + PACKED_W, lane)", "rows_wfrag<N>(wp + PACKED_W, lane, uint(R32), uint(SW))");
+            s = try replaceOnceAlloc(a, s, "nfrag wf[UNR][2];", "nfrag wf[2][2];");
+            s = try replaceAllAlloc(a, s, "for (uint u = 0u; u < uint(UNR); u++) {", "#pragma clang loop unroll(full)\n  for (uint u = 0u; u < 2u; u++) { if (u >= uint(UNR)) break;");
+            s = try replaceOnceAlloc(a, s, "if constexpr (FOLD || KPARTS > 1u) tgm[", "if constexpr (false) tgm[");
+            s = try replaceOnceAlloc(a, s, "if constexpr (FOLD) {", "if constexpr (false) {");
+            s = try replaceOnceAlloc(a, s, "} else if constexpr (KPARTS > 1u) {", "} else if constexpr (false) {");
+            s = try replaceAllAlloc(a, s, "uint(KPH)", "1u");
+            s = try replaceOptAlloc(a, s, "KPH", "1");
+            const tr_fc = try fcSingleRateNhw(a, s);
             const b_full = try std.mem.concat(a, u8, &.{ "{\ntypedef bfloat16_t OutT;\n", tr_fc, "\n}\n" });
             const b_io: []const []const u8 = if (is_down)
                 &.{ "x", "trellis", "svh", "y" }
             else
-                &.{ "x", "tg", "tu", "suhg", "suhu", "yg", "yu" };
+                &.{ "xg", "xu", "tg", "tu", "yg", "yu" };
             const b_ints: []const []const u8 = &.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD", "NHW", "SB1", "SB2", "SB3", "UNR", "R32", "SW" };
             return buildFusedSource(a, a_body, b_full, b_io, b_ints);
         }
@@ -2702,7 +2713,7 @@ const fz_simd_specs = blk: {
                 inSlot("s_x", fix(.bfloat16)), inSlot("s_suhg", fix(.float16)), inSlot("s_suhu", fix(.float16)), inSlot("s_slots", fix(.uint32)),
             },
             .outputs = &.{ outSlot("prep", fix(.float16)), outSlot("s_yg", fix(.float16)), outSlot("s_yu", fix(.float16)) },
-            .params = &[_]ParamSpec{ fcInt("IDIM"), fcInt("TOPK") } ++ &fz_grid_params,
+            .params = &[_]ParamSpec{ fcInt("IDIM"), fcInt("TOPK"), fcInt("S_IDIM"), fcInt("S_TOPK") } ++ &fz_grid_params,
         },
         .{
             .name = "sushi_exl3_fz_mid",
@@ -3207,7 +3218,7 @@ fn fzPairSnaxSpec(comptime group: u32, comptime a_pair1: bool) KernelSpec {
     else
         &[_]ParamSpec{ .{ .name = "GROUP", .kind = .ct_int, .ints = &.{@as(i32, @intCast(group))} }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("NSPLIT"), fcInt("TOPK"), fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL"), fcInt("NSLOTS") };
     const b_p = [_]ParamSpec{
-        fcInt("S_IDIM"), fcInt("S_ODIM"), fcInt("S_ROWS"), fcInt("S_GROUPS"), ign("S_TGRP"), ign("S_KPH"), fcInt("S_NSPLIT"), fcInt("S_CHUNK"), fcInt("S_FOLD"), fcInt("S_NHW"), fcInt("S_SB1"), fcInt("S_SB2"), fcInt("S_SB3"), fcInt("S_UNR"), fcInt("S_R32"), fcInt("S_SW"),
+        fcInt("S_IDIM"), fcInt("S_ODIM"), fcInt("S_ROWS"), ign("S_GROUPS"), ign("S_TGRP"), ign("S_KPH"), fcInt("S_NSPLIT"), ign("S_CHUNK"), fcInt("S_FOLD"), fcInt("S_NHW"), fcInt("S_SB1"), fcInt("S_SB2"), fcInt("S_SB3"), fcInt("S_UNR"), fcInt("S_R32"), fcInt("S_SW"),
     };
     return .{
         .name = "sushi_exl3_fz_pair" ++ g_s ++ "_snax" ++ a_s,
@@ -3215,8 +3226,8 @@ fn fzPairSnaxSpec(comptime group: u32, comptime a_pair1: bool) KernelSpec {
         .header_fn = hdrFzSnaxStage(a_pair1),
         .source_fn = srcFzSnaxStage(false, group, a_pair1),
         .inputs = &.{
-            inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)),   inSlot("tu", fix(.uint16)),   inSlot("slots", fix(.uint32)),   inSlot("meta", fix(.uint32)),
-            inSlot("s_x", fix(.bfloat16)), inSlot("s_tg", fix(.uint16)), inSlot("s_tu", fix(.uint16)), inSlot("s_suhg", fix(.float16)), inSlot("s_suhu", fix(.float16)),
+            inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)),   inSlot("tu", fix(.uint16)),   inSlot("slots", fix(.uint32)), inSlot("meta", fix(.uint32)),
+            inSlot("s_xg", fix(.float16)), inSlot("s_xu", fix(.float16)), inSlot("s_tg", fix(.uint16)), inSlot("s_tu", fix(.uint16)),
         },
         .outputs = &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)), outSlot("s_yg", fix(.float32)), outSlot("s_yu", fix(.float32)) },
         .params = a_p ++ &b_p ++ &fz_grid_params,
@@ -3753,18 +3764,16 @@ fn resolveFusedFz(
     const is_snax = std.mem.eql(u8, b_mode, "snax");
     var simd_b_mode: i32 = 0;
     if (is_snax) {
-        // Validate `srcFzSnaxStage` fixed geometry and static cap (`ROW_CAP=16`, `UNR<=2`, `KPH=1`, `TGRP=4`, `FOLD=0`,
-        // `PREP_F=2048` floats = 4096 halves for `fz_pair_snax`, `S_GROUPS=1` for `fz_down_snax`).
+        // Validate `srcFzSnaxStage` fixed geometry (`ROW_CAP=16`, `UNR<=2`, `KPH=1`, `TGRP=4`, `FOLD=0`, `S_GROUPS=1`,
+        // and `KT = S_IDIM / S_NSPLIT / 16` divisible by `S_UNR` so the unrolled k-loop stays in bounds).
         const s_rows = findIntTarg(targs, "S_ROWS") orelse return false;
         const s_unr = findIntTarg(targs, "S_UNR") orelse return false;
+        const s_idim = findIntTarg(targs, "S_IDIM") orelse return false;
+        const s_nsplit = findIntTarg(targs, "S_NSPLIT") orelse return false;
         if (s_rows < 1 or s_rows > 16 or (s_unr != 1 and s_unr != 2)) return false;
+        if (s_idim <= 0 or s_nsplit <= 0 or @rem(s_idim, s_nsplit * 16 * s_unr) != 0) return false;
         if (findIntTarg(targs, "S_TGRP") != 4 or findIntTarg(targs, "S_KPH") != 1 or findIntTarg(targs, "S_FOLD") != 0) return false;
-        if (is_down) {
-            if (findIntTarg(targs, "S_GROUPS") != 1) return false;
-        } else {
-            const s_chunk = findIntTarg(targs, "S_CHUNK") orelse return false;
-            if (s_chunk <= 0 or @as(i64, s_rows) * @as(i64, s_chunk) > 4096) return false;
-        }
+        if (findIntTarg(targs, "S_GROUPS") != 1) return false;
     } else if (std.mem.eql(u8, b_mode, "lane")) {
         simd_b_mode = 0;
     } else if (std.mem.eql(u8, b_mode, "one")) {

@@ -615,8 +615,8 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\}
     \\template<uint N, bool Scaled = false>
     \\__attribute__((always_inline)) static inline nfrag nax_wfrag_k(const device uint *words, uint lane) {
-    \\  // Every PAIR1 rate (n = 24..64): a lane's four odd codewords lie in 2 words at K1.5/K2, 3 words
-    \\  // at n = 26..62, or one aligned uint2 + previous word with pure 32-bit funnels at K4.
+    \\  // Every PAIR1 rate (n = 24..64): direct L1 loads + 2 parallel funnels for n = 26..62 (N != 32),
+    \\  // or aligned uint2 + previous word with pure 32-bit funnels at K4.
     \\  if constexpr (EXL3_LANE_FIRST == 1u && N >= 24u && N <= 64u) {
     \\    if constexpr (N == 64u) {
     \\      const uint source0 = (lane & 16u) + ((lane & 7u) << 1u);
@@ -643,17 +643,15 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\        const uint pw = words[last == 0u ? W - 1u : last - 1u];
     \\        const uint lo = nax_funnel(words[last], pw, s);
     \\        return nax_quads<N, Scaled>(nax_funnel(lo, pw >> s, W), lo, 0u, d, 0u);
-    \\      } else if constexpr (N >= 38u) {
-    \\        const uint pw = words[last - 1u];
-    \\        const uint lo = nax_funnel(words[last], pw, s);
-    \\        const uint hi = nax_funnel(pw, words[last == 1u ? W - 1u : last - 2u], s);
-    \\        return nax_quads<N, Scaled>(nax_funnel(lo, hi, W), lo, 0u, d, 0u);
     \\      } else {
-    \\        const uint prev_i = last == 0u ? W - 1u : last - 1u;
+    \\        const uint prev_i = (N >= 38u) ? (last - 1u) : (last == 0u ? W - 1u : last - 1u);
+    \\        const uint w_last = words[last];
     \\        const uint pw = words[prev_i];
-    \\        const uint lo = nax_funnel(words[last], pw, s);
-    \\        const uint hi = nax_funnel(pw, words[prev_i == 0u ? W - 1u : prev_i - 1u], s);
-    \\        return nax_quads<N, Scaled>(nax_funnel(lo, hi, W), lo, 0u, d, 0u);
+    \\        const uint p2 = words[prev_i == 0u ? W - 1u : prev_i - 1u];
+    \\        const uint lo = nax_funnel(w_last, pw, s);
+    \\        const bool small = (s + W) < 32u;
+    \\        const uint hi_w = nax_funnel(small ? w_last : pw, small ? pw : p2, (s + W) & 31u);
+    \\        return nax_quads<N, Scaled>(hi_w, lo, 0u, d, 0u);
     \\      }
     \\    }
     \\  }
@@ -809,13 +807,12 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\  const size_t o1 = o0 + 8u * (size_t)odim;
     \\  const bool l0 = uint(origin.y) < rem;
     \\  const bool l1 = uint(origin.y) + 8u < rem;
+    \\  using y4 = vec<Y, 4>;
     \\  for (uint ct = 0u; ct < 2u; ct++) {
-    \\    for (uint c = 0u; c < 4u; c++) {
-    \\      const uint col = obase + ct * 16u + uint(origin.x) + c;
-    \\      if (col >= odim) continue;
-    \\      if (l0) y[o0 + col] = Y(exl3_out(float(dst[ct * 8u + c])));
-    \\      if (l1) y[o1 + col] = Y(exl3_out(float(dst[ct * 8u + 4u + c])));
-    \\    }
+    \\    const uint col0 = obase + ct * 16u + uint(origin.x);
+    \\    if (col0 >= odim) continue;
+    \\    if (l0) *(device y4 *)(y + o0 + col0) = y4(Y(exl3_out(float(dst[ct * 8u]))), Y(exl3_out(float(dst[ct * 8u + 1u]))), Y(exl3_out(float(dst[ct * 8u + 2u]))), Y(exl3_out(float(dst[ct * 8u + 3u]))));
+    \\    if (l1) *(device y4 *)(y + o1 + col0) = y4(Y(exl3_out(float(dst[ct * 8u + 4u]))), Y(exl3_out(float(dst[ct * 8u + 5u]))), Y(exl3_out(float(dst[ct * 8u + 6u]))), Y(exl3_out(float(dst[ct * 8u + 7u]))));
     \\  }
     \\}
 ;
@@ -878,17 +875,16 @@ pub const GEMM_NAX_REFERENCE_SOURCE: [:0]const u8 =
 
 /// The NAX body. A lane's x rows are clamped into the input, so a padded row reads a live
 /// neighbour whose product is never stored and the loads carry no bounds branch; the k loop is
-/// unswitched on the window's second 16-row block. Bytes equal GEMM_NAX_REFERENCE_SOURCE's.
+/// unswitched on the window's second 16-row block, with x loads issued ahead of weight decode to
+/// overlap activation latency with trellis ALU. Bytes equal GEMM_NAX_REFERENCE_SOURCE's.
 pub const GEMM_NAX_SOURCE: [:0]const u8 = blk: {
-    const decode_lo =
+    const decode_w =
         \\  const nfrag w0 = nax_wfrag_k<N>(words, lane);
         \\  const nfrag w1 = nax_wfrag_k<N>(words + PACKED_W, lane);
         \\  for (short s = 0; s < 8; s++) {
         \\    right[s] = w0[s];
         \\    right[8 + s] = w1[s];
         \\  }
-        \\  nax_left_rows(left, xl0 + tk * TILE, xl1 + tk * TILE);
-        \\  op.run(left, right, destination);
         \\
     ;
     const open_loop =
@@ -939,13 +935,27 @@ pub const GEMM_NAX_SOURCE: [:0]const u8 = blk: {
     \\const device uint *wp = trellis_e + (size_t)(output_base / TILE) * PACKED_W;
     \\if (n_hi > 0u) {
     \\
-    ++ open_loop ++ decode_lo ++
-        \\  nax_left_rows(left, xh0 + tk * TILE, xh1 + tk * TILE);
+    ++ open_loop ++
+        \\  const half4 a0 = *(const device half4 *)(xl0 + tk * TILE);
+        \\  const half4 a1 = *(const device half4 *)(xl1 + tk * TILE);
+        \\
+    ++ decode_w ++
+        \\  for (uint c = 0u; c < 4u; c++) { left[c] = a0[c]; left[4 + c] = a1[c]; }
+        \\  op.run(left, right, destination);
+        \\  const half4 b0 = *(const device half4 *)(xh0 + tk * TILE);
+        \\  const half4 b1 = *(const device half4 *)(xh1 + tk * TILE);
+        \\  for (uint c = 0u; c < 4u; c++) { left[c] = b0[c]; left[4 + c] = b1[c]; }
         \\  op.run(left, right, dest_hi);
         \\}
         \\} else {
         \\
-    ++ open_loop ++ decode_lo ++
+    ++ open_loop ++
+        \\  const half4 a0 = *(const device half4 *)(xl0 + tk * TILE);
+        \\  const half4 a1 = *(const device half4 *)(xl1 + tk * TILE);
+        \\
+    ++ decode_w ++
+        \\  for (uint c = 0u; c < 4u; c++) { left[c] = a0[c]; left[4 + c] = a1[c]; }
+        \\  op.run(left, right, destination);
         \\}
         \\}
         \\nax_store(destination, y, run0, uint(ODIM), output_base, origin, nlive);
@@ -1054,73 +1064,97 @@ pub const TOKEN_SCATTER_SOURCE: [:0]const u8 =
 ;
 
 pub const PREPARE_SOURCE: [:0]const u8 =
-    \\uint block = uint(threadgroup_position_in_grid.x);
-    \\uint slot = uint(threadgroup_position_in_grid.y);
-    \\ushort lane = thread_index_in_simdgroup;
-    \\const uint eid = uint(slots[slot]);
+    \\const uint block = uint(threadgroup_position_in_grid.x);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const uint nslots = uint(slots_shape[0]);
     \\const uint base = block * 128u;
-    \\const size_t xb = (size_t)slot * (size_t)(IDIM) + base;
-    \\const size_t sb = (size_t)eid * (size_t)(IDIM) + base;
-    \\float4 v = float4(
-    \\  float(x[xb + lane]) * float(suh[sb + lane]),
-    \\  float(x[xb + lane + 32u]) * float(suh[sb + lane + 32u]),
-    \\  float(x[xb + lane + 64u]) * float(suh[sb + lane + 64u]),
-    \\  float(x[xb + lane + 96u]) * float(suh[sb + lane + 96u]));
-    \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
-    \\  const float p0 = simd_shuffle_xor(v.x, bit);
-    \\  const float p1 = simd_shuffle_xor(v.y, bit);
-    \\  const float p2 = simd_shuffle_xor(v.z, bit);
-    \\  const float p3 = simd_shuffle_xor(v.w, bit);
-    \\  const bool lower = (lane & bit) == 0u;
-    \\  v.x = lower ? v.x + p0 : p0 - v.x;
-    \\  v.y = lower ? v.y + p1 : p1 - v.y;
-    \\  v.z = lower ? v.z + p2 : p2 - v.z;
-    \\  v.w = lower ? v.w + p3 : p3 - v.w;
-    \\}
-    \\const float s0 = v.x + v.y;
-    \\const float s1 = v.x - v.y;
-    \\const float s2 = v.z + v.w;
-    \\const float s3 = v.z - v.w;
+    \\const uint slot0 = uint(threadgroup_position_in_grid.y) * 32u + sg;
     \\const float sc = 0.08838834764831845f;
-    \\y[xb + lane] = half((s0 + s2) * sc);
-    \\y[xb + lane + 32u] = half((s1 + s3) * sc);
-    \\y[xb + lane + 64u] = half((s0 - s2) * sc);
-    \\y[xb + lane + 96u] = half((s1 - s3) * sc);
+    \\uint prev_eid = 0xffffffffu;
+    \\float4 sh = 0.0f;
+    \\for (uint r = 0u; r < 8u; r++) {
+    \\  const uint slot = slot0 + r * 4u;
+    \\  if (slot >= nslots) break;
+    \\  const uint eid = uint(slots[slot]);
+    \\  if (eid != prev_eid) {
+    \\    prev_eid = eid;
+    \\    const size_t sb = (size_t)eid * (size_t)(IDIM) + base;
+    \\    sh = float4(float(suh[sb + lane]), float(suh[sb + lane + 32u]), float(suh[sb + lane + 64u]), float(suh[sb + lane + 96u]));
+    \\  }
+    \\  const size_t xb = (size_t)slot * (size_t)(IDIM) + base;
+    \\  float4 v = float4(
+    \\    float(x[xb + lane]) * sh.x,
+    \\    float(x[xb + lane + 32u]) * sh.y,
+    \\    float(x[xb + lane + 64u]) * sh.z,
+    \\    float(x[xb + lane + 96u]) * sh.w);
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  const float s0 = v.x + v.y;
+    \\  const float s1 = v.x - v.y;
+    \\  const float s2 = v.z + v.w;
+    \\  const float s3 = v.z - v.w;
+    \\  y[xb + lane] = half((s0 + s2) * sc);
+    \\  y[xb + lane + 32u] = half((s1 + s3) * sc);
+    \\  y[xb + lane + 64u] = half((s0 - s2) * sc);
+    \\  y[xb + lane + 96u] = half((s1 - s3) * sc);
+    \\}
 ;
 
 pub const FINISH_SOURCE: [:0]const u8 =
-    \\uint block = uint(threadgroup_position_in_grid.x);
-    \\uint slot = uint(threadgroup_position_in_grid.y);
-    \\ushort lane = thread_index_in_simdgroup;
-    \\const uint eid = uint(slots[slot]);
+    \\const uint block = uint(threadgroup_position_in_grid.x);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const uint nslots = uint(slots_shape[0]);
     \\const uint base = block * 128u;
-    \\const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
-    \\const size_t sb = (size_t)eid * (size_t)(ODIM) + base;
-    \\float4 v = float4(
-    \\  float(inner[xb + lane]),
-    \\  float(inner[xb + lane + 32u]),
-    \\  float(inner[xb + lane + 64u]),
-    \\  float(inner[xb + lane + 96u]));
-    \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
-    \\  const float p0 = simd_shuffle_xor(v.x, bit);
-    \\  const float p1 = simd_shuffle_xor(v.y, bit);
-    \\  const float p2 = simd_shuffle_xor(v.z, bit);
-    \\  const float p3 = simd_shuffle_xor(v.w, bit);
-    \\  const bool lower = (lane & bit) == 0u;
-    \\  v.x = lower ? v.x + p0 : p0 - v.x;
-    \\  v.y = lower ? v.y + p1 : p1 - v.y;
-    \\  v.z = lower ? v.z + p2 : p2 - v.z;
-    \\  v.w = lower ? v.w + p3 : p3 - v.w;
-    \\}
-    \\const float s0 = v.x + v.y;
-    \\const float s1 = v.x - v.y;
-    \\const float s2 = v.z + v.w;
-    \\const float s3 = v.z - v.w;
+    \\const uint slot0 = uint(threadgroup_position_in_grid.y) * 32u + sg;
     \\const float sc = 0.08838834764831845f;
-    \\y[xb + lane] = OutT((s0 + s2) * sc * float(svh[sb + lane]));
-    \\y[xb + lane + 32u] = OutT((s1 + s3) * sc * float(svh[sb + lane + 32u]));
-    \\y[xb + lane + 64u] = OutT((s0 - s2) * sc * float(svh[sb + lane + 64u]));
-    \\y[xb + lane + 96u] = OutT((s1 - s3) * sc * float(svh[sb + lane + 96u]));
+    \\uint prev_eid = 0xffffffffu;
+    \\float4 sh = 0.0f;
+    \\for (uint r = 0u; r < 8u; r++) {
+    \\  const uint slot = slot0 + r * 4u;
+    \\  if (slot >= nslots) break;
+    \\  const uint eid = uint(slots[slot]);
+    \\  if (eid != prev_eid) {
+    \\    prev_eid = eid;
+    \\    const size_t sb = (size_t)eid * (size_t)(ODIM) + base;
+    \\    sh = float4(float(svh[sb + lane]), float(svh[sb + lane + 32u]), float(svh[sb + lane + 64u]), float(svh[sb + lane + 96u]));
+    \\  }
+    \\  const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
+    \\  float4 v = float4(
+    \\    float(inner[xb + lane]),
+    \\    float(inner[xb + lane + 32u]),
+    \\    float(inner[xb + lane + 64u]),
+    \\    float(inner[xb + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  const float s0 = v.x + v.y;
+    \\  const float s1 = v.x - v.y;
+    \\  const float s2 = v.z + v.w;
+    \\  const float s3 = v.z - v.w;
+    \\  y[xb + lane] = OutT((s0 + s2) * sc * sh.x);
+    \\  y[xb + lane + 32u] = OutT((s1 + s3) * sc * sh.y);
+    \\  y[xb + lane + 64u] = OutT((s0 - s2) * sc * sh.z);
+    \\  y[xb + lane + 96u] = OutT((s1 - s3) * sc * sh.w);
+    \\}
 ;
 
 var gemm_sorted_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
@@ -1696,7 +1730,7 @@ fn gemmSortedInto(
     if (tab.nwin <= 0) return error.BadExl3Shape;
     logGemmSelector(win, aligned, tab.nwin, n);
     const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win, .n = rate.n };
-    if (gemmNaxOn() and @rem(out_dim, 128) == 0) {
+    if (gemmNaxOn() and @rem(out_dim, 128) == 0 and mlx.mlx_array_dtype(x) == .float16) {
         // The fallback below answers a NAX build or dispatch that failed, so the
         // failure's latch is ours to drop: left standing it becomes the next
         // decode tick's `MlxFailure`.
@@ -1807,7 +1841,9 @@ fn applyUnary(
 }
 
 pub fn prepareIndexed(s: mlx.mlx_stream, x_in: mlx.mlx_array, suh: mlx.mlx_array, slots: mlx.mlx_array) !mlx.mlx_array {
-    const topk = mlx.getShape(slots)[0];
+    const ssh = mlx.getShape(slots);
+    if (ssh.len != 1) return error.BadExl3Shape;
+    const topk = ssh[0];
     const xsh = mlx.getShape(x_in);
     const in_dim = xsh[xsh.len - 1];
     // The kernel reads `topk` rows of x, so a rank-2 x must already carry them.
@@ -1831,8 +1867,8 @@ pub fn prepareIndexed(s: mlx.mlx_stream, x_in: mlx.mlx_array, suh: mlx.mlx_array
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const out_shape = [_]c_int{ topk, in_dim };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, .float16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * blocks, topk, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 128 * blocks, @divFloor(topk + 31, 32), 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         prepare_cfgs.put(key, c);
         break :blk c;
@@ -1847,6 +1883,8 @@ pub fn finishIndexed(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array
 /// `finishIndexed` storing `out_dt` (f16, bf16 or f32), rounded once from the f32 result.
 pub fn finishIndexedAs(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, out_dt: mlx.mlx_dtype) !mlx.mlx_array {
     const sh = mlx.getShape(inner);
+    const ssh = mlx.getShape(slots);
+    if (sh.len != 2 or ssh.len != 1 or ssh[0] != sh[0]) return error.BadExl3Shape;
     const topk = sh[0];
     const out_dim = sh[1];
     const blocks = @divExact(out_dim, 128);
@@ -1857,8 +1895,8 @@ pub fn finishIndexedAs(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_arr
         const out_shape = [_]c_int{ topk, out_dim };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, out_dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", out_dt));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * blocks, topk, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 128 * blocks, @divFloor(topk + 31, 32), 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
         finish_cfgs.put(key, c);
         break :blk c;
@@ -6268,7 +6306,7 @@ fn metalReplaceAll(comptime source: []const u8, comptime old: []const u8, compti
     return comptime source[0..at] ++ replacement ++ metalReplaceAll(source[at + old.len ..], old, replacement);
 }
 
-pub const DECODE_MID_SOURCE: [:0]const u8 = blk: {
+pub const DECODE_MID_LINEAR_SOURCE: [:0]const u8 = blk: {
     @setEvalBranchQuota(200000);
     const start = std.mem.indexOf(u8, DOWN_FUSED_SOURCE, "const float sc =").?;
     const end = start + std.mem.indexOf(u8, DOWN_FUSED_SOURCE[start..], "threadgroup_barrier(mem_flags::mem_threadgroup);").?;
@@ -6282,14 +6320,18 @@ pub const DECODE_MID_SOURCE: [:0]const u8 = blk: {
     break :blk head ++ "\n" ++ metalReplaceAll(DOWN_FUSED_SOURCE[start..end], "prepared[base", "prepared[(size_t)slot * uint(IDIM) + base");
 };
 
+/// `DECODE_MID_LINEAR_SOURCE` writing each 128-block in lane order so `DOWN_PREPARED_SOURCE` and
+/// `downGroupedSource` read one device `half4` per lane and k-tile instead of four strided halves.
+pub const DECODE_MID_SOURCE: [:0]const u8 = metalReplaceFound(DECODE_MID_LINEAR_SOURCE, "base + lane", "base + " ++ LANE_ORDER_SLOT);
+
 pub const DOWN_PREPARED_SOURCE: [:0]const u8 = blk: {
-    @setEvalBranchQuota(200000);
+    @setEvalBranchQuota(400000);
     const start = std.mem.indexOf(u8, DOWN_FUSED_SOURCE, "const float sc =").?;
     const barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);";
     const end = start + std.mem.indexOf(u8, DOWN_FUSED_SOURCE[start..], barrier).? + barrier.len;
     const head = metalReplaceAll(DOWN_FUSED_SOURCE[0..start], "threadgroup half prepared[uint(IDIM)];", "");
     const tail = metalReplaceAll(DOWN_FUSED_SOURCE[end..], "const threadgroup half *pp", "const device half *pp");
-    break :blk head ++ "const device half *prepared = middle + (size_t)slot * uint(IDIM);\n" ++ tail;
+    break :blk laneQuadReads(head ++ "const device half *prepared = middle + (size_t)slot * uint(IDIM);\n" ++ tail);
 };
 
 /// A multi-row block's slots routed to one expert share a threadgroup: the slot whose rank
@@ -6568,10 +6610,10 @@ fn downGroupedBody(comptime size: u32, comptime mc: []const u8) []const u8 {
         groupEpilogue(mc, "y[(size_t)members[j] * (size_t)(ODIM) + (ot + o) * TILE + e]", "half");
 }
 
-/// `DOWN_PREPARED_SOURCE`'s lane-funnel arm, grouped to `g` members; each member reads its own prepared middle.
+/// `DOWN_PREPARED_SOURCE`'s lane-funnel arm, grouped to `g` members; each member reads its own lane-ordered middle.
 pub fn downGroupedSource(comptime g: u32) [:0]const u8 {
     @setEvalBranchQuota(1000000);
-    return
+    return laneQuadReads(
     \\constexpr uint TILE = 16u;
     \\constexpr uint N = uint(NHW);
     \\constexpr uint PACKED_W = N / 2u;
@@ -6585,7 +6627,7 @@ pub fn downGroupedSource(comptime g: u32) [:0]const u8 {
     \\const uint lane = uint(thread_index_in_simdgroup);
     \\const uint lid = uint(thread_index_in_threadgroup);
     \\
-    ++ GROUP_MEMBERS_SOURCE ++ groupLadder(g, downGroupedBody);
+    ++ GROUP_MEMBERS_SOURCE ++ groupLadder(g, downGroupedBody));
 }
 
 /// Where lane `lane`'s value of a 128-block lands in lane order: each 16-row tile keeps rows

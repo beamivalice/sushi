@@ -82,8 +82,11 @@ fn renameB(alloc: std.mem.Allocator, src: []const u8, names: []const []const u8,
         } else if (std.mem.startsWith(u8, word, "exl3_") or std.mem.startsWith(u8, word, "EXL3_")) {
             try out.appendSlice(alloc, "sx_");
             try out.appendSlice(alloc, word);
-        } else if (for (names) |n| {
-            if (std.mem.eql(u8, n, word)) break true;
+        } else if (io_hit: for (names) |n| {
+            if (std.mem.eql(u8, n, word)) break :io_hit true;
+            inline for (.{ "_shape", "_strides", "_ndim" }) |suffix| {
+                if (std.mem.endsWith(u8, word, suffix) and std.mem.eql(u8, n, word[0 .. word.len - suffix.len])) break :io_hit true;
+            }
         } else false) {
             try out.appendSlice(alloc, shared_ins_prefix);
             try out.appendSlice(alloc, word);
