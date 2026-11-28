@@ -284,7 +284,8 @@ fn recordOnePass(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, 
 
         try m.makeLogitsBlocks();
         try m.makeIdsBlock();
-        if (probe.phase != .wide) try m.makePassFixed(reach);
+        // Under the unified D97 arena (`beginNarrow .. endNarrow`), every per-pass scratch buffer is freed before
+        // `endNarrow()`, so `PassFixed` copies (~111 `sushi_ops_copy_into` dispatches/forward) are redundant.
 
         switch (probe.phase) {
             .forward, .wide, .draft => try dryState(m, probe.n, reach),
@@ -757,7 +758,7 @@ pub fn recordEncode(p: *Plans, encode: Encode) !void {
 }
 
 /// Allocates the shared static Metal arena covering all planned narrow envelopes and wide regions, plus fixed
-/// Cooler logit/id/pass blocks on `m`.
+/// Cooler logit/id blocks on `m`.
 pub fn makeArena(m: *Model, p: *Plans) !void {
     return makeArenaWithBorrow(m, p, null);
 }
@@ -775,7 +776,6 @@ pub fn makeArenaWithBorrowBudget(m: *Model, p: *Plans, engine: ?*expert_stream.E
     try ensureSpecFixed(m);
     if (m.logits_fixed[0] == null) try m.makeLogitsBlocks();
     if (m.ids_fixed == null) try m.makeIdsBlock();
-    if (m.pass_fixed == null) try m.makePassFixed(p.reach);
     if (p.sample.planned) try @import("dsv41_sample_plan.zig").makeTokens(m, &p.sample);
     p.keep_g = null;
     p.alias_bytes = 0;

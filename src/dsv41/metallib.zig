@@ -37,6 +37,16 @@ fn findIntTarg(targs: []const custom.RuntimeTarg, name: []const u8) ?i32 {
     return null;
 }
 
+fn denseF32xFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const rps = findIntTarg(targs, "RPS") orelse return false;
+    return rps == 1 or rps == 2 or rps == 4;
+}
+
+fn hcStageFastFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const rblk = findIntTarg(targs, "RBLK") orelse return false;
+    return rblk >= 1 and rblk <= 8;
+}
+
 fn sameFirstTwoDtypes(vals: []const CtVal) bool {
     return vals[0].dtype == vals[1].dtype;
 }
@@ -130,7 +140,9 @@ fn attnFusedFp4FcFilter(targs: []const custom.RuntimeTarg) bool {
 fn attnNaxFcFilter(targs: []const custom.RuntimeTarg) bool {
     if (!attnFusedFcFilter(targs)) return false;
     const d = findIntTarg(targs, "D") orelse return false;
-    return d == 256 or d == 512;
+    const epi = findIntTarg(targs, "EPI") orelse return false;
+    const gin = findIntTarg(targs, "GIN") orelse return false;
+    return (d == 256 or d == 512) and (epi == 0 or @rem(gin, 4) == 0);
 }
 
 fn attnNaxFp4FcFilter(targs: []const custom.RuntimeTarg) bool {
@@ -601,6 +613,7 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "dsv41_dense_f32x",
+        .header = k.VEC_LOAD_HEADER,
         .source = k.DENSE_F32X_SOURCE,
         .inputs = &.{
             .{ .name = "x", .ty = par("OT") },
@@ -610,8 +623,9 @@ pub const specs: []const KernelSpec = &.{
         .params = &.{
             .{ .name = "OT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "W", .kind = .io_dtype, .dtypes = &bf_f32 },
-            .{ .name = "RPS", .kind = .ct_int, .ints = &.{4} },
+            .{ .name = "RPS", .kind = .fc_int, .ints = &.{ 1, 2, 4 } },
         },
+        .fc_filter = denseF32xFcFilter,
     },
 
     // ── dsv41_kernels.zig: rotary & kv row (4 SIMD kernels) ──
@@ -1061,7 +1075,7 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "dsv41_attn_nax_fp4",
         .nax = true,
-        .header = k.ATTN_NAX_HEADER ++ k.ATTN_EPI_HEADER ++ qat.PACK_HEADER,
+        .header = k.ATTN_NAX_HEADER ++ k.ATTN_EPI_HEADER ++ k.ATTN_NAX_FP4_PACK_HEADER,
         .source = k.ATTN_NAX_FP4_SOURCE,
         .inputs = &attn_fused_fp4_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
@@ -1171,7 +1185,7 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "dsv41_attn_dec_nax_packed",
         .nax = true,
-        .header = if (custom.is_codegen) k.ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ qat.PACK_HEADER else "",
+        .header = if (custom.is_codegen) k.ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ k.ATTN_NAX_FP4_PACK_HEADER else "",
         .source = if (custom.is_codegen) k.ATTN_DEC_NAX_PACKED_SOURCE else "",
         .inputs = &attn_dec_nax_packed_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
@@ -1194,7 +1208,7 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "dsv41_attn_dec_nax_packed_ride",
         .nax = true,
-        .header = if (custom.is_codegen) k.ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ qat.PACK_HEADER else "",
+        .header = if (custom.is_codegen) k.ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ k.ATTN_NAX_FP4_PACK_HEADER else "",
         .source = if (custom.is_codegen) k.ATTN_DEC_NAX_PACKED_RIDE_SOURCE else "",
         .inputs = &(attn_dec_nax_packed_ins ++ ride_extra_ins),
         .outputs = &([_]OutputSlot{.{ .name = "out", .ty = par("OT") }} ++ ride_extra_outs),
@@ -1219,7 +1233,7 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "dsv41_attn_split_nax_packed",
         .nax = true,
-        .header = if (custom.is_codegen) k.ATTN_NAX_HEADER ++ "\n" ++ qat.PACK_HEADER else "",
+        .header = if (custom.is_codegen) k.ATTN_NAX_HEADER ++ "\n" ++ k.ATTN_NAX_FP4_PACK_HEADER else "",
         .source = if (custom.is_codegen) k.ATTN_SPLIT_NAX_PACKED_SOURCE else "",
         .inputs = &attn_split_nax_packed_ins,
         .outputs = &.{
@@ -1241,7 +1255,7 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "dsv41_attn_split_nax_packed_ride",
         .nax = true,
-        .header = if (custom.is_codegen) k.ATTN_NAX_HEADER ++ "\n" ++ qat.PACK_HEADER else "",
+        .header = if (custom.is_codegen) k.ATTN_NAX_HEADER ++ "\n" ++ k.ATTN_NAX_FP4_PACK_HEADER else "",
         .source = if (custom.is_codegen) k.ATTN_SPLIT_NAX_PACKED_RIDE_SOURCE else "",
         .inputs = &(attn_split_nax_packed_ins ++ ride_extra_ins),
         .outputs = &([_]OutputSlot{
@@ -1468,8 +1482,9 @@ pub const specs: []const KernelSpec = &.{
         },
         .params = &.{
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &bf_f32 },
-            .{ .name = "RBLK", .kind = .fc_int },
+            .{ .name = "RBLK", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } },
         },
+        .fc_filter = hcStageFastFcFilter,
     },
     .{
         .name = "dsv41_hc_split_part",
@@ -1486,6 +1501,21 @@ pub const specs: []const KernelSpec = &.{
         .params = &.{
             .{ .name = "HC", .kind = .fc_int },
             .{ .name = "ITERS", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "dsv41_hc_expand_v4",
+        .header = if (custom.is_codegen) k.VEC_LOAD_HEADER else "",
+        .source = if (custom.is_codegen) k.HC_EXPAND_V4_SOURCE else "",
+        .inputs = &.{
+            .{ .name = "x", .ty = par("T") },
+            .{ .name = "y", .ty = par("T") },
+            .{ .name = "post", .ty = fix(.float32) },
+            .{ .name = "comb", .ty = fix(.float32) },
+        },
+        .outputs = &.{.{ .name = "out", .ty = par("T") }},
+        .params = &.{
+            .{ .name = "T", .kind = .ct_dtype, .dtypes = &bf_f32 },
         },
     },
     .{

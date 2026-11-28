@@ -352,25 +352,58 @@ const ROUTE_BODY =
     \\}
 ;
 
-/// `x` [L, K] times dense rows `w` [N, K] (any float dtypes) in f32, RPS rows a simdgroup: the product the
-/// reference computes after widening w, rounded once to OT. A row's sum never depends on L.
+/// Address-space-agnostic vector loads (`device` on engine and large MLX buffers; `constant` on small MLX buffers).
+pub const VEC_LOAD_HEADER: [:0]const u8 =
+    \\template <typename V> inline metal::vec<V, 2> dsv41_ld2(const device V* p) { return *(const device metal::vec<V, 2>*)p; }
+    \\template <typename V> inline metal::vec<V, 2> dsv41_ld2(const constant V* p) { return *(const constant metal::vec<V, 2>*)p; }
+    \\template <typename V> inline metal::vec<V, 4> dsv41_ld4(const device V* p) { return *(const device metal::vec<V, 4>*)p; }
+    \\template <typename V> inline metal::vec<V, 4> dsv41_ld4(const constant V* p) { return *(const constant metal::vec<V, 4>*)p; }
+    \\inline ushort dsv41_ld_u16(const device uchar* p) { return *(const device ushort*)p; }
+    \\inline ushort dsv41_ld_u16(const constant uchar* p) { return *(const constant ushort*)p; }
+    \\inline uint dsv41_ld_u32(const device uchar* p) { return *(const device uint*)p; }
+    \\inline uint dsv41_ld_u32(const constant uchar* p) { return *(const constant uint*)p; }
+    \\
+;
+
+/// `x` [L, K] times dense rows `w` [N, K] (any float dtypes) in f32, RPS rows a simdgroup with vectorized `vec<4>`
+/// loads: the product the reference computes after widening w, rounded once to OT. A row's sum never depends on L.
 pub const DENSE_F32X_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
-    \\const int n0 = thread_position_in_grid.y * RPS, l = thread_position_in_grid.z;
+    \\const int n0 = int(threadgroup_position_in_grid.y) * RPS;
+    \\const int l = int(threadgroup_position_in_grid.z);
     \\const int K = x_shape[1], N = w_shape[0];
-    \\float acc[RPS];
-    \\for (int r = 0; r < RPS; ++r) acc[r] = 0.0f;
-    \\const device auto* xr = x + size_t(l) * K;
+    \\const size_t x_off = size_t(l) * K;
+    \\if (RPS == 1) {
+    \\  if (n0 >= N) return;
+    \\  const size_t w_off = size_t(n0) * K;
+    \\  float acc = 0.0f;
+    \\  for (int k = int(lane) * 4; k < K; k += 128) {
+    \\    const auto xv = dsv41_ld4(x + x_off + k);
+    \\    const auto wv = dsv41_ld4(w + w_off + k);
+    \\    acc += float(xv.x) * float(wv.x) + float(xv.y) * float(wv.y) + float(xv.z) * float(wv.z) + float(xv.w) * float(wv.w);
+    \\  }
+    \\  const float v = metal::simd_sum(acc);
+    \\  if (lane == 0u) out[size_t(l) * N + n0] = OT(v);
+    \\  return;
+    \\}
+    \\float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     \\for (int k = int(lane) * 4; k < K; k += 128) {
-    \\  const float4 xv = float4(float(xr[k]), float(xr[k + 1]), float(xr[k + 2]), float(xr[k + 3]));
-    \\  for (int r = 0; r < RPS; ++r) {
-    \\    const device auto* wr = w + size_t(n0 + r) * K + k;
-    \\    acc[r] += xv.x * float(wr[0]) + xv.y * float(wr[1]) + xv.z * float(wr[2]) + xv.w * float(wr[3]);
+    \\  const auto xv = dsv41_ld4(x + x_off + k);
+    \\  const float x0 = float(xv.x), x1 = float(xv.y), x2 = float(xv.z), x3 = float(xv.w);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int r = 0; r < 4; ++r) {
+    \\    if (r < RPS && n0 + r < N) {
+    \\      const auto wv = dsv41_ld4(w + size_t(n0 + r) * K + k);
+    \\      acc[r] += x0 * float(wv.x) + x1 * float(wv.y) + x2 * float(wv.z) + x3 * float(wv.w);
+    \\    }
     \\  }
     \\}
-    \\for (int r = 0; r < RPS; ++r) {
-    \\  const float v = metal::simd_sum(acc[r]);
-    \\  if (lane == 0 && n0 + r < N) out[size_t(l) * N + n0 + r] = OT(v);
+    \\#pragma clang loop unroll(full)
+    \\for (int r = 0; r < 4; ++r) {
+    \\  if (r < RPS) {
+    \\    const float v = metal::simd_sum(acc[r]);
+    \\    if (lane == 0u && n0 + r < N) out[size_t(l) * N + n0 + r] = OT(v);
+    \\  }
     \\}
 ;
 
@@ -393,7 +426,7 @@ var gate_def = Def{ .name = "dsv41_gate", .ins = &.{ "x", "w" }, .outs = &.{"log
 var route_def = Def{ .name = "dsv41_route", .ins = &.{ "logits", "bias", "scal" }, .outs = &.{ "idx", "wts" }, .source = ROUTE_SOURCE };
 var route_split_def = Def{ .name = "dsv41_route_split", .ins = &.{ "logits", "bias", "scal", "z", "eps" }, .outs = &.{ "idx", "wts", "pre", "post", "comb" }, .source = ROUTE_SPLIT_SOURCE };
 var route_split_slots_def = Def{ .name = "dsv41_route_split_slots", .ins = &.{ "logits", "bias", "scal", "z", "eps", "map" }, .outs = &.{ "idx", "wts", "pre", "post", "comb", "local" }, .source = ROUTE_SPLIT_SLOTS_SOURCE };
-var dense_f32x_def = Def{ .name = "dsv41_dense_f32x", .ins = &.{ "x", "w" }, .outs = &.{"out"}, .source = DENSE_F32X_SOURCE };
+var dense_f32x_def = Def{ .name = "dsv41_dense_f32x", .ins = &.{ "x", "w" }, .outs = &.{"out"}, .source = DENSE_F32X_SOURCE, .header = VEC_LOAD_HEADER };
 
 const gate_sgs = 8;
 const dense_f32x_rps = 4;
@@ -498,11 +531,17 @@ pub fn denseF32xFits(n: usize, k: usize) bool {
 
 /// `x` `[L, K]` times the rows of `w` `[N, K]`, both widened to f32 and summed in f32, in x's dtype.
 pub fn denseF32x(sc: *Scope, x: A, w: A) !A {
-    const L = dim(x, 0);
+    const xsh = mlx.getShape(x);
+    if (xsh.len != 2 or xsh[0] <= 0 or xsh[1] <= 0 or @rem(xsh[1], 4) != 0) return error.TensorShape;
+    const L: usize = @intCast(xsh[0]);
     const N = dim(w, 0);
+    if (N == 0) return error.TensorShape;
     const dt = mlx.mlx_array_dtype(x);
+    const rps: usize = if (N <= 64) 1 else dense_f32x_rps;
     var o: [1]A = undefined;
-    try launch(sc, &dense_f32x_def, &.{ x, w }, &.{.{ .shape = &.{ ci(L), ci(N) }, .dt = dt }}, .{ 32, N / dense_f32x_rps, L }, .{ 32, 1, 1 }, &.{.{ .name = "RPS", .v = dense_f32x_rps }}, &.{.{ .name = "OT", .dt = dt }}, &o);
+    try launch(sc, &dense_f32x_def, &.{ x, w }, &.{.{ .shape = &.{ ci(L), ci(N) }, .dt = dt }}, .{ 32, (N + rps - 1) / rps, L }, .{ 32, 1, 1 }, &.{
+        .{ .name = "RPS", .v = ci(rps) },
+    }, &.{.{ .name = "OT", .dt = dt }}, &o);
     return o[0];
 }
 
@@ -1031,7 +1070,7 @@ pub const HEAD_AT_HEADER =
 
 /// UNROPE_HEADER and the fp8 activation round trip of a simdgroup's 32 channels (one dsv41_qat group), for the
 /// kernels that write the heads attnOut rounds next.
-pub const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
+pub const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++ VEC_LOAD_HEADER ++
     \\template <typename OT>
     \\inline OT dsv41_fp8_store(OT v) {
     \\  #pragma clang fp contract(off)
@@ -1077,22 +1116,64 @@ pub const ATTN_SPLIT_RIDE_SOURCE = ATTN_RIDE_PRE ++ ATTN_SPLIT_SOURCE;
 pub const ATTN_SPLIT_PACKED_RIDE_SOURCE = ATTN_RIDE_PRE ++ ATTN_SPLIT_PACKED_SOURCE;
 
 /// The S partials of one (row, head) `ATTN_SPLIT_SOURCE` wrote, merged with the sink in the denominator, then the
-/// inverse rotation (as `ATTN_DEC_SOURCE` ends); one thread a channel.
+/// inverse rotation and optional FP8 QAT: zero-barrier per-simdgroup parallel split-weight softmax in registers, then
+/// each thread processes 1 aligned pair (`float2` load, single cos/sin inverse RoPE, `vec<OT, 2>` store).
 pub const ATTN_MERGE_SOURCE =
-    \\const int d = thread_position_in_threadgroup.x, h = threadgroup_position_in_grid.y, i = threadgroup_position_in_grid.z;
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const int h = threadgroup_position_in_grid.y, i = threadgroup_position_in_grid.z;
     \\const int H = pm_shape[1], S = pm_shape[2];
     \\const size_t base = (size_t(i) * H + h) * S;
-    \\float M = sink[h];
-    \\for (int j = 0; j < S; ++j) M = metal::max(M, pm[base + j]);
-    \\float total = metal::precise::exp(sink[h] - M), o = 0.0f;
-    \\for (int j = 0; j < S; ++j) {
-    \\  const float w = pl[base + j] > 0.0f ? metal::precise::exp(pm[base + j] - M) : 0.0f;
-    \\  total += pl[base + j] * w;
-    \\  o += pacc[(base + j) * D + d] * w;
+    \\const int c0 = int(tid) * 2;
+    \\const float sk = float(sink[h]);
+    \\float total;
+    \\float2 o2 = float2(0.0f);
+    \\if (S <= 32) {
+    \\  const float pj = int(lane) < S ? pm[base + lane] : -INFINITY;
+    \\  const float lj = int(lane) < S ? pl[base + lane] : 0.0f;
+    \\  const float M = metal::max(sk, metal::simd_max(pj));
+    \\  const float wj = (int(lane) < S && lj > 0.0f) ? metal::precise::exp(pj - M) : 0.0f;
+    \\  const float ljwj = (int(lane) < S) ? (lj * wj) : 0.0f;
+    \\  total = metal::precise::exp(sk - M);
+    \\  for (int j = 0; j < S; ++j) {
+    \\    const float w = metal::simd_shuffle(wj, ushort(j));
+    \\    total += metal::simd_shuffle(ljwj, ushort(j));
+    \\    if ((D >= 64 && (D & 63) == 0) || c0 < D) o2 += dsv41_ld2(pacc + (base + j) * D + c0) * w;
+    \\  }
+    \\} else {
+    \\  float M = sk;
+    \\  for (int j = 0; j < S; ++j) M = metal::max(M, pm[base + j]);
+    \\  total = metal::precise::exp(sk - M);
+    \\  for (int j = 0; j < S; ++j) {
+    \\    const float w = pl[base + j] > 0.0f ? metal::precise::exp(pm[base + j] - M) : 0.0f;
+    \\    total += pl[base + j] * w;
+    \\    if (c0 < D) o2 += dsv41_ld2(pacc + (base + j) * D + c0) * w;
+    \\  }
     \\}
-    \\OT ov = dsv41_unrope<OT>(OT(o / total), d, meta[0] + i, freqs, RD, D);
-    \\if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
-    \\out[dsv41_head_at(i, h, H, meta[1], OG) * D + d] = ov;
+    \\if (c0 >= D) return;
+    \\float v0 = float(OT(o2.x / total));
+    \\float v1 = float(OT(o2.y / total));
+    \\if (RD > 0 && c0 >= D - RD) {
+    \\  #pragma clang fp contract(off)
+    \\  const float theta = float(meta[0] + i) * freqs[(c0 - (D - RD)) / 2];
+    \\  const float cs = metal::precise::cos(theta), sn = -metal::precise::sin(theta);
+    \\  const float x1 = v0, x2 = v1;
+    \\  v0 = float(OT(x1 * cs - x2 * sn));
+    \\  v1 = float(OT(x1 * sn + x2 * cs));
+    \\}
+    \\if (QAT != 0) {
+    \\  #pragma clang fp contract(off)
+    \\  #pragma clang fp reassociate(off)
+    \\  float amax = metal::max(metal::fabs(v0), metal::fabs(v1));
+    \\  amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
+    \\  amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(2)));
+    \\  amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(4)));
+    \\  amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
+    \\  const float s = qat_scale<0>(amax);
+    \\  v0 = float(static_cast<OT>(qat_round<0>(v0, s)));
+    \\  v1 = float(static_cast<OT>(qat_round<0>(v1, s)));
+    \\}
+    \\*(device metal::vec<OT, 2>*)(out + dsv41_head_at(i, h, H, meta[1], OG) * D + c0) = metal::vec<OT, 2>(OT(v0), OT(v1));
 ;
 
 /// A wide span's softmax, one simdgroup per (row, head): the raw window scores `lw` [L*H, Wk] under the band
@@ -1338,7 +1419,8 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
         if (a.split) |sp| sp.* = .{ .pre = parts[3], .post = parts[4], .comb = parts[5] };
     } else try launch(sc, &attn_split_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal }, &part_outs, grid, tg, &common, &.{.{ .name = "KT", .dt = kt }}, parts[0..3]);
     var o: [1]A = undefined;
-    try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = out_shape, .dt = a.out_dt }}, .{ D, H, L }, .{ D, 1, 1 }, &.{
+    const merge_tg = (D / 2 + 31) / 32 * 32;
+    try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = out_shape, .dt = a.out_dt }}, .{ merge_tg, H, L }, .{ merge_tg, 1, 1 }, &.{
         .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) }, .{ .name = "OG", .v = ci(og) },
     }, &.{.{ .name = "OT", .dt = a.out_dt }}, &o);
     return o[0];
@@ -1634,11 +1716,11 @@ pub const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
 /// holds a 16 x 16 fragment as 8 elements, rows `dsv41_nax_r` (lane, i) and columns `dsv41_nax_c` (lane, i), four
 /// contiguous columns a row. `dsv41_nax_mma` runs one 16 x N x KK multiply-accumulate on register fragments (one of N and
 /// KK is 32): `a` is 16 x KK, `b` KK x N, a dimension of 32 two consecutive 16-wide fragments.
-pub const ATTN_NAX_HEADER = metal_def.NAX_HEADER;
+pub const ATTN_NAX_HEADER = metal_def.NAX_HEADER ++ "\n" ++ VEC_LOAD_HEADER;
 
-/// `ATTN_FUSED_HEAD` with both products on the matrix units: the scores as 16 keys x 16 heads over 32-channel steps
+/// `ATTN_FUSED_HEAD` with both products on the matrix units: the scores as 16 keys x HB heads over 32-channel steps
 /// (keys the left operand, so a tile's key fragments are read once and serve P x V as its right operand), P x V as
-/// 16 heads x 32 channels over the 16 keys. Only the summation order inside the products differs.
+/// HB heads x 32 channels over the 16 keys with 2-pass `T` (`ph + pl`) probabilities.
 const ATTN_NAX_HEAD =
     \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
     \\const ushort lane = thread_index_in_simdgroup;
@@ -1658,8 +1740,9 @@ const ATTN_NAX_HEAD =
     \\threadgroup T ph[HB * KT], pl[HB * KT];
     \\threadgroup float cr[HB], rl[HB];
     \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
-    \\float m = sink[h0 + hh], lsum = 1.0f;
-    \\const float scale = scal[0];
+    \\constexpr float LOG2E = 1.4426950408889634f;
+    \\float m = float(sink[h0 + hh]) * LOG2E, lsum = 1.0f;
+    \\const float scale = scal[0] * LOG2E;
     \\T qt[HBLK][QS_CAP][16];
     \\float o[HBLK][OF_CAP * 8];
     \\#pragma clang loop unroll(full)
@@ -1680,17 +1763,15 @@ const ATTN_NAX_HEAD =
 /// own `DS`-channel slice directly into `kf`, avoiding threadgroup staging (`kt`) and 2 threadgroup barriers per tile.
 const ATTN_NAX_LOAD_ROWS =
     \\  const int src0 = source_row(int(nr0)), src1 = source_row(int(nr0) + 8);
-    \\  const device T* rowp0 = (src0 >= 0) ? (keys + size_t(src0) * D) : ((src0 != -1) ? (comp + size_t(-2 - src0) * D) : nullptr);
-    \\  const device T* rowp1 = (src1 >= 0) ? (keys + size_t(src1) * D) : ((src1 != -1) ? (comp + size_t(-2 - src1) * D) : nullptr);
     \\  T kf[QS_CAP][16];
     \\  #pragma clang loop unroll(full)
     \\  for (int ks = 0; ks < QS_CAP; ++ks) {
     \\    if (ks >= QS) break;
     \\    const int kd = d0 + ks * 32 + int(nc0);
-    \\    const metal::vec<T, 4> k0 = rowp0 ? *(const device metal::vec<T, 4>*)(rowp0 + kd) : metal::vec<T, 4>(T(0));
-    \\    const metal::vec<T, 4> k1 = rowp1 ? *(const device metal::vec<T, 4>*)(rowp1 + kd) : metal::vec<T, 4>(T(0));
-    \\    const metal::vec<T, 4> k2 = rowp0 ? *(const device metal::vec<T, 4>*)(rowp0 + kd + 16) : metal::vec<T, 4>(T(0));
-    \\    const metal::vec<T, 4> k3 = rowp1 ? *(const device metal::vec<T, 4>*)(rowp1 + kd + 16) : metal::vec<T, 4>(T(0));
+    \\    const metal::vec<T, 4> k0 = (src0 >= 0) ? dsv41_ld4(keys + size_t(src0) * D + kd) : ((src0 != -1) ? dsv41_ld4(comp + size_t(-2 - src0) * D + kd) : metal::vec<T, 4>(T(0)));
+    \\    const metal::vec<T, 4> k1 = (src1 >= 0) ? dsv41_ld4(keys + size_t(src1) * D + kd) : ((src1 != -1) ? dsv41_ld4(comp + size_t(-2 - src1) * D + kd) : metal::vec<T, 4>(T(0)));
+    \\    const metal::vec<T, 4> k2 = (src0 >= 0) ? dsv41_ld4(keys + size_t(src0) * D + kd + 16) : ((src0 != -1) ? dsv41_ld4(comp + size_t(-2 - src0) * D + kd + 16) : metal::vec<T, 4>(T(0)));
+    \\    const metal::vec<T, 4> k3 = (src1 >= 0) ? dsv41_ld4(keys + size_t(src1) * D + kd + 16) : ((src1 != -1) ? dsv41_ld4(comp + size_t(-2 - src1) * D + kd + 16) : metal::vec<T, 4>(T(0)));
     \\    kf[ks][0] = k0[0]; kf[ks][1] = k0[1]; kf[ks][2] = k0[2]; kf[ks][3] = k0[3];
     \\    kf[ks][4] = k1[0]; kf[ks][5] = k1[1]; kf[ks][6] = k1[2]; kf[ks][7] = k1[3];
     \\    kf[ks][8] = k2[0]; kf[ks][9] = k2[1]; kf[ks][10] = k2[2]; kf[ks][11] = k2[3];
@@ -1698,9 +1779,23 @@ const ATTN_NAX_LOAD_ROWS =
     \\  }
 ;
 
+/// Branchless register-only FP4 E2M1 x E4M3 decode into `half4`: every E2M1*E4M3 product has at most 5 mantissa bits
+/// and magnitude in [2^-10, 2880], so fp16 holds it with zero rounding and casts bit-exactly to `bfloat` / `float`.
+const ATTN_NAX_FP4_HELPER =
+    \\inline half dsv41_e4m3_half(uint b) {
+    \\  const uint e = (b >> 3) & 15u, m = b & 7u;
+    \\  return e == 0u ? half(m) * half(0.001953125f) : as_type<half>(ushort(((e + 8u) << 10) | (m << 7)));
+    \\}
+    \\inline half4 dsv41_e2m1_half4(ushort p) {
+    \\  const ushort4 nib = ushort4(p, p >> 4, p >> 8, p >> 12);
+    \\  const ushort4 mag = nib & ushort4(7u);
+    \\  const ushort4 lo = metal::select(ushort4(0x3800u) + (mag << ushort4(9u)), mag * ushort4(0x3800u), mag < ushort4(2u));
+    \\  return as_type<half4>(lo | ((nib & ushort4(8u)) << ushort4(12u)));
+    \\}
+;
+
 /// Direct-to-register key fragment load for NAX attention with FP4-packed compressed rows (`keys` + `ccodes`/`cscales`).
 const ATTN_NAX_LOAD_FP4 =
-    \\  constexpr float E2M1_S[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
     \\  const int src0 = source_row(int(nr0)), src1 = source_row(int(nr0) + 8);
     \\  T kf[QS_CAP][16];
     \\  #pragma clang loop unroll(full)
@@ -1710,36 +1805,66 @@ const ATTN_NAX_LOAD_FP4 =
     \\    metal::vec<T, 4> k0 = metal::vec<T, 4>(T(0)), k2 = metal::vec<T, 4>(T(0));
     \\    if (src0 < -1) {
     \\      const size_t r0 = size_t(-2 - src0);
-    \\      const ushort p0 = *(const device ushort*)(ccodes + r0 * (D / 2) + kd / 2);
-    \\      const ushort p2 = *(const device ushort*)(ccodes + r0 * (D / 2) + (kd + 16) / 2);
-    \\      const float sc0 = scale_of(uint(cscales[r0 * (D / G) + kd / G]), MODE);
-    \\      const float sc2 = (G >= 32) ? sc0 : scale_of(uint(cscales[r0 * (D / G) + (kd + 16) / G]), MODE);
-    \\      #pragma clang loop unroll(full)
-    \\      for (int e = 0; e < 4; ++e) {
-    \\        k0[e] = static_cast<T>(E2M1_S[(p0 >> (e * 4)) & 15u] * sc0);
-    \\        k2[e] = static_cast<T>(E2M1_S[(p2 >> (e * 4)) & 15u] * sc2);
+    \\      const ushort p0 = dsv41_ld_u16(ccodes + r0 * (D / 2) + kd / 2);
+    \\      const ushort p2 = dsv41_ld_u16(ccodes + r0 * (D / 2) + (kd + 16) / 2);
+    \\      if (MODE == 2) {
+    \\        half sc0, sc2;
+    \\        if (G == 16) {
+    \\          const ushort sp_b = dsv41_ld_u16(cscales + r0 * (D / 16) + (d0 + ks * 32) / 16);
+    \\          sc0 = dsv41_e4m3_half(sp_b & 255u);
+    \\          sc2 = dsv41_e4m3_half(sp_b >> 8);
+    \\        } else {
+    \\          sc0 = dsv41_e4m3_half(uint(cscales[r0 * (D / G) + kd / G]));
+    \\          sc2 = (G >= 32) ? sc0 : dsv41_e4m3_half(uint(cscales[r0 * (D / G) + (kd + 16) / G]));
+    \\        }
+    \\        const half4 h0 = dsv41_e2m1_half4(p0) * sc0;
+    \\        const half4 h2 = dsv41_e2m1_half4(p2) * sc2;
+    \\        k0 = metal::vec<T, 4>(static_cast<T>(h0[0]), static_cast<T>(h0[1]), static_cast<T>(h0[2]), static_cast<T>(h0[3]));
+    \\        k2 = metal::vec<T, 4>(static_cast<T>(h2[0]), static_cast<T>(h2[1]), static_cast<T>(h2[2]), static_cast<T>(h2[3]));
+    \\      } else {
+    \\        const float sc0 = scale_of(uint(cscales[r0 * (D / G) + kd / G]), MODE);
+    \\        const float sc2 = (G >= 32) ? sc0 : scale_of(uint(cscales[r0 * (D / G) + (kd + 16) / G]), MODE);
+    \\        const float4 f0 = float4(dsv41_e2m1_half4(p0)) * sc0;
+    \\        const float4 f2 = float4(dsv41_e2m1_half4(p2)) * sc2;
+    \\        k0 = metal::vec<T, 4>(static_cast<T>(f0[0]), static_cast<T>(f0[1]), static_cast<T>(f0[2]), static_cast<T>(f0[3]));
+    \\        k2 = metal::vec<T, 4>(static_cast<T>(f2[0]), static_cast<T>(f2[1]), static_cast<T>(f2[2]), static_cast<T>(f2[3]));
     \\      }
     \\    } else if (src0 >= 0) {
-    \\      const device T* rp = keys + size_t(src0) * D + kd;
-    \\      k0 = *(const device metal::vec<T, 4>*)rp;
-    \\      k2 = *(const device metal::vec<T, 4>*)(rp + 16);
+    \\      const size_t k_off = size_t(src0) * D + kd;
+    \\      k0 = dsv41_ld4(keys + k_off);
+    \\      k2 = dsv41_ld4(keys + k_off + 16);
     \\    }
     \\    metal::vec<T, 4> k1 = metal::vec<T, 4>(T(0)), k3 = metal::vec<T, 4>(T(0));
     \\    if (src1 < -1) {
     \\      const size_t r1 = size_t(-2 - src1);
-    \\      const ushort p1 = *(const device ushort*)(ccodes + r1 * (D / 2) + kd / 2);
-    \\      const ushort p3 = *(const device ushort*)(ccodes + r1 * (D / 2) + (kd + 16) / 2);
-    \\      const float sc1 = scale_of(uint(cscales[r1 * (D / G) + kd / G]), MODE);
-    \\      const float sc3 = (G >= 32) ? sc1 : scale_of(uint(cscales[r1 * (D / G) + (kd + 16) / G]), MODE);
-    \\      #pragma clang loop unroll(full)
-    \\      for (int e = 0; e < 4; ++e) {
-    \\        k1[e] = static_cast<T>(E2M1_S[(p1 >> (e * 4)) & 15u] * sc1);
-    \\        k3[e] = static_cast<T>(E2M1_S[(p3 >> (e * 4)) & 15u] * sc3);
+    \\      const ushort p1 = dsv41_ld_u16(ccodes + r1 * (D / 2) + kd / 2);
+    \\      const ushort p3 = dsv41_ld_u16(ccodes + r1 * (D / 2) + (kd + 16) / 2);
+    \\      if (MODE == 2) {
+    \\        half sc1, sc3;
+    \\        if (G == 16) {
+    \\          const ushort sp_b = dsv41_ld_u16(cscales + r1 * (D / 16) + (d0 + ks * 32) / 16);
+    \\          sc1 = dsv41_e4m3_half(sp_b & 255u);
+    \\          sc3 = dsv41_e4m3_half(sp_b >> 8);
+    \\        } else {
+    \\          sc1 = dsv41_e4m3_half(uint(cscales[r1 * (D / G) + kd / G]));
+    \\          sc3 = (G >= 32) ? sc1 : dsv41_e4m3_half(uint(cscales[r1 * (D / G) + (kd + 16) / G]));
+    \\        }
+    \\        const half4 h1 = dsv41_e2m1_half4(p1) * sc1;
+    \\        const half4 h3 = dsv41_e2m1_half4(p3) * sc3;
+    \\        k1 = metal::vec<T, 4>(static_cast<T>(h1[0]), static_cast<T>(h1[1]), static_cast<T>(h1[2]), static_cast<T>(h1[3]));
+    \\        k3 = metal::vec<T, 4>(static_cast<T>(h3[0]), static_cast<T>(h3[1]), static_cast<T>(h3[2]), static_cast<T>(h3[3]));
+    \\      } else {
+    \\        const float sc1 = scale_of(uint(cscales[r1 * (D / G) + kd / G]), MODE);
+    \\        const float sc3 = (G >= 32) ? sc1 : scale_of(uint(cscales[r1 * (D / G) + (kd + 16) / G]), MODE);
+    \\        const float4 f1 = float4(dsv41_e2m1_half4(p1)) * sc1;
+    \\        const float4 f3 = float4(dsv41_e2m1_half4(p3)) * sc3;
+    \\        k1 = metal::vec<T, 4>(static_cast<T>(f1[0]), static_cast<T>(f1[1]), static_cast<T>(f1[2]), static_cast<T>(f1[3]));
+    \\        k3 = metal::vec<T, 4>(static_cast<T>(f3[0]), static_cast<T>(f3[1]), static_cast<T>(f3[2]), static_cast<T>(f3[3]));
     \\      }
     \\    } else if (src1 >= 0) {
-    \\      const device T* rp = keys + size_t(src1) * D + kd;
-    \\      k1 = *(const device metal::vec<T, 4>*)rp;
-    \\      k3 = *(const device metal::vec<T, 4>*)(rp + 16);
+    \\      const size_t k_off = size_t(src1) * D + kd;
+    \\      k1 = dsv41_ld4(keys + k_off);
+    \\      k3 = dsv41_ld4(keys + k_off + 16);
     \\    }
     \\    kf[ks][0] = k0[0]; kf[ks][1] = k0[1]; kf[ks][2] = k0[2]; kf[ks][3] = k0[3];
     \\    kf[ks][4] = k1[0]; kf[ks][5] = k1[1]; kf[ks][6] = k1[2]; kf[ks][7] = k1[3];
@@ -1767,6 +1892,7 @@ const ATTN_NAX_TAIL =
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  float sv[NJ], tmax = -INFINITY;
+    \\  #pragma clang loop unroll(full)
     \\  for (int jj = 0; jj < NJ; ++jj) {
     \\    const int j = sub + jj * TPH;
     \\    float v = -INFINITY;
@@ -1780,11 +1906,13 @@ const ATTN_NAX_TAIL =
     \\    tmax = metal::max(tmax, v);
     \\  }
     \\  for (int off = TPH / 2; off > 0; off >>= 1) tmax = metal::max(tmax, metal::simd_shuffle_xor(tmax, ushort(off)));
-    \\  const float mn = metal::max(m, tmax), corr = metal::precise::exp(m - mn);
+    \\  const float mn = metal::max(m, tmax);
+    \\  const float corr = (m > -INFINITY) ? metal::exp2(m - mn) : 0.0f;
     \\  float psum = 0.0f;
+    \\  #pragma clang loop unroll(full)
     \\  for (int jj = 0; jj < NJ; ++jj) {
     \\    const int j = sub + jj * TPH;
-    \\    const float p = metal::precise::exp(sv[jj] - mn);
+    \\    const float p = (sv[jj] > -INFINITY) ? metal::exp2(sv[jj] - mn) : 0.0f;
     \\    const T hi = T(p);
     \\    psum += p;
     \\    ph[hh * KT + j] = hi;
@@ -1798,11 +1926,13 @@ const ATTN_NAX_TAIL =
     \\  #pragma clang loop unroll(full)
     \\  for (int hb = 0; hb < HBLK; ++hb) {
     \\    const float cr0 = cr[hb * 16 + int(nr0)], cr1 = cr[hb * 16 + int(nr0) + 8];
-    \\    #pragma clang loop unroll(full)
-    \\    for (int f = 0; f < OF_CAP; ++f) {
-    \\      if (f >= OF) break;
-    \\      o[hb][f * 8 + 0] *= cr0; o[hb][f * 8 + 1] *= cr0; o[hb][f * 8 + 2] *= cr0; o[hb][f * 8 + 3] *= cr0;
-    \\      o[hb][f * 8 + 4] *= cr1; o[hb][f * 8 + 5] *= cr1; o[hb][f * 8 + 6] *= cr1; o[hb][f * 8 + 7] *= cr1;
+    \\    if (metal::simd_any(cr0 != 1.0f || cr1 != 1.0f)) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int f = 0; f < OF_CAP; ++f) {
+    \\        if (f >= OF) break;
+    \\        o[hb][f * 8 + 0] *= cr0; o[hb][f * 8 + 1] *= cr0; o[hb][f * 8 + 2] *= cr0; o[hb][f * 8 + 3] *= cr0;
+    \\        o[hb][f * 8 + 4] *= cr1; o[hb][f * 8 + 5] *= cr1; o[hb][f * 8 + 6] *= cr1; o[hb][f * 8 + 7] *= cr1;
+    \\      }
     \\    }
     \\    const metal::vec<T, 4> ah0 = *(const threadgroup metal::vec<T, 4>*)(ph + (hb * 16 + int(nr0)) * KT + int(nc0));
     \\    const metal::vec<T, 4> ah1 = *(const threadgroup metal::vec<T, 4>*)(ph + (hb * 16 + int(nr0) + 8) * KT + int(nc0));
@@ -1864,16 +1994,16 @@ const ATTN_NAX_TAIL =
     \\        if (f >= OF) break;
     \\        const int flat = head * D + d0 + f * 16 + cc0;
     \\        device OT* dst = out + (size_t(flat / GIN) * meta[5] + meta[6] + l) * GIN + flat % GIN;
-    \\        #pragma clang loop unroll(full)
-    \\        for (int j = 0; j < 4; ++j) dst[j] = OT(v[f][j]);
+    \\        *(device metal::vec<OT, 4>*)dst = metal::vec<OT, 4>(OT(v[f][0]), OT(v[f][1]), OT(v[f][2]), OT(v[f][3]));
     \\      }
     \\    } else {
     \\      device OT* dst = out + (size_t(l) * H + head) * D + d0 + cc0;
     \\      #pragma clang loop unroll(full)
     \\      for (int f = 0; f < OF_CAP; ++f) {
     \\        if (f >= OF) break;
-    \\        #pragma clang loop unroll(full)
-    \\        for (int j = 0; j < 4; ++j) dst[f * 16 + j] = OT(o[hb][f * 8 + hs * 4 + j] * inv);
+    \\        *(device metal::vec<OT, 4>*)(dst + f * 16) = metal::vec<OT, 4>(
+    \\          OT(o[hb][f * 8 + hs * 4 + 0] * inv), OT(o[hb][f * 8 + hs * 4 + 1] * inv),
+    \\          OT(o[hb][f * 8 + hs * 4 + 2] * inv), OT(o[hb][f * 8 + hs * 4 + 3] * inv));
     \\      }
     \\    }
     \\  }
@@ -1915,14 +2045,16 @@ const ATTN_TILE_SHUFFLE =
 
 pub const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
 pub const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
-pub const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SHUFFLE ++ ATTN_NAX_LOAD_ROWS ++ ATTN_NAX_TAIL;
-pub const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SHUFFLE ++ ATTN_NAX_LOAD_FP4 ++ ATTN_NAX_TAIL;
+pub const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ "\n" ++ ATTN_TILE_SHUFFLE ++ "\n" ++ ATTN_NAX_LOAD_ROWS ++ "\n" ++ ATTN_NAX_TAIL;
+pub const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ "\n" ++ ATTN_TILE_SHUFFLE ++ "\n" ++ ATTN_NAX_LOAD_FP4 ++ "\n" ++ ATTN_NAX_TAIL;
+
+pub const ATTN_NAX_FP4_PACK_HEADER: [:0]const u8 = qat_mod.PACK_HEADER ++ "\n" ++ ATTN_NAX_FP4_HELPER;
 
 var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE, .header = ATTN_EPI_HEADER };
 var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
 
 var attn_nax_def = Def{ .name = "dsv41_attn_nax", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_NAX_SOURCE, .header = ATTN_NAX_HEADER ++ ATTN_EPI_HEADER };
-var attn_nax_fp4_def = Def{ .name = "dsv41_attn_nax_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_NAX_FP4_SOURCE, .header = ATTN_NAX_HEADER ++ ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
+var attn_nax_fp4_def = Def{ .name = "dsv41_attn_nax_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_NAX_FP4_SOURCE, .header = ATTN_NAX_HEADER ++ ATTN_EPI_HEADER ++ ATTN_NAX_FP4_PACK_HEADER };
 
 /// Decode attention over `HB = 16` MQA heads per threadgroup on the NAX matrix units (`KT = 16`, `NSG = 8`),
 /// either single-pass (`!split_k`, with inverse RoPE + optional FP8 QAT + grouped output) or split-K (`split_k`,
@@ -1950,8 +2082,8 @@ fn attnDecNaxSource(comptime packed_comp: bool, comptime split_k: bool, comptime
         \\const int S = int(threadgroups_per_grid.z), sp_idx = threadgroup_position_in_grid.z;
         \\const int chunk = (nw + Ki + S - 1) / S;
         \\const int t_lo = sp_idx * chunk, t_hi = metal::min(nw + Ki, t_lo + chunk);
-        \\const device T* keys = ring;
-        \\constexpr int NT = NSG * 32, TPH = NT / HB;
+        \\const auto keys = ring;
+        \\constexpr int NT = NSG * 32, TPH = NT / HB, SP_STRIDE = HB + 4, PH_STRIDE = KT + 4;
         \\const int DS = D / NSG, QS = DS / 32, OF = DS / 16;
         \\#ifdef SUSHI_METALLIB
         \\constexpr int QS_CAP = 2, OF_CAP = 4;
@@ -1959,8 +2091,8 @@ fn attnDecNaxSource(comptime packed_comp: bool, comptime split_k: bool, comptime
         \\constexpr int QS_CAP = QS, OF_CAP = OF;
         \\#endif
         \\const int d0 = int(sg) * DS;
-        \\threadgroup float sp[NSG * HB * KT];
-        \\threadgroup T t_ph[HB * KT], t_pl[HB * KT];
+        \\threadgroup float sp[NSG * KT * SP_STRIDE];
+        \\threadgroup T t_ph[HB * PH_STRIDE], t_pl[HB * PH_STRIDE];
         \\threadgroup float cr[HB];
     ++ (if (split_k)
         ""
@@ -1969,12 +2101,14 @@ fn attnDecNaxSource(comptime packed_comp: bool, comptime split_k: bool, comptime
             \\threadgroup float rl[HB];
     ) ++ "\n" ++
         \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
+        \\constexpr float LOG2E = 1.4426950408889634f;
+        \\constexpr float INV_LOG2E = 0.6931471805599453f;
     ++ (if (split_k)
         \\float m = -INFINITY, lsum = 0.0f;
     else
-        \\float m = sink[h0 + hh], lsum = 1.0f;
+        \\float m = float(sink[h0 + hh]) * LOG2E, lsum = 1.0f;
     ) ++ "\n" ++
-        \\const float scale = scal[0];
+        \\const float scale = scal[0] * LOG2E;
         \\T qt[QS_CAP][16];
         \\float o[OF_CAP * 8];
         \\#pragma clang loop unroll(full)
@@ -2004,41 +2138,43 @@ fn attnDecNaxSource(comptime packed_comp: bool, comptime split_k: bool, comptime
         \\  for (int i = 0; i < 8; ++i) s[i] = 0.0f;
         \\  #pragma clang loop unroll(full)
         \\  for (int ks = 0; ks < QS_CAP; ++ks) { if (ks >= QS) break; dsv41_nax_mma<16, 32>(s, kf[ks], qt[ks]); }
-        \\  #pragma clang loop unroll(full)
-        \\  for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + dsv41_nax_c(lane, i)) * KT + dsv41_nax_r(lane, i)] = s[i];
+        \\  *(threadgroup float4*)(sp + (int(sg) * KT + int(nr0)) * SP_STRIDE + int(nc0)) = float4(s[0], s[1], s[2], s[3]);
+        \\  *(threadgroup float4*)(sp + (int(sg) * KT + int(nr0) + 8) * SP_STRIDE + int(nc0)) = float4(s[4], s[5], s[6], s[7]);
         \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         \\  float v = -INFINITY;
         \\  if (source_row(sub) != -1) {
         \\    float a = 0.0f;
         \\    #pragma clang loop unroll(full)
-        \\    for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + sub];
+        \\    for (int g = 0; g < NSG; ++g) a += sp[(g * KT + sub) * SP_STRIDE + hh];
         \\    v = a * scale;
         \\  }
         \\  float tmax = v;
         \\  for (int off = TPH / 2; off > 0; off >>= 1) tmax = metal::max(tmax, metal::simd_shuffle_xor(tmax, ushort(off)));
         \\  const float mn = metal::max(m, tmax);
-        \\  const float corr = (m > -INFINITY) ? metal::precise::exp(m - mn) : 0.0f;
-        \\  const float p = (v > -INFINITY) ? metal::precise::exp(v - mn) : 0.0f;
+        \\  const float corr = (m > -INFINITY) ? metal::exp2(m - mn) : 0.0f;
+        \\  const float p = (v > -INFINITY) ? metal::exp2(v - mn) : 0.0f;
         \\  const T hi = T(p);
         \\  float psum = p;
-        \\  t_ph[hh * KT + sub] = hi;
-        \\  t_pl[hh * KT + sub] = T(p - float(hi));
+        \\  t_ph[hh * PH_STRIDE + sub] = hi;
+        \\  t_pl[hh * PH_STRIDE + sub] = T(p - float(hi));
         \\  for (int off = TPH / 2; off > 0; off >>= 1) psum += metal::simd_shuffle_xor(psum, ushort(off));
         \\  lsum = lsum * corr + psum;
         \\  m = mn;
         \\  if (sub == 0) cr[hh] = corr;
         \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         \\  const float cr0 = cr[int(nr0)], cr1 = cr[int(nr0) + 8];
-        \\  #pragma clang loop unroll(full)
-        \\  for (int f = 0; f < OF_CAP; ++f) {
-        \\    if (f >= OF) break;
-        \\    o[f * 8 + 0] *= cr0; o[f * 8 + 1] *= cr0; o[f * 8 + 2] *= cr0; o[f * 8 + 3] *= cr0;
-        \\    o[f * 8 + 4] *= cr1; o[f * 8 + 5] *= cr1; o[f * 8 + 6] *= cr1; o[f * 8 + 7] *= cr1;
+        \\  if (metal::simd_any(cr0 != 1.0f || cr1 != 1.0f)) {
+        \\    #pragma clang loop unroll(full)
+        \\    for (int f = 0; f < OF_CAP; ++f) {
+        \\      if (f >= OF) break;
+        \\      o[f * 8 + 0] *= cr0; o[f * 8 + 1] *= cr0; o[f * 8 + 2] *= cr0; o[f * 8 + 3] *= cr0;
+        \\      o[f * 8 + 4] *= cr1; o[f * 8 + 5] *= cr1; o[f * 8 + 6] *= cr1; o[f * 8 + 7] *= cr1;
+        \\    }
         \\  }
-        \\  const metal::vec<T, 4> ah0 = *(const threadgroup metal::vec<T, 4>*)(t_ph + int(nr0) * KT + int(nc0));
-        \\  const metal::vec<T, 4> ah1 = *(const threadgroup metal::vec<T, 4>*)(t_ph + (int(nr0) + 8) * KT + int(nc0));
-        \\  const metal::vec<T, 4> al0 = *(const threadgroup metal::vec<T, 4>*)(t_pl + int(nr0) * KT + int(nc0));
-        \\  const metal::vec<T, 4> al1 = *(const threadgroup metal::vec<T, 4>*)(t_pl + (int(nr0) + 8) * KT + int(nc0));
+        \\  const metal::vec<T, 4> ah0 = *(const threadgroup metal::vec<T, 4>*)(t_ph + int(nr0) * PH_STRIDE + int(nc0));
+        \\  const metal::vec<T, 4> ah1 = *(const threadgroup metal::vec<T, 4>*)(t_ph + (int(nr0) + 8) * PH_STRIDE + int(nc0));
+        \\  const metal::vec<T, 4> al0 = *(const threadgroup metal::vec<T, 4>*)(t_pl + int(nr0) * PH_STRIDE + int(nc0));
+        \\  const metal::vec<T, 4> al1 = *(const threadgroup metal::vec<T, 4>*)(t_pl + (int(nr0) + 8) * PH_STRIDE + int(nc0));
         \\  const T ah[8] = { ah0[0], ah0[1], ah0[2], ah0[3], ah1[0], ah1[1], ah1[2], ah1[3] };
         \\  const T al[8] = { al0[0], al0[1], al0[2], al0[3], al1[0], al1[1], al1[2], al1[3] };
         \\  #pragma clang loop unroll(full)
@@ -2051,7 +2187,7 @@ fn attnDecNaxSource(comptime packed_comp: bool, comptime split_k: bool, comptime
     ++ "\n" ++ (if (split_k)
         \\if (sub == 0) {
         \\  const size_t base = (size_t(l) * H + h0 + hh) * S + sp_idx;
-        \\  pm[base] = m;
+        \\  pm[base] = (m > -INFINITY) ? (m * INV_LOG2E) : -INFINITY;
         \\  pl[base] = lsum;
         \\}
         \\const int cc0 = dsv41_nax_c(lane, 0);
@@ -2063,8 +2199,9 @@ fn attnDecNaxSource(comptime packed_comp: bool, comptime split_k: bool, comptime
         \\  #pragma clang loop unroll(full)
         \\  for (int f = 0; f < OF_CAP; ++f) {
         \\    if (f >= OF) break;
-        \\    #pragma clang loop unroll(full)
-        \\    for (int j = 0; j < 4; ++j) dst[f * 16 + j] = o[f * 8 + hs * 4 + j];
+        \\    *(device float4*)(dst + f * 16) = float4(
+        \\      o[f * 8 + hs * 4 + 0], o[f * 8 + hs * 4 + 1],
+        \\      o[f * 8 + hs * 4 + 2], o[f * 8 + hs * 4 + 3]);
         \\  }
         \\}
     else
@@ -2110,8 +2247,7 @@ fn attnDecNaxSource(comptime packed_comp: bool, comptime split_k: bool, comptime
         \\  #pragma clang loop unroll(full)
         \\  for (int f = 0; f < OF_CAP; ++f) {
         \\    if (f >= OF) break;
-        \\    #pragma clang loop unroll(full)
-        \\    for (int j = 0; j < 4; ++j) dst_head[f * 16 + j] = OT(v[f][j]);
+        \\    *(device metal::vec<OT, 4>*)(dst_head + f * 16) = metal::vec<OT, 4>(OT(v[f][0]), OT(v[f][1]), OT(v[f][2]), OT(v[f][3]));
         \\  }
         \\}
     );
@@ -2148,7 +2284,7 @@ fn attnDsparkNaxSource(comptime ride: bool) [:0]const u8 {
         \\const int p0 = meta[0], B = meta[1], nw = meta[2], total = nw + B;
         \\const int H = q_shape[1];
         \\const int pos = p0 + l;
-        \\constexpr int NT = NSG * 32, TPH = NT / HB;
+        \\constexpr int NT = NSG * 32, TPH = NT / HB, SP_STRIDE = HB + 4, PH_STRIDE = KT + 4;
         \\const int DS = D / NSG, QS = DS / 32, OF = DS / 16;
         \\#ifdef SUSHI_METALLIB
         \\constexpr int QS_CAP = 2, OF_CAP = 4;
@@ -2156,12 +2292,13 @@ fn attnDsparkNaxSource(comptime ride: bool) [:0]const u8 {
         \\constexpr int QS_CAP = QS, OF_CAP = OF;
         \\#endif
         \\const int d0 = int(sg) * DS;
-        \\threadgroup float sp[NSG * HB * KT];
-        \\threadgroup T t_ph[HB * KT], t_pl[HB * KT];
+        \\threadgroup float sp[NSG * KT * SP_STRIDE];
+        \\threadgroup T t_ph[HB * PH_STRIDE], t_pl[HB * PH_STRIDE];
         \\threadgroup float cr[HB], rl[HB];
         \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
-        \\float m = sink[h0 + hh], lsum = 1.0f;
-        \\const float scale = scal[0];
+        \\constexpr float LOG2E = 1.4426950408889634f;
+        \\float m = float(sink[h0 + hh]) * LOG2E, lsum = 1.0f;
+        \\const float scale = scal[0] * LOG2E;
         \\T qt[QS_CAP][16];
         \\float o[OF_CAP * 8];
         \\#pragma clang loop unroll(full)
@@ -2175,61 +2312,62 @@ fn attnDsparkNaxSource(comptime ride: bool) [:0]const u8 {
         \\const short nr0 = dsv41_nax_r(lane, 0), nc0 = dsv41_nax_c(lane, 0);
         \\for (int t0 = 0; t0 < total; t0 += KT) {
         \\  const int t_r0 = t0 + int(nr0), t_r1 = t_r0 + 8;
-        \\  const device T* rowp0 = (t_r0 < total) ? ((t_r0 < nw) ? (win + size_t(t_r0) * D) : (blk + size_t(t_r0 - nw) * D)) : nullptr;
-        \\  const device T* rowp1 = (t_r1 < total) ? ((t_r1 < nw) ? (win + size_t(t_r1) * D) : (blk + size_t(t_r1 - nw) * D)) : nullptr;
-        \\  float s[8];
-        \\  #pragma clang loop unroll(full)
-        \\  for (int i = 0; i < 8; ++i) s[i] = 0.0f;
         \\  T kf[QS_CAP][16];
         \\  #pragma clang loop unroll(full)
         \\  for (int ks = 0; ks < QS_CAP; ++ks) {
         \\    if (ks >= QS) break;
         \\    const int kd = d0 + ks * 32 + int(nc0);
-        \\    const metal::vec<T, 4> k0 = rowp0 ? *(const device metal::vec<T, 4>*)(rowp0 + kd) : metal::vec<T, 4>(T(0));
-        \\    const metal::vec<T, 4> k1 = rowp1 ? *(const device metal::vec<T, 4>*)(rowp1 + kd) : metal::vec<T, 4>(T(0));
-        \\    const metal::vec<T, 4> k2 = rowp0 ? *(const device metal::vec<T, 4>*)(rowp0 + kd + 16) : metal::vec<T, 4>(T(0));
-        \\    const metal::vec<T, 4> k3 = rowp1 ? *(const device metal::vec<T, 4>*)(rowp1 + kd + 16) : metal::vec<T, 4>(T(0));
+        \\    const metal::vec<T, 4> k0 = (t_r0 < total) ? ((t_r0 < nw) ? dsv41_ld4(win + size_t(t_r0) * D + kd) : dsv41_ld4(blk + size_t(t_r0 - nw) * D + kd)) : metal::vec<T, 4>(T(0));
+        \\    const metal::vec<T, 4> k1 = (t_r1 < total) ? ((t_r1 < nw) ? dsv41_ld4(win + size_t(t_r1) * D + kd) : dsv41_ld4(blk + size_t(t_r1 - nw) * D + kd)) : metal::vec<T, 4>(T(0));
+        \\    const metal::vec<T, 4> k2 = (t_r0 < total) ? ((t_r0 < nw) ? dsv41_ld4(win + size_t(t_r0) * D + kd + 16) : dsv41_ld4(blk + size_t(t_r0 - nw) * D + kd + 16)) : metal::vec<T, 4>(T(0));
+        \\    const metal::vec<T, 4> k3 = (t_r1 < total) ? ((t_r1 < nw) ? dsv41_ld4(win + size_t(t_r1) * D + kd + 16) : dsv41_ld4(blk + size_t(t_r1 - nw) * D + kd + 16)) : metal::vec<T, 4>(T(0));
         \\    kf[ks][0] = k0[0]; kf[ks][1] = k0[1]; kf[ks][2] = k0[2]; kf[ks][3] = k0[3];
         \\    kf[ks][4] = k1[0]; kf[ks][5] = k1[1]; kf[ks][6] = k1[2]; kf[ks][7] = k1[3];
         \\    kf[ks][8] = k2[0]; kf[ks][9] = k2[1]; kf[ks][10] = k2[2]; kf[ks][11] = k2[3];
         \\    kf[ks][12] = k3[0]; kf[ks][13] = k3[1]; kf[ks][14] = k3[2]; kf[ks][15] = k3[3];
-        \\    dsv41_nax_mma<16, 32>(s, kf[ks], qt[ks]);
         \\  }
+        \\  float s[8];
         \\  #pragma clang loop unroll(full)
-        \\  for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + dsv41_nax_c(lane, i)) * KT + dsv41_nax_r(lane, i)] = s[i];
+        \\  for (int i = 0; i < 8; ++i) s[i] = 0.0f;
+        \\  #pragma clang loop unroll(full)
+        \\  for (int ks = 0; ks < QS_CAP; ++ks) { if (ks >= QS) break; dsv41_nax_mma<16, 32>(s, kf[ks], qt[ks]); }
+        \\  *(threadgroup float4*)(sp + (int(sg) * KT + int(nr0)) * SP_STRIDE + int(nc0)) = float4(s[0], s[1], s[2], s[3]);
+        \\  *(threadgroup float4*)(sp + (int(sg) * KT + int(nr0) + 8) * SP_STRIDE + int(nc0)) = float4(s[4], s[5], s[6], s[7]);
         \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         \\  float v = -INFINITY;
         \\  if (t0 + sub < total) {
         \\    float a = 0.0f;
         \\    #pragma clang loop unroll(full)
-        \\    for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + sub];
+        \\    for (int g = 0; g < NSG; ++g) a += sp[(g * KT + sub) * SP_STRIDE + hh];
         \\    v = a * scale;
         \\  }
         \\  float tmax = v;
         \\  for (int off = TPH / 2; off > 0; off >>= 1) tmax = metal::max(tmax, metal::simd_shuffle_xor(tmax, ushort(off)));
         \\  const float mn = metal::max(m, tmax);
-        \\  const float corr = (m > -INFINITY) ? metal::precise::exp(m - mn) : 0.0f;
-        \\  const float p = (v > -INFINITY) ? metal::precise::exp(v - mn) : 0.0f;
+        \\  const float corr = (m > -INFINITY) ? metal::exp2(m - mn) : 0.0f;
+        \\  const float p = (v > -INFINITY) ? metal::exp2(v - mn) : 0.0f;
         \\  const T hi = T(p);
         \\  float psum = p;
-        \\  t_ph[hh * KT + sub] = hi;
-        \\  t_pl[hh * KT + sub] = T(p - float(hi));
+        \\  t_ph[hh * PH_STRIDE + sub] = hi;
+        \\  t_pl[hh * PH_STRIDE + sub] = T(p - float(hi));
         \\  for (int off = TPH / 2; off > 0; off >>= 1) psum += metal::simd_shuffle_xor(psum, ushort(off));
         \\  lsum = lsum * corr + psum;
         \\  m = mn;
         \\  if (sub == 0) cr[hh] = corr;
         \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         \\  const float cr0 = cr[int(nr0)], cr1 = cr[int(nr0) + 8];
-        \\  #pragma clang loop unroll(full)
-        \\  for (int f = 0; f < OF_CAP; ++f) {
-        \\    if (f >= OF) break;
-        \\    o[f * 8 + 0] *= cr0; o[f * 8 + 1] *= cr0; o[f * 8 + 2] *= cr0; o[f * 8 + 3] *= cr0;
-        \\    o[f * 8 + 4] *= cr1; o[f * 8 + 5] *= cr1; o[f * 8 + 6] *= cr1; o[f * 8 + 7] *= cr1;
+        \\  if (metal::simd_any(cr0 != 1.0f || cr1 != 1.0f)) {
+        \\    #pragma clang loop unroll(full)
+        \\    for (int f = 0; f < OF_CAP; ++f) {
+        \\      if (f >= OF) break;
+        \\      o[f * 8 + 0] *= cr0; o[f * 8 + 1] *= cr0; o[f * 8 + 2] *= cr0; o[f * 8 + 3] *= cr0;
+        \\      o[f * 8 + 4] *= cr1; o[f * 8 + 5] *= cr1; o[f * 8 + 6] *= cr1; o[f * 8 + 7] *= cr1;
+        \\    }
         \\  }
-        \\  const metal::vec<T, 4> ah0 = *(const threadgroup metal::vec<T, 4>*)(t_ph + int(nr0) * KT + int(nc0));
-        \\  const metal::vec<T, 4> ah1 = *(const threadgroup metal::vec<T, 4>*)(t_ph + (int(nr0) + 8) * KT + int(nc0));
-        \\  const metal::vec<T, 4> al0 = *(const threadgroup metal::vec<T, 4>*)(t_pl + int(nr0) * KT + int(nc0));
-        \\  const metal::vec<T, 4> al1 = *(const threadgroup metal::vec<T, 4>*)(t_pl + (int(nr0) + 8) * KT + int(nc0));
+        \\  const metal::vec<T, 4> ah0 = *(const threadgroup metal::vec<T, 4>*)(t_ph + int(nr0) * PH_STRIDE + int(nc0));
+        \\  const metal::vec<T, 4> ah1 = *(const threadgroup metal::vec<T, 4>*)(t_ph + (int(nr0) + 8) * PH_STRIDE + int(nc0));
+        \\  const metal::vec<T, 4> al0 = *(const threadgroup metal::vec<T, 4>*)(t_pl + int(nr0) * PH_STRIDE + int(nc0));
+        \\  const metal::vec<T, 4> al1 = *(const threadgroup metal::vec<T, 4>*)(t_pl + (int(nr0) + 8) * PH_STRIDE + int(nc0));
         \\  const T ah[8] = { ah0[0], ah0[1], ah0[2], ah0[3], ah1[0], ah1[1], ah1[2], ah1[3] };
         \\  const T al[8] = { al0[0], al0[1], al0[2], al0[3], al1[0], al1[1], al1[2], al1[3] };
         \\  #pragma clang loop unroll(full)
@@ -2281,8 +2419,7 @@ fn attnDsparkNaxSource(comptime ride: bool) [:0]const u8 {
         \\  #pragma clang loop unroll(full)
         \\  for (int f = 0; f < OF_CAP; ++f) {
         \\    if (f >= OF) break;
-        \\    #pragma clang loop unroll(full)
-        \\    for (int j = 0; j < 4; ++j) dst_head[f * 16 + j] = OT(v[f][j]);
+        \\    *(device metal::vec<OT, 4>*)(dst_head + f * 16) = metal::vec<OT, 4>(OT(v[f][0]), OT(v[f][1]), OT(v[f][2]), OT(v[f][3]));
         \\  }
         \\}
     ;
@@ -2360,10 +2497,10 @@ var attn_dec_nax_def = Def{ .name = "dsv41_attn_dec_nax", .ins = &.{ "q", "ring"
 var attn_split_nax_def = Def{ .name = "dsv41_attn_split_nax", .ins = &.{ "q", "ring", "comp", "topk", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_NAX_SOURCE, .header = ATTN_NAX_HEADER };
 var attn_dec_nax_ride_def = Def{ .name = "dsv41_attn_dec_nax_ride", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_DEC_NAX_RIDE_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER };
 var attn_split_nax_ride_def = Def{ .name = "dsv41_attn_split_nax_ride", .ins = &.{ "q", "ring", "comp", "topk", "meta", "scal", "z", "eps" }, .outs = &.{ "pacc", "pm", "pl", "pre", "post", "comb" }, .source = ATTN_SPLIT_NAX_RIDE_SOURCE, .header = ATTN_NAX_HEADER };
-var attn_dec_nax_packed_def = Def{ .name = "dsv41_attn_dec_nax_packed", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_NAX_PACKED_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
-var attn_split_nax_packed_def = Def{ .name = "dsv41_attn_split_nax_packed", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_NAX_PACKED_SOURCE, .header = ATTN_NAX_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
-var attn_dec_nax_packed_ride_def = Def{ .name = "dsv41_attn_dec_nax_packed_ride", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_DEC_NAX_PACKED_RIDE_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
-var attn_split_nax_packed_ride_def = Def{ .name = "dsv41_attn_split_nax_packed_ride", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "meta", "scal", "z", "eps" }, .outs = &.{ "pacc", "pm", "pl", "pre", "post", "comb" }, .source = ATTN_SPLIT_NAX_PACKED_RIDE_SOURCE, .header = ATTN_NAX_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
+var attn_dec_nax_packed_def = Def{ .name = "dsv41_attn_dec_nax_packed", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_NAX_PACKED_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ ATTN_NAX_FP4_PACK_HEADER };
+var attn_split_nax_packed_def = Def{ .name = "dsv41_attn_split_nax_packed", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_NAX_PACKED_SOURCE, .header = ATTN_NAX_HEADER ++ "\n" ++ ATTN_NAX_FP4_PACK_HEADER };
+var attn_dec_nax_packed_ride_def = Def{ .name = "dsv41_attn_dec_nax_packed_ride", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_DEC_NAX_PACKED_RIDE_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ ATTN_NAX_FP4_PACK_HEADER };
+var attn_split_nax_packed_ride_def = Def{ .name = "dsv41_attn_split_nax_packed_ride", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "meta", "scal", "z", "eps" }, .outs = &.{ "pacc", "pm", "pl", "pre", "post", "comb" }, .source = ATTN_SPLIT_NAX_PACKED_RIDE_SOURCE, .header = ATTN_NAX_HEADER ++ "\n" ++ ATTN_NAX_FP4_PACK_HEADER };
 
 fn attnDecodeNaxSplit(sc: *Scope, a: DecodeArgs, splits: usize, L: usize, H: usize, D: usize, kt: mlx.mlx_dtype, packed_comp: bool, comp: A, ids: A, meta: A, scal: A, freqs: A, og: usize, out_shape: []const c_int) !A {
     const ride = a.mixes;
@@ -2415,7 +2552,8 @@ fn attnDecodeNaxSplit(sc: *Scope, a: DecodeArgs, splits: usize, L: usize, H: usi
         if (a.split) |sp| sp.* = .{ .pre = parts[3], .post = parts[4], .comb = parts[5] };
     } else try launch(sc, &attn_split_nax_def, &.{ a.q, a.ring, comp, ids, meta, scal }, &part_outs, grid, tg, &common, &.{.{ .name = "T", .dt = kt }}, parts[0..3]);
     var o: [1]A = undefined;
-    try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = out_shape, .dt = a.out_dt }}, .{ D, H, L }, .{ D, 1, 1 }, &.{
+    const merge_tg = (D / 2 + 31) / 32 * 32;
+    try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = out_shape, .dt = a.out_dt }}, .{ merge_tg, H, L }, .{ merge_tg, 1, 1 }, &.{
         .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) }, .{ .name = "OG", .v = ci(og) },
     }, &.{.{ .name = "OT", .dt = a.out_dt }}, &o);
     return o[0];
@@ -2483,7 +2621,7 @@ fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const 
     const D = dim(q, 2);
     if (!attnFusedFits(H, D)) return error.TensorShape;
     if ((def == &attn_nax_def or def == &attn_nax_fp4_def) and D % (fused_nsg * 32) != 0) return error.TensorShape;
-    if (epi) |e| if (e.rd > D or e.rd % 2 != 0 or e.og == 0 or (H * D) / e.og == 0) return error.TensorShape;
+    if (epi) |e| if (e.rd > D or e.rd % 2 != 0 or e.og == 0 or (H * D) % e.og != 0 or (H * D / e.og) % 4 != 0) return error.TensorShape;
     const span = if (epi) |e| e.span else null;
     const rows = if (span) |part| part.rows else L;
     const first = if (span) |part| part.first else 0;
@@ -2780,8 +2918,19 @@ pub const IDX_NAX_PREP_SOURCE =
     \\}
 ;
 
-/// `dsv41_index_scores_fp4`'s loop for one key of one row, `q` read in place: the keys the matrix form cannot hold.
+/// `dsv41_index_scores_fp4`'s loop for one key of one row, `q` read in place: the keys the matrix form cannot hold,
+/// plus register-only branchless doubled E2M1 decode (`0,1,2,3,4,6,8,12` as `half4`, zero TG LUT / bank conflicts).
 pub const IDX_NAX_HEADER = IDX_PACKED_HEADER ++
+    \\inline uint dsv41_load_u32(const device uchar* p) { return *(const device uint*)p; }
+    \\inline uint dsv41_load_u32(const constant uchar* p) { return *(const constant uint*)p; }
+    \\inline ushort dsv41_load_u16(const device uchar* p) { return *(const device ushort*)p; }
+    \\inline ushort dsv41_load_u16(const constant uchar* p) { return *(const constant ushort*)p; }
+    \\inline half4 dsv41_e2m1x2_half4(ushort p) {
+    \\  const ushort4 nib = ushort4(p, p >> 4, p >> 8, p >> 12);
+    \\  const ushort4 mag = nib & ushort4(7u);
+    \\  const ushort4 lo = metal::select(ushort4(0x3c00u) + (mag << ushort4(9u)), mag * ushort4(0x3c00u), mag < ushort4(2u));
+    \\  return as_type<half4>(lo | ((nib & ushort4(8u)) << ushort4(12u)));
+    \\}
     \\template <typename Q, typename C, typename S, typename W, typename WS>
     \\inline float dsv41_idx_scalar(Q qf, C codes, S scales, W w, WS wsc, int l, int key) {
     \\  const auto qr = qf + size_t(l) * 32 * 128;
@@ -2821,7 +2970,7 @@ pub const IDX_NAX_HEADER = IDX_PACKED_HEADER ++
 /// from the codes. RB rows a threadgroup, SPR simdgroups a row, each taking 32-key steps SPR apart, IT steps a group.
 /// The result for a column n is `-inf` past what its row sees. GATHER: columns are the keys of `blocks` (BS a block).
 const IDX_NAX_COMMON =
-    \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    \\const uint sg = simdgroup_index_in_threadgroup;
     \\const ushort lane = thread_index_in_simdgroup;
     \\const int l0 = threadgroup_position_in_grid.y * RB;
     \\const int L = qf_shape[0];
@@ -2830,19 +2979,8 @@ const IDX_NAX_COMMON =
     \\#else
     \\constexpr int NSG_CAP = RB * SPR;
     \\#endif
-    \\threadgroup uint lut[256];
     \\threadgroup float wtp[NSG_CAP * 32];
     \\threadgroup float4 scr[NSG_CAP * 256];
-    \\for (uint i = tid; i < 256u; i += uint(RB * SPR * 32)) {
-    \\  uint e[2];
-    \\  for (uint hf = 0; hf < 2; ++hf) {
-    \\    const uint nib = hf ? (i >> 4) : (i & 15u), mag = nib & 7u;
-    \\    const uint x2 = mag < 4u ? mag : (2u + (mag & 1u)) << ((mag >> 1) - 1u);
-    \\    e[hf] = uint(as_type<ushort>((nib & 8u) ? -half(x2) : half(x2)));
-    \\  }
-    \\  lut[i] = e[0] | (e[1] << 16);
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\const int rs = int(sg) / SPR, ks = int(sg) % SPR, l = l0 + rs;
     \\if (l >= L) return;
     \\const short r0 = dsv41_nax_r(lane, 0), cb = dsv41_nax_c(lane, 0);
@@ -2873,44 +3011,43 @@ const IDX_NAX_COMMON =
     \\    if (n < NC) scores[size_t(l) * NC + n] = -INFINITY;
     \\    continue;
     \\  }
-    \\  uint bg[4];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int g = 0; g < 4; ++g) bg[g] = uint(scales[size_t(mykey) * 4 + g]);
-    \\  const uint bmin = metal::min(metal::min(bg[0], bg[1]), metal::min(bg[2], bg[3]));
-    \\  const uint bmax = metal::max(metal::max(bg[0], bg[1]), metal::max(bg[2], bg[3]));
+    \\  const uint sc_word = dsv41_load_u32(scales + size_t(mykey) * 4);
+    \\  const uint bg0 = sc_word & 255u, bg1 = (sc_word >> 8) & 255u, bg2 = (sc_word >> 16) & 255u, bg3 = sc_word >> 24;
+    \\  const uint bmin = metal::min(metal::min(bg0, bg1), metal::min(bg2, bg3));
+    \\  const uint bmax = metal::max(metal::max(bg0, bg1), metal::max(bg2, bg3));
     \\  const bool slow = sq + int(bmax - bmin) > 9 || bmin < 88u || bmax > 168u;
     \\  const float kscale = as_type<float>((bmax - 1u) << 23);
-    \\  uint hs[4];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int g = 0; g < 4; ++g) hs[g] = (15u - metal::min(bmax - bg[g], 14u)) << 10;
-    \\  const uint ps0 = hs[0] | (hs[1] << 16), ps1 = hs[2] | (hs[3] << 16);
+    \\  const uint ps0 = ((15u - metal::min(bmax - bg0, 14u)) << 10) | ((15u - metal::min(bmax - bg1, 14u)) << 26);
+    \\  const uint ps1 = ((15u - metal::min(bmax - bg2, 14u)) << 10) | ((15u - metal::min(bmax - bg3, 14u)) << 26);
     \\  for (int u = 0; u < 2; ++u) {
     \\    int key[4];
     \\    float kj[4];
-    \\    half2 sv[4][4];
+    \\    half sv[4][4];
     \\    #pragma clang loop unroll(full)
     \\    for (int j = 0; j < 4; ++j) {
     \\      const ushort col = ushort(16 * u + cb + j);
     \\      key[j] = metal::simd_shuffle(mykey, col);
     \\      kj[j] = metal::simd_shuffle(kscale, col);
     \\      const uint s0 = metal::simd_shuffle(ps0, col), s1 = metal::simd_shuffle(ps1, col);
-    \\      sv[j][0] = half2(as_type<half>(ushort(s0 & 0xffffu)));
-    \\      sv[j][1] = half2(as_type<half>(ushort(s0 >> 16)));
-    \\      sv[j][2] = half2(as_type<half>(ushort(s1 & 0xffffu)));
-    \\      sv[j][3] = half2(as_type<half>(ushort(s1 >> 16)));
+    \\      sv[j][0] = as_type<half>(ushort(s0 & 0xffffu));
+    \\      sv[j][1] = as_type<half>(ushort(s0 >> 16));
+    \\      sv[j][2] = as_type<half>(ushort(s1 & 0xffffu));
+    \\      sv[j][3] = as_type<half>(ushort(s1 >> 16));
     \\    }
     \\    half b[4][16];
     \\    #pragma clang loop unroll(full)
-    \\    for (int j = 0; j < 4; ++j)
+    \\    for (int j = 0; j < 4; ++j) {
+    \\      const auto base_c = codes + size_t(key[j]) * 64 + 2 * r0;
     \\      #pragma clang loop unroll(full)
     \\      for (int g = 0; g < 4; ++g) {
-    \\        const auto cp = codes + size_t(key[j]) * 64 + g * 16 + 2 * r0;
-    \\        const half2 h0 = as_type<half2>(lut[uint(cp[0])]) * sv[j][g], h1 = as_type<half2>(lut[uint(cp[1])]) * sv[j][g];
-    \\        b[g][j] = h0.x;
-    \\        b[g][j + 4] = h0.y;
-    \\        b[g][j + 8] = h1.x;
-    \\        b[g][j + 12] = h1.y;
+    \\        const ushort pk = dsv41_load_u16(base_c + g * 16);
+    \\        const half4 hv = dsv41_e2m1x2_half4(pk) * sv[j][g];
+    \\        b[g][j] = hv.x;
+    \\        b[g][j + 4] = hv.y;
+    \\        b[g][j + 8] = hv.z;
+    \\        b[g][j + 12] = hv.w;
     \\      }
+    \\    }
     \\    float c[2][8];
     \\    #pragma clang loop unroll(full)
     \\    for (int hh = 0; hh < 2; ++hh) {
@@ -2943,7 +3080,7 @@ pub const IDX_NAX_SOURCE: [:0]const u8 =
 
 pub const IDX_NAX_GATHER_SOURCE: [:0]const u8 =
     \\const int NC = blocks_shape[1] * BS;
-    \\#define COLUMN(n, vis, key) { const int blk = (n) < NC ? blocks[size_t(l) * blocks_shape[1] + (n) / BS] : -1; key = blk >= 0 ? blk * BS + (n) % BS : 0; vis = blk >= 0 && key < seen; }
+    \\#define COLUMN(n, vis, key) { const int blk = (n) < NC ? blocks[size_t(l) * blocks_shape[1] + (n) / BS] : -1; const int raw_k = blk >= 0 ? blk * BS + (n) % BS : 0; vis = blk >= 0 && raw_k < seen && raw_k < codes_shape[0]; key = vis ? raw_k : 0; }
     \\
 ++ IDX_NAX_COMMON;
 
@@ -2965,7 +3102,7 @@ fn naxTiling(rows: usize) NaxTiling {
     return switch (rows) {
         1 => .{ .rb = 1, .spr = 6 },
         2 => .{ .rb = 2, .spr = 3 },
-        3 => .{ .rb = 3, .spr = 2 },
+        3, 5, 6 => .{ .rb = 3, .spr = 2 },
         else => .{ .rb = @min(rows, 4), .spr = 1 },
     };
 }
@@ -3102,9 +3239,9 @@ pub fn indexNaxTrials(a: std.mem.Allocator, s: mlx.mlx_stream) !bool {
     if (!indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return false;
     const specs = [_]IndexNaxSpec{
         .{ .rows = 1, .nb = 1537, .ratio = 1, .key_cycle = 7, .q_cycle = 4, .extreme_every = 13 },
-        .{ .rows = 6, .nb = 1537, .ratio = 2, .key_cycle = 12, .q_cycle = 4, .extreme_every = 13 },
+        .{ .rows = 7, .nb = 1537, .ratio = 2, .key_cycle = 12, .q_cycle = 4, .extreme_every = 13 },
         .{ .rows = 2, .nb = 700, .ratio = 1, .key_cycle = 12, .q_cycle = 4, .wide_row = true },
-        .{ .rows = 3, .nb = 700, .ratio = 1, .key_cycle = 9, .q_cycle = 4 },
+        .{ .rows = 5, .nb = 700, .ratio = 1, .key_cycle = 9, .q_cycle = 4 },
     };
     for (specs) |spec| if (!try indexNaxTrial(a, s, spec)) return false;
     return true;
@@ -3289,9 +3426,9 @@ pub const HC_SPLIT_PART_SOURCE: [:0]const u8 =
 ++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY;
 
 /// Fast decode-width plain hyper-connection stage (`HC = 4, MIX = 24, D <= 8192, D % 4 == 0`):
-/// splits the 24 mixes across the 4 streams (`96` TGs + `nr` norm TGs, `256` threads/TG) with coalesced `float4`
-/// loads and multi-row `fn` weight reuse (`RBLK <= 8`), writing compact stream partials `[L, 125]` reduced inside
-/// the downstream riding HC split (`HC_SPLIT_GLOBAL`) with zero extra dispatch.
+/// splits the 24 mixes across the 4 streams (`48` TGs, 2 mixes x 1 stream per TG + `RBLK` norm TGs, `256` threads/TG)
+/// with coalesced `float4` loads and multi-row `fn` weight reuse (`RBLK <= 8`), writing compact stream partials
+/// `[L, 125]` reduced inside the downstream riding HC split (`HC_SPLIT_GLOBAL`) with zero extra dispatch.
 pub const HC_STAGE_FAST_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint role = threadgroup_position_in_grid.x;
@@ -3568,9 +3705,56 @@ pub fn hcExpandServes(x: A) bool {
     return hc_expand_tf32 and dim(x, 1) == 4;
 }
 
-/// `hcExpand` of four copies in one kernel, in `x`'s dtype, one thread an output element; valid only where
-/// `hcExpandServes`.
+/// Vectorized 4-copy hyper-connection expand (`D % 4 == 0`, `HC == 4`): reads each `vec<T, 4>` of `x[0..3]` and `y`
+/// ONCE per thread and writes all 4 output copies with coalesced `vec<T, 4>` stores, preserving exact TF32 truncation
+/// and pairwise summation order (`(p0 + p1) + (p2 + p3)`).
+pub const HC_EXPAND_V4_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const int d0 = int(thread_position_in_grid.x) * 4, l = int(thread_position_in_grid.y);
+    \\const int D = x_shape[2];
+    \\if (d0 >= D) return;
+    \\const size_t xo = size_t(l) * 4 * D + d0;
+    \\const auto x0 = dsv41_ld4(x + xo);
+    \\const auto x1 = dsv41_ld4(x + xo + D);
+    \\const auto x2 = dsv41_ld4(x + xo + 2 * D);
+    \\const auto x3 = dsv41_ld4(x + xo + 3 * D);
+    \\const auto yv = dsv41_ld4(y + size_t(l) * D + d0);
+    \\const float4 fx0 = as_type<float4>(as_type<uint4>(float4(float(x0[0]), float(x0[1]), float(x0[2]), float(x0[3]))) & uint4(0xFFFFE000u));
+    \\const float4 fx1 = as_type<float4>(as_type<uint4>(float4(float(x1[0]), float(x1[1]), float(x1[2]), float(x1[3]))) & uint4(0xFFFFE000u));
+    \\const float4 fx2 = as_type<float4>(as_type<uint4>(float4(float(x2[0]), float(x2[1]), float(x2[2]), float(x2[3]))) & uint4(0xFFFFE000u));
+    \\const float4 fx3 = as_type<float4>(as_type<uint4>(float4(float(x3[0]), float(x3[1]), float(x3[2]), float(x3[3]))) & uint4(0xFFFFE000u));
+    \\const float4 fy  = float4(float(yv[0]), float(yv[1]), float(yv[2]), float(yv[3]));
+    \\const float4 pv  = dsv41_ld4(post + size_t(l) * 4);
+    \\const float4 c0  = as_type<float4>(as_type<uint4>(dsv41_ld4(comb + size_t(l) * 16 + 0)) & uint4(0xFFFFE000u));
+    \\const float4 c1  = as_type<float4>(as_type<uint4>(dsv41_ld4(comb + size_t(l) * 16 + 4)) & uint4(0xFFFFE000u));
+    \\const float4 c2  = as_type<float4>(as_type<uint4>(dsv41_ld4(comb + size_t(l) * 16 + 8)) & uint4(0xFFFFE000u));
+    \\const float4 c3  = as_type<float4>(as_type<uint4>(dsv41_ld4(comb + size_t(l) * 16 + 12)) & uint4(0xFFFFE000u));
+    \\#pragma clang loop unroll(full)
+    \\for (int k = 0; k < 4; ++k) {
+    \\  const float4 p0 = c0[k] * fx0;
+    \\  const float4 p1 = c1[k] * fx1;
+    \\  const float4 p2 = c2[k] * fx2;
+    \\  const float4 p3 = c3[k] * fx3;
+    \\  const float4 res = pv[k] * fy + ((p0 + p1) + (p2 + p3));
+    \\  *(device metal::vec<T, 4>*)(out + xo + size_t(k) * D) = metal::vec<T, 4>(T(res.x), T(res.y), T(res.z), T(res.w));
+    \\}
+;
+
+var hc_expand_v4_def = Def{ .name = "dsv41_hc_expand_v4", .ins = &.{ "x", "y", "post", "comb" }, .outs = &.{"out"}, .source = HC_EXPAND_V4_SOURCE, .header = VEC_LOAD_HEADER };
+
+/// `hcExpand` of four copies in one kernel, in `x`'s dtype; valid only where `hcExpandServes`.
 pub fn hcExpandFused(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
+    const sh = mlx.getShape(x);
+    if (sh.len == 3 and sh[1] == 4 and sh[0] > 0 and sh[2] > 0 and @rem(sh[2], 4) == 0) {
+        const dt = mlx.mlx_array_dtype(x);
+        if (dt == .bfloat16 or dt == .float32) {
+            const L: usize = @intCast(sh[0]);
+            const d4: usize = @intCast(@divExact(sh[2], 4));
+            var o: [1]A = undefined;
+            try launch(sc, &hc_expand_v4_def, &.{ x, y, post, comb }, &.{.{ .shape = sh, .dt = dt }}, .{ (d4 + 255) / 256 * 256, L, 1 }, .{ 256, 1, 1 }, &.{}, &.{.{ .name = "T", .dt = dt }}, &o);
+            return o[0];
+        }
+    }
     return sc.keep(try hck.expand(sc.s, x, y, post, comb, true));
 }
 
@@ -6127,5 +6311,339 @@ test "dsv41 metallib: FC specs resolve valid parameters, reject OOB, and hold PS
             };
             try testing.expect(!catalog.resolve("dsv41_index_scores_nax", &idx_nax_ins, &.{.float32}, &targs, &res));
         }
+
+        // `dsv41_attn_nax` rejects non-multiple-of-4 GIN when EPI != 0 (guards vec<OT, 4> stores).
+        const attn_nax_ins = [_]catalog.RuntimeInput{
+            .{ .name = "q", .dtype = .bfloat16 },
+            .{ .name = "keys", .dtype = .bfloat16 },
+            .{ .name = "comp", .dtype = .bfloat16 },
+            .{ .name = "topk", .dtype = .int32 },
+            .{ .name = "sink", .dtype = .bfloat16 },
+            .{ .name = "meta", .dtype = .int32 },
+            .{ .name = "scal", .dtype = .float32 },
+            .{ .name = "freqs", .dtype = .float32 },
+        };
+        const attn_nax_bad_gin = [_]catalog.RuntimeTarg{
+            .{ .name = "D", .value = .{ .int = 512 } },
+            .{ .name = "HB", .value = .{ .int = 16 } },
+            .{ .name = "NSG", .value = .{ .int = 8 } },
+            .{ .name = "KT", .value = .{ .int = 16 } },
+            .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "OT", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "EPI", .value = .{ .int = 1 } },
+            .{ .name = "RD", .value = .{ .int = 64 } },
+            .{ .name = "QAT", .value = .{ .int = 1 } },
+            .{ .name = "GIN", .value = .{ .int = 6 } },
+        };
+        try testing.expect(!catalog.resolve("dsv41_attn_nax", &attn_nax_ins, &.{.bfloat16}, &attn_nax_bad_gin, &res));
+    }
+
+    // 6. dsv41_dense_f32x FC RPS, dsv41_hc_stage_fast FC RBLK, and dsv41_hc_expand_v4: valid/OOB + PSO occupancy.
+    const dense_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "w", .dtype = .bfloat16 },
+    };
+    for ([_]i32{ 1, 2, 4 }) |rps_ok| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "OT", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "RPS", .value = .{ .int = rps_ok } },
+        };
+        try testing.expect(catalog.resolve("dsv41_dense_f32x", &dense_ins, &.{.bfloat16}, &targs, &res));
+        try checkPso(dev, lib, &res, min_threads);
+    }
+    for ([_]i32{ 0, 3, 5, 8 }) |rps_bad| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "OT", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "RPS", .value = .{ .int = rps_bad } },
+        };
+        try testing.expect(!catalog.resolve("dsv41_dense_f32x", &dense_ins, &.{.bfloat16}, &targs, &res));
+    }
+
+    const hc_fast_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16 },
+        .{ .name = "fn", .dtype = .float32 },
+        .{ .name = "w", .dtype = .bfloat16 },
+        .{ .name = "cpre", .dtype = .float32 },
+        .{ .name = "scale", .dtype = .float32 },
+        .{ .name = "base", .dtype = .float32 },
+        .{ .name = "eps", .dtype = .float32 },
+    };
+    for ([_]i32{ 1, 4, 8 }) |rblk_ok| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "RBLK", .value = .{ .int = rblk_ok } },
+        };
+        try testing.expect(catalog.resolve("dsv41_hc_stage_fast", &hc_fast_ins, &.{ .bfloat16, .float32 }, &targs, &res));
+        try checkPso(dev, lib, &res, min_threads);
+    }
+    for ([_]i32{ 0, 9 }) |rblk_bad| {
+        const targs = [_]catalog.RuntimeTarg{
+            .{ .name = "T", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "RBLK", .value = .{ .int = rblk_bad } },
+        };
+        try testing.expect(!catalog.resolve("dsv41_hc_stage_fast", &hc_fast_ins, &.{ .bfloat16, .float32 }, &targs, &res));
+    }
+
+    for ([_]catalog.Dtype{ .bfloat16, .float32 }) |dt_ok| {
+        const exp_ins = [_]catalog.RuntimeInput{
+            .{ .name = "x", .dtype = dt_ok },
+            .{ .name = "y", .dtype = dt_ok },
+            .{ .name = "post", .dtype = .float32 },
+            .{ .name = "comb", .dtype = .float32 },
+        };
+        const targs = [_]catalog.RuntimeTarg{.{ .name = "T", .value = .{ .dtype = dt_ok } }};
+        try testing.expect(catalog.resolve("dsv41_hc_expand_v4", &exp_ins, &.{dt_ok}, &targs, &res));
+        try checkPso(dev, lib, &res, min_threads);
+    }
+    {
+        const exp_f16 = [_]catalog.RuntimeInput{
+            .{ .name = "x", .dtype = .float16 },
+            .{ .name = "y", .dtype = .float16 },
+            .{ .name = "post", .dtype = .float32 },
+            .{ .name = "comb", .dtype = .float32 },
+        };
+        const targs = [_]catalog.RuntimeTarg{.{ .name = "T", .value = .{ .dtype = .float16 } }};
+        try testing.expect(!catalog.resolve("dsv41_hc_expand_v4", &exp_f16, &.{.float16}, &targs, &res));
+    }
+}
+
+test "dsv41 branchless FP4 decode helpers match reference bit-for-bit across all nibbles, E4M3 scales, and 65536 u16 patterns" {
+    const e2m1_ref = [16]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0 };
+    const toBf16 = struct {
+        fn run(v: f32) u16 {
+            const b: u32 = @bitCast(v);
+            return @intCast((b +% 0x7FFF +% ((b >> 16) & 1)) >> 16);
+        }
+    }.run;
+    const e4m3Ref = struct {
+        fn run(b: u32) f32 {
+            const e = (b >> 3) & 15;
+            const m = b & 7;
+            if (e == 0) return @as(f32, @floatFromInt(m)) * 0.001953125;
+            return @bitCast(((e + 120) << 23) | (m << 20));
+        }
+    }.run;
+    const e4m3Half = struct {
+        fn run(b: u32) f16 {
+            const e = (b >> 3) & 15;
+            const m = b & 7;
+            if (e == 0) return @as(f16, @floatFromInt(m)) * @as(f16, 0.001953125);
+            return @bitCast(@as(u16, @intCast(((e + 8) << 10) | (m << 7))));
+        }
+    }.run;
+    const e2m1Half = struct {
+        fn run(nib: u16) f16 {
+            const mag: u16 = nib & 7;
+            const lo: u16 = if (mag < 2) mag *% 0x3800 else 0x3800 +% (mag << 9);
+            return @bitCast(lo | ((nib & 8) << 12));
+        }
+    }.run;
+    const e2m1x2Half = struct {
+        fn run(nib: u16) f16 {
+            const mag: u16 = nib & 7;
+            const lo: u16 = if (mag < 2) mag *% 0x3c00 else 0x3c00 +% (mag << 9);
+            return @bitCast(lo | ((nib & 8) << 12));
+        }
+    }.run;
+
+    // 1. All 256 E4M3 scale bytes: dsv41_e4m3_half bit-exact to scale_of(b, 2).
+    for (0..256) |b| {
+        const ref = e4m3Ref(@intCast(b));
+        const got: f32 = @floatCast(e4m3Half(@intCast(b)));
+        try testing.expectEqual(@as(u32, @bitCast(ref)), @as(u32, @bitCast(got)));
+    }
+
+    // 2. All 16 E2M1 nibbles x 256 E4M3 scale bytes: exact in half, f32, and bf16 (including -0.0).
+    for (0..16) |n| {
+        const h_val = e2m1Half(@intCast(n));
+        try testing.expectEqual(@as(u32, @bitCast(e2m1_ref[n])), @as(u32, @bitCast(@as(f32, @floatCast(h_val)))));
+        for (0..256) |b| {
+            const prod_f32 = e2m1_ref[n] * e4m3Ref(@intCast(b));
+            const prod_f16: f32 = @floatCast(h_val * e4m3Half(@intCast(b)));
+            try testing.expectEqual(@as(u32, @bitCast(prod_f32)), @as(u32, @bitCast(prod_f16)));
+            try testing.expectEqual(toBf16(prod_f32), toBf16(prod_f16));
+        }
+    }
+
+    // 3. All 65,536 ushort patterns: dsv41_e2m1x2_half4 bit-exact to prior lut[256].
+    var lut: [256]u32 = undefined;
+    for (0..256) |i| {
+        var e: [2]u32 = undefined;
+        for (0..2) |hf| {
+            const nib: u32 = if (hf != 0) @intCast(i >> 4) else @intCast(i & 15);
+            const mag: u32 = nib & 7;
+            const x2: u32 = if (mag < 4) mag else (2 + (mag & 1)) << @intCast((mag >> 1) - 1);
+            const hv: f16 = if ((nib & 8) != 0) -@as(f16, @floatFromInt(x2)) else @as(f16, @floatFromInt(x2));
+            e[hf] = @as(u16, @bitCast(hv));
+        }
+        lut[i] = e[0] | (e[1] << 16);
+    }
+    for (0..65536) |pk| {
+        const p: u16 = @intCast(pk);
+        const w0 = lut[pk & 0xff];
+        const w1 = lut[pk >> 8];
+        const want = [4]u16{ @truncate(w0), @truncate(w0 >> 16), @truncate(w1), @truncate(w1 >> 16) };
+        const got = [4]u16{
+            @bitCast(e2m1x2Half(p)),
+            @bitCast(e2m1x2Half(p >> 4)),
+            @bitCast(e2m1x2Half(p >> 8)),
+            @bitCast(e2m1x2Half(p >> 12)),
+        };
+        try testing.expectEqual(want, got);
+    }
+}
+
+test "dsv41 wave2 edge cases: attn_merge D=96 S=20/36, dense_f32x odd N, hc_expand tail, indexer rows=3/5/6 & gather OOB, masked NAX" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+
+    // 1. dsv41_attn_merge: D=96 (D % 64 == 32, non-multiple of 64) with S=20 (16 < S <= 32) and S=36 (S > 32), RoPE + QAT.
+    {
+        const s = mlx.engine.stream();
+        const host = mlx.engine.enter(s);
+        defer host.end();
+        var sc = Scope.plain(testing.allocator, s);
+        defer sc.deinit();
+        const H: usize = 4;
+        const D: usize = 96;
+        const window: usize = 128;
+        const K: usize = 64;
+        const nc: usize = 96;
+        const freqs = try ropeFreqs(&sc);
+        var picks: [K]i32 = undefined;
+        for (&picks, 0..) |*v, idx| v.* = if (idx % 11 == 5) -1 else @intCast((idx * 7 + 3) % nc);
+        const args: DecodeArgs = .{
+            .q = try trialValues(&sc, &.{ 1, ci(H), ci(D) }, .bfloat16, 201, 0.7),
+            .ring = try trialValues(&sc, &.{ ci(window), ci(D) }, .bfloat16, 202, 0.7),
+            .comp = try trialValues(&sc, &.{ ci(nc), ci(D) }, .bfloat16, 203, 0.7),
+            .topk = try sc.ints(&picks, &.{ 1, ci(K) }),
+            .sink = try trialValues(&sc, &.{ 1, ci(H), 1 }, .float32, 204, 1.0),
+            .p0 = 200,
+            .window = window,
+            .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(D))),
+            .freqs = freqs,
+            .rd = 32,
+            .qat_fp8 = true,
+            .out_dt = .bfloat16,
+            .groups = 2,
+        };
+        const ref = try hostOf(&sc, try attnDecodeSplit(&sc, args, 1));
+        for ([_]usize{ 20, 36 }) |splits| {
+            const got = try hostOf(&sc, try attnDecodeSplit(&sc, args, splits));
+            try expectLe("attn_merge D=96", maxRelDiff(got, ref), 1e-2);
+        }
+    }
+
+    // 2. dsv41_dense_f32x: RPS=1 (N <= 64, incl. odd N=33) and RPS=4 (odd N=65) on engine + MLX, plus K % 4 != 0 rejection.
+    {
+        for ([_]bool{ false, true }) |on_engine| {
+            const s = if (on_engine) mlx.engine.stream() else mlx.gpuStream();
+            const host = if (on_engine) mlx.engine.enter(s) else null;
+            defer if (host) |h| h.end();
+            var sc = Scope.plain(testing.allocator, s);
+            defer sc.deinit();
+            const K = 256;
+            const x = try trialValues(&sc, &.{ 2, K }, .bfloat16, 211, 1.5);
+            for ([_]usize{ 32, 33, 64, 65 }) |N| {
+                const w = try trialValues(&sc, &.{ ci(N), K }, .bfloat16, 212 + N, 0.2);
+                const got = try hostOf(&sc, try denseF32x(&sc, x, w));
+                const want = try hostOf(&sc, try sc.astype(try sc.matmul(try sc.astype(x, .float32), try sc.t2(try sc.astype(w, .float32))), .bfloat16));
+                try expectLe("dense_f32x odd N", maxRelDiff(got, want), 2e-2);
+            }
+            const x_bad = try trialValues(&sc, &.{ 1, 10 }, .bfloat16, 219, 1.0);
+            const w_bad = try trialValues(&sc, &.{ 4, 10 }, .bfloat16, 220, 1.0);
+            try testing.expectError(error.TensorShape, denseF32x(&sc, x_bad, w_bad));
+        }
+    }
+
+    // 3. hcExpandFused: non-multiple-of-4 D=66 fallback + L=1 D=64 (constant post on MLX stream) + engine stream.
+    {
+        for ([_]bool{ false, true }) |on_engine| {
+            const s = if (on_engine) mlx.engine.stream() else mlx.gpuStream();
+            const host = if (on_engine) mlx.engine.enter(s) else null;
+            defer if (host) |h| h.end();
+            var sc = Scope.plain(testing.allocator, s);
+            defer sc.deinit();
+            for ([_]c_int{ 64, 66 }) |D| {
+                const x = try trialValues(&sc, &.{ 1, 4, D }, .bfloat16, 231, 1.5);
+                const y = try trialValues(&sc, &.{ 1, D }, .bfloat16, 232, 1.0);
+                const post = try trialValues(&sc, &.{ 1, 4 }, .float32, 233, 0.7);
+                const comb = try trialValues(&sc, &.{ 1, 4, 4 }, .float32, 234, 0.5);
+                const want = try hostOf(&sc, try hcExpandPerColumn(&sc, x, y, post, comb));
+                const got = try hostOf(&sc, try hcExpandFused(&sc, x, y, post, comb));
+                try expectBitEqual("hcExpandFused tail/L=1", got, want);
+            }
+        }
+    }
+
+    // 4. NAX indexer rows=3,5,6 with non-multiple-of-BS nb=100, BS=8 (including last partial block) + masked NAX attention.
+    if (mlx.engine.matrixUnits() and nax_gate.verifyQmmNaxAvailable()) {
+        const s = mlx.engine.stream();
+        const host = mlx.engine.enter(s);
+        defer host.end();
+        var sc = Scope.plain(testing.allocator, s);
+        defer sc.deinit();
+
+        const nb: usize = 100; // Not a multiple of bs=8 (last block 12 covers keys 96..99; 100..103 are OOB!)
+        const bs: usize = 8;
+        const keys_h = try fp4GridRows(testing.allocator, 0x511, nb, -2, 7, 11);
+        defer testing.allocator.free(keys_h);
+        const keys = try qat_mod.packFp4(&sc, try sc.floats(keys_h, &.{ ci(nb), 128 }), .fp4_ue8m0, 32);
+        for ([_]usize{ 3, 5, 6 }) |L| {
+            const q_h = try fp4GridRows(testing.allocator, 0x512 + L, L * 32, -1, 4, 0);
+            defer testing.allocator.free(q_h);
+            const q = try sc.floats(q_h, &.{ ci(L), 32, 128 });
+            const w = try sc.astype(try trialValues(&sc, &.{ ci(L), 32 }, .float32, 0x513 + L, 1.0), .bfloat16);
+            const wscale: f32 = 1.0 / @sqrt(128.0) / @sqrt(32.0);
+            const p0 = nb - L;
+            const want_p = try sc_mod.hostF32(try indexScoresPacked(&sc, q, keys.codes, keys.scales, w, wscale, p0, 1, .fp4_ue8m0, 32));
+            const got_p = try sc_mod.hostF32(try indexScoresPackedNax(&sc, q, keys.codes, keys.scales, w, wscale, p0, 1, .fp4_ue8m0, 32));
+            try testing.expect(bitsEqual(want_p, got_p));
+
+            // Explicitly include the last partial block (12) and -1 entries in gather blocks.
+            const kb: usize = 6;
+            const ids = try testing.allocator.alloc(i32, L * kb);
+            defer testing.allocator.free(ids);
+            for (0..L) |l| {
+                ids[l * kb + 0] = 0;
+                ids[l * kb + 1] = 3;
+                ids[l * kb + 2] = 12; // partial tail block [96..103] where nb=100
+                ids[l * kb + 3] = 7;
+                ids[l * kb + 4] = -1;
+                ids[l * kb + 5] = 11;
+            }
+            const blocks = try sc.ints(ids, &.{ ci(L), ci(kb) });
+            const want_g = try sc_mod.hostF32(try indexScoresGather(&sc, q, keys.codes, keys.scales, w, wscale, p0, 1, .fp4_ue8m0, 32, blocks, bs));
+            const got_g = try sc_mod.hostF32(try indexScoresGatherNax(&sc, q, keys.codes, keys.scales, w, wscale, p0, 1, .fp4_ue8m0, 32, blocks, bs));
+            try testing.expect(bitsEqual(want_g, got_g));
+        }
+
+        // Fully masked topk tiles (all -1) on prefill NAX + split-K NAX must produce zero NaNs.
+        const H: usize = 32;
+        const D: usize = 256;
+        const q = try trialValues(&sc, &.{ 4, ci(H), ci(D) }, .bfloat16, 0x601, 0.5);
+        const ring = try trialValues(&sc, &.{ 16, ci(D) }, .bfloat16, 0x602, 0.5);
+        const comp = try trialValues(&sc, &.{ 16, ci(D) }, .bfloat16, 0x603, 0.5);
+        const sink = try trialValues(&sc, &.{ 1, ci(H), 1 }, .float32, 0x604, 0.5);
+        var masked_tk: [4 * 32]i32 = @splat(-1);
+        const topk = try sc.ints(&masked_tk, &.{ 4, 32 });
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+        const pre_out = try hostOf(&sc, try attnFused(&sc, try sc.reshape(sink, &.{ ci(H), 1 }), q, ring, 4, 8, comp, topk, scale, .bfloat16, null, true));
+        for (pre_out) |v| try testing.expect(!std.math.isNan(v));
+        const dec_out = try hostOf(&sc, try attnDecodeSplit(&sc, .{
+            .q = q,
+            .ring = ring,
+            .comp = comp,
+            .topk = topk,
+            .sink = sink,
+            .p0 = 4,
+            .window = 8,
+            .scale = scale,
+            .out_dt = .bfloat16,
+            .nax = true,
+        }, 4));
+        for (dec_out) |v| try testing.expect(!std.math.isNan(v));
     }
 }

@@ -2048,8 +2048,8 @@ fn streamsIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize) bool {
 /// Whether a packed scan of `q` (f32 `[Ls, ih, ihd]`, FP4-rounded where QAT is on) runs on the matrix units.
 fn indexNaxOn(m: *const Model, pk: Rows.Pack, q: A, nb: usize, gather: bool) bool {
     const rows = dim(q, 0);
-    // The extra launch for q does not pay back on one row of a short scan, or on a gather of the few candidate keys.
-    const big = if (gather) rows >= 5 else rows > 1 or nb >= m.index_nax_keys;
+    // The extra launch for q does not pay back on one row of a short scan, or on a tiny gather.
+    const big = if (gather) rows >= 3 else rows > 1 or nb >= m.index_nax_keys;
     return big and m.index_nax and m.qat_on and kernels.indexNaxFits(pk.mode, pk.group, dim(q, 1), dim(q, 2));
 }
 

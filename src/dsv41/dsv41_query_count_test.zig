@@ -232,8 +232,9 @@ test "dsv41 queries: a decode token (DSV41_TINY, DSV41_STQ_TINY)" {
             ran = true;
             try testing.expectEqual(folds, kernels.hcExpandProbed());
             // The two counts alternate with the compressed-attention cycle (shared unpacked-picks cache across non-owner
-            // layers; fused STQ decode attention checks array metadata once per layer). The Engram gate reads no width.
-            const want: [6]u64 = if (is_tiny) .{ 1142, 1191, 1142, 1191, 1142, 1191 } else if (folds) .{ 2298, 2354, 2298, 2354, 2298, 2354 } else .{ 2186, 2242, 2186, 2242, 2186, 2242 };
+            // layers; fused STQ decode attention checks array metadata once per layer). The Engram gate reads no width,
+            // and `hcExpandFused` reads `getShape(x)` once (-4 queries/call, -32/token on `DSV41_STQ_TINY` `folds=true`).
+            const want: [6]u64 = if (is_tiny) .{ 1142, 1191, 1142, 1191, 1142, 1191 } else if (folds) .{ 2266, 2322, 2266, 2322, 2266, 2322 } else .{ 2186, 2242, 2186, 2242, 2186, 2242 };
             try testing.expectEqual(want, got);
         }
     }
