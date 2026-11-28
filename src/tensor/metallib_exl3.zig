@@ -52,6 +52,11 @@ const fc_win_mask: u32 = 37; // uint bitcast to i32 (Part A)
 const fc_hash_mult: u32 = 38; // uint bitcast to i32 (Part A single-rate scalar)
 const fc_hash_mask: u32 = 39; // uint bitcast to i32 (Part A single-rate scalar)
 const fc_table_id: u32 = 40; // 0=alpha, 1=spec1-w15, 2=spec1-w16, 3=std1, 4=spec1-test-per-rate (Part A mixed)
+// Single-rate PAIR1 reuses slots 36, 38, 39, 40 (unused by PAIR1) for its 4 per-rate pair constants.
+const fc_pair1_rot: u32 = fc_cb_kind;
+const fc_pair1_mult: u32 = fc_hash_mult;
+const fc_pair1_mask0: u32 = fc_hash_mask;
+const fc_pair1_mask1: u32 = fc_table_id;
 const fc_clamp_limit: u32 = 41; // int >= 0 (rg_mid / rg_down / fz_mid)
 const fc_b_cb_kind: u32 = 42; // Part B cb_kind
 const fc_b_win_mask: u32 = 43; // Part B win_mask
@@ -266,14 +271,13 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
 
     if (opts.is_pair1) {
         try raw.appendSlice(a, "#define EXL3_LANE_FIRST 1u\n");
-        try emitPair1RowsTable(&raw, a);
         if (opts.fc_nhw) {
+            std.debug.assert(!opts.mixed_rate and !opts.secondary);
             try raw.print(a,
-                \\__attribute__((always_inline)) static inline half2 exl3_unscaled_fc(uint2 cw, uint N) {{
-                \\  const exl3_pair_row r = exl3_pair_row_at(N);
-                \\  cw &= uint2(as_type<uint>(FC_I{d}));
-                \\  const uint p = cw.y * r.mult;
-                \\  const half4 h = as_type<half4>(uint2(p & r.mask0, rotate(p, r.rot) & r.mask1));
+                \\__attribute__((always_inline)) static inline half2 exl3_unscaled_fc(uint2 cw, uint) {{
+                \\  const uint c = cw.y & as_type<uint>(FC_I{d});
+                \\  const uint p = c * as_type<uint>(FC_I{d});
+                \\  const half4 h = as_type<half4>(uint2(p & as_type<uint>(FC_I{d}), rotate(p, as_type<uint>(FC_I{d})) & as_type<uint>(FC_I{d})));
                 \\  return half2(h.x + h.y, h.z + h.w);
                 \\}}
                 \\__attribute__((always_inline)) static inline half2 exl3_pairh_fc(uint2 cw, uint N) {{
@@ -297,8 +301,9 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
                 \\#define exl3_decode2(cw) exl3_decode2_fc((cw), N)
                 \\#define exl3_slot(cw, slot) exl3_slot_fc((cw), (slot), N)
                 \\
-            , .{ win_fc, fold_b, fold_b, fold_b });
+            , .{ win_fc, fc_pair1_mult, fc_pair1_mask0, fc_pair1_rot, fc_pair1_mask1, fold_b, fold_b, fold_b });
         } else {
+            try emitPair1RowsTable(&raw, a);
             try raw.print(a,
                 \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_unscaled_n(uint2 cw) {{
                 \\  constexpr exl3_pair_row r = exl3_pair_row_at(N);
@@ -459,22 +464,21 @@ const FC_LANE_HELPERS: []const u8 =
     \\  const uint last = (end - 1u) >> 5u;
     \\  const uint prev = last == 0u ? W - 1u : last - 1u;
     \\  const uint s = (0u - end) & 31u;
-    \\  if (EXL3_LANE_FIRST == 1u && N == 56u) {
-    \\    const uint low_bits = uint(exl3_window(words, end, W, false));
-    \\    const uint prior = simd_shuffle(low_bits, ushort((lane + 31u) & 31u));
-    \\    return uint3(low_bits, prior >> 4u, 0u);
-    \\  }
     \\  const uint sh0 = exl3_lane_sh(N, 0u);
     \\  const uint shf = exl3_lane_sh(N, EXL3_LANE_FIRST);
     \\  if (shf + 16u <= 32u) {
     \\    return uint3(exl3_fc_funnel(words[last], words[prev], s), 0u, 0u);
     \\  }
-    \\  if (sh0 + 16u <= 64u) {
+    \\  if (EXL3_LANE_FIRST == 1u || sh0 + 16u <= 64u) {
     \\    const bool full = (shf + 16u > 32u + (low < 32u ? low : 32u));
     \\    const uint a = words[last];
     \\    const uint b = words[prev];
     \\    const uint w0 = exl3_fc_funnel(a, b, s);
     \\    if (full) {
+    \\      if (EXL3_LANE_FIRST == 1u) {
+    \\        const uint prior = simd_shuffle(w0, ushort((lane + 31u) & 31u));
+    \\        return uint3(w0, prior >> ((32u - W) & 31u), 0u);
+    \\      }
     \\      const uint third = prev == 0u ? W - 1u : prev - 1u;
     \\      return uint3(w0, exl3_fc_funnel(b, words[third], s), 0u);
     \\    }
@@ -494,6 +498,9 @@ const FC_LANE_HELPERS: []const u8 =
     \\  return uint3(w0, w1, c >> s);
     \\}
     \\__attribute__((always_inline)) static inline uint exl3_lane_word_fc(uint3 bits, uint sh) {
+    \\  if (EXL3_LANE_FIRST == 1u) {
+    \\    return (sh <= 16u) ? (bits.x >> sh) : uint(as_type<ulong>(uint2(bits.x, bits.y)) >> sh);
+    \\  }
     \\  return (sh <= 16u) ? (bits.x >> sh)
     \\    : (sh < 32u) ? uint(as_type<ulong>(uint2(bits.x, bits.y)) >> sh)
     \\    : (sh <= 48u) ? (bits.y >> (sh - 32u))
@@ -522,6 +529,33 @@ const FC_SMAT_FRAGS: []const u8 =
     \\}
     \\template<bool Scaled = false>
     \\__attribute__((always_inline)) static inline void smat_group_fc(uint N, const device uint *words, uint g, thread half2 *p) {
+    \\  if (EXL3_LANE_FIRST == 1u) {
+    \\    if (N == 64u) {
+    \\      const uint curr = words[g];
+    \\      const uint prev = words[(g + 31u) & 31u];
+    \\      p[0] = smat_pairh_fc<Scaled>(uint2(0u, (prev << 8u) | (curr >> 24u)), N);
+    \\      p[1] = smat_pairh_fc<Scaled>(uint2(0u, curr >> 16u), N);
+    \\      p[2] = smat_pairh_fc<Scaled>(uint2(0u, curr >> 8u), N);
+    \\      p[3] = smat_pairh_fc<Scaled>(uint2(0u, curr), N);
+    \\    } else if (N <= 42u) {
+    \\      const uint W = N / 2u;
+    \\      const uint lo = uint(exl3_window(words, W * g + W, W, false));
+    \\      p[0] = smat_pair_fc<Scaled>(lo, 0u, W - exl3_end(N, 1u), N);
+    \\      p[1] = smat_pair_fc<Scaled>(lo, 0u, W - exl3_end(N, 3u), N);
+    \\      p[2] = smat_pair_fc<Scaled>(lo, 0u, W - exl3_end(N, 5u), N);
+    \\      p[3] = smat_pair_fc<Scaled>(lo, 0u, 0u, N);
+    \\    } else {
+    \\      const uint W = N / 2u;
+    \\      const uint E = exl3_end(N, 5u);
+    \\      const uint lo = uint(exl3_window(words, W * g + E, W, false));
+    \\      const uint hi = uint(exl3_window(words, W * g + W, W, false));
+    \\      p[0] = smat_pair_fc<Scaled>(lo, 0u, E - exl3_end(N, 1u), N);
+    \\      p[1] = smat_pair_fc<Scaled>(lo, 0u, E - exl3_end(N, 3u), N);
+    \\      p[2] = smat_pair_fc<Scaled>(lo, 0u, 0u, N);
+    \\      p[3] = smat_pair_fc<Scaled>(hi, 0u, 0u, N);
+    \\    }
+    \\    return;
+    \\  }
     \\  if (N == 64u) {
     \\    const uint cur = words[g];
     \\    const uint prev = words[(g + 31u) & 31u];
@@ -639,16 +673,45 @@ fn buildNaxFragsFc(a: std.mem.Allocator) ![]u8 {
         \\}
         \\template<bool Scaled = false>
         \\__attribute__((always_inline)) static inline nfrag nax_wfrag_fc(uint N, const device uint *words, uint lane) {
-        \\  if (EXL3_LANE_FIRST == 1u && (N == 40u || N == 48u || N == 56u)) {
-        \\    const uint P = N / 8u;
-        \\    const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
-        \\    const uint end = group * N + P * (7u + ((lane >> 3u) & 1u));
-        \\    const uint last = (end - 1u) >> 5u;
-        \\    const uint s = (0u - end) & 31u;
-        \\    const uint prev = words[last - 1u];
-        \\    const uint lo = nax_funnel(words[last], prev, s);
-        \\    const uint hi = nax_funnel(prev, words[last == 1u ? N / 2u - 1u : last - 2u], s);
-        \\    return nax_quads_fc<Scaled>(N, nax_funnel(lo, hi, 4u * P), lo, 0u, 2u * P, 0u);
+        \\  if (EXL3_LANE_FIRST == 1u) {
+        \\    if (N == 64u) {
+        \\      const uint source0 = (lane & 16u) + ((lane & 7u) << 1u);
+        \\      const uint2 current = *(const device uint2 *)(words + source0);
+        \\      const uint previous = words[(source0 + 31u) & 31u];
+        \\      const uint s = 8u - (((lane >> 3u) & 1u) << 3u);
+        \\      return nax_quads_fc<Scaled>(64u, nax_funnel(current.x, previous, s), nax_funnel(current.y, current.x, s), 0u, 16u, 0u);
+        \\    } else if (N == 32u) {
+        \\      const uint b = (lane >> 3u) & 1u;
+        \\      const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+        \\      const uint a = words[group];
+        \\      const uint pw = words[(group + 15u) & 15u];
+        \\      const uint s = 4u - (b << 2u);
+        \\      return nax_quads_fc<Scaled>(32u, nax_funnel(a, pw, s + 16u), nax_funnel(a, pw, s), 0u, 8u, 0u);
+        \\    } else {
+        \\      const uint W = N / 2u;
+        \\      const uint b = (lane >> 3u) & 1u;
+        \\      const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+        \\      const uint end = group * N + W + nax_end(N, 0u, 5u) + b * (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u));
+        \\      const uint last = (end - 1u) >> 5u;
+        \\      const uint s = (0u - end) & 31u;
+        \\      const uint d = nax_sh(N, b, 1u);
+        \\      if (N == 24u) {
+        \\        const uint pw = words[last == 0u ? W - 1u : last - 1u];
+        \\        const uint lo = nax_funnel(words[last], pw, s);
+        \\        return nax_quads_fc<Scaled>(N, nax_funnel(lo, pw >> s, W), lo, 0u, d, 0u);
+        \\      } else if (N >= 38u) {
+        \\        const uint pw = words[last - 1u];
+        \\        const uint lo = nax_funnel(words[last], pw, s);
+        \\        const uint hi = nax_funnel(pw, words[last == 1u ? W - 1u : last - 2u], s);
+        \\        return nax_quads_fc<Scaled>(N, nax_funnel(lo, hi, W), lo, 0u, d, 0u);
+        \\      } else {
+        \\        const uint prev_i = last == 0u ? W - 1u : last - 1u;
+        \\        const uint pw = words[prev_i];
+        \\        const uint lo = nax_funnel(words[last], pw, s);
+        \\        const uint hi = nax_funnel(pw, words[prev_i == 0u ? W - 1u : prev_i - 1u], s);
+        \\        return nax_quads_fc<Scaled>(N, nax_funnel(lo, hi, W), lo, 0u, d, 0u);
+        \\      }
+        \\    }
         \\  }
         \\  if (N == 32u) {
         \\    const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
@@ -3648,7 +3711,13 @@ fn resolveSingleRate(
 
     if (!matched) return false;
 
-    if (parsed.meta.cb != .pair1) {
+    if (parsed.meta.cb == .pair1) {
+        const pair = format.pair1Pair(.{ .n = nhw }) orelse return false;
+        if (!appendFcU32(out, fc_pair1_rot, pair.rot)) return false;
+        if (!appendFcU32(out, fc_pair1_mult, pair.mult)) return false;
+        if (!appendFcU32(out, fc_pair1_mask0, pair.mask0)) return false;
+        if (!appendFcU32(out, fc_pair1_mask1, pair.mask1)) return false;
+    } else {
         if (!appendFcInt(out, fc_cb_kind, cbKindInt(parsed.meta.cb))) return false;
         if (!appendFcU32(out, fc_hash_mult, hm.mult)) return false;
         if (!appendFcU32(out, fc_hash_mask, hm.mask)) return false;

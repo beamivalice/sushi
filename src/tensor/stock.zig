@@ -1325,7 +1325,8 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
             try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
         }
     }
-    for ([_]i32{ 24, 32, 40, 42, 44, 48, 56, 64 }) |n_p1| {
+    var n_p1: i32 = 24;
+    while (n_p1 <= 64) : (n_p1 += 2) {
         const smat_targs = [_]catalog.RuntimeTarg{
             .{ .name = "NHW", .value = .{ .int = n_p1 } },
             .{ .name = "IDIM", .value = .{ .int = 512 } },
@@ -1333,10 +1334,10 @@ test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to
             .{ .name = "WIN", .value = .{ .int = 32 } },
         };
         try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_simdmat_pair1", &gemm_ins, &.{.float16}, &smat_targs, &res));
-        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
         if (has_nax) {
             try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_nax_pair1", &gemm_ins, &.{.float16}, &smat_targs, &res));
-            try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+            try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
         }
     }
 }
