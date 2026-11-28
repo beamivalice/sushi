@@ -73,16 +73,10 @@ const pair1_rates: [21]i32 = blk: {
     break :blk r;
 };
 
-/// Served & tested scalar rates for mixed-rate switches and secondary variants (30 values).
+/// Served & tested scalar rates for mixed-rate switches (`rg_simd`, `fz_*`, `fold*`) (30 values).
 const served_scalar_rates = [_]i32{
     16, 18, 20, 22,
     24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64,
-    72, 80, 96, 112, 128,
-};
-
-/// Common trunk & test rates for secondary NAX/SIMD rows variants (26 values).
-const trunk_scalar_rates = [_]i32{
-    16, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64,
     72, 80, 96, 112, 128,
 };
 
@@ -201,6 +195,7 @@ const CodecHeaderOpts = struct {
     is_pair1: bool,
     mixed_rate: bool = false,
     secondary: bool = false,
+    fc_nhw: bool = false,
 };
 
 fn emitPair1RowsTable(out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
@@ -272,102 +267,501 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
     if (opts.is_pair1) {
         try raw.appendSlice(a, "#define EXL3_LANE_FIRST 1u\n");
         try emitPair1RowsTable(&raw, a);
-        try raw.print(a,
-            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_unscaled_n(uint2 cw) {{
-            \\  constexpr exl3_pair_row r = exl3_pair_row_at(N);
-            \\  cw &= uint2(as_type<uint>(FC_I{d}));
-            \\  const uint p = cw.y * r.mult;
-            \\  const half4 h = as_type<half4>(uint2(p & r.mask0, rotate(p, r.rot) & r.mask1));
-            \\  return half2(h.x + h.y, h.z + h.w);
-            \\}}
-            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_pairh_n(uint2 cw) {{
-            \\  return exl3_unscaled_n<N>(cw) * half2(4096.0h);
-            \\}}
-            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_mma_pairh_n(uint2 cw) {{
-            \\  return FC_B{d} ? exl3_unscaled_n<N>(cw) : exl3_pairh_n<N>(cw);
-            \\}}
-            \\template<uint N> __attribute__((always_inline)) static inline float2 exl3_decode2_n(uint2 cw) {{
-            \\  return FC_B{d} ? float2(exl3_unscaled_n<N>(cw)) : float2(exl3_pairh_n<N>(cw));
-            \\}}
-            \\__attribute__((always_inline)) static inline float exl3_out(float v) {{
-            \\  return FC_B{d} ? (v * 4096.0f) : v;
-            \\}}
-            \\template<uint N> __attribute__((always_inline)) static inline float exl3_slot_n(thread const ushort *cw, uint slot) {{
-            \\  const float2 w = exl3_decode2_n<N>(uint2(0u, uint(cw[slot | 1u])));
-            \\  return (slot & 1u) != 0u ? w.y : w.x;
-            \\}}
-            \\#define exl3_pairh(cw) exl3_pairh_n<N>((cw))
-            \\#define exl3_mma_pairh(cw) exl3_mma_pairh_n<N>((cw))
-            \\#define exl3_decode2(cw) exl3_decode2_n<N>((cw))
-            \\#define exl3_slot(cw, slot) exl3_slot_n<N>((cw), (slot))
-            \\
-        , .{ win_fc, fold_b, fold_b, fold_b });
+        if (opts.fc_nhw) {
+            try raw.print(a,
+                \\__attribute__((always_inline)) static inline half2 exl3_unscaled_fc(uint2 cw, uint N) {{
+                \\  const exl3_pair_row r = exl3_pair_row_at(N);
+                \\  cw &= uint2(as_type<uint>(FC_I{d}));
+                \\  const uint p = cw.y * r.mult;
+                \\  const half4 h = as_type<half4>(uint2(p & r.mask0, rotate(p, r.rot) & r.mask1));
+                \\  return half2(h.x + h.y, h.z + h.w);
+                \\}}
+                \\__attribute__((always_inline)) static inline half2 exl3_pairh_fc(uint2 cw, uint N) {{
+                \\  return exl3_unscaled_fc(cw, N) * half2(4096.0h);
+                \\}}
+                \\__attribute__((always_inline)) static inline half2 exl3_mma_pairh_fc(uint2 cw, uint N) {{
+                \\  return FC_B{d} ? exl3_unscaled_fc(cw, N) : exl3_pairh_fc(cw, N);
+                \\}}
+                \\__attribute__((always_inline)) static inline float2 exl3_decode2_fc(uint2 cw, uint N) {{
+                \\  return FC_B{d} ? float2(exl3_unscaled_fc(cw, N)) : float2(exl3_pairh_fc(cw, N));
+                \\}}
+                \\__attribute__((always_inline)) static inline float exl3_out(float v) {{
+                \\  return FC_B{d} ? (v * 4096.0f) : v;
+                \\}}
+                \\__attribute__((always_inline)) static inline float exl3_slot_fc(thread const ushort *cw, uint slot, uint N) {{
+                \\  const float2 w = exl3_decode2_fc(uint2(0u, uint(cw[slot | 1u])), N);
+                \\  return (slot & 1u) != 0u ? w.y : w.x;
+                \\}}
+                \\#define exl3_pairh(cw) exl3_pairh_fc((cw), N)
+                \\#define exl3_mma_pairh(cw) exl3_mma_pairh_fc((cw), N)
+                \\#define exl3_decode2(cw) exl3_decode2_fc((cw), N)
+                \\#define exl3_slot(cw, slot) exl3_slot_fc((cw), (slot), N)
+                \\
+            , .{ win_fc, fold_b, fold_b, fold_b });
+        } else {
+            try raw.print(a,
+                \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_unscaled_n(uint2 cw) {{
+                \\  constexpr exl3_pair_row r = exl3_pair_row_at(N);
+                \\  cw &= uint2(as_type<uint>(FC_I{d}));
+                \\  const uint p = cw.y * r.mult;
+                \\  const half4 h = as_type<half4>(uint2(p & r.mask0, rotate(p, r.rot) & r.mask1));
+                \\  return half2(h.x + h.y, h.z + h.w);
+                \\}}
+                \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_pairh_n(uint2 cw) {{
+                \\  return exl3_unscaled_n<N>(cw) * half2(4096.0h);
+                \\}}
+                \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_mma_pairh_n(uint2 cw) {{
+                \\  return FC_B{d} ? exl3_unscaled_n<N>(cw) : exl3_pairh_n<N>(cw);
+                \\}}
+                \\template<uint N> __attribute__((always_inline)) static inline float2 exl3_decode2_n(uint2 cw) {{
+                \\  return FC_B{d} ? float2(exl3_unscaled_n<N>(cw)) : float2(exl3_pairh_n<N>(cw));
+                \\}}
+                \\__attribute__((always_inline)) static inline float exl3_out(float v) {{
+                \\  return FC_B{d} ? (v * 4096.0f) : v;
+                \\}}
+                \\template<uint N> __attribute__((always_inline)) static inline float exl3_slot_n(thread const ushort *cw, uint slot) {{
+                \\  const float2 w = exl3_decode2_n<N>(uint2(0u, uint(cw[slot | 1u])));
+                \\  return (slot & 1u) != 0u ? w.y : w.x;
+                \\}}
+                \\#define exl3_pairh(cw) exl3_pairh_n<N>((cw))
+                \\#define exl3_mma_pairh(cw) exl3_mma_pairh_n<N>((cw))
+                \\#define exl3_decode2(cw) exl3_decode2_n<N>((cw))
+                \\#define exl3_slot(cw, slot) exl3_slot_n<N>((cw), (slot))
+                \\
+            , .{ win_fc, fold_b, fold_b, fold_b });
+        }
     } else {
         try raw.appendSlice(a, "#define EXL3_LANE_FIRST 0u\n");
         if (opts.mixed_rate) {
             try emitMixedHashTables(&raw, a);
         }
-        try raw.print(a,
-            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_unscaled_n(uint2 cw) {{
-            \\  cw &= uint2(as_type<uint>(FC_I{d}));
-            \\  if (FC_I{d} == 2) {{
-            \\
-        , .{ win_fc, cb_fc });
-        if (opts.mixed_rate) {
+        if (opts.fc_nhw) {
+            std.debug.assert(!opts.mixed_rate);
             try raw.print(a,
-                \\    const exl3_hash_row r = exl3_hash_row_at(FC_I{d}, N);
-                \\    const half4 h = as_type<half4>((cw * uint2(r.mult)) & uint2(r.mask));
-                \\    return half2(h.x + h.y, h.z + h.w);
-                \\
-            , .{fc_table_id});
-        } else {
-            try raw.print(a,
+                \\__attribute__((always_inline)) static inline half2 exl3_unscaled_fc(uint2 cw, uint) {{
+                \\  cw &= uint2(as_type<uint>(FC_I{d}));
+                \\  if (FC_I{d} == 2) {{
                 \\    const half4 h = as_type<half4>((cw * uint2(as_type<uint>(FC_I{d}))) & uint2(as_type<uint>(FC_I{d})));
                 \\    return half2(h.x + h.y, h.z + h.w);
+                \\  }} else if (FC_I{d} == 1) {{
+                \\    const uint2 r = ((cw * uint2(0xCBAC1FEDu)) & uint2(0x8FFF8FFFu)) ^ uint2(0x3B603B60u);
+                \\    const half4 h = as_type<half4>(r);
+                \\    return half2(h.x + h.y, h.z + h.w);
+                \\  }} else {{
+                \\    const uint2 mixed = cw * uint2(0x83DCD12Du);
+                \\    const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+                \\    const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+                \\    const half2 h = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+                \\    return fma(h, as_type<half2>(ushort2(0x1EEEu)), as_type<half2>(ushort2(0xC931u)));
+                \\  }}
+                \\}}
+                \\__attribute__((always_inline)) static inline half2 exl3_pairh_fc(uint2 cw, uint N) {{
+                \\  return (FC_I{d} == 2) ? (exl3_unscaled_fc(cw, N) * half2(4096.0h)) : exl3_unscaled_fc(cw, N);
+                \\}}
+                \\__attribute__((always_inline)) static inline half2 exl3_mma_pairh_fc(uint2 cw, uint N) {{
+                \\  return (FC_I{d} == 2 && FC_B{d}) ? exl3_unscaled_fc(cw, N) : exl3_pairh_fc(cw, N);
+                \\}}
+                \\__attribute__((always_inline)) static inline float2 exl3_decode2_fc(uint2 cw, uint N) {{
+                \\  return (FC_I{d} == 2 && FC_B{d}) ? float2(exl3_unscaled_fc(cw, N)) : float2(exl3_pairh_fc(cw, N));
+                \\}}
+                \\__attribute__((always_inline)) static inline float exl3_out(float v) {{
+                \\  return (FC_I{d} == 2 && FC_B{d}) ? (v * 4096.0f) : v;
+                \\}}
+                \\__attribute__((always_inline)) static inline float exl3_slot_fc(thread const ushort *cw, uint slot, uint N) {{
+                \\  return exl3_decode2_fc(uint2(uint(cw[slot]), 0u), N).x;
+                \\}}
+                \\#define exl3_pairh(cw) exl3_pairh_fc((cw), N)
+                \\#define exl3_mma_pairh(cw) exl3_mma_pairh_fc((cw), N)
+                \\#define exl3_decode2(cw) exl3_decode2_fc((cw), N)
+                \\#define exl3_slot(cw, slot) exl3_slot_fc((cw), (slot), N)
                 \\
-            , .{ mult_fc, mask_fc });
+            , .{ win_fc, cb_fc, mult_fc, mask_fc, cb_fc, cb_fc, cb_fc, fold_b, cb_fc, fold_b, cb_fc, fold_b });
+        } else {
+            try raw.print(a,
+                \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_unscaled_n(uint2 cw) {{
+                \\  cw &= uint2(as_type<uint>(FC_I{d}));
+                \\  if (FC_I{d} == 2) {{
+                \\
+            , .{ win_fc, cb_fc });
+            if (opts.mixed_rate) {
+                try raw.print(a,
+                    \\    const exl3_hash_row r = exl3_hash_row_at(FC_I{d}, N);
+                    \\    const half4 h = as_type<half4>((cw * uint2(r.mult)) & uint2(r.mask));
+                    \\    return half2(h.x + h.y, h.z + h.w);
+                    \\
+                , .{fc_table_id});
+            } else {
+                try raw.print(a,
+                    \\    const half4 h = as_type<half4>((cw * uint2(as_type<uint>(FC_I{d}))) & uint2(as_type<uint>(FC_I{d})));
+                    \\    return half2(h.x + h.y, h.z + h.w);
+                    \\
+                , .{ mult_fc, mask_fc });
+            }
+            try raw.print(a,
+                \\  }} else if (FC_I{d} == 1) {{
+                \\    const uint2 r = ((cw * uint2(0xCBAC1FEDu)) & uint2(0x8FFF8FFFu)) ^ uint2(0x3B603B60u);
+                \\    const half4 h = as_type<half4>(r);
+                \\    return half2(h.x + h.y, h.z + h.w);
+                \\  }} else {{
+                \\    const uint2 mixed = cw * uint2(0x83DCD12Du);
+                \\    const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+                \\    const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+                \\    const half2 h = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+                \\    return fma(h, as_type<half2>(ushort2(0x1EEEu)), as_type<half2>(ushort2(0xC931u)));
+                \\  }}
+                \\}}
+                \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_pairh_n(uint2 cw) {{
+                \\  return (FC_I{d} == 2) ? (exl3_unscaled_n<N>(cw) * half2(4096.0h)) : exl3_unscaled_n<N>(cw);
+                \\}}
+                \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_mma_pairh_n(uint2 cw) {{
+                \\  return (FC_I{d} == 2 && FC_B{d}) ? exl3_unscaled_n<N>(cw) : exl3_pairh_n<N>(cw);
+                \\}}
+                \\template<uint N> __attribute__((always_inline)) static inline float2 exl3_decode2_n(uint2 cw) {{
+                \\  return (FC_I{d} == 2 && FC_B{d}) ? float2(exl3_unscaled_n<N>(cw)) : float2(exl3_pairh_n<N>(cw));
+                \\}}
+                \\__attribute__((always_inline)) static inline float exl3_out(float v) {{
+                \\  return (FC_I{d} == 2 && FC_B{d}) ? (v * 4096.0f) : v;
+                \\}}
+                \\template<uint N> __attribute__((always_inline)) static inline float exl3_slot_n(thread const ushort *cw, uint slot) {{
+                \\  return exl3_decode2_n<N>(uint2(uint(cw[slot]), 0u)).x;
+                \\}}
+                \\#define exl3_pairh(cw) exl3_pairh_n<N>((cw))
+                \\#define exl3_mma_pairh(cw) exl3_mma_pairh_n<N>((cw))
+                \\#define exl3_decode2(cw) exl3_decode2_n<N>((cw))
+                \\#define exl3_slot(cw, slot) exl3_slot_n<N>((cw), (slot))
+                \\
+            , .{ cb_fc, cb_fc, cb_fc, fold_b, cb_fc, fold_b, cb_fc, fold_b });
         }
-        try raw.print(a,
-            \\  }} else if (FC_I{d} == 1) {{
-            \\    const uint2 r = ((cw * uint2(0xCBAC1FEDu)) & uint2(0x8FFF8FFFu)) ^ uint2(0x3B603B60u);
-            \\    const half4 h = as_type<half4>(r);
-            \\    return half2(h.x + h.y, h.z + h.w);
-            \\  }} else {{
-            \\    const uint2 mixed = cw * uint2(0x83DCD12Du);
-            \\    const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
-            \\    const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
-            \\    const half2 h = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
-            \\    return fma(h, as_type<half2>(ushort2(0x1EEEu)), as_type<half2>(ushort2(0xC931u)));
-            \\  }}
-            \\}}
-            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_pairh_n(uint2 cw) {{
-            \\  return (FC_I{d} == 2) ? (exl3_unscaled_n<N>(cw) * half2(4096.0h)) : exl3_unscaled_n<N>(cw);
-            \\}}
-            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_mma_pairh_n(uint2 cw) {{
-            \\  return (FC_I{d} == 2 && FC_B{d}) ? exl3_unscaled_n<N>(cw) : exl3_pairh_n<N>(cw);
-            \\}}
-            \\template<uint N> __attribute__((always_inline)) static inline float2 exl3_decode2_n(uint2 cw) {{
-            \\  return (FC_I{d} == 2 && FC_B{d}) ? float2(exl3_unscaled_n<N>(cw)) : float2(exl3_pairh_n<N>(cw));
-            \\}}
-            \\__attribute__((always_inline)) static inline float exl3_out(float v) {{
-            \\  return (FC_I{d} == 2 && FC_B{d}) ? (v * 4096.0f) : v;
-            \\}}
-            \\template<uint N> __attribute__((always_inline)) static inline float exl3_slot_n(thread const ushort *cw, uint slot) {{
-            \\  return exl3_decode2_n<N>(uint2(uint(cw[slot]), 0u)).x;
-            \\}}
-            \\#define exl3_pairh(cw) exl3_pairh_n<N>((cw))
-            \\#define exl3_mma_pairh(cw) exl3_mma_pairh_n<N>((cw))
-            \\#define exl3_decode2(cw) exl3_decode2_n<N>((cw))
-            \\#define exl3_slot(cw, slot) exl3_slot_n<N>((cw), (slot))
-            \\
-        , .{ cb_fc, cb_fc, cb_fc, fold_b, cb_fc, fold_b, cb_fc, fold_b });
     }
     try raw.appendSlice(a, kernel_src.HELPERS_TAIL);
+    if (opts.fc_nhw) {
+        try raw.appendSlice(a, FC_LANE_HELPERS);
+    }
 
     if (!opts.secondary) return raw.toOwnedSlice(a);
     const base = try raw.toOwnedSlice(a);
     defer a.free(base);
     return renamePartB(a, base, &.{}, &.{}, false);
+}
+
+// ── Function-Constant Single-Rate Leaf-Arm Readers (Build-Time Only) ──
+
+/// Function-constant lane reader (`exl3_lane_fc`) with small structural leaf arms:
+/// dead branches and unused `uint3` channels are eliminated at PSO specialization time.
+const FC_LANE_HELPERS: []const u8 =
+    \\__attribute__((always_inline)) static inline uint exl3_fc_funnel(uint late, uint early, uint s) {
+    \\  return uint(((ulong(early) << 32u) | ulong(late)) >> s);
+    \\}
+    \\__attribute__((always_inline)) static inline uint3 exl3_lane_fc(uint N, const device uint *words, uint lane) {
+    \\  const uint W = N / 2u;
+    \\  const uint low = W & (0u - W);
+    \\  const uint end = W * lane + W;
+    \\  const uint last = (end - 1u) >> 5u;
+    \\  const uint prev = last == 0u ? W - 1u : last - 1u;
+    \\  const uint s = (0u - end) & 31u;
+    \\  if (EXL3_LANE_FIRST == 1u && N == 56u) {
+    \\    const uint low_bits = uint(exl3_window(words, end, W, false));
+    \\    const uint prior = simd_shuffle(low_bits, ushort((lane + 31u) & 31u));
+    \\    return uint3(low_bits, prior >> 4u, 0u);
+    \\  }
+    \\  const uint sh0 = exl3_lane_sh(N, 0u);
+    \\  const uint shf = exl3_lane_sh(N, EXL3_LANE_FIRST);
+    \\  if (shf + 16u <= 32u) {
+    \\    return uint3(exl3_fc_funnel(words[last], words[prev], s), 0u, 0u);
+    \\  }
+    \\  if (sh0 + 16u <= 64u) {
+    \\    const bool full = (shf + 16u > 32u + (low < 32u ? low : 32u));
+    \\    const uint a = words[last];
+    \\    const uint b = words[prev];
+    \\    const uint w0 = exl3_fc_funnel(a, b, s);
+    \\    if (full) {
+    \\      const uint third = prev == 0u ? W - 1u : prev - 1u;
+    \\      return uint3(w0, exl3_fc_funnel(b, words[third], s), 0u);
+    \\    }
+    \\    return uint3(w0, b >> s, 0u);
+    \\  }
+    \\  const bool full = (shf + 16u > 64u + (low < 32u ? low : 32u));
+    \\  const uint third = prev == 0u ? W - 1u : prev - 1u;
+    \\  const uint a = words[last];
+    \\  const uint b = words[prev];
+    \\  const uint c = words[third];
+    \\  const uint w0 = exl3_fc_funnel(a, b, s);
+    \\  const uint w1 = exl3_fc_funnel(b, c, s);
+    \\  if (full) {
+    \\    const uint fourth = third == 0u ? W - 1u : third - 1u;
+    \\    return uint3(w0, w1, exl3_fc_funnel(c, words[fourth], s));
+    \\  }
+    \\  return uint3(w0, w1, c >> s);
+    \\}
+    \\__attribute__((always_inline)) static inline uint exl3_lane_word_fc(uint3 bits, uint sh) {
+    \\  return (sh <= 16u) ? (bits.x >> sh)
+    \\    : (sh < 32u) ? uint(as_type<ulong>(uint2(bits.x, bits.y)) >> sh)
+    \\    : (sh <= 48u) ? (bits.y >> (sh - 32u))
+    \\    : uint(as_type<ulong>(uint2(bits.y, bits.z)) >> (sh - 32u));
+    \\}
+    \\
+;
+
+/// Function-constant `simdgroup_matrix` fragment reader (`smat_group_fc`) with structural leaf arms.
+const FC_SMAT_FRAGS: []const u8 =
+    \\#define SMAT_UNROLL _Pragma("clang loop unroll(full)")
+    \\__attribute__((always_inline)) static inline uint smat_funnel(uint late, uint early, uint s) {
+    \\  return uint(((ulong(early) << 32u) | ulong(late)) >> s);
+    \\}
+    \\template<bool Scaled = false>
+    \\__attribute__((always_inline)) static inline half2 smat_pairh_fc(uint2 cw, uint N) {
+    \\  if constexpr (Scaled) return exl3_pairh_fc(cw & uint2(0xffffu), N);
+    \\  else return exl3_mma_pairh_fc(cw & uint2(0xffffu), N);
+    \\}
+    \\template<bool Scaled = false>
+    \\__attribute__((always_inline)) static inline half2 smat_pair_fc(uint f, uint s0, uint s1, uint N) {
+    \\  return smat_pairh_fc<Scaled>(uint2(f >> s0, f >> s1), N);
+    \\}
+    \\static inline constexpr uint smat_split(uint N) {
+    \\  return exl3_end(N, 7u) - exl3_end(N, 0u) <= 16u ? 7u : exl3_end(N, 5u) - exl3_end(N, 0u) <= 16u ? 5u : 3u;
+    \\}
+    \\template<bool Scaled = false>
+    \\__attribute__((always_inline)) static inline void smat_group_fc(uint N, const device uint *words, uint g, thread half2 *p) {
+    \\  if (N == 64u) {
+    \\    const uint cur = words[g];
+    \\    const uint prev = words[(g + 31u) & 31u];
+    \\    const uint hi = (cur >> 16u) | (prev << 16u);
+    \\    p[0] = smat_pair_fc<Scaled>(hi, 12u, 8u, N);
+    \\    p[1] = smat_pair_fc<Scaled>(hi, 4u, 0u, N);
+    \\    p[2] = smat_pair_fc<Scaled>(cur, 12u, 8u, N);
+    \\    p[3] = smat_pair_fc<Scaled>(cur, 4u, 0u, N);
+    \\  } else if (exl3_end(N, 3u) - exl3_end(N, 0u) > 16u || N / 2u - exl3_end(N, 4u) > 16u) {
+    \\    const uint W = N / 2u;
+    \\    const uint end = W * g + W;
+    \\    const uint last = (end - 1u) >> 5u;
+    \\    const uint prev = last == 0u ? W - 1u : last - 1u;
+    \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    const uint a = words[last], b = words[prev], c = words[third];
+    \\    const uint w0 = smat_funnel(a, b, s);
+    \\    const uint w1 = smat_funnel(b, c, s);
+    \\    if (exl3_lane_sh(N, 0u) + 16u <= 64u) {
+    \\      const ulong bits = as_type<ulong>(uint2(w0, w1));
+    \\      SMAT_UNROLL for (uint j = 0u; j < 4u; j++) {
+    \\        p[j] = smat_pairh_fc<Scaled>(uint2(uint(bits >> exl3_lane_sh(N, 2u * j)), uint(bits >> exl3_lane_sh(N, 2u * j + 1u))), N);
+    \\      }
+    \\    } else {
+    \\      const uint low = W & (0u - W);
+    \\      const bool need4 = exl3_lane_sh(N, 0u) + 16u > 64u + (low < 32u ? low : 32u);
+    \\      const uint w2 = need4 ? smat_funnel(c, words[third == 0u ? W - 1u : third - 1u], s) : (c >> s);
+    \\      const ulong b0 = as_type<ulong>(uint2(w0, w1));
+    \\      const ulong b1 = as_type<ulong>(uint2(w1, w2));
+    \\      SMAT_UNROLL for (uint j = 0u; j < 4u; j++) {
+    \\        const uint sh0 = exl3_lane_sh(N, 2u * j);
+    \\        const uint sh1 = exl3_lane_sh(N, 2u * j + 1u);
+    \\        const uint c0 = sh0 <= 48u ? uint(b0 >> sh0) : uint(b1 >> (sh0 - 32u));
+    \\        const uint c1 = sh1 <= 48u ? uint(b0 >> sh1) : uint(b1 >> (sh1 - 32u));
+    \\        p[j] = smat_pairh_fc<Scaled>(uint2(c0, c1), N);
+    \\      }
+    \\    }
+    \\  } else {
+    \\    const uint W = N / 2u;
+    \\    const uint L = smat_split(N);
+    \\    const uint lo = uint(exl3_window(words, W * g + exl3_end(N, L), W, false));
+    \\    const uint hi = (L < 7u) ? uint(exl3_window(words, W * g + W, W, false)) : 0u;
+    \\    const uint E = exl3_end(N, L);
+    \\    p[0] = smat_pair_fc<Scaled>(lo, E - exl3_end(N, 0u), E - exl3_end(N, 1u), N);
+    \\    p[1] = smat_pair_fc<Scaled>(lo, E - exl3_end(N, 2u), E - exl3_end(N, 3u), N);
+    \\    if (L >= 5u) p[2] = smat_pair_fc<Scaled>(lo, E - exl3_end(N, 4u), E - exl3_end(N, 5u), N);
+    \\    else p[2] = smat_pair_fc<Scaled>(hi, W - exl3_end(N, 4u), W - exl3_end(N, 5u), N);
+    \\    if (L == 7u) p[3] = smat_pair_fc<Scaled>(lo, E - exl3_end(N, 6u), 0u, N);
+    \\    else p[3] = smat_pair_fc<Scaled>(hi, W - exl3_end(N, 6u), 0u, N);
+    \\  }
+    \\}
+    \\
+;
+
+/// Function-constant NAX fragment reader (`nax_wfrag_fc` / `rows_wfrag_fc`) with structural leaf arms,
+/// sharing `nax_origin`..`nax_store` verbatim from `kernels.GEMM_NAX_FRAGS`.
+fn buildNaxFragsFc(a: std.mem.Allocator) ![]u8 {
+    const tail_anchor = "__attribute__((always_inline)) static inline short2 nax_origin(";
+    const tail_at = std.mem.indexOf(u8, kernels.GEMM_NAX_FRAGS, tail_anchor) orelse std.debug.panic("metallib_exl3: missing nax_origin anchor", .{});
+    const prefix =
+        \\using nfrag = vec<half, 8>;
+        \\template<bool Scaled = false>
+        \\__attribute__((always_inline)) static inline half2 nax_pairh_fc(uint2 cw, uint N) {
+        \\  if constexpr (Scaled) return exl3_pairh_fc(cw & uint2(0xffffu), N);
+        \\  else return exl3_mma_pairh_fc(cw & uint2(0xffffu), N);
+        \\}
+        \\__attribute__((always_inline)) static inline uint nax_funnel(uint late, uint early, uint s) { return uint(((ulong(early) << 32u) | ulong(late)) >> s); }
+        \\template<bool Scaled = false>
+        \\__attribute__((always_inline)) static inline nfrag nax_wfrag_fc64(const device uint *words, uint lane) {
+        \\  const uint source0 = (lane & 16u) + ((lane & 7u) << 1u);
+        \\  const uint2 current = *(const device uint2 *)(words + source0);
+        \\  const uint previous = words[(source0 + 31u) & 31u];
+        \\  const uint slot = ((lane >> 3u) & 1u) * 2u;
+        \\  const uint hi0 = (current.x >> 16u) | (previous << 16u);
+        \\  const uint hi1 = (current.y >> 16u) | (current.x << 16u);
+        \\  const uint sh = 12u - slot * 4u;
+        \\  const half2 p00 = nax_pairh_fc<Scaled>(uint2(hi0 >> sh, hi0 >> (sh - 4u)), 64u);
+        \\  const half2 p01 = nax_pairh_fc<Scaled>(uint2(hi1 >> sh, hi1 >> (sh - 4u)), 64u);
+        \\  const half2 p10 = nax_pairh_fc<Scaled>(uint2(current.x >> sh, current.x >> (sh - 4u)), 64u);
+        \\  const half2 p11 = nax_pairh_fc<Scaled>(uint2(current.y >> sh, current.y >> (sh - 4u)), 64u);
+        \\  return nfrag(p00.x, p00.y, p01.x, p01.y, p10.x, p10.y, p11.x, p11.y);
+        \\}
+        \\static inline constexpr uint nax_end(uint N, uint b, uint j) { return ((2u * b + j + 1u) * N) >> 4u; }
+        \\__attribute__((always_inline)) static inline uint nax_sh(uint N, uint b, uint j) {
+        \\  const uint s0 = nax_end(N, 0u, 5u) - nax_end(N, 0u, j);
+        \\  return s0 + b * (nax_end(N, 1u, 5u) - nax_end(N, 1u, j) - s0);
+        \\}
+        \\template<bool Scaled = false, typename F>
+        \\__attribute__((always_inline)) static inline nfrag nax_quads_fc(uint N, F lo, F hi, uint s0, uint s1, uint s4) {
+        \\  const half2 p0 = nax_pairh_fc<Scaled>(uint2(uint(lo >> s0), uint(lo >> s1)), N);
+        \\  const half2 p1 = nax_pairh_fc<Scaled>(uint2(uint(lo >> s4), uint(lo)), N);
+        \\  const half2 p2 = nax_pairh_fc<Scaled>(uint2(uint(hi >> s0), uint(hi >> s1)), N);
+        \\  const half2 p3 = nax_pairh_fc<Scaled>(uint2(uint(hi >> s4), uint(hi)), N);
+        \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+        \\}
+        \\template<bool Scaled = false>
+        \\__attribute__((always_inline)) static inline half2 nax_k5_pair_fc(uint bits) {
+        \\  return nax_pairh_fc<Scaled>(uint2(bits >> 5u, bits), 80u);
+        \\}
+        \\template<bool Scaled = false>
+        \\__attribute__((always_inline)) static inline nfrag nax_k5_frag_fc(const device uint *words, uint lane) {
+        \\  const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+        \\  const uint word = (5u * group) >> 1u;
+        \\  const uint shift = 26u - 16u * (group & 1u) - 10u * ((lane >> 3u) & 1u);
+        \\  const uint prev = words[word == 0u ? 39u : word - 1u];
+        \\  const uint x = words[word], y = words[word + 1u], z = words[word + 2u];
+        \\  const uint a = nax_funnel(x, prev, shift);
+        \\  const uint b = nax_funnel(y, x, shift);
+        \\  const uint c = nax_funnel(z, y, shift);
+        \\  const half2 p0 = nax_k5_pair_fc<Scaled>(nax_funnel(b, a, 28u));
+        \\  const half2 p1 = nax_k5_pair_fc<Scaled>(b >> 8u);
+        \\  const half2 p2 = nax_k5_pair_fc<Scaled>(nax_funnel(c, b, 20u));
+        \\  const half2 p3 = nax_k5_pair_fc<Scaled>(c);
+        \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+        \\}
+        \\template<bool Scaled = false>
+        \\__attribute__((always_inline)) static inline nfrag nax_wfrag_fc(uint N, const device uint *words, uint lane) {
+        \\  if (EXL3_LANE_FIRST == 1u && (N == 40u || N == 48u || N == 56u)) {
+        \\    const uint P = N / 8u;
+        \\    const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+        \\    const uint end = group * N + P * (7u + ((lane >> 3u) & 1u));
+        \\    const uint last = (end - 1u) >> 5u;
+        \\    const uint s = (0u - end) & 31u;
+        \\    const uint prev = words[last - 1u];
+        \\    const uint lo = nax_funnel(words[last], prev, s);
+        \\    const uint hi = nax_funnel(prev, words[last == 1u ? N / 2u - 1u : last - 2u], s);
+        \\    return nax_quads_fc<Scaled>(N, nax_funnel(lo, hi, 4u * P), lo, 0u, 2u * P, 0u);
+        \\  }
+        \\  if (N == 32u) {
+        \\    const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+        \\    const uint cur = words[group];
+        \\    const uint prev = words[(group + 15u) & 15u];
+        \\    const uint s = ((lane >> 3u) & 1u) ? 0u : 4u;
+        \\    const uint lo = cur >> s;
+        \\    const uint hi = ((cur >> 16u) | (prev << 16u)) >> s;
+        \\    const half2 p0 = nax_pairh_fc<Scaled>(uint2(hi >> 10u, hi >> 8u), 32u);
+        \\    const half2 p1 = nax_pairh_fc<Scaled>(uint2(hi >> 2u, hi), 32u);
+        \\    const half2 p2 = nax_pairh_fc<Scaled>(uint2(lo >> 10u, lo >> 8u), 32u);
+        \\    const half2 p3 = nax_pairh_fc<Scaled>(uint2(lo >> 2u, lo), 32u);
+        \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+        \\  }
+        \\  if (N == 64u) return nax_wfrag_fc64<Scaled>(words, lane);
+        \\  if (N == 80u) return nax_k5_frag_fc<Scaled>(words, lane);
+        \\  if (N == 96u) {
+        \\    constexpr uint W = 48u;
+        \\    const uint b = (lane >> 3u) & 1u;
+        \\    const uint end = 8u * 96u * (lane >> 4u) + 96u * (lane & 7u) + (nax_end(96u, 1u, 5u) - nax_end(96u, 0u, 5u)) * b + nax_end(96u, 0u, 5u);
+        \\    const uint l = (end - 1u) >> 5u;
+        \\    const uint s = (0u - end) & 31u;
+        \\    const uint sp = (s + 16u) & 31u;
+        \\    const uint wm = words[l == 1u ? W - 1u : l - 2u];
+        \\    const uint w0 = words[l - 1u];
+        \\    const uint w1 = words[l];
+        \\    const uint w2 = words[l + 1u];
+        \\    const uint2 lo = uint2(nax_funnel(w1, w0, s), nax_funnel(w0, wm, sp));
+        \\    const uint2 hi = uint2(nax_funnel(w2, w1, sp), nax_funnel(w2, w1, s));
+        \\    const half2 p0 = nax_pairh_fc<Scaled>(uint2(lo.y >> 14u, lo.y >> 8u), 96u);
+        \\    const half2 p1 = nax_pairh_fc<Scaled>(uint2(lo.x >> 6u, lo.x), 96u);
+        \\    const half2 p2 = nax_pairh_fc<Scaled>(uint2(hi.y >> 14u, hi.y >> 8u), 96u);
+        \\    const half2 p3 = nax_pairh_fc<Scaled>(uint2(hi.x >> 6u, hi.x), 96u);
+        \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+        \\  }
+        \\  if (N == 128u) {
+        \\    const uint wbase = (((lane & 16u) >> 1u) + (lane & 7u)) << 2u;
+        \\    const uint4 v = *(const device uint4 *)(words + wbase);
+        \\    const uint prev = words[(wbase + 63u) & 63u];
+        \\    const uint s = ((lane >> 3u) & 1u) ? 0u : 16u;
+        \\    const uint u0 = nax_funnel(v.x, prev, s);
+        \\    const uint u1 = nax_funnel(v.y, v.x, s);
+        \\    const uint u2 = nax_funnel(v.z, v.y, s);
+        \\    const uint u3 = nax_funnel(v.w, v.z, s);
+        \\    const half2 p0 = nax_pairh_fc<Scaled>(uint2(u0 >> 8u, u0), 128u);
+        \\    const half2 p1 = nax_pairh_fc<Scaled>(uint2(u1 >> 8u, u1), 128u);
+        \\    const half2 p2 = nax_pairh_fc<Scaled>(uint2(u2 >> 8u, u2), 128u);
+        \\    const half2 p3 = nax_pairh_fc<Scaled>(uint2(u3 >> 8u, u3), 128u);
+        \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+        \\  }
+        \\  const uint W = N / 2u;
+        \\  const uint b = (lane >> 3u) & 1u;
+        \\  const uint end_lo = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
+        \\  const uint end_hi = end_lo + W;
+        \\  const uint l = (end_hi - 1u) >> 5u;
+        \\  const uint s = (0u - end_hi) & 31u;
+        \\  const uint s0 = nax_sh(N, b, 0u);
+        \\  const uint s1 = nax_sh(N, b, 1u);
+        \\  const uint s4 = nax_sh(N, b, 4u);
+        \\  if (N <= 58u) {
+        \\    const uint p1 = l == 0u ? W - 1u : l - 1u;
+        \\    const uint p0 = p1 == 0u ? W - 1u : p1 - 1u;
+        \\    const uint w2 = words[l], w1 = words[p1], w0 = words[p0];
+        \\    const ulong bits = as_type<ulong>(uint2(nax_funnel(w2, w1, s), nax_funnel(w1, w0, s)));
+        \\    const half2 hp0 = nax_pairh_fc<Scaled>(uint2(uint(bits >> (W + s0)), uint(bits >> (W + s1))), N);
+        \\    const half2 hp1 = nax_pairh_fc<Scaled>(uint2(uint(bits >> (W + s4)), uint(bits >> W)), N);
+        \\    const half2 hp2 = nax_pairh_fc<Scaled>(uint2(uint(bits >> s0), uint(bits >> s1)), N);
+        \\    const half2 hp3 = nax_pairh_fc<Scaled>(uint2(uint(bits >> s4), uint(bits)), N);
+        \\    return nfrag(hp0.x, hp0.y, hp2.x, hp2.y, hp1.x, hp1.y, hp3.x, hp3.y);
+        \\  } else if (N <= 98u) {
+        \\    const uint p2 = l == 0u ? W - 1u : l - 1u;
+        \\    const uint p1 = p2 == 0u ? W - 1u : p2 - 1u;
+        \\    const uint p0 = p1 == 0u ? W - 1u : p1 - 1u;
+        \\    const uint w3 = words[l], w2 = words[p2], w1 = words[p1], w0 = words[p0];
+        \\    const uint c = nax_funnel(w3, w2, s);
+        \\    const uint m = nax_funnel(w2, w1, s);
+        \\    const uint a = nax_funnel(w1, w0, s);
+        \\    const ulong lo = as_type<ulong>(uint2(c, m));
+        \\    const ulong hi = as_type<ulong>(uint2(m, a));
+        \\    uint cw5;
+        \\    if (N <= 62u) cw5 = uint(lo >> W);
+        \\    else cw5 = uint(hi >> (W - 32u));
+        \\    const half2 hp0 = nax_pairh_fc<Scaled>(uint2(uint(hi >> (W + s0 - 32u)), uint(hi >> (W + s1 - 32u))), N);
+        \\    const half2 hp1 = nax_pairh_fc<Scaled>(uint2(uint(hi >> (W + s4 - 32u)), cw5), N);
+        \\    const half2 hp2 = nax_pairh_fc<Scaled>(uint2(uint(lo >> s0), uint(lo >> s1)), N);
+        \\    const half2 hp3 = nax_pairh_fc<Scaled>(uint2(c >> s4, c), N);
+        \\    return nfrag(hp0.x, hp0.y, hp2.x, hp2.y, hp1.x, hp1.y, hp3.x, hp3.y);
+        \\  } else {
+        \\    const uint p3 = l == 0u ? W - 1u : l - 1u;
+        \\    const uint p2 = p3 == 0u ? W - 1u : p3 - 1u;
+        \\    const uint p1 = p2 == 0u ? W - 1u : p2 - 1u;
+        \\    const uint p0 = p1 == 0u ? W - 1u : p1 - 1u;
+        \\    const uint w4 = words[l], w3 = words[p3], w2 = words[p2], w1 = words[p1], w0 = words[p0];
+        \\    const uint d0 = nax_funnel(w4, w3, s);
+        \\    const uint d1 = nax_funnel(w3, w2, s);
+        \\    const uint d2 = nax_funnel(w2, w1, s);
+        \\    const uint d3 = nax_funnel(w1, w0, s);
+        \\    const ulong q0 = as_type<ulong>(uint2(d0, d1));
+        \\    const ulong q1 = as_type<ulong>(uint2(d1, d2));
+        \\    const ulong q2 = as_type<ulong>(uint2(d2, d3));
+        \\    const half2 hp0 = nax_pairh_fc<Scaled>(uint2(uint(q2 >> (W + s0 - 64u)), uint(q2 >> (W + s1 - 64u))), N);
+        \\    const half2 hp1 = nax_pairh_fc<Scaled>(uint2(uint(q1 >> (W + s4 - 32u)), uint(q1 >> (W - 32u))), N);
+        \\    const half2 hp2 = nax_pairh_fc<Scaled>(uint2(uint(q0 >> s0), uint(q0 >> s1)), N);
+        \\    const half2 hp3 = nax_pairh_fc<Scaled>(uint2(d0 >> s4, d0), N);
+        \\    return nfrag(hp0.x, hp0.y, hp2.x, hp2.y, hp1.x, hp1.y, hp3.x, hp3.y);
+        \\  }
+        \\}
+        \\__attribute__((always_inline)) static inline nfrag rows_wfrag_fc(uint N, const device uint *words, uint lane, uint, uint) {
+        \\  return nax_wfrag_fc<false>(N, words, lane);
+        \\}
+        \\
+    ;
+    return std.mem.concat(a, u8, &.{ prefix, kernels.GEMM_NAX_FRAGS[tail_at..] });
 }
 
 // ── Build-Time Source / Header Builders ──
@@ -406,55 +800,102 @@ fn buildRowsNaxFragsFc(a: std.mem.Allocator) ![]u8 {
 
 fn exl3HeaderFn(a: std.mem.Allocator, arg: usize) ![]const u8 {
     switch (arg) {
-        hdr_scalar => return buildCodecHeader(a, .{ .is_pair1 = false }),
-        hdr_pair1 => return buildCodecHeader(a, .{ .is_pair1 = true }),
+        hdr_scalar => return buildCodecHeader(a, .{ .is_pair1 = false, .fc_nhw = true }),
+        hdr_pair1 => return buildCodecHeader(a, .{ .is_pair1 = true, .fc_nhw = true }),
         hdr_scalar_smat => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = false });
-            return std.mem.concat(a, u8, &.{ c, kernels.GEMM_SIMDMAT_FRAGS });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = false, .fc_nhw = true });
+            return std.mem.concat(a, u8, &.{ c, FC_SMAT_FRAGS });
         },
         hdr_pair1_smat => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = true });
-            return std.mem.concat(a, u8, &.{ c, kernels.GEMM_SIMDMAT_FRAGS });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = true, .fc_nhw = true });
+            return std.mem.concat(a, u8, &.{ c, FC_SMAT_FRAGS });
         },
         hdr_scalar_nax => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = false });
-            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, kernels.GEMM_NAX_FRAGS });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = false, .fc_nhw = true });
+            const f = try buildNaxFragsFc(a);
+            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, f });
         },
         hdr_pair1_nax => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = true });
-            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, kernels.GEMM_NAX_FRAGS });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = true, .fc_nhw = true });
+            const f = try buildNaxFragsFc(a);
+            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, f });
         },
         hdr_scalar_rows_simd => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = false });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = false, .fc_nhw = true });
             return std.mem.concat(a, u8, &.{ c, project_rows.ROWS_HELPERS });
         },
         hdr_pair1_rows_simd => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = true });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = true, .fc_nhw = true });
             return std.mem.concat(a, u8, &.{ c, project_rows.ROWS_HELPERS });
         },
         hdr_scalar_rows_simd_cnt => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = false });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = false, .fc_nhw = true });
             return std.mem.concat(a, u8, &.{ c, project_rows.ROWS_HELPERS, project_rows.COUNTED_STORE });
         },
         hdr_scalar_rows_nax => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = false });
-            const f = try buildRowsNaxFragsFc(a);
-            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, f });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = false, .fc_nhw = true });
+            const f = try buildNaxFragsFc(a);
+            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, f, project_rows.ROWS_HELPERS });
         },
         hdr_pair1_rows_nax => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = true });
-            const f = try buildRowsNaxFragsFc(a);
-            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, f });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = true, .fc_nhw = true });
+            const f = try buildNaxFragsFc(a);
+            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, f, project_rows.ROWS_HELPERS });
         },
         hdr_scalar_rows_nax_cnt => {
-            const c = try buildCodecHeader(a, .{ .is_pair1 = false });
-            const f = try buildRowsNaxFragsFc(a);
-            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, f, project_rows.COUNTED_STORE });
+            const c = try buildCodecHeader(a, .{ .is_pair1 = false, .fc_nhw = true });
+            const f = try buildNaxFragsFc(a);
+            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, c, f, project_rows.ROWS_HELPERS, project_rows.COUNTED_STORE });
         },
         hdr_rg_scalar => return buildCodecHeader(a, .{ .is_pair1 = false, .mixed_rate = true }),
         hdr_rg_pair1 => return buildCodecHeader(a, .{ .is_pair1 = true, .mixed_rate = true }),
         else => unreachable,
     }
+}
+
+fn ensureUnrollLoop(a: std.mem.Allocator, src: []const u8, needle: []const u8) ![]u8 {
+    if (std.mem.indexOf(u8, src, needle) == null) return a.dupe(u8, src);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, needle)) |at| {
+        try out.appendSlice(a, src[pos..at]);
+        // Check whether the immediately preceding non-whitespace line already has `unroll(full)`.
+        const prefix = std.mem.trimEnd(u8, src[0..at], " \t\r\n");
+        if (!std.mem.endsWith(u8, prefix, "unroll(full)")) {
+            try out.appendSlice(a, "#pragma clang loop unroll(full)\n");
+        }
+        try out.appendSlice(a, needle);
+        pos = at + needle.len;
+    }
+    try out.appendSlice(a, src[pos..]);
+    return out.toOwnedSlice(a);
+}
+
+fn ensureUnrollP4(a: std.mem.Allocator, src: []const u8) ![]u8 {
+    var s = try ensureUnrollLoop(a, src, "for (uint u = 0u; u < 2u; u++) {");
+    s = try ensureUnrollLoop(a, s, "for (uint o = 0u; o < 2u; o++) {");
+    s = try ensureUnrollLoop(a, s, "for (uint p = 0u; p < 4u; p++) {");
+    return s;
+}
+
+/// Converts a single-rate kernel body whose `NHW` is a `[[function_constant]]` so its fragment/lane readers
+/// dispatch via small structural leaf arms specialized at PSO creation, with zero whole-body rate duplication.
+fn fcSingleRateNhw(a: std.mem.Allocator, base: []const u8) ![]u8 {
+    var s = try a.dupe(u8, base);
+    s = try replaceOptAlloc(a, s, "constexpr uint N = uint(NHW);", "const uint N = uint(NHW);");
+    s = try replaceOptAlloc(a, s, "constexpr uint PACKED_HW = N;", "const uint PACKED_HW = N;");
+    s = try replaceOptAlloc(a, s, "constexpr uint PACKED_W = N / 2u;", "const uint PACKED_W = N / 2u;");
+    s = try replaceOptAlloc(a, s, "constexpr uint sh[8] = ", "const uint sh[8] = ");
+    s = try replaceOptAlloc(a, s, "exl3_lane_bits<N>", "uint3");
+    s = try replaceOptAlloc(a, s, "exl3_lane<N>(", "exl3_lane_fc(N, ");
+    s = try replaceOptAlloc(a, s, "exl3_lane_word(", "exl3_lane_word_fc(");
+    s = try replaceOptAlloc(a, s, "smat_group<N>(", "smat_group_fc<false>(N, ");
+    s = try replaceOptAlloc(a, s, "nax_wfrag_k<N, true>(", "nax_wfrag_fc<true>(N, ");
+    s = try replaceOptAlloc(a, s, "nax_wfrag_k<N>(", "nax_wfrag_fc<false>(N, ");
+    s = try replaceOptAlloc(a, s, "rows_wfrag<N>(", "rows_wfrag_fc(N, ");
+    s = try ensureUnrollP4(a, s);
+    return s;
 }
 
 /// Converts runtime `CLAMP_LIMIT` / `vals` / `counts` / `prepared` / `seen` / `if constexpr` to FC-safe MSL.
@@ -849,6 +1290,16 @@ fn srcClean(comptime raw: []const u8) ?custom.SourceFn {
     }.f;
 }
 
+fn srcSingleClean(comptime raw: []const u8) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
+    return struct {
+        fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
+            const clean = try fcCleanSource(a, raw);
+            return fcSingleRateNhw(a, clean);
+        }
+    }.f;
+}
+
 fn srcRgMid(a: std.mem.Allocator, _: usize) ![]const u8 {
     const clean = try fcCleanSource(a, kernels.DECODE_MID_SOURCE);
     return addFcClamp(a, clean);
@@ -900,14 +1351,15 @@ fn srcClampedMidDown(a: std.mem.Allocator, _: usize) ![]const u8 {
     var s = try fcCleanSource(a, kernels.CLAMPED_MIDDLE_DOWN_SOURCE);
     // Clamped middle down allows IDIM up to 8192 (`expert_exl3_kernels.zig:7940`).
     s = try replaceOnceAlloc(a, s, "threadgroup half prepared[4096];", "threadgroup half prepared[8192];");
-    return s;
+    return fcSingleRateNhw(a, s);
 }
 
 fn srcRows(comptime raw: []const u8, comptime is_nax: bool, comptime is_counted: bool) ?custom.SourceFn {
     if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
-            return transformRowsSource(a, raw, is_nax, is_counted);
+            const tr = try transformRowsSource(a, raw, is_nax, is_counted);
+            return fcSingleRateNhw(a, tr);
         }
     }.f;
 }
@@ -1480,18 +1932,17 @@ fn pairCodecSpecs(
     comptime sfn: ?custom.SourceFn,
     comptime ins: []const InputSlot,
     comptime outs: []const OutputSlot,
-    comptime params_scalar: []const ParamSpec,
-    comptime params_pair1: []const ParamSpec,
+    comptime params: []const ParamSpec,
 ) [2]KernelSpec {
     return .{
-        .{ .name = base ++ "_scalar", .nax = nax, .header_fn = custom.codegenFn(exl3HeaderFn), .source_arg = h_scalar, .source_fn = sfn, .inputs = ins, .outputs = outs, .params = params_scalar },
-        .{ .name = base ++ "_pair1", .nax = nax, .header_fn = custom.codegenFn(exl3HeaderFn), .source_arg = h_pair1, .source_fn = sfn, .inputs = ins, .outputs = outs, .params = params_pair1 },
+        .{ .name = base ++ "_scalar", .nax = nax, .header_fn = custom.codegenFn(exl3HeaderFn), .source_arg = h_scalar, .source_fn = sfn, .inputs = ins, .outputs = outs, .params = params },
+        .{ .name = base ++ "_pair1", .nax = nax, .header_fn = custom.codegenFn(exl3HeaderFn), .source_arg = h_pair1, .source_fn = sfn, .inputs = ins, .outputs = outs, .params = params },
     };
 }
 
-fn nhwParams(comptime rates: []const i32, comptime rest: []const ParamSpec) [rest.len + 1]ParamSpec {
+fn nhwParams(comptime rest: []const ParamSpec) [rest.len + 1]ParamSpec {
     var out: [rest.len + 1]ParamSpec = undefined;
-    out[0] = .{ .name = "NHW", .kind = .ct_int, .ints = rates };
+    out[0] = fcInt("NHW");
     for (rest, 0..) |p, i| out[i + 1] = p;
     return out;
 }
@@ -1505,31 +1956,18 @@ const gemm_ins = [_]InputSlot{
 };
 const gemm_outs = [_]OutputSlot{outSlot("y", fix(.float16))};
 
-const gemm_sorted_p_sc = nhwParams(&served_scalar_rates, &.{ fcInt("IDIM"), fcInt("ODIM"), fcInt("WIN") });
-const gemm_sorted_p_p1 = nhwParams(&pair1_rates, &.{ fcInt("IDIM"), fcInt("ODIM"), fcInt("WIN") });
+const gemm_sorted_p = nhwParams(&.{ fcInt("IDIM"), fcInt("ODIM"), fcInt("WIN") });
+const gemm_smat_p = nhwParams(&.{ .{ .name = "WIN", .kind = .ct_int, .ints = &.{ 16, 32 } }, fcInt("IDIM"), fcInt("ODIM") });
+const gemv_idx_p = nhwParams(&.{ fcInt("IDIM"), fcInt("ODIM") });
+const down_fused_p = nhwParams(&.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("FUNNEL") });
+const pair_gemv_p = nhwParams(&.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
+const pair_prep_gemv_p = nhwParams(&.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
+const down_prep_p = nhwParams(&.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL") });
 
-const gemm_smat_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "WIN", .kind = .ct_int, .ints = &.{ 16, 32 } }, fcInt("IDIM"), fcInt("ODIM") });
-const gemm_smat_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "WIN", .kind = .ct_int, .ints = &.{ 16, 32 } }, fcInt("IDIM"), fcInt("ODIM") });
-
-const gemv_idx_p_sc = nhwParams(&served_scalar_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
-const gemv_idx_p_p1 = nhwParams(&pair1_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
-
-const down_fused_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("FUNNEL") });
-const down_fused_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("FUNNEL") });
-
-const pair_gemv_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
-const pair_gemv_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
-
-const pair_prep_gemv_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
-const pair_prep_gemv_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
-
-const down_prep_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL") });
-const down_prep_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL") });
-
-fn pairGroupedParams(comptime g: i32, comptime rates: []const i32, comptime otpts: []const i32, comptime prepared: bool) [if (prepared) 9 else 10]ParamSpec {
+fn pairGroupedParams(comptime g: i32, comptime otpts: []const i32, comptime prepared: bool) [if (prepared) 9 else 10]ParamSpec {
     if (prepared) {
         return .{
-            .{ .name = "NHW", .kind = .ct_int, .ints = rates },
+            fcInt("NHW"),
             .{ .name = "GROUP", .kind = .ct_int, .ints = &.{g} },
             .{ .name = "OTPT", .kind = .ct_int, .ints = otpts },
             fcInt("IDIM"),
@@ -1541,7 +1979,7 @@ fn pairGroupedParams(comptime g: i32, comptime rates: []const i32, comptime otpt
         };
     }
     return .{
-        .{ .name = "NHW", .kind = .ct_int, .ints = rates },
+        fcInt("NHW"),
         .{ .name = "X", .kind = .io_dtype, .dtypes = &bf_f16 },
         .{ .name = "GROUP", .kind = .ct_int, .ints = &.{g} },
         .{ .name = "OTPT", .kind = .ct_int, .ints = otpts },
@@ -1554,9 +1992,9 @@ fn pairGroupedParams(comptime g: i32, comptime rates: []const i32, comptime otpt
     };
 }
 
-fn downGroupedParams(comptime g: i32, comptime rates: []const i32, comptime otpts: []const i32) [7]ParamSpec {
+fn downGroupedParams(comptime g: i32, comptime otpts: []const i32) [7]ParamSpec {
     return .{
-        .{ .name = "NHW", .kind = .ct_int, .ints = rates },
+        fcInt("NHW"),
         .{ .name = "GROUP", .kind = .ct_int, .ints = &.{g} },
         .{ .name = "OTPT", .kind = .ct_int, .ints = otpts },
         fcInt("IDIM"),
@@ -1566,46 +2004,39 @@ fn downGroupedParams(comptime g: i32, comptime rates: []const i32, comptime otpt
     };
 }
 
-const pg_g2_sc = pairGroupedParams(2, &served_scalar_rates, &.{ 1, 2 }, false);
-const pg_g2_p1 = pairGroupedParams(2, &pair1_rates, &.{ 1, 2 }, false);
-const ppg_g2_sc = pairGroupedParams(2, &served_scalar_rates, &.{ 1, 2 }, true);
-const ppg_g2_p1 = pairGroupedParams(2, &pair1_rates, &.{ 1, 2 }, true);
-const dpg_g2_sc = downGroupedParams(2, &served_scalar_rates, &.{ 1, 2 });
-const dpg_g2_p1 = downGroupedParams(2, &pair1_rates, &.{ 1, 2 });
+const pg_g2_p = pairGroupedParams(2, &.{ 1, 2 }, false);
+const ppg_g2_p = pairGroupedParams(2, &.{ 1, 2 }, true);
+const dpg_g2_p = downGroupedParams(2, &.{ 1, 2 });
 
-const clamped_md_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 4, 8 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("CLAMP_LIMIT") });
-const clamped_md_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 4, 8 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("CLAMP_LIMIT") });
-
-const coop_t1_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{1} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
-const coop_t1_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{1} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
-const coop_t2_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{2} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
-const coop_t2_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{2} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
+const clamped_md_p = nhwParams(&.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 4, 8 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("CLAMP_LIMIT") });
+const coop_t1_p = nhwParams(&.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{1} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
+const coop_t2_p = nhwParams(&.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{2} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
 
 const single_simd_specs =
-    pairCodecSpecs("sushi_exl3_k4_gemm_sorted", false, hdr_scalar, hdr_pair1, srcClean(kernels.GEMM_SORTED_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p_sc, &gemm_sorted_p_p1) ++
-    pairCodecSpecs("sushi_exl3_k4_gemm_sorted_tm", false, hdr_scalar, hdr_pair1, srcClean(kernels.GEMM_SORTED_TM_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p_sc, &gemm_sorted_p_p1) ++
-    pairCodecSpecs("sushi_exl3_k4_gemm_simdmat", false, hdr_scalar_smat, hdr_pair1_smat, srcClean(kernels.GEMM_SIMDMAT_SOURCE), &gemm_ins, &gemm_outs, &gemm_smat_p_sc, &gemm_smat_p_p1) ++
-    pairCodecSpecs("sushi_exl3_k4_gemm_simdmat_tm", false, hdr_scalar_smat, hdr_pair1_smat, srcClean(kernels.GEMM_SIMDMAT_TM_SOURCE), &gemm_ins, &gemm_outs, &gemm_smat_p_sc, &gemm_smat_p_p1) ++
-    pairCodecSpecs("sushi_exl3_k4_mul1_gemv_indexed", false, hdr_scalar, hdr_pair1, srcClean(kernels.INDEXED_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_exl3_indexed_pair_coop", false, hdr_scalar, hdr_pair1, srcClean(kernels.INDEXED_PAIR_COOP_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_exl3_k4_down_fused", false, hdr_scalar, hdr_pair1, srcClean(kernels.DOWN_FUSED_SOURCE), &.{ inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("trellis", fix(.uint16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &down_fused_p_sc, &down_fused_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_gemv", false, hdr_scalar, hdr_pair1, srcClean(kernels.PAIR_GEMV_SOURCE), &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pair_gemv_p_sc, &pair_gemv_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_gemv_prepared", false, hdr_scalar, hdr_pair1, srcClean(kernels.PAIR_GEMV_PREPARED_SOURCE), &.{ inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pair_prep_gemv_p_sc, &pair_prep_gemv_p_p1) ++
-    pairCodecSpecs("sushi_exl3_down_prepared", false, hdr_scalar, hdr_pair1, srcClean(kernels.DOWN_PREPARED_SOURCE), &.{ inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &down_prep_p_sc, &down_prep_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_gemv_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcClean(kernels.pairGroupedSource(2)) else null, &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pg_g2_sc, &pg_g2_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_gemv_prepared_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcClean(kernels.pairPreparedGroupedSource(2)) else null, &.{ inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &ppg_g2_sc, &ppg_g2_p1) ++
-    pairCodecSpecs("sushi_exl3_down_prepared_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcClean(kernels.downGroupedSource(2)) else null, &.{ inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &dpg_g2_sc, &dpg_g2_p1) ++
-    pairCodecSpecs("sushi_lane_pair", false, hdr_scalar, hdr_pair1, srcClean(kernels.LANE_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_lane_pair_one", false, hdr_scalar, hdr_pair1, srcClean(kernels.ONE_ROW_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_down_lane_coop", false, hdr_scalar, hdr_pair1, srcClean(kernels.DOWN_LANE_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_down_one", false, hdr_scalar, hdr_pair1, srcClean(kernels.ONE_ROW_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_exl3_clamped_middle_down", false, hdr_scalar, hdr_pair1, custom.codegenFn(srcClampedMidDown), &.{ inSlot("ig", fix(.float16)), inSlot("iu", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &clamped_md_p_sc, &clamped_md_p_p1) ++
-    pairCodecSpecs("sushi_exl3_group2", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t1_p_sc, &coop_t1_p_p1) ++
-    pairCodecSpecs("sushi_exl3_group2_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_TILED_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t2_p_sc, &coop_t2_p_p1) ++
-    pairCodecSpecs("sushi_exl3_group3_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_THREE_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t2_p_sc, &coop_t2_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_group2", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t1_p_sc, &coop_t1_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_group2_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_TILED_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t2_p_sc, &coop_t2_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_group3_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_THREE_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t2_p_sc, &coop_t2_p_p1);
+    pairCodecSpecs("sushi_exl3_k4_gemm_sorted", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.GEMM_SORTED_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p) ++
+    pairCodecSpecs("sushi_exl3_k4_gemm_sorted_tm", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.GEMM_SORTED_TM_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p) ++
+    pairCodecSpecs("sushi_exl3_k4_gemm_simdmat", false, hdr_scalar_smat, hdr_pair1_smat, srcSingleClean(kernels.GEMM_SIMDMAT_SOURCE), &gemm_ins, &gemm_outs, &gemm_smat_p) ++
+    pairCodecSpecs("sushi_exl3_k4_gemm_simdmat_tm", false, hdr_scalar_smat, hdr_pair1_smat, srcSingleClean(kernels.GEMM_SIMDMAT_TM_SOURCE), &gemm_ins, &gemm_outs, &gemm_smat_p) ++
+    pairCodecSpecs("sushi_exl3_k4_mul1_gemv_indexed", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.INDEXED_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p) ++
+    pairCodecSpecs("sushi_exl3_indexed_pair_coop", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.INDEXED_PAIR_COOP_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p) ++
+    pairCodecSpecs("sushi_exl3_k4_down_fused", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.DOWN_FUSED_SOURCE), &.{ inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("trellis", fix(.uint16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &down_fused_p) ++
+    pairCodecSpecs("sushi_exl3_pair_gemv", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.PAIR_GEMV_SOURCE), &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pair_gemv_p) ++
+    pairCodecSpecs("sushi_exl3_pair_gemv_prepared", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.PAIR_GEMV_PREPARED_SOURCE), &.{ inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pair_prep_gemv_p) ++
+    pairCodecSpecs("sushi_exl3_down_prepared", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.DOWN_PREPARED_SOURCE), &.{ inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &down_prep_p) ++
+    pairCodecSpecs("sushi_exl3_pair_gemv_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcSingleClean(kernels.pairGroupedSource(2)) else null, &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pg_g2_p) ++
+    pairCodecSpecs("sushi_exl3_pair_gemv_prepared_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcSingleClean(kernels.pairPreparedGroupedSource(2)) else null, &.{ inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &ppg_g2_p) ++
+    pairCodecSpecs("sushi_exl3_down_prepared_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcSingleClean(kernels.downGroupedSource(2)) else null, &.{ inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &dpg_g2_p) ++
+    pairCodecSpecs("sushi_lane_pair", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.LANE_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p) ++
+    pairCodecSpecs("sushi_lane_pair_one", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.ONE_ROW_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p) ++
+    pairCodecSpecs("sushi_down_lane_coop", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.DOWN_LANE_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p) ++
+    pairCodecSpecs("sushi_down_one", false, hdr_scalar, hdr_pair1, srcSingleClean(kernels.ONE_ROW_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p) ++
+    pairCodecSpecs("sushi_exl3_clamped_middle_down", false, hdr_scalar, hdr_pair1, custom.codegenFn(srcClampedMidDown), &.{ inSlot("ig", fix(.float16)), inSlot("iu", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &clamped_md_p) ++
+    pairCodecSpecs("sushi_exl3_group2", false, hdr_scalar, hdr_pair1, srcSingleClean(coop_rows2.SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t1_p) ++
+    pairCodecSpecs("sushi_exl3_group2_tile2_lane", false, hdr_scalar, hdr_pair1, srcSingleClean(coop_rows2.LANE_TILED_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t2_p) ++
+    pairCodecSpecs("sushi_exl3_group3_tile2_lane", false, hdr_scalar, hdr_pair1, srcSingleClean(coop_rows2.LANE_THREE_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t2_p) ++
+    pairCodecSpecs("sushi_exl3_pair_group2", false, hdr_scalar, hdr_pair1, srcSingleClean(coop_rows2.PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t1_p) ++
+    pairCodecSpecs("sushi_exl3_pair_group2_tile2_lane", false, hdr_scalar, hdr_pair1, srcSingleClean(coop_rows2.LANE_TILED_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t2_p) ++
+    pairCodecSpecs("sushi_exl3_pair_group3_tile2_lane", false, hdr_scalar, hdr_pair1, srcSingleClean(coop_rows2.LANE_THREE_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t2_p);
 
 // ── Unit 2: `exl3_rows_simd` Spec Tables ──
 
@@ -1712,7 +2143,7 @@ const rows_finish_specs = [_]KernelSpec{
 /// Filter for SIMD `project_rows`: only the 5 served `(ROW_CAP, TGRP, KPH)` geometries
 /// `{(1,1,4), (4,2,4), (8,2,4), (4,4,2), (8,4,2)}` and valid `(OutT, Y)` pairs (`Y=f32` when `TGRP<4`, `Y=OutT` when `TGRP==4`).
 fn rowsSimdFilter(vals: []const CtVal) bool {
-    // Variant order: [OutT, Y, ROW_CAP, TGRP, KPH, NHW]
+    // Variant order: [OutT, Y, ROW_CAP, TGRP, KPH]
     const out_t = vals[0].dtype;
     const y_t = vals[1].dtype;
     const cap = vals[2].int;
@@ -1727,7 +2158,7 @@ fn rowsSimdFilter(vals: []const CtVal) bool {
 }
 
 fn rowsSimdPendFilter(vals: []const CtVal) bool {
-    // Variant order: [OutT, XT, Y, ROW_CAP, TGRP, KPH, NHW]
+    // Variant order: [OutT, XT, Y, ROW_CAP, TGRP, KPH]
     const out_t = vals[0].dtype;
     const xt = vals[1].dtype;
     const y_t = vals[2].dtype;
@@ -1744,22 +2175,22 @@ fn rowsSimdPendFilter(vals: []const CtVal) bool {
 }
 
 fn rowsSimdThruFilter(vals: []const CtVal) bool {
-    // Variant order: [OutT, X, ROW_CAP, TGRP, KPH, NHW]
+    // Variant order: [OutT, X, ROW_CAP, TGRP, KPH]
     const n = vals.len;
-    const cap = vals[n - 4].int;
-    const tgrp = vals[n - 3].int;
-    const kph = vals[n - 2].int;
+    const cap = vals[n - 3].int;
+    const tgrp = vals[n - 2].int;
+    const kph = vals[n - 1].int;
     return (cap == 1 and tgrp == 1 and kph == 4) or
         ((cap == 4 or cap == 8) and tgrp == 2 and kph == 4) or
         ((cap == 4 or cap == 8) and tgrp == 4 and kph == 2);
 }
 
 fn rowsSimdCountedFilter(vals: []const CtVal) bool {
-    // Variant order: [OutT, (FIN or W)?, ROW_CAP, TGRP, KPH, NHW]
+    // Variant order: [OutT, (FIN or W)?, ROW_CAP, TGRP, KPH]
     const n = vals.len;
-    const cap = vals[n - 4].int;
-    const tgrp = vals[n - 3].int;
-    const kph = vals[n - 2].int;
+    const cap = vals[n - 3].int;
+    const tgrp = vals[n - 2].int;
+    const kph = vals[n - 1].int;
     return ((cap == 1 and tgrp == 1) or ((cap == 4 or cap == 8) and tgrp == 2)) and kph == 4;
 }
 
@@ -1828,7 +2259,7 @@ const rows_simd_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 1, 4, 8 } },
             .{ .name = "TGRP", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 2, 4 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsSimdFilter,
@@ -1846,7 +2277,7 @@ const rows_simd_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 1, 4, 8 } },
             .{ .name = "TGRP", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 2, 4 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &pair1_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsSimdFilter,
@@ -1865,7 +2296,7 @@ const rows_simd_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 1, 4, 8 } },
             .{ .name = "TGRP", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 2, 4 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &.{ 32, 48, 64, 80, 96, 112, 128 } },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"), fcInt("XSPLIT"), fcInt("XODIM"),
         },
         .filter = rowsSimdPendFilter,
@@ -1883,7 +2314,7 @@ const rows_simd_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 1, 4, 8 } },
             .{ .name = "TGRP", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 2, 4 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsSimdThruFilter,
@@ -1901,7 +2332,7 @@ const rows_simd_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 1, 4, 8 } },
             .{ .name = "TGRP", .kind = .ct_int, .ints = &.{ 1, 2 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{4} },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsSimdCountedFilter,
@@ -1919,7 +2350,7 @@ const rows_simd_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 1, 4, 8 } },
             .{ .name = "TGRP", .kind = .ct_int, .ints = &.{ 1, 2 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{4} },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsSimdCountedFilter,
@@ -1936,7 +2367,7 @@ const rows_simd_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 1, 4, 8 } },
             .{ .name = "TGRP", .kind = .ct_int, .ints = &.{ 1, 2 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{4} },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsSimdCountedFilter,
@@ -2197,20 +2628,19 @@ const fz_simd_specs = blk: {
 
 // ── Unit 5: `exl3_gemm_nax` Spec Tables ──
 
-const dense_nax_p_sc = nhwParams(&served_scalar_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
-const dense_nax_p_p1 = nhwParams(&pair1_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
+const dense_nax_p = nhwParams(&.{ fcInt("IDIM"), fcInt("ODIM") });
 
 const gemm_nax_specs =
-    pairCodecSpecs("sushi_exl3_k4_gemm_nax", true, hdr_scalar_nax, hdr_pair1_nax, srcClean(kernels.GEMM_NAX_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p_sc, &gemm_sorted_p_p1) ++
-    pairCodecSpecs("sushi_exl3_k4_gemm_nax_tm", true, hdr_scalar_nax, hdr_pair1_nax, srcClean(kernels.GEMM_NAX_TM_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p_sc, &gemm_sorted_p_p1) ++
-    pairCodecSpecs("sushi_exl3_k4_gemm_nax_ref", true, hdr_scalar_nax, hdr_pair1_nax, srcClean(kernels.GEMM_NAX_REFERENCE_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p_sc, &gemm_sorted_p_p1) ++
-    pairCodecSpecs("sushi_exl3_trunk_dense_nax", true, hdr_scalar_nax, hdr_pair1_nax, srcClean(trunk_gemm.DENSE_SOURCE), &.{inSlot("trellis", fix(.uint16))}, &.{outSlot("y", fix(.float16))}, &dense_nax_p_sc, &dense_nax_p_p1) ++
-    pairCodecSpecs("sushi_prefill_grid_transpose", true, hdr_scalar_nax, hdr_pair1_nax, srcClean(prefill_grid.SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p_sc, &gemm_sorted_p_p1);
+    pairCodecSpecs("sushi_exl3_k4_gemm_nax", true, hdr_scalar_nax, hdr_pair1_nax, srcSingleClean(kernels.GEMM_NAX_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p) ++
+    pairCodecSpecs("sushi_exl3_k4_gemm_nax_tm", true, hdr_scalar_nax, hdr_pair1_nax, srcSingleClean(kernels.GEMM_NAX_TM_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p) ++
+    pairCodecSpecs("sushi_exl3_k4_gemm_nax_ref", true, hdr_scalar_nax, hdr_pair1_nax, srcSingleClean(kernels.GEMM_NAX_REFERENCE_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p) ++
+    pairCodecSpecs("sushi_exl3_trunk_dense_nax", true, hdr_scalar_nax, hdr_pair1_nax, srcSingleClean(trunk_gemm.DENSE_SOURCE), &.{inSlot("trellis", fix(.uint16))}, &.{outSlot("y", fix(.float16))}, &dense_nax_p) ++
+    pairCodecSpecs("sushi_prefill_grid_transpose", true, hdr_scalar_nax, hdr_pair1_nax, srcSingleClean(prefill_grid.SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p);
 
 // ── Unit 6: `exl3_rows_nax` Spec Tables ──
 
 fn rowsNaxFilter(vals: []const CtVal) bool {
-    // Variant order: [OutT, Y, ROW_CAP, KPH, UNR, NHW]
+    // Variant order: [OutT, Y, ROW_CAP, KPH, UNR]
     const out_t = vals[0].dtype;
     const y_t = vals[1].dtype;
     const cap = vals[2].int;
@@ -2225,7 +2655,7 @@ fn rowsNaxFilter(vals: []const CtVal) bool {
 }
 
 fn rowsNaxDynFilter(vals: []const CtVal) bool {
-    // Variant order: [OutT, Y, ROW_CAP, KPH, UNR, NHW]
+    // Variant order: [OutT, Y, ROW_CAP, KPH, UNR]
     const out_t = vals[0].dtype;
     const y_t = vals[1].dtype;
     const cap = vals[2].int;
@@ -2240,7 +2670,7 @@ fn rowsNaxDynFilter(vals: []const CtVal) bool {
 }
 
 fn rowsNaxPendFilter(vals: []const CtVal) bool {
-    // Variant order: [OutT, XT, Y, ROW_CAP, KPH, UNR, NHW]
+    // Variant order: [OutT, XT, Y, ROW_CAP, KPH, UNR]
     const out_t = vals[0].dtype;
     const xt = vals[1].dtype;
     const y_t = vals[2].dtype;
@@ -2257,20 +2687,21 @@ fn rowsNaxPendFilter(vals: []const CtVal) bool {
 }
 
 fn rowsNaxThruFilter(vals: []const CtVal) bool {
-    // Variant order: [OutT, (FIN|W)?, ROW_CAP, KPH, UNR, NHW]
+    // Variant order: [OutT, (X)?, ROW_CAP, KPH, UNR]
     const n = vals.len;
-    const cap = vals[n - 4].int;
-    const kph = vals[n - 3].int;
-    const unr = vals[n - 2].int;
+    const cap = vals[n - 3].int;
+    const kph = vals[n - 2].int;
+    const unr = vals[n - 1].int;
     if (unr == 2 and kph != 1) return false;
     if (kph < 4) return cap == 16;
     return cap == 8 or cap == 16;
 }
 
 fn rowsNaxCountedFilter(vals: []const CtVal) bool {
+    // Variant order: [OutT, (FIN|W)?, ROW_CAP, KPH, UNR]
     const n = vals.len;
-    const kph = vals[n - 3].int;
-    const unr = vals[n - 2].int;
+    const kph = vals[n - 2].int;
+    const unr = vals[n - 1].int;
     return (kph == 1 and unr == 2) or (kph == 2 and unr == 1) or (kph == 4 and unr == 1);
 }
 
@@ -2289,7 +2720,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 8, 16 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{ 1, 2 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsNaxFilter,
@@ -2308,7 +2739,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{1} },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{2} },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &pair1_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsNaxFilter,
@@ -2326,7 +2757,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 8, 16 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{ 1, 2 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"), fcInt("HD"), fcInt("RD"),
         },
         .filter = rowsNaxThruFilter,
@@ -2344,7 +2775,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{1} },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{2} },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &pair1_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"), fcInt("HD"), fcInt("RD"),
         },
         .filter = rowsNaxThruFilter,
@@ -2363,7 +2794,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 8, 16 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{ 1, 2 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &.{ 32, 48, 64, 80, 96, 112, 128 } },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsNaxDynFilter,
@@ -2383,7 +2814,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 8, 16 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{ 1, 2 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &.{ 32, 48, 64, 80, 96, 112, 128 } },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"), fcInt("XSPLIT"), fcInt("XODIM"),
         },
         .filter = rowsNaxPendFilter,
@@ -2402,7 +2833,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 8, 16 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{ 1, 2 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsNaxThruFilter,
@@ -2421,7 +2852,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 4, 8 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{ 1, 2 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsNaxCountedFilter,
@@ -2440,7 +2871,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 1, 4, 8 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{ 1, 2 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsNaxCountedFilter,
@@ -2458,7 +2889,7 @@ const rows_nax_specs = [_]KernelSpec{
             .{ .name = "ROW_CAP", .kind = .ct_int, .ints = &.{ 4, 8 } },
             .{ .name = "KPH", .kind = .ct_int, .ints = &.{ 1, 2, 4 } },
             .{ .name = "UNR", .kind = .ct_int, .ints = &.{ 1, 2 } },
-            .{ .name = "NHW", .kind = .ct_int, .ints = &trunk_scalar_rates },
+            fcInt("NHW"),
             fcInt("IDIM"), fcInt("ODIM"), fcInt("ROWS"), fcInt("GROUPS"), ign("TGRP"), fcInt("NSPLIT"), fcInt("CHUNK"), fcInt("FOLD"), fcInt("R32"), fcInt("SW"), fcInt("SB1"), fcInt("SB2"), fcInt("SB3"),
         },
         .filter = rowsNaxCountedFilter,
@@ -3168,7 +3599,7 @@ fn resolveSingleRate(
 ) bool {
     const parsed = parseSingleRateName(name);
     const nhw_i = findIntTarg(targs, "NHW") orelse return false;
-    if (nhw_i <= 0) return false;
+    if (nhw_i < format.Rate.min_n or nhw_i > format.Rate.max_n or (nhw_i & 1) != 0) return false;
     const nhw: u32 = @intCast(nhw_i);
     const hm = lookupSingleHashMask(parsed.meta, nhw) orelse return false;
 

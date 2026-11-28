@@ -1058,3 +1058,510 @@ test "stock metallib: every kernel src/tensor can construct across all GPU class
     try testing.expectError(error.MetalCompile, kernel_mod.launch(bogus, &.{x}, &cfg, &out));
     try testing.expect(std.mem.indexOf(u8, metal.lastError(), "no_such_sushi_custom_kernel") != null);
 }
+
+test "stock metallib: all 57 admitted scalar rates and 21 PAIR1 rates resolve to precompiled FC_NHW functions" {
+    try @import("../mlx.zig").requireGpu();
+    const dev = try metal.device();
+    const l = try lib(dev);
+    const names = try l.functionNames(testing.allocator);
+    defer {
+        for (names) |s| testing.allocator.free(s);
+        testing.allocator.free(names);
+    }
+    var have: std.StringHashMapUnmanaged(void) = .empty;
+    defer have.deinit(testing.allocator);
+    for (names) |s| try have.put(testing.allocator, s, {});
+
+    const catalog = @import("../metallib_catalog.zig");
+    const gemm_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .float16, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "eids", .dtype = .uint32, .scalar = false },
+        .{ .name = "wstarts", .dtype = .uint32, .scalar = false },
+        .{ .name = "wnlive", .dtype = .uint32, .scalar = false },
+    };
+    const rows_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "suh", .dtype = .float16, .scalar = false },
+        .{ .name = "svh", .dtype = .float16, .scalar = false },
+    };
+    const pair_ins = [_]catalog.RuntimeInput{
+        .{ .name = "x", .dtype = .bfloat16, .scalar = false },
+        .{ .name = "suhg", .dtype = .float16, .scalar = false },
+        .{ .name = "suhu", .dtype = .float16, .scalar = false },
+        .{ .name = "tg", .dtype = .uint16, .scalar = false },
+        .{ .name = "tu", .dtype = .uint16, .scalar = false },
+        .{ .name = "slots", .dtype = .uint32, .scalar = false },
+    };
+
+    const scalar_cases = [_]struct { suf: []const u8, min_n: i32, max_n: i32 }{
+        .{ .suf = "", .min_n = 16, .max_n = 128 },
+        .{ .suf = "_mcg", .min_n = 16, .max_n = 128 },
+        .{ .suf = "_alpha", .min_n = 16, .max_n = 128 },
+        .{ .suf = "_spec1_w15_t37f72431", .min_n = 16, .max_n = 128 },
+        .{ .suf = "_spec1_t753ffa03", .min_n = 24, .max_n = 64 },
+        .{ .suf = "_std1_tc5dba171", .min_n = 24, .max_n = 64 },
+    };
+
+    var res: catalog.Resolved = undefined;
+    var n: i32 = 16;
+    while (n <= 128) : (n += 2) {
+        const gemm_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "NHW", .value = .{ .int = n } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "WIN", .value = .{ .int = 32 } },
+        };
+        const rows_nax_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "OutT", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "KPH", .value = .{ .int = 1 } },
+            .{ .name = "UNR", .value = .{ .int = 2 } },
+            .{ .name = "NHW", .value = .{ .int = n } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "ROWS", .value = .{ .int = 8 } },
+            .{ .name = "GROUPS", .value = .{ .int = 1 } },
+            .{ .name = "TGRP", .value = .{ .int = 4 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "CHUNK", .value = .{ .int = 128 } },
+            .{ .name = "FOLD", .value = .{ .int = 1 } },
+            .{ .name = "R32", .value = .{ .int = 0 } },
+            .{ .name = "SW", .value = .{ .int = 0 } },
+            .{ .name = "SB1", .value = .{ .int = 512 } },
+            .{ .name = "SB2", .value = .{ .int = 512 } },
+            .{ .name = "SB3", .value = .{ .int = 512 } },
+        };
+        const rows_simd_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "OutT", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "TGRP", .value = .{ .int = 4 } },
+            .{ .name = "KPH", .value = .{ .int = 2 } },
+            .{ .name = "NHW", .value = .{ .int = n } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "ROWS", .value = .{ .int = 4 } },
+            .{ .name = "GROUPS", .value = .{ .int = 1 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "CHUNK", .value = .{ .int = 128 } },
+            .{ .name = "FOLD", .value = .{ .int = 1 } },
+            .{ .name = "SB1", .value = .{ .int = 512 } },
+            .{ .name = "SB2", .value = .{ .int = 512 } },
+            .{ .name = "SB3", .value = .{ .int = 512 } },
+        };
+        const pair_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "NHW", .value = .{ .int = n } },
+            .{ .name = "OTPT", .value = .{ .int = 2 } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "TOPK", .value = .{ .int = 8 } },
+            .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+        };
+
+        var nbuf: [128]u8 = undefined;
+        for (scalar_cases) |sc| {
+            const want = n >= sc.min_n and n <= sc.max_n;
+
+            const g_nax = try std.fmt.bufPrint(&nbuf, "sushi_exl3_k4_gemm_nax{s}", .{sc.suf});
+            try testing.expectEqual(want, catalog.resolve(g_nax, &gemm_ins, &.{.float16}, &gemm_targs, &res));
+            if (want) try testing.expect(have.contains(res.fnName()));
+
+            const g_smat = try std.fmt.bufPrint(&nbuf, "sushi_exl3_k4_gemm_simdmat{s}", .{sc.suf});
+            try testing.expectEqual(want, catalog.resolve(g_smat, &gemm_ins, &.{.float16}, &gemm_targs, &res));
+            if (want) try testing.expect(have.contains(res.fnName()));
+
+            const r_nax = try std.fmt.bufPrint(&nbuf, "sushi_exl3_rows_nax{s}", .{sc.suf});
+            try testing.expectEqual(want, catalog.resolve(r_nax, &rows_ins, &.{.bfloat16}, &rows_nax_targs, &res));
+            if (want) try testing.expect(have.contains(res.fnName()));
+
+            const r_simd = try std.fmt.bufPrint(&nbuf, "sushi_exl3_rows{s}", .{sc.suf});
+            try testing.expectEqual(want, catalog.resolve(r_simd, &rows_ins, &.{.bfloat16}, &rows_simd_targs, &res));
+            if (want) try testing.expect(have.contains(res.fnName()));
+
+            const p_gemv = try std.fmt.bufPrint(&nbuf, "sushi_exl3_pair_gemv{s}", .{sc.suf});
+            try testing.expectEqual(want, catalog.resolve(p_gemv, &pair_ins, &.{ .float32, .float32 }, &pair_targs, &res));
+            if (want) try testing.expect(have.contains(res.fnName()));
+        }
+
+        // PAIR1 admits 24..64 even only.
+        const p1_ok = n >= 24 and n <= 64;
+        try testing.expectEqual(p1_ok, catalog.resolve("sushi_exl3_k4_gemm_nax_pair1_w15", &gemm_ins, &.{.float16}, &gemm_targs, &res));
+        if (p1_ok) try testing.expect(have.contains(res.fnName()));
+        try testing.expectEqual(p1_ok, catalog.resolve("sushi_exl3_pair_gemv_pair1_w15", &pair_ins, &.{ .float32, .float32 }, &pair_targs, &res));
+        if (p1_ok) try testing.expect(have.contains(res.fnName()));
+    }
+
+    // Out-of-range and odd rates are refused.
+    for ([_]i32{ 14, 17, 65, 130 }) |bad_n| {
+        const bad_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "NHW", .value = .{ .int = bad_n } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "WIN", .value = .{ .int = 32 } },
+        };
+        try testing.expect(!catalog.resolve("sushi_exl3_k4_gemm_nax_spec1_w15_t37f72431", &gemm_ins, &.{.float16}, &bad_targs, &res));
+    }
+
+    // `_unfolded` test-seam names resolve to the same precompiled functions with FC_B12 = false.
+    const unfold_targs = [_]catalog.RuntimeTarg{
+        .{ .name = "NHW", .value = .{ .int = 64 } },
+        .{ .name = "IDIM", .value = .{ .int = 512 } },
+        .{ .name = "ODIM", .value = .{ .int = 512 } },
+        .{ .name = "WIN", .value = .{ .int = 32 } },
+    };
+    for ([_][]const u8{
+        "sushi_exl3_k4_gemm_nax_spec1_unfolded_w15_t37f72431",
+        "sushi_exl3_k4_gemm_nax_tm_spec1_unfolded_w15_t37f72431",
+        "sushi_exl3_k4_gemm_nax_ref_spec1_unfolded_w15_t37f72431",
+        "sushi_exl3_k4_gemm_simdmat_spec1_unfolded_w15_t37f72431",
+        "sushi_exl3_k4_gemm_nax_pair1_unfolded",
+        "sushi_exl3_k4_gemm_nax_tm_pair1_unfolded",
+    }) |uname| {
+        try testing.expect(catalog.resolve(uname, &gemm_ins, &.{.float16}, &unfold_targs, &res));
+        try testing.expect(have.contains(res.fnName()));
+        var saw_b12 = false;
+        for (res.flagSlice()) |fl| {
+            if (fl.index == 60) {
+                try testing.expect(!fl.value);
+                saw_b12 = true;
+            }
+        }
+        try testing.expect(saw_b12);
+    }
+
+    // Specialize live PSOs across boundary scalar & PAIR1 rates and verify threadgroup headroom.
+    const down_ins = [_]catalog.RuntimeInput{
+        .{ .name = "ig", .dtype = .float32, .scalar = false },
+        .{ .name = "iu", .dtype = .float32, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "svhg", .dtype = .float16, .scalar = false },
+        .{ .name = "svhu", .dtype = .float16, .scalar = false },
+        .{ .name = "suhd", .dtype = .float16, .scalar = false },
+        .{ .name = "slots", .dtype = .uint32, .scalar = false },
+    };
+    const specializeMaxThreads = struct {
+        fn run(d: *const metal.Device, lib_h: metal.Library, r: *const catalog.Resolved) !usize {
+            var fbuf: [512]u8 = undefined;
+            const fname = try std.fmt.bufPrintSentinel(&fbuf, "{s}", .{r.fnName()}, 0);
+            var flags: [catalog.max_fc_bools]metal.Flag = undefined;
+            for (r.flagSlice(), 0..) |f, i| flags[i] = .{ .index = f.index, .value = f.value };
+            var ints_fc: [catalog.max_fc_ints]metal.IntConstant = undefined;
+            for (r.intSlice(), 0..) |c, i| ints_fc[i] = .{ .index = c.index, .value = c.value };
+            const p = try d.pipelineOfConstants(lib_h, fname, flags[0..r.n_flags], ints_fc[0..r.n_ints]);
+            return p.max_threads;
+        }
+    }.run;
+    const has_nax = @import("sushi_exl3").device.current().has(.matrix_g17);
+    for ([_]i32{ 16, 18, 32, 34, 36, 56, 58, 60, 62, 64, 66, 70, 80, 84, 86, 96, 98, 100, 108, 110, 126, 128 }) |n_new| {
+        const smat_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "WIN", .value = .{ .int = 32 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_simdmat_spec1_w15_t37f72431", &gemm_ins, &.{.float16}, &smat_targs, &res));
+        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+
+        const rsimd_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "OutT", .value = .{ .dtype = .bfloat16 } },
+            .{ .name = "TGRP", .value = .{ .int = 4 } },
+            .{ .name = "KPH", .value = .{ .int = 2 } },
+            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "ROWS", .value = .{ .int = 4 } },
+            .{ .name = "GROUPS", .value = .{ .int = 1 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "CHUNK", .value = .{ .int = 128 } },
+            .{ .name = "FOLD", .value = .{ .int = 1 } },
+            .{ .name = "SB1", .value = .{ .int = 512 } },
+            .{ .name = "SB2", .value = .{ .int = 512 } },
+            .{ .name = "SB3", .value = .{ .int = 512 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_rows_spec1_w15_t37f72431", &rows_ins, &.{.bfloat16}, &rsimd_targs, &res));
+        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+
+        const p_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "OTPT", .value = .{ .int = 2 } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "TOPK", .value = .{ .int = 8 } },
+            .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_pair_gemv_spec1_w15_t37f72431", &pair_ins, &.{ .float32, .float32 }, &p_targs, &res));
+        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+
+        const d_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "OTPT", .value = .{ .int = 2 } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_k4_down_fused_spec1_w15_t37f72431", &down_ins, &.{.float16}, &d_targs, &res));
+        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+
+        const coop_ins = [_]catalog.RuntimeInput{
+            .{ .name = "x", .dtype = .float16, .scalar = false },
+            .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+            .{ .name = "slots", .dtype = .uint32, .scalar = false },
+        };
+        const coop_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "NHW", .value = .{ .int = n_new } },
+            .{ .name = "TILES", .value = .{ .int = 1 } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "NSLOTS", .value = .{ .int = 16 } },
+            .{ .name = "SERIAL_REDUCTION", .value = .{ .int = 1 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_group2_spec1_w15_t37f72431", &coop_ins, &.{.float16}, &coop_targs, &res));
+        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+
+        if (has_nax) {
+            try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_nax_spec1_w15_t37f72431", &gemm_ins, &.{.float16}, &smat_targs, &res));
+            try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+        }
+    }
+    for ([_]i32{ 24, 32, 40, 42, 44, 48, 56, 64 }) |n_p1| {
+        const smat_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "NHW", .value = .{ .int = n_p1 } },
+            .{ .name = "IDIM", .value = .{ .int = 512 } },
+            .{ .name = "ODIM", .value = .{ .int = 512 } },
+            .{ .name = "WIN", .value = .{ .int = 32 } },
+        };
+        try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_simdmat_pair1", &gemm_ins, &.{.float16}, &smat_targs, &res));
+        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+        if (has_nax) {
+            try testing.expect(catalog.resolve("sushi_exl3_k4_gemm_nax_pair1", &gemm_ins, &.{.float16}, &smat_targs, &res));
+            try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 256);
+        }
+    }
+}
+
+test "stock metallib: precompiled FC_NHW readers match host bit-for-bit across all 57 scalar and 21 PAIR1 rates" {
+    try @import("../mlx.zig").requireGpu();
+    const kernel_mod = @import("kernel.zig");
+    const exl3_mod = @import("sushi_exl3");
+    const format = exl3_mod.format;
+    const has_nax = @import("sushi_exl3").device.current().has(.matrix_g17);
+
+    // 16x16 identity in f16 for GEMM (y = I * W = W bit-for-bit) and [16, 128] identity prefix for down_prepared.
+    var eye16: [16 * 16]u16 = @splat(0);
+    var eye128: [16 * 128]u16 = @splat(0);
+    for (0..16) |r| {
+        eye16[r * 16 + r] = 0x3C00; // 1.0h
+        eye128[r * 128 + r] = 0x3C00;
+    }
+    const x_eye16 = try core.fromHost(std.mem.sliceAsBytes(&eye16), .float16, &.{ 16, 16 });
+    defer core.release(x_eye16);
+    const x_eye128 = try core.fromHost(std.mem.sliceAsBytes(&eye128), .float16, &.{ 16, 128 });
+    defer core.release(x_eye128);
+    const zeros16: [16]u32 = @splat(0);
+    const eids_t = try core.fromHost(std.mem.sliceAsBytes(&zeros16), .uint32, &.{16});
+    defer core.release(eids_t);
+    const wstarts_t = try core.fromHost(std.mem.sliceAsBytes(&[_]u32{0}), .uint32, &.{1});
+    defer core.release(wstarts_t);
+    const wnlive_t = try core.fromHost(std.mem.sliceAsBytes(&[_]u32{16}), .uint32, &.{1});
+    defer core.release(wnlive_t);
+
+    const gemm_in_names = &[_][]const u8{ "x", "trellis", "eids", "wstarts", "wnlive" };
+    const dp_in_names = &[_][]const u8{ "middle", "trellis", "slots" };
+    const dense_in_names = &[_][]const u8{"trellis"};
+    const rows_in_names = &[_][]const u8{ "x", "trellis", "suh", "svh" };
+
+    const Case = struct {
+        suf: []const u8,
+        unfolded_suf: ?[]const u8,
+        dec: format.Decode,
+        min_n: u32,
+        max_n: u32,
+        all_rates: bool,
+    };
+    const mcg_boundary = [_]u32{ 16, 18, 32, 34, 36, 56, 58, 60, 62, 64, 66, 80, 84, 86, 96, 98, 100, 108, 110, 126, 128 };
+    const cases = [_]Case{
+        .{ .suf = "_spec1_w15_t37f72431", .unfolded_suf = "_spec1_unfolded_w15_t37f72431", .dec = format.Decode.tabled(.spec1, .w15), .min_n = 16, .max_n = 128, .all_rates = true },
+        .{ .suf = "_mcg", .unfolded_suf = null, .dec = .{ .codebook = .mcg, .window = .w16 }, .min_n = 16, .max_n = 128, .all_rates = false },
+        .{ .suf = "_pair1", .unfolded_suf = "_pair1_unfolded", .dec = .{ .codebook = .pair1, .window = .w16 }, .min_n = 24, .max_n = 64, .all_rates = true },
+    };
+
+    var prng = std.Random.DefaultPrng.init(0x5EC1_FC01);
+    const rnd = prng.random();
+    var trellis_buf: [8 * 128]u16 = undefined;
+    var want_tiles: [8][format.TILE_VALUES]u16 = undefined;
+    var name_buf: [128]u8 = undefined;
+
+    const readU16 = struct {
+        fn f(t: *const Tensor) ![]const u16 {
+            const b = try core.hostRead(t);
+            return std.mem.bytesAsSlice(u16, @as([]align(2) const u8, @alignCast(b)));
+        }
+    }.f;
+
+    for (cases) |cs| {
+        const smat_def = try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_k4_gemm_simdmat{s}", .{cs.suf}), gemm_in_names, &.{"y"}, exl3_mod.kernels.GEMM_SIMDMAT_SOURCE, "", true, false);
+        const dp_def = try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_down_prepared{s}", .{cs.suf}), dp_in_names, &.{"y"}, exl3_mod.kernels.DOWN_PREPARED_SOURCE, "", true, false);
+        const nax_def = if (has_nax) try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_k4_gemm_nax{s}", .{cs.suf}), gemm_in_names, &.{"y"}, exl3_mod.kernels.GEMM_NAX_SOURCE, "", true, false) else null;
+        const dense_def = if (has_nax) try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_trunk_dense_nax{s}", .{cs.suf}), dense_in_names, &.{"y"}, exl3_mod.trunk_gemm.DENSE_SOURCE, "", true, false) else null;
+        const nax_u_def = if (has_nax and cs.unfolded_suf != null) try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_k4_gemm_nax{s}", .{cs.unfolded_suf.?}), gemm_in_names, &.{"y"}, exl3_mod.kernels.GEMM_NAX_SOURCE, "", true, false) else null;
+
+        var n: u32 = cs.min_n;
+        while (n <= cs.max_n) : (n += 2) {
+            if (!cs.all_rates and std.mem.indexOfScalar(u32, &mcg_boundary, n) == null) continue;
+            const rate: format.Rate = .{ .n = n };
+            const n_c: c_int = @intCast(n);
+            const slice = trellis_buf[0 .. 8 * n];
+            for (slice) |*w| w.* = rnd.int(u16);
+            for (0..8) |t_idx| format.decodeTile(slice[t_idx * n .. (t_idx + 1) * n], rate, cs.dec, &want_tiles[t_idx]);
+
+            const tr_gemm = try core.fromHost(std.mem.sliceAsBytes(slice), .uint16, &.{ 1, 1, 8, n_c });
+            defer core.release(tr_gemm);
+            const tr_dp = try core.fromHost(std.mem.sliceAsBytes(slice), .uint16, &.{ 1, 8, 1, n_c });
+            defer core.release(tr_dp);
+
+            // 1. smat_group_fc (sushi_exl3_k4_gemm_simdmat): folded MMA + exl3_out matches decodeTile bit-for-bit.
+            {
+                var cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                try cfg.addOutput(&.{ 16, 128 }, .float16);
+                try cfg.addTemplate("NHW", .{ .int = n_c });
+                try cfg.addTemplate("IDIM", .{ .int = 16 });
+                try cfg.addTemplate("ODIM", .{ .int = 128 });
+                try cfg.addTemplate("WIN", .{ .int = 16 });
+                var out: [1]*Tensor = undefined;
+                try kernel_mod.launch(smat_def, &.{ x_eye16, tr_gemm, eids_t, wstarts_t, wnlive_t }, &cfg, &out);
+                defer core.release(out[0]);
+                const got = try readU16(out[0]);
+                for (0..16) |r| {
+                    for (0..8) |t_idx| {
+                        for (0..16) |c| {
+                            try testing.expectEqual(want_tiles[t_idx][r * 16 + c], got[r * 128 + t_idx * 16 + c]);
+                        }
+                    }
+                }
+            }
+
+            // 2. exl3_lane_fc + exl3_lane_word_fc (sushi_exl3_down_prepared): matches decodeTile bit-for-bit
+            //    at every rate including n=64 and PAIR1 n=56 (simd_shuffle).
+            {
+                var cfg: kernel_mod.Config = .{ .grid = .{ 128, 16, 1 }, .group = .{ 128, 1, 1 } };
+                try cfg.addOutput(&.{ 16, 16 }, .float16);
+                try cfg.addTemplate("NHW", .{ .int = n_c });
+                try cfg.addTemplate("OTPT", .{ .int = 1 });
+                try cfg.addTemplate("IDIM", .{ .int = 128 });
+                try cfg.addTemplate("ODIM", .{ .int = 16 });
+                try cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                var out: [1]*Tensor = undefined;
+                try kernel_mod.launch(dp_def, &.{ x_eye128, tr_dp, eids_t }, &cfg, &out);
+                defer core.release(out[0]);
+                const got = try readU16(out[0]);
+                try testing.expectEqualSlices(u16, &want_tiles[0], got);
+            }
+
+            if (has_nax) {
+                // 3. nax_wfrag_fc<true> (sushi_exl3_trunk_dense_nax): scaled dense decode matches decodeTile bit-for-bit.
+                {
+                    const tr_dense = try core.fromHost(std.mem.sliceAsBytes(slice[0 .. 2 * n]), .uint16, &.{ 1, 1, 2, n_c });
+                    defer core.release(tr_dense);
+                    var cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                    try cfg.addOutput(&.{ 32, 16 }, .float16);
+                    try cfg.addTemplate("NHW", .{ .int = n_c });
+                    try cfg.addTemplate("IDIM", .{ .int = 16 });
+                    try cfg.addTemplate("ODIM", .{ .int = 32 });
+                    var out: [1]*Tensor = undefined;
+                    try kernel_mod.launch(dense_def.?, &.{tr_dense}, &cfg, &out);
+                    defer core.release(out[0]);
+                    const got = try readU16(out[0]);
+                    for (0..2) |t_idx| {
+                        for (0..16) |r| {
+                            for (0..16) |c| {
+                                try testing.expectEqual(want_tiles[t_idx][r * 16 + c], got[(t_idx * 16 + c) * 16 + r]);
+                            }
+                        }
+                    }
+                }
+
+                // 4. nax_wfrag_fc<false> (sushi_exl3_k4_gemm_nax): folded MMA + exl3_out matches decodeTile bit-for-bit.
+                {
+                    var cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                    try cfg.addOutput(&.{ 16, 128 }, .float16);
+                    try cfg.addTemplate("NHW", .{ .int = n_c });
+                    try cfg.addTemplate("IDIM", .{ .int = 16 });
+                    try cfg.addTemplate("ODIM", .{ .int = 128 });
+                    try cfg.addTemplate("WIN", .{ .int = 16 });
+                    var out: [1]*Tensor = undefined;
+                    try kernel_mod.launch(nax_def.?, &.{ x_eye16, tr_gemm, eids_t, wstarts_t, wnlive_t }, &cfg, &out);
+                    defer core.release(out[0]);
+                    const got = try readU16(out[0]);
+                    for (0..16) |r| {
+                        for (0..8) |t_idx| {
+                            for (0..16) |c| {
+                                try testing.expectEqual(want_tiles[t_idx][r * 16 + c], got[r * 128 + t_idx * 16 + c]);
+                            }
+                        }
+                    }
+                    // Also verify _unfolded (FC_B12 = false) on boundary rates matches bit-for-bit.
+                    if (nax_u_def != null and (n == cs.min_n or n == 32 or n == 56 or n == 64 or n == 80 or n == 96 or n == cs.max_n)) {
+                        var out_u: [1]*Tensor = undefined;
+                        try kernel_mod.launch(nax_u_def.?, &.{ x_eye16, tr_gemm, eids_t, wstarts_t, wnlive_t }, &cfg, &out_u);
+                        defer core.release(out_u[0]);
+                        const got_u = try readU16(out_u[0]);
+                        try testing.expectEqualSlices(u16, got, got_u);
+                    }
+                }
+            }
+        }
+
+        // 5. rows_wfrag_fc (sushi_exl3_rows_nax, FOLD=1): folded vs unfolded bit-exact on boundary rates.
+        if (has_nax and cs.unfolded_suf != null) {
+            const rn_f = try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_rows_nax{s}", .{cs.suf}), rows_in_names, &.{"y"}, exl3_mod.project_rows.ROWS_NAX_SOURCE, "", true, false);
+            const rn_u = try kernel_mod.Def.create(try std.fmt.bufPrint(&name_buf, "sushi_exl3_rows_nax{s}", .{cs.unfolded_suf.?}), rows_in_names, &.{"y"}, exl3_mod.project_rows.ROWS_NAX_SOURCE, "", true, false);
+            var rx_data: [128]u16 = undefined;
+            const ones128: [128]u16 = @splat(0x3C00);
+            for (&rx_data, 0..) |*v, i| v.* = if ((i & 1) == 0) 0x3F80 else 0xBF00; // bf16 +1.0 / -0.5
+            const rx = try core.fromHost(std.mem.sliceAsBytes(&rx_data), .bfloat16, &.{ 1, 128 });
+            defer core.release(rx);
+            const suh_t = try core.fromHost(std.mem.sliceAsBytes(&ones128), .float16, &.{128});
+            defer core.release(suh_t);
+            const svh_t = try core.fromHost(std.mem.sliceAsBytes(&ones128), .float16, &.{128});
+            defer core.release(svh_t);
+            var r_tr: [64 * 128]u16 = undefined;
+            for ([_]u32{ 16, 32, 40, 48, 56, 58, 60, 62, 64, 80, 96, 98, 100, 126, 128 }) |rn| {
+                if (rn < cs.min_n or rn > cs.max_n) continue;
+                const rslice = r_tr[0 .. 64 * rn];
+                for (rslice) |*w| w.* = rnd.int(u16);
+                const rtr_t = try core.fromHost(std.mem.sliceAsBytes(rslice), .uint16, &.{ 8, 8, @intCast(rn) });
+                defer core.release(rtr_t);
+                var cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                try cfg.addOutput(&.{ 1, 128 }, .bfloat16);
+                try cfg.addTemplate("OutT", .{ .dtype = .bfloat16 });
+                try cfg.addTemplate("KPH", .{ .int = 1 });
+                try cfg.addTemplate("UNR", .{ .int = 2 });
+                try cfg.addTemplate("NHW", .{ .int = @intCast(rn) });
+                try cfg.addTemplate("IDIM", .{ .int = 128 });
+                try cfg.addTemplate("ODIM", .{ .int = 128 });
+                try cfg.addTemplate("ROWS", .{ .int = 1 });
+                try cfg.addTemplate("GROUPS", .{ .int = 1 });
+                try cfg.addTemplate("TGRP", .{ .int = 4 });
+                try cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                try cfg.addTemplate("CHUNK", .{ .int = 128 });
+                try cfg.addTemplate("FOLD", .{ .int = 1 });
+                try cfg.addTemplate("R32", .{ .int = 0 });
+                try cfg.addTemplate("SW", .{ .int = 0 });
+                try cfg.addTemplate("SB1", .{ .int = 128 });
+                try cfg.addTemplate("SB2", .{ .int = 128 });
+                try cfg.addTemplate("SB3", .{ .int = 128 });
+                var out_f: [1]*Tensor = undefined;
+                var out_u: [1]*Tensor = undefined;
+                try kernel_mod.launch(rn_f, &.{ rx, rtr_t, suh_t, svh_t }, &cfg, &out_f);
+                defer core.release(out_f[0]);
+                try kernel_mod.launch(rn_u, &.{ rx, rtr_t, suh_t, svh_t }, &cfg, &out_u);
+                defer core.release(out_u[0]);
+                const gf = try readU16(out_f[0]);
+                const gu = try readU16(out_u[0]);
+                try testing.expectEqualSlices(u16, gu, gf);
+            }
+        }
+    }
+}
