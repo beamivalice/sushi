@@ -988,6 +988,13 @@ pub fn submit() !void {
     if (enabled) try core.submit();
 }
 
+/// Waits only until the submitted pass that last wrote `a` completes, leaving later submitted passes running.
+pub fn waitWritten(a: A) !void {
+    if (!enabled) return;
+    const t = try core.ready(a);
+    try core.waitWritten(t);
+}
+
 /// Dispatches encoded and not yet handed over.
 pub fn openDispatches() u32 {
     return if (enabled) core.openDispatches() else 0;

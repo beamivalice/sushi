@@ -486,7 +486,7 @@ fn mixedSource(alloc: std.mem.Allocator, kind: Kind, classes: []const RateClass,
         .down_prepared => kernels.DOWN_PREPARED_SOURCE,
     };
     const d = std.mem.indexOf(u8, base, N_DECL) orelse return error.RateGroupSourceAnchor;
-    const a = if (down) std.mem.indexOf(u8, base, "float acc[OTPT][8] = {};") orelse return error.RateGroupSourceAnchor else std.mem.indexOf(u8, base, PAIR_LOOP) orelse return error.RateGroupSourceAnchor;
+    const a = if (down) std.mem.indexOf(u8, base, "float acc[OTPT][4] = {};") orelse return error.RateGroupSourceAnchor else std.mem.indexOf(u8, base, PAIR_LOOP) orelse return error.RateGroupSourceAnchor;
     // The pair body ends with its projection loop; the down body runs to the end.
     const z = if (down) base.len else std.mem.lastIndexOfScalar(u8, base, '}') orelse return error.RateGroupSourceAnchor;
     if (!(d < a and a < z)) return error.RateGroupSourceAnchor;
@@ -1874,7 +1874,8 @@ pub const GROUP_WINDOW_SOURCE: [:0]const u8 =
     \\const uint idx = tg * experts + tid;
     \\if (idx < n) {
     \\  inverse[uint(order[idx])] = idx;
-    \\  local[idx] = meta[uint(eids[idx]) * 8u + 7u];
+    \\  const uint eid = uint(eids[idx]);
+    \\  local[idx] = eid < experts ? meta[eid * 8u + 7u] : 0u;
     \\}
     \\if (tg != 0u) return;
     \\const uint C = (n + uint(WIN) - 1u) / uint(WIN);
@@ -1955,7 +1956,9 @@ pub fn combineSource(alloc: std.mem.Allocator, planes: usize, chained: bool) ![:
         \\const uint i = thread_position_in_grid.x;
         \\const uint row = thread_position_in_grid.y;
         \\if (i >= uint(DIM) / 4u) return;
-        \\const uint g = meta[uint(eids[row]) * 8u + 3u];
+        \\const uint eid = uint(eids[row]);
+        \\if (eid >= uint(meta_shape[0]) / 8u) return;
+        \\const uint g = meta[eid * 8u + 3u];
         \\const size_t at = (size_t)row * (uint(DIM) / 4u) + i;
         \\
     );
@@ -2311,6 +2314,7 @@ pub const PREFILL_PAIR_PREP_SOURCE: [:0]const u8 =
     \\  const uint slot = slot0 + r * 4u;
     \\  if (slot >= nslots) break;
     \\  const uint eid = uint(slots[slot]);
+    \\  if (eid >= uint(suhg_shape[0])) continue;
     \\  if (eid != prev_eid) {
     \\    prev_eid = eid;
     \\    const size_t sb = (size_t)eid * (size_t)(IDIM) + base;
@@ -2390,6 +2394,7 @@ pub const MID_PLANES_MULTI_SOURCE: [:0]const u8 =
     \\  const uint slot = slot0 + r * 4u;
     \\  if (slot >= nslots) break;
     \\  const uint eid = uint(slots[slot]);
+    \\  if (eid >= uint(svhg_shape[0])) continue;
     \\  if (eid != prev_eid) {
     \\    prev_eid = eid;
     \\    const uint pg = meta[eid * 8u + 3u];
@@ -2595,19 +2600,23 @@ pub const SHARED_MID_MULTI_SOURCE: [:0]const u8 =
 /// combined one.
 pub const MID_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
     kernels.MID_SOURCE,
-    "const uint eid = uint(slots[slot]);",
-    "const uint eid = uint(slots[slot]);\nconst uint pg = meta[eid * 8u + 3u];\nconst device half *ig;\nconst device half *iu;\n" ++ planePick("ig", "ig") ++ planePick("iu", "iu"),
+    "if (eid >= uint(svhg_shape[0])) return;",
+    "if (eid >= uint(svhg_shape[0])) return;\nconst uint pg = meta[eid * 8u + 3u];\nconst device half *ig;\nconst device half *iu;\n" ++ planePick("ig", "ig") ++ planePick("iu", "iu"),
 );
 
 /// The shared expert's SwiGLU as the forward builds it from the shared linears' bf16 outputs: f32 ops, rounded to bf16
 /// once more before the down projection.
-pub const SHARED_MID_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
+pub const SHARED_MID_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
     kernels.MID_SOURCE,
     "const uint eid = uint(slots[slot]);",
     "",
-), "const size_t sb = (size_t)eid * (size_t)(ODIM) + base;", "const size_t sb = base;"), "v = float4(float(iu[xb + lane]),", "g0 = float(bfloat16_t(g0)); g1 = float(bfloat16_t(g1)); g2 = float(bfloat16_t(g2)); g3 = float(bfloat16_t(g3));\nv = float4(float(iu[xb + lane]),"), "if constexpr (CLAMP_LIMIT > 0) {", "u0 = float(bfloat16_t(u0)); u1 = float(bfloat16_t(u1)); u2 = float(bfloat16_t(u2)); u3 = float(bfloat16_t(u3));\nif constexpr (CLAMP_LIMIT > 0) {"), "const float h0 = silu0 * u0;", "const float h0 = float(bfloat16_t(silu0 * u0));"), "const float h1 = silu1 * u1;", "const float h1 = float(bfloat16_t(silu1 * u1));"), "const float h2 = silu2 * u2;", "const float h2 = float(bfloat16_t(silu2 * u2));"), "const float h3 = silu3 * u3;", "const float h3 = float(bfloat16_t(silu3 * u3));");
+), "if (eid >= uint(svhg_shape[0])) return;", ""), "const size_t sb = (size_t)eid * (size_t)(ODIM) + base;", "const size_t sb = base;"), "v = float4(float(iu[xb + lane]),", "g0 = float(bfloat16_t(g0)); g1 = float(bfloat16_t(g1)); g2 = float(bfloat16_t(g2)); g3 = float(bfloat16_t(g3));\nv = float4(float(iu[xb + lane]),"), "if constexpr (CLAMP_LIMIT > 0) {", "u0 = float(bfloat16_t(u0)); u1 = float(bfloat16_t(u1)); u2 = float(bfloat16_t(u2)); u3 = float(bfloat16_t(u3));\nif constexpr (CLAMP_LIMIT > 0) {"), "const float h0 = silu0 * u0;", "const float h0 = float(bfloat16_t(silu0 * u0));"), "const float h1 = silu1 * u1;", "const float h1 = float(bfloat16_t(silu1 * u1));"), "const float h2 = silu2 * u2;", "const float h2 = float(bfloat16_t(silu2 * u2));"), "const float h3 = silu3 * u3;", "const float h3 = float(bfloat16_t(silu3 * u3));");
 
-pub const SHARED_PREPARE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.TOKEN_PAIR_PREPARE_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;");
+pub const SHARED_PREPARE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
+    kernels.metalReplaceFound(kernels.TOKEN_PAIR_PREPARE_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;"),
+    "if (eid >= uint(suhg_shape[0])) return;",
+    "",
+);
 
 /// `REDUCE_FUSED_SOURCE` over a sorted down plane: the routed slot's row is `inverse[slot]`, and the sum is the f32 add
 /// of the routed bf16 sum and the shared bf16 result, stored f32 (the add the forward makes after both).

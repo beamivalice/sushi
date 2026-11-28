@@ -12,10 +12,14 @@ const Arr = mlx.mlx_array;
 
 /// Query columns of one matrix-unit fragment: the heads of a head block (padded past the layer's heads).
 const hb = 16;
-/// Keys a tile takes.
+/// Keys a tile takes on NAX (`matrix_g17`).
 const kt = 32;
-/// Channels a latent simdgroup owns (one affine group of the kv8 store); the last simdgroup owns the rope channels.
+/// Keys a tile takes on non-NAX SIMD (`simdgroup_float8x8`).
+const simd_kt = 16;
+/// Channels a latent simdgroup owns on NAX (one affine group of the kv8 store); the last simdgroup owns the rope channels.
 const slice = 64;
+/// Channels a latent simdgroup owns on non-NAX SIMD (`DT=4`, halving register footprint for high occupancy).
+const simd_slice = 32;
 const head: [:0]const u8 =
     \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
     \\const ushort lane = thread_index_in_simdgroup;
@@ -74,7 +78,7 @@ const range_rows: [:0]const u8 =
 /// The key rows a row picked: `rows[l, t]` where `keep[l, t]`, a tile's ids made while the tile before it is softmaxed.
 const picks_rows: [:0]const u8 =
     \\const int total = S;
-    \\#define SRC(t) ((t) < S && keep[size_t(l) * S + (t)] && int(rows[size_t(l) * S + (t)]) < N ? int(rows[size_t(l) * S + (t)]) : -1)
+    \\#define SRC(t) ((t) < S && keep[size_t(l) * S + (t)] && N > 0 && rows[size_t(l) * S + (t)] < uint(N) ? int(rows[size_t(l) * S + (t)]) : -1)
     \\#define TSRC(jj) rsrc[bb][(jj)]
     \\#define PRELUDE if (tid < KT) rsrc[0][tid] = SRC(int(tid)); threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\#define PREFETCH if (tid < KT) rsrc[bb ^ 1][tid] = SRC(t0 + KT + int(tid));
@@ -217,16 +221,302 @@ pub const header: [:0]const u8 = metal_def.NAX_HEADER ++
 pub const range_source: [:0]const u8 = head ++ "\n" ++ range_rows ++ "\n" ++ key4_bf16 ++ "\n" ++ tile_open ++ "\n" ++ tile_close;
 pub const picks_source: [:0]const u8 = head ++ "\n" ++ picks_rows ++ "\n" ++ key4_bf16 ++ "\n" ++ tile_open ++ "\n" ++ tile_close;
 
+/// Non-NAX `simdgroup_float8x8` header: fragment coordinate map, bitwise BF16→F32 unpack, and IEEE f32 8x8 MMA.
+pub const simd_header: [:0]const u8 =
+    \\#include <metal_simdgroup_matrix>
+    \\inline short2 hy4_simd_coord(ushort lane) {
+    \\  const short qid = short(lane / 4u);
+    \\  const short fm = (qid & 4) + ((short(lane) / 2) % 4);
+    \\  const short fn = (qid & 2) * 2 + (short(lane) % 2) * 2;
+    \\  return short2(fn, fm);
+    \\}
+    \\inline float2 hy4_bf16_u1_f2(uint w) {
+    \\  return float2(as_type<float>((w & 0xffffu) << 16u), as_type<float>(w & 0xffff0000u));
+    \\}
+    \\inline void hy4_simd_mma(thread float2 &d, float2 a, float2 b) {
+    \\  metal::simdgroup_float8x8 D, A, B, C;
+    \\  A.thread_elements()[0] = a.x;
+    \\  A.thread_elements()[1] = a.y;
+    \\  B.thread_elements()[0] = b.x;
+    \\  B.thread_elements()[1] = b.y;
+    \\  C.thread_elements()[0] = d.x;
+    \\  C.thread_elements()[1] = d.y;
+    \\  simdgroup_multiply_accumulate(D, A, B, C);
+    \\  d.x = D.thread_elements()[0];
+    \\  d.y = D.thread_elements()[1];
+    \\}
+    \\
+;
+
+/// Non-NAX `simdgroup_float8x8` fused attention (V1-half): `NSG = L/32` simdgroups (`16` SGs = `512` threads at `L=512`),
+/// `HB=16` heads, `KT=16` keys, `DT=4` (`32` latent cols/SG). Halves per-thread register state (`qf[2][4]` + `o[2][4]` +
+/// `kf[2][4]` + `s[2][2]` = `48` regs), folds rope into SGs `0..R/8-1` (zero idle rope SG during `PV`), keeps `staticTG`
+/// ~18.4 KiB (`<= 32 KiB`, with `sp[NSG*16*17]` padded stride eliminating 4-way bank conflicts at `NSG=16`), reads `K`
+/// once per tile with bitwise BF16→F32 unpack, and overlaps `s[2][2]` (4 accumulators) across the inner `c` loop.
+const simd_head: [:0]const u8 =
+    \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const int l = int(threadgroup_position_in_grid.y);
+    \\const int h0 = int(threadgroup_position_in_grid.x) * HB;
+    \\const int H = ql_shape[0];
+    \\const int p0 = meta[0], window = meta[1], N = meta[2], S = meta[3], row0 = meta[5], T = meta[6];
+    \\const float scale2 = as_type<float>(meta[4]) * 1.4426950408889634f;
+    \\constexpr int RT = HB / 8, KC = KT / 8, DT = 4;
+    \\constexpr int KT_PAD = KT + 1, PF_STR = KT + 2;
+    \\const bool work = int(sg) < NSG;
+    \\const int d0 = int(sg) * 32;
+    \\const short2 rc = hy4_simd_coord(lane);
+    \\const int fn = int(rc.x), fm = int(rc.y);
+    \\threadgroup float sp[NSG * HB * KT_PAD];
+    \\threadgroup float pf[HB * PF_STR];
+    \\threadgroup float cr[HB], rl[HB];
+    \\threadgroup int rsrc[2][KT];
+    \\const int hh = int(tid) >> 4, sub = int(tid) & 15;
+    \\const bool soft = int(tid) < HB * KT;
+    \\float m = soft ? float(sink[metal::min(h0 + hh, H - 1)]) * 1.4426950408889634f : 0.0f, lsum = 1.0f;
+    \\float2 qf[RT][DT];
+    \\float2 qr[RT];
+    \\const bool has_rope = work && (int(sg) * 8 < R);
+    \\{
+    \\  const size_t qs0 = size_t(ql_strides[0]), qs1 = size_t(ql_strides[1]), qs2 = size_t(ql_strides[2]);
+    \\  const size_t ps0 = size_t(qp_strides[0]), ps1 = size_t(qp_strides[1]), ps2 = size_t(qp_strides[2]);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int r = 0; r < RT; ++r) {
+    \\    const int head0 = h0 + r * 8 + fn, head1 = head0 + 1;
+    \\    const size_t qrow0 = size_t(head0 < H ? head0 : 0) * qs0 + size_t(row0 + l) * qs1;
+    \\    const size_t qrow1 = size_t(head1 < H ? head1 : 0) * qs0 + size_t(row0 + l) * qs1;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int d = 0; d < DT; ++d) {
+    \\      const int ch = d0 + d * 8 + fm;
+    \\      float v0 = 0.0f, v1 = 0.0f;
+    \\      if (work) {
+    \\        if (head0 < H) v0 = ql[qrow0 + size_t(ch) * qs2];
+    \\        if (head1 < H) v1 = ql[qrow1 + size_t(ch) * qs2];
+    \\      }
+    \\      qf[r][d] = float2(v0, v1);
+    \\    }
+    \\    float rv0 = 0.0f, rv1 = 0.0f;
+    \\    const int rch = int(sg) * 8 + fm;
+    \\    if (has_rope && rch < R) {
+    \\      const size_t prow0 = size_t(head0 < H ? head0 : 0) * ps0 + size_t(row0 + l) * ps1 + size_t(rch) * ps2;
+    \\      const size_t prow1 = size_t(head1 < H ? head1 : 0) * ps0 + size_t(row0 + l) * ps1 + size_t(rch) * ps2;
+    \\      if (head0 < H) rv0 = qp[prow0];
+    \\      if (head1 < H) rv1 = qp[prow1];
+    \\    }
+    \\    qr[r] = float2(rv0, rv1);
+    \\  }
+    \\}
+    \\float2 o[RT][DT];
+    \\#pragma clang loop unroll(full)
+    \\for (int r = 0; r < RT; ++r)
+    \\  #pragma clang loop unroll(full)
+    \\  for (int d = 0; d < DT; ++d) o[r][d] = float2(0.0f);
+;
+
+const simd_range_rows: [:0]const u8 =
+    \\const int pos = p0 + l;
+    \\const int c0 = window > 0 ? metal::max(0, pos - window + 1) : 0;
+    \\const int c1 = metal::min(pos, N - 1);
+    \\const int total = c1 >= c0 ? c1 - c0 + 1 : 0;
+    \\#define SSRC(t) ((t) < total ? c0 + (t) : -1)
+    \\#define STSRC(jj) SSRC(t0 + (jj))
+    \\#define SPRELUDE
+    \\#define SPREFETCH
+;
+
+const simd_picks_rows: [:0]const u8 =
+    \\const int total = S;
+    \\const device uint* r_row = rows + size_t(l) * size_t(S);
+    \\const device bool* k_row = keep + size_t(l) * size_t(S);
+    \\#define SSRC(t) ((t) < S && k_row[(t)] && N > 0 && r_row[(t)] < uint(N) ? int(r_row[(t)]) : -1)
+    \\#define STSRC(jj) rsrc[bb][(jj)]
+    \\#define SPRELUDE if (tid < KT) rsrc[0][tid] = SSRC(int(tid)); threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\#define SPREFETCH if (tid < KT) rsrc[bb ^ 1][tid] = SSRC(t0 + KT + int(tid));
+;
+
+const simd_body: [:0]const u8 =
+    \\int bb = 0;
+    \\SPRELUDE
+    \\for (int t0 = 0; t0 < total; t0 += KT, bb ^= 1) {
+    \\  uint kf[KC][DT];
+    \\  if (work) {
+    \\    const int src0 = STSRC(fm);
+    \\    const int src1 = STSRC(8 + fm);
+    \\    const device bfloat16_t* krow0 = kc + size_t(src0 >= 0 ? src0 : 0) * size_t(L) + size_t(d0 + fn);
+    \\    const device bfloat16_t* krow1 = kc + size_t(src1 >= 0 ? src1 : 0) * size_t(L) + size_t(d0 + fn);
+    \\    if (src0 >= 0) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = 0; d < DT; ++d) kf[0][d] = *(const device uint*)(krow0 + d * 8);
+    \\    } else {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = 0; d < DT; ++d) kf[0][d] = 0u;
+    \\    }
+    \\    if (src1 >= 0) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = 0; d < DT; ++d) kf[1][d] = *(const device uint*)(krow1 + d * 8);
+    \\    } else {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = 0; d < DT; ++d) kf[1][d] = 0u;
+    \\    }
+    \\    uint rw0 = 0u, rw1 = 0u;
+    \\    if (has_rope) {
+    \\      const int rcol = int(sg) * 8 + fn;
+    \\      if (rcol < R) {
+    \\        rw0 = (src0 >= 0) ? *(const device uint*)(kp + size_t(src0) * size_t(R) + size_t(rcol)) : 0u;
+    \\        rw1 = (src1 >= 0) ? *(const device uint*)(kp + size_t(src1) * size_t(R) + size_t(rcol)) : 0u;
+    \\      }
+    \\    }
+    \\    float2 s[KC][RT];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int c = 0; c < KC; ++c)
+    \\      #pragma clang loop unroll(full)
+    \\      for (int r = 0; r < RT; ++r) s[c][r] = float2(0.0f);
+    \\    #pragma clang loop unroll(full)
+    \\    for (int d = 0; d < DT; ++d) {
+    \\      const float2 kv0 = hy4_bf16_u1_f2(kf[0][d]);
+    \\      const float2 kv1 = hy4_bf16_u1_f2(kf[1][d]);
+    \\      hy4_simd_mma(s[0][0], kv0, qf[0][d]);
+    \\      hy4_simd_mma(s[0][1], kv0, qf[1][d]);
+    \\      hy4_simd_mma(s[1][0], kv1, qf[0][d]);
+    \\      hy4_simd_mma(s[1][1], kv1, qf[1][d]);
+    \\    }
+    \\    if (has_rope) {
+    \\      const float2 kv0 = hy4_bf16_u1_f2(rw0);
+    \\      const float2 kv1 = hy4_bf16_u1_f2(rw1);
+    \\      hy4_simd_mma(s[0][0], kv0, qr[0]);
+    \\      hy4_simd_mma(s[0][1], kv0, qr[1]);
+    \\      hy4_simd_mma(s[1][0], kv1, qr[0]);
+    \\      hy4_simd_mma(s[1][1], kv1, qr[1]);
+    \\      if (NSG * 8 < R) {
+    \\        const size_t ps0 = size_t(qp_strides[0]), ps1 = size_t(qp_strides[1]), ps2 = size_t(qp_strides[2]);
+    \\        for (int rd = (int(sg) + NSG) * 8; rd < R; rd += NSG * 8) {
+    \\          const int rch = rd + fm;
+    \\          const int rc2 = rd + fn;
+    \\          float2 qx[RT];
+    \\          #pragma clang loop unroll(full)
+    \\          for (int r = 0; r < RT; ++r) {
+    \\            const int head0 = h0 + r * 8 + fn, head1 = head0 + 1;
+    \\            float v0 = 0.0f, v1 = 0.0f;
+    \\            if (rch < R) {
+    \\              if (head0 < H) v0 = qp[size_t(head0) * ps0 + size_t(row0 + l) * ps1 + size_t(rch) * ps2];
+    \\              if (head1 < H) v1 = qp[size_t(head1) * ps0 + size_t(row0 + l) * ps1 + size_t(rch) * ps2];
+    \\            }
+    \\            qx[r] = float2(v0, v1);
+    \\          }
+    \\          const uint xw0 = (src0 >= 0 && rc2 < R) ? *(const device uint*)(kp + size_t(src0) * size_t(R) + size_t(rc2)) : 0u;
+    \\          const uint xw1 = (src1 >= 0 && rc2 < R) ? *(const device uint*)(kp + size_t(src1) * size_t(R) + size_t(rc2)) : 0u;
+    \\          const float2 rkv0 = hy4_bf16_u1_f2(xw0);
+    \\          const float2 rkv1 = hy4_bf16_u1_f2(xw1);
+    \\          hy4_simd_mma(s[0][0], rkv0, qx[0]);
+    \\          hy4_simd_mma(s[0][1], rkv0, qx[1]);
+    \\          hy4_simd_mma(s[1][0], rkv1, qx[0]);
+    \\          hy4_simd_mma(s[1][1], rkv1, qx[1]);
+    \\        }
+    \\      }
+    \\    }
+    \\    #pragma clang loop unroll(full)
+    \\    for (int c = 0; c < KC; ++c)
+    \\      #pragma clang loop unroll(full)
+    \\      for (int r = 0; r < RT; ++r) {
+    \\        sp[(int(sg) * HB + r * 8 + fn) * KT_PAD + c * 8 + fm] = s[c][r].x;
+    \\        sp[(int(sg) * HB + r * 8 + fn + 1) * KT_PAD + c * 8 + fm] = s[c][r].y;
+    \\      }
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (soft) {
+    \\    float v = -INFINITY;
+    \\    if (STSRC(sub) != -1) {
+    \\      const threadgroup float* spp = sp + hh * KT_PAD + sub;
+    \\      constexpr int SP_STEP = HB * KT_PAD;
+    \\      float a;
+    \\      if (NSG == 16) {
+    \\        const float s0 = (spp[0 * SP_STEP] + spp[1 * SP_STEP]) + (spp[2 * SP_STEP] + spp[3 * SP_STEP]);
+    \\        const float s1 = (spp[4 * SP_STEP] + spp[5 * SP_STEP]) + (spp[6 * SP_STEP] + spp[7 * SP_STEP]);
+    \\        const float s2 = (spp[8 * SP_STEP] + spp[9 * SP_STEP]) + (spp[10 * SP_STEP] + spp[11 * SP_STEP]);
+    \\        const float s3 = (spp[12 * SP_STEP] + spp[13 * SP_STEP]) + (spp[14 * SP_STEP] + spp[15 * SP_STEP]);
+    \\        a = (s0 + s1) + (s2 + s3);
+    \\      } else {
+    \\        a = 0.0f;
+    \\        #pragma clang loop unroll(full)
+    \\        for (int g = 0; g < NSG; ++g) a += spp[g * SP_STEP];
+    \\      }
+    \\      v = a * scale2;
+    \\    }
+    \\    SPREFETCH
+    \\    float tmax = v;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int off = 8; off > 0; off >>= 1) tmax = metal::max(tmax, metal::simd_shuffle_xor(tmax, ushort(off)));
+    \\    const float mn = metal::max(m, tmax);
+    \\    const float corr = metal::exp2(m - mn);
+    \\    const float p = metal::exp2(v - mn);
+    \\    pf[hh * PF_STR + sub] = p;
+    \\    float psum = p;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int off = 8; off > 0; off >>= 1) psum += metal::simd_shuffle_xor(psum, ushort(off));
+    \\    lsum = lsum * corr + psum;
+    \\    m = mn;
+    \\    if (sub == 0) cr[hh] = corr;
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (work) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int r = 0; r < RT; ++r) {
+    \\      const float c_r = cr[r * 8 + fm];
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = 0; d < DT; ++d) o[r][d] *= c_r;
+    \\    }
+    \\    #pragma clang loop unroll(full)
+    \\    for (int c = 0; c < KC; ++c) {
+    \\      const int pi0 = fm * PF_STR + c * 8 + fn;
+    \\      const int pi1 = (8 + fm) * PF_STR + c * 8 + fn;
+    \\      const float2 a0 = float2(pf[pi0], pf[pi0 + 1]);
+    \\      const float2 a1 = float2(pf[pi1], pf[pi1 + 1]);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = 0; d < DT; ++d) {
+    \\        const float2 kv = hy4_bf16_u1_f2(kf[c][d]);
+    \\        hy4_simd_mma(o[0][d], a0, kv);
+    \\        hy4_simd_mma(o[1][d], a1, kv);
+    \\      }
+    \\    }
+    \\  }
+    \\}
+    \\if (soft && sub == 0) rl[hh] = 1.0f / lsum;
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (work) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int r = 0; r < RT; ++r) {
+    \\    const int head = h0 + r * 8 + fm;
+    \\    if (head < H) {
+    \\      const float inv = rl[r * 8 + fm];
+    \\      device float* dst = out + (size_t(head) * size_t(T) + size_t(l)) * size_t(L) + size_t(d0 + fn);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = 0; d < DT; ++d) {
+    \\        dst[d * 8] = o[r][d].x * inv;
+    \\        dst[d * 8 + 1] = o[r][d].y * inv;
+    \\      }
+    \\    }
+    \\  }
+    \\}
+;
+
+pub const simd_range_source: [:0]const u8 = simd_head ++ "\n" ++ simd_range_rows ++ "\n" ++ simd_body;
+pub const simd_picks_source: [:0]const u8 = simd_head ++ "\n" ++ simd_picks_rows ++ "\n" ++ simd_body;
+
 const Kind = enum { range, picks };
 
-fn defOf(kind: Kind) *metal_def.Def {
+fn defOf(kind: Kind, nax: bool) *metal_def.Def {
     const S = struct {
         var range: metal_def.Def = .{ .name = "sushi_hy4_attn_range", .ins = &.{ "ql", "qp", "kc", "kp", "sink", "meta" }, .outs = &.{"out"}, .source = range_source, .header = header };
         var picks: metal_def.Def = .{ .name = "sushi_hy4_attn_picks", .ins = &.{ "ql", "qp", "kc", "kp", "rows", "keep", "sink", "meta" }, .outs = &.{"out"}, .source = picks_source, .header = header };
+        var simd_range: metal_def.Def = .{ .name = "sushi_hy4_attn_simd_range", .ins = &.{ "ql", "qp", "kc", "kp", "sink", "meta" }, .outs = &.{"out"}, .source = simd_range_source, .header = simd_header };
+        var simd_picks: metal_def.Def = .{ .name = "sushi_hy4_attn_simd_picks", .ins = &.{ "ql", "qp", "kc", "kp", "rows", "keep", "sink", "meta" }, .outs = &.{"out"}, .source = simd_picks_source, .header = simd_header };
     };
-    return switch (kind) {
+    return if (nax) switch (kind) {
         .range => &S.range,
         .picks => &S.picks,
+    } else switch (kind) {
+        .range => &S.simd_range,
+        .picks => &S.simd_picks,
     };
 }
 
@@ -238,11 +528,14 @@ pub const Query = struct { lat: Arr, pe: Arr };
 /// is read to this width first: `hy4_latent.rangeBf16`).
 pub const Keys = struct { c: Arr, k_pe: Arr };
 
-/// Whether the kernel serves a layer of `heads` heads with a `latent` and `rope` width and `sinks`, on stream `s`: matrix
-/// units and a GPU stream, a latent a whole number of 64-channel groups, a rope of at most 64, f32 or bf16 sinks.
+/// Whether the kernel serves a layer of `heads` heads with a `latent` and `rope` width and `sinks`, on stream `s`:
+/// GPU stream (NAX on `matrix_g17`, `simdgroup_float8x8` SIMD arm otherwise), a latent matching a compiled `NSG` bucket
+/// (`{64, 128, 256, 512}`), a rope of at most 64 (multiple of 4), f32 or bf16 sinks.
 pub fn fits(s: mlx.mlx_stream, heads: c_int, latent: c_int, rope: c_int, sinks: Arr) bool {
-    if (!mlx.streamIsGpu(s) or !nax_gate.verifyQmmNaxAvailable()) return false;
+    if (!mlx.streamIsGpu(s)) return false;
     if (heads <= 0 or latent <= 0 or @rem(latent, slice) != 0 or rope <= 0 or rope > slice or @rem(rope, 4) != 0) return false;
+    const nsg = @divExact(latent, slice) + 1;
+    if (nsg != 2 and nsg != 3 and nsg != 5 and nsg != 9) return false;
     const sd = mlx.mlx_array_dtype(sinks);
     return (sd == .float32 or sd == .bfloat16) and mlx.getShape(sinks).len == 1 and mlx.getShape(sinks)[0] == heads;
 }
@@ -266,12 +559,13 @@ pub fn applies(s: mlx.mlx_stream, q: Query, keys: Keys, sinks: Arr) bool {
 /// The launches made, a test's count of who reaches the core.
 pub var launched: u64 = 0;
 
-const Key = struct { kind: Kind, heads: c_int, rows: c_int, latent: c_int, rope: c_int };
+const Key = struct { kind: Kind, nax: bool, heads: c_int, rows: c_int, latent: c_int, rope: c_int };
 var cfgs: kcfg.Cache(Key) = .{};
 
 fn build(k: Key) !kcfg.Config {
-    const nsg = @divExact(k.latent, slice) + 1;
+    const nsg = if (k.nax) @divExact(k.latent, slice) + 1 else @divExact(k.latent, simd_slice);
     const blocks = @divTrunc(k.heads + hb - 1, hb);
+    const tile_k: c_int = if (k.nax) kt else simd_kt;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.heads, k.rows, k.latent }, 3, .float32));
@@ -279,7 +573,7 @@ fn build(k: Key) !kcfg.Config {
     const threads = @max(nsg * 32, hb * 16);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, blocks * threads, k.rows, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, threads, 1, 1));
-    for ([_]struct { [*:0]const u8, c_int }{ .{ "L", k.latent }, .{ "R", k.rope }, .{ "HB", hb }, .{ "KT", kt }, .{ "NSG", nsg } }) |t|
+    for ([_]struct { [*:0]const u8, c_int }{ .{ "L", k.latent }, .{ "R", k.rope }, .{ "HB", hb }, .{ "KT", tile_k }, .{ "NSG", nsg } }) |t|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], t[1]));
     return cfg;
 }
@@ -291,8 +585,9 @@ fn launch(s: mlx.mlx_stream, kind: Kind, q: Query, keys: Keys, picked: ?struct {
     const mv = [_]i32{ p0, window, n, sel, kcfg.bits(scale), row0, rows };
     const meta = try mlx.newData(&mv, &.{mv.len}, .int32);
     defer _ = mlx.mlx_array_free(meta);
-    const cfg = try cfgs.get(.{ .kind = kind, .heads = ls[0], .rows = rows, .latent = ls[2], .rope = mlx.getShape(q.pe)[2] }, build);
-    const def = defOf(kind);
+    const use_nax = nax_gate.verifyQmmNaxAvailable();
+    const cfg = try cfgs.get(.{ .kind = kind, .nax = use_nax, .heads = ls[0], .rows = rows, .latent = ls[2], .rope = mlx.getShape(q.pe)[2] }, build);
+    const def = defOf(kind, use_nax);
     const k = try getKernel(def);
     launched += 1;
     var ins: [8]Arr = undefined;
@@ -534,7 +829,6 @@ fn rangeCells(es: mlx.mlx_stream) !void {
 
 test "hy4 attn range: a sliding window and a dense causal range give the f64 truth's heads at the release's shapes and the tiny's, a query a view of the roped query, at a query of 4 and 16 sigma and with one large term" {
     try mlx.requireGpu();
-    if (!nax_gate.verifyQmmNaxAvailable()) return error.SkipZigTest;
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
@@ -548,6 +842,12 @@ test "hy4 attn range: a sliding window and a dense causal range give the f64 tru
         std.debug.print("\nhy4 attn failed ({t}): {s}\n", .{ e, mlx.takeError(&said) orelse "(no message)" });
         return e;
     };
+    if (nax_gate.verifyQmmNaxAvailable()) {
+        const device = @import("sushi_exl3").device;
+        const simd = device.withProfile(device.simdOnly());
+        defer simd.end();
+        try rangeCells(es);
+    }
 }
 
 const PicksCase = struct { h: c_int, latent: c_int, rope: c_int, t: c_int, n: c_int, s: c_int, kv8: bool, q_std: f32 = 4 };
@@ -616,7 +916,6 @@ fn picksCells(es: mlx.mlx_stream) !void {
 
 test "hy4 attn picks: the picked rows read from the kv8 or bf16 store give the f64 truth's heads, at the release's 32 heads of 2,048 picks and the tiny's, with rows that keep none or one" {
     try mlx.requireGpu();
-    if (!nax_gate.verifyQmmNaxAvailable()) return error.SkipZigTest;
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
@@ -630,6 +929,12 @@ test "hy4 attn picks: the picked rows read from the kv8 or bf16 store give the f
         std.debug.print("\nhy4 attn failed ({t}): {s}\n", .{ e, mlx.takeError(&said) orelse "(no message)" });
         return e;
     };
+    if (nax_gate.verifyQmmNaxAvailable()) {
+        const device = @import("sushi_exl3").device;
+        const simd = device.withProfile(device.simdOnly());
+        defer simd.end();
+        try picksCells(es);
+    }
 }
 
 fn outlierCells(es: mlx.mlx_stream) !void {
@@ -709,7 +1014,6 @@ fn outlierCells(es: mlx.mlx_stream) !void {
 
 test "hy4 attn outliers: release shapes with large query outliers, constant-sign key channels, sinks and small queries stay within the chain's f64 error" {
     try mlx.requireGpu();
-    if (!nax_gate.verifyQmmNaxAvailable()) return error.SkipZigTest;
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
@@ -719,4 +1023,10 @@ test "hy4 attn outliers: release shapes with large query outliers, constant-sign
     const exact = mlx.engine.exactF32();
     defer exact.end();
     try outlierCells(es);
+    if (nax_gate.verifyQmmNaxAvailable()) {
+        const device = @import("sushi_exl3").device;
+        const simd = device.withProfile(device.simdOnly());
+        defer simd.end();
+        try outlierCells(es);
+    }
 }

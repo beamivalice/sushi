@@ -305,6 +305,53 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "TSINK", .kind = .io_dtype, .dtypes = f32_bf16 },
         },
     },
+    // ── hy4_attn (SIMD, non-NAX `simdgroup_float8x8`) ──────────────────────────
+    .{
+        .name = "sushi_hy4_attn_simd_range",
+        .header = hy4_attn.simd_header,
+        .source = hy4_attn.simd_range_source,
+        .inputs = &.{
+            .{ .name = "ql", .ty = .{ .fixed = .float32 } },
+            .{ .name = "qp", .ty = .{ .fixed = .float32 } },
+            .{ .name = "kc", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "kp", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "sink", .ty = .{ .param = "TSINK" } },
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "L", .kind = .fc_int },
+            .{ .name = "R", .kind = .fc_int },
+            .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
+            .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
+            .{ .name = "NSG", .kind = .ct_int, .ints = &.{ 2, 4, 8, 16 } },
+            .{ .name = "TSINK", .kind = .io_dtype, .dtypes = f32_bf16 },
+        },
+    },
+    .{
+        .name = "sushi_hy4_attn_simd_picks",
+        .header = hy4_attn.simd_header,
+        .source = hy4_attn.simd_picks_source,
+        .inputs = &.{
+            .{ .name = "ql", .ty = .{ .fixed = .float32 } },
+            .{ .name = "qp", .ty = .{ .fixed = .float32 } },
+            .{ .name = "kc", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "kp", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "rows", .ty = .{ .fixed = .uint32 } },
+            .{ .name = "keep", .ty = .{ .fixed = .bool_ } },
+            .{ .name = "sink", .ty = .{ .param = "TSINK" } },
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "L", .kind = .fc_int },
+            .{ .name = "R", .kind = .fc_int },
+            .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
+            .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
+            .{ .name = "NSG", .kind = .ct_int, .ints = &.{ 2, 4, 8, 16 } },
+            .{ .name = "TSINK", .kind = .io_dtype, .dtypes = f32_bf16 },
+        },
+    },
 
     // ── hy4_hc (14 SIMD kernels: 7 forms × narrow/wide) ─────────────────────────
     hcSpec(.plain, false),

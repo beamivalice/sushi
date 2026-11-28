@@ -269,6 +269,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   kernel is bound by its matrix-unit passes: P at two parts instead of three is 6.4% less prefill time a chunk. Dequantizing a kv8 key row inside the kernel
   costs more than its dot (a layer's 2,048 picks a row: 35 ms against 17): the store is read to bf16 once a layer
   and chunk (`hy4_latent.rangeBf16`) and picks index into that copy.
+  On non-NAX GPUs (`M1`–`M4`), `hy4_attn` dispatches the `simdgroup_float8x8` `V1-half` arm
+  (`sushi_hy4_attn_simd_{range,picks}`): `NSG = L/32` (16 SGs = 512 threads at `L = 512`), `DT = 4`, `KT = 16`, rope
+  folded into SGs `0..R/8-1` (no idle rope SG during `PV`), padded `sp[NSG * 16 * 17]` (~18.4 KiB TG memory), and
+  exact IEEE f32 `simdgroup_float8x8` MMA (4.23 TF/s sliding / 5.00 TF/s sparse-dense on M1 Max, 1.18x over the op
+  chain, 20/20 `f64` parity). **Apple M1 (`G13`) barrier caveat**: `metal::simdgroup_barrier` does not fence
+  `simdgroup_load` from threadgroup memory on G13; use `threadgroup_barrier(mem_flags::mem_threadgroup)` for shared
+  score/P handoffs.
+- **M1–M4 EXL3 register/occupancy specialization** (`src/exl3/expert_exl3_kernels.zig`):
+  - `GEMM_SIMDMAT_SOURCE` specializes the run loop via `SMAT_RUN(MB_R)` (`MB_R = 1..4`) with a hoisted `xrun` base
+    pointer and `fn_off`/`r0_last`/`r1_last` offsets instead of an `size_t xo[4][2]` table and fixed `acc[4][4]`,
+    lifting PSO `maxThreads` from 512 to 576–640 on M1 Max (`flash_gate_up n36` 13.10 → 9.90 ms, 1.32x; `attn_o`
+    8.87 → 8.15 ms, 7.91 TF/s = 97% of dense BF16).
+  - Decode funnel kernels (`DOWN_FUSED_SOURCE`, `PAIR_GEMV_SOURCE`, `pairGroupedSource`, `downGroupedBody`,
+    `pairPreparedGroupedBody`) halve `acc[...][8]` to `acc[...][4]` (`ai = p & 2u`), keep staged inputs as `half ins`
+    with `half4` device loads, replace `const device half *pm[mc]` pointer arrays with `pbase + po[mc]` 32-bit offsets,
+    and scalarize `members[j]` (`mj`) + `#pragma clang loop unroll(full)` in `groupEpilogue`, lifting M1 Max PSO
+    `maxThreads` on `rg_pair_prepared_g2_pair1_2_2` from 576 to 768 (+50% active TGs/core), `g2_1` from 704 to 1024,
+    and `down_g2_2` from 640 to 832 with bit-exact outputs.
 - `hy4_absorb` wide-span FP32 `simdgroup_float8x8` kernels (`sushi_hy4_absorb_q_sg`, `v_sg`, `v_sg_gated`,
   `v_sg_prepared_into`; `src/hy4flash/hy4_absorb.zig`, landed on `75a20f8b`) replace the composed wide-span
   absorb GEMMs and separate gate + Hadamard-128 `W_o` prepare launches while keeping exact FP32 accumulation (an earlier

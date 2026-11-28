@@ -2700,6 +2700,19 @@ pub fn hostRead(t: *const Tensor) Error![]u8 {
     return (t.store.ptr + t.offset)[0..t.nbytes()];
 }
 
+/// Waits only until the submitted pass that last wrote `t` finishes on the GPU, leaving later submitted passes
+/// in flight and skipping `evalPoint`.
+pub fn waitWritten(t: *const Tensor) Error!void {
+    const s = try st();
+    if (t.store.seq > s.done) {
+        if (s.pass != null and s.pass_writes.contains(t.store)) {
+            try waitFor(s, s.seq);
+        } else if (s.writers.get(t.store)) |w| {
+            if (w.seq > s.done) try waitFor(s, w.seq);
+        }
+    }
+}
+
 /// `t`'s bytes on the host once every pass that binds them has run, for the host to write. Row-contiguous tensors only.
 pub fn hostBytes(t: *const Tensor) Error![]u8 {
     if (!t.rowContiguous()) return error.NotRowContiguous;

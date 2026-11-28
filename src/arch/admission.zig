@@ -81,8 +81,8 @@ test "expert-stream traits per model type and layout" {
     const rows = [_]struct { model_type: []const u8, layout: @TypeOf(@as(model.ModelConfig, .{}).expert_layout), want: T }{
         .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = true, .cache_bias = true } },
         .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = false, .cache_bias = true } },
-        .{ .model_type = "hy_v4_flash", .layout = .exl3_k4, .want = .{ .stq_experts = true, .tile_major = true, .cache_bias = true } },
-        .{ .model_type = "hy_v4_flash", .layout = .bf16_fused, .want = .{ .cache_bias = true } },
+        .{ .model_type = "hy_v4_flash", .layout = .exl3_k4, .want = .{ .prefetch = true, .stq_experts = true, .tile_major = true, .cache_bias = true } },
+        .{ .model_type = "hy_v4_flash", .layout = .bf16_fused, .want = .{ .prefetch = true, .cache_bias = true } },
         .{ .model_type = "glm5_next", .layout = .exl3_k4, .want = .{} },
         .{ .model_type = "qwen4_exp", .layout = .exl3_k4, .want = .{ .drop_expert = true, .stq_experts = true, .cache_bias = true } },
         .{ .model_type = "qwen4_exp", .layout = .bf16_fused, .want = .{} },

@@ -1251,7 +1251,7 @@ fn buildMixedRateBody(a: std.mem.Allocator, kind: RgKind, group: u32, is_pair1: 
     const pair_loop = "for (uint proj = 0u; proj < 2u; proj++) {\n";
 
     const d = std.mem.indexOf(u8, base, n_decl) orelse std.debug.panic("metallib_exl3: rg missing N_DECL", .{});
-    const split_anchor = if (group > 0) "const uint prow = " else if (down) "float acc[OTPT][8] = {};" else pair_loop;
+    const split_anchor = if (group > 0) "const uint prow = " else if (down) "float acc[OTPT][4] = {};" else pair_loop;
     const anchor_pos = std.mem.indexOf(u8, base, split_anchor) orelse std.debug.panic("metallib_exl3: rg missing split anchor", .{});
     const z = if (group > 0 or down) base.len else std.mem.lastIndexOfScalar(u8, base, '}') orelse unreachable;
 

@@ -122,9 +122,29 @@ fn gpuWindowCapacityCase(s: mlx.mlx_stream, experts: c_int) !void {
 }
 
 pub const SORTED_INVERSE_SOURCE: [:0]const u8 = blk: {
-    const old = "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;";
-    const at = std.mem.indexOf(u8, kernels.REDUCE_SOURCE, old).?;
-    break :blk kernels.REDUCE_SOURCE[0..at] ++ "const size_t xb = (size_t)inverse[slot] * (size_t)(ODIM) + base;" ++ kernels.REDUCE_SOURCE[at + old.len ..];
+    const k = @import("expert_exl3_kernels.zig");
+    const with_inv = k.metalReplaceFound(
+        kernels.REDUCE_SOURCE,
+        "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;",
+        "const size_t xb = (size_t)inverse[slot] * (size_t)(ODIM) + base;",
+    );
+    const guard_open = k.metalReplaceFound(
+        with_inv,
+        "const size_t sb = (size_t)eid * (size_t)(ODIM) + base;",
+        "if (eid < uint(svh_shape[0])) {\nconst size_t sb = (size_t)eid * (size_t)(ODIM) + base;",
+    );
+    break :blk k.metalReplaceFound(
+        guard_open,
+        "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        \\} else {
+        \\  vals[sg * 128u + lane] = 0.0f;
+        \\  vals[sg * 128u + lane + 32u] = 0.0f;
+        \\  vals[sg * 128u + lane + 64u] = 0.0f;
+        \\  vals[sg * 128u + lane + 96u] = 0.0f;
+        \\}
+        \\threadgroup_barrier(mem_flags::mem_threadgroup);
+        ,
+    );
 };
 
 var sorted_inverse_kernel: ?mlx.mlx_fast_metal_kernel = null;

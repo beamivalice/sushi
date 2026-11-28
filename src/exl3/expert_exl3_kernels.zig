@@ -492,6 +492,50 @@ pub const GEMM_SIMDMAT_SOURCE: [:0]const u8 =
     \\const ushort fn = (qid & 2) * 2 + (lane & 1) * 2;
     \\const uint g = uint(fm) * 4u + uint(fn >> 1);
     \\constexpr uint MB = (uint(WIN) + 7u) / 8u;
+    \\#define SMAT_RUN(MB_R) do { \
+    \\  const uint fn_off = uint(fn) * uint(IDIM); \
+    \\  const uint r0_last = min(((MB_R) - 1u) * 8u + uint(fn), nlive - 1u) * uint(IDIM); \
+    \\  const uint r1_last = min(((MB_R) - 1u) * 8u + uint(fn) + 1u, nlive - 1u) * uint(IDIM); \
+    \\  simdgroup_matrix<float, 8, 8> acc[4][(MB_R)]; \
+    \\  SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) { \
+    \\    SMAT_UNROLL for (uint mb = 0u; mb < (MB_R); mb++) acc[nb][mb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \
+    \\  } \
+    \\  for (uint tk = 0u; tk < IT; tk++) { \
+    \\    const device half *xb = xrun + tk * TILE; \
+    \\    simdgroup_matrix<half, 8, 8> b[2][(MB_R)]; \
+    \\    SMAT_UNROLL for (uint mb = 0u; mb < (MB_R); mb++) { \
+    \\      const uint r0 = (mb + 1u < (MB_R)) ? (fn_off + (mb * 8u) * uint(IDIM)) : r0_last; \
+    \\      const uint r1 = (mb + 1u < (MB_R)) ? (r0 + uint(IDIM)) : r1_last; \
+    \\      b[0][mb].thread_elements()[0] = xb[r0]; \
+    \\      b[0][mb].thread_elements()[1] = xb[r1]; \
+    \\      b[1][mb].thread_elements()[0] = xb[r0 + 8u]; \
+    \\      b[1][mb].thread_elements()[1] = xb[r1 + 8u]; \
+    \\    } \
+    \\    const device uint *words = tiles + (size_t)tk * (size_t)OT * (size_t)PACKED_W; \
+    \\    simdgroup_matrix<half, 8, 8> a[4][2]; \
+    \\    SMAT_UNROLL for (uint t = 0u; t < 2u; t++) { \
+    \\      half2 p[4]; \
+    \\      smat_group<N>(words + t * PACKED_W, g, p); \
+    \\      SMAT_UNROLL for (uint j = 0u; j < 4u; j++) { \
+    \\        a[2u * t + (j >> 1u)][j & 1u].thread_elements()[0] = p[j].x; \
+    \\        a[2u * t + (j >> 1u)][j & 1u].thread_elements()[1] = p[j].y; \
+    \\      } \
+    \\    } \
+    \\    SMAT_UNROLL for (uint mb = 0u; mb < (MB_R); mb++) { \
+    \\      SMAT_UNROLL for (uint kb = 0u; kb < 2u; kb++) { \
+    \\        SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) simdgroup_multiply_accumulate(acc[nb][mb], a[nb][kb], b[kb][mb], acc[nb][mb]); \
+    \\      } \
+    \\    } \
+    \\  } \
+    \\  SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) { \
+    \\    const size_t oc = (size_t)(col0 + nb * 8u + uint(fm)); \
+    \\    SMAT_UNROLL for (uint mb = 0u; mb < (MB_R); mb++) { \
+    \\      const uint m = mb * 8u + uint(fn); \
+    \\      if (m < nlive) y[(size_t)(run0 + m) * (size_t)(ODIM) + oc] = half(exl3_out(acc[nb][mb].thread_elements()[0])); \
+    \\      if (m + 1u < nlive) y[(size_t)(run0 + m + 1u) * (size_t)(ODIM) + oc] = half(exl3_out(acc[nb][mb].thread_elements()[1])); \
+    \\    } \
+    \\  } \
+    \\} while (0)
     \\uint row = start;
     \\const uint end = start + n;
     \\while (row < end) {
@@ -500,51 +544,21 @@ pub const GEMM_SIMDMAT_SOURCE: [:0]const u8 =
     \\uint run_end = row + 1u;
     \\while (run_end < end && uint(eids[run_end]) == eid) run_end++;
     \\const uint nlive = run_end - row;
-    \\size_t xo[4][2];
-    \\SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
-    \\  xo[mb][0] = (size_t)(run0 + min(mb * 8u + uint(fn), nlive - 1u)) * (size_t)(IDIM);
-    \\  xo[mb][1] = (size_t)(run0 + min(mb * 8u + uint(fn) + 1u, nlive - 1u)) * (size_t)(IDIM);
-    \\}
-    \\simdgroup_matrix<float, 8, 8> acc[4][4];
-    \\SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) {
-    \\  SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) acc[nb][mb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\}
+    \\const device half *xrun = x + (size_t)run0 * (size_t)(IDIM) + uint(fm);
     \\const device uint *tiles = (const device uint *)(trellis + (size_t)eid * (size_t)IT * (size_t)OT * (size_t)N) + (col0 / TILE) * PACKED_W;
-    \\for (uint tk = 0u; tk < IT; tk++) {
-    \\  const uint kc = tk * TILE + uint(fm);
-    \\  simdgroup_matrix<half, 8, 8> b[2][4];
-    \\  SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
-    \\    SMAT_UNROLL for (uint kb = 0u; kb < 2u; kb++) {
-    \\      b[kb][mb].thread_elements()[0] = x[xo[mb][0] + kc + kb * 8u];
-    \\      b[kb][mb].thread_elements()[1] = x[xo[mb][1] + kc + kb * 8u];
-    \\    }
-    \\  }
-    \\  const device uint *words = tiles + (size_t)tk * (size_t)OT * (size_t)PACKED_W;
-    \\  simdgroup_matrix<half, 8, 8> a[4][2];
-    \\  SMAT_UNROLL for (uint t = 0u; t < 2u; t++) {
-    \\    half2 p[4];
-    \\    smat_group<N>(words + t * PACKED_W, g, p);
-    \\    SMAT_UNROLL for (uint j = 0u; j < 4u; j++) {
-    \\      a[2u * t + (j >> 1u)][j & 1u].thread_elements()[0] = p[j].x;
-    \\      a[2u * t + (j >> 1u)][j & 1u].thread_elements()[1] = p[j].y;
-    \\    }
-    \\  }
-    \\  SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
-    \\    SMAT_UNROLL for (uint kb = 0u; kb < 2u; kb++) {
-    \\      SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) simdgroup_multiply_accumulate(acc[nb][mb], a[nb][kb], b[kb][mb], acc[nb][mb]);
-    \\    }
-    \\  }
-    \\}
-    \\SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) {
-    \\  const size_t oc = (size_t)(col0 + nb * 8u + uint(fm));
-    \\  SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
-    \\    const uint m = mb * 8u + uint(fn);
-    \\    if (m < nlive) y[(size_t)(run0 + m) * (size_t)(ODIM) + oc] = half(exl3_out(acc[nb][mb].thread_elements()[0]));
-    \\    if (m + 1u < nlive) y[(size_t)(run0 + m + 1u) * (size_t)(ODIM) + oc] = half(exl3_out(acc[nb][mb].thread_elements()[1]));
+    \\if constexpr (MB <= 2u) {
+    \\  if (nlive <= 8u) { SMAT_RUN(1u); } else { SMAT_RUN(2u); }
+    \\} else {
+    \\  switch ((nlive - 1u) >> 3u) {
+    \\    case 0u: SMAT_RUN(1u); break;
+    \\    case 1u: SMAT_RUN(2u); break;
+    \\    case 2u: SMAT_RUN(3u); break;
+    \\    default: SMAT_RUN(4u); break;
     \\  }
     \\}
     \\row = run_end;
     \\}
+    \\#undef SMAT_RUN
 ;
 pub const GEMM_NAX_INCLUDES: [:0]const u8 =
     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -994,6 +1008,7 @@ pub const TOKEN_PAIR_PREPARE_SOURCE: [:0]const u8 =
     \\uint slot = uint(threadgroup_position_in_grid.y);
     \\ushort lane = thread_index_in_simdgroup;
     \\const uint eid = uint(slots[slot]);
+    \\if (eid >= uint(suhg_shape[0])) return;
     \\const uint orig = uint(order[slot]);
     \\const uint row = orig / uint(TOPK);
     \\const uint base = block * 128u;
@@ -2220,7 +2235,7 @@ pub const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\const uint row1 = prow + 1u;
     \\const uint row2 = prow + 8u;
     \\const uint row3 = prow + 9u;
-    \\float acc[OTPT][8] = {};
+    \\float acc[OTPT][4] = {};
     \\const device uint* trellis_e = (const device uint*)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * PACKED_HW);
     \\if (FUNNEL) {
     \\  // Both k-tiles' words load before either decodes; a k range is whole H128
@@ -2251,8 +2266,9 @@ pub const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\        for (uint p = 0u; p < 4u; p++) {
     \\          const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
     \\          const float2 w = exl3_decode2(cw);
-    \\          acc[o][p * 2u] = fma(ins[p * 2u], w.x, acc[o][p * 2u]);
-    \\          acc[o][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[o][p * 2u + 1u]);
+    \\          const uint ai = p & 2u;
+    \\          acc[o][ai] = fma(ins[p * 2u], w.x, acc[o][ai]);
+    \\          acc[o][ai + 1u] = fma(ins[p * 2u + 1u], w.y, acc[o][ai + 1u]);
     \\        }
     \\      }
     \\    }
@@ -2283,14 +2299,15 @@ pub const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\      const uint funnel = uint(merged >> shv[p]);
     \\      const uint2 cw = uint2((funnel >> frv[p]) & 0xffffu, funnel & 0xffffu);
     \\      const float2 w = exl3_decode2(cw);
-    \\      acc[0][p * 2u] = fma(ins[p * 2u], w.x, acc[0][p * 2u]);
-    \\      acc[0][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[0][p * 2u + 1u]);
+    \\      const uint ai = p & 2u;
+    \\      acc[0][ai] = fma(ins[p * 2u], w.x, acc[0][ai]);
+    \\      acc[0][ai + 1u] = fma(ins[p * 2u + 1u], w.y, acc[0][ai + 1u]);
     \\    }
     \\  }
     \\}
     \\for (uint o = 0u; o < uint(OTPT); o++) {
-    \\  float clo = (acc[o][0] + acc[o][1]) + (acc[o][2] + acc[o][3]);
-    \\  float chi = (acc[o][4] + acc[o][5]) + (acc[o][6] + acc[o][7]);
+    \\  float clo = acc[o][0] + acc[o][1];
+    \\  float chi = acc[o][2] + acc[o][3];
     \\  clo += simd_shuffle_xor(clo, 1u);
     \\  chi += simd_shuffle_xor(chi, 1u);
     \\  clo += simd_shuffle_xor(clo, 2u);
@@ -2442,7 +2459,7 @@ pub const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\  const uint xb = proj * KSPAN;
     \\  const device ushort *trellis = (proj == 0u) ? tg : tu;
     \\  device float *y = (proj == 0u) ? yg : yu;
-    \\  float acc[OTPT][8] = {};
+    \\  float acc[OTPT][4] = {};
     \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * PACKED_HW);
     \\  if (FUNNEL) {
     \\    // Both k-tiles' words load before either decodes; a k range is whole H128
@@ -2473,8 +2490,9 @@ pub const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\          for (uint p = 0u; p < 4u; p++) {
     \\            const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
     \\            const float2 w = exl3_decode2(cw);
-    \\            acc[o][p * 2u] = fma(ins[p * 2u], w.x, acc[o][p * 2u]);
-    \\            acc[o][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[o][p * 2u + 1u]);
+    \\            const uint ai = p & 2u;
+    \\            acc[o][ai] = fma(ins[p * 2u], w.x, acc[o][ai]);
+    \\            acc[o][ai + 1u] = fma(ins[p * 2u + 1u], w.y, acc[o][ai + 1u]);
     \\          }
     \\        }
     \\      }
@@ -2505,14 +2523,15 @@ pub const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\        const uint funnel = uint(merged >> shv[p]);
     \\        const uint2 cw = uint2((funnel >> frv[p]) & 0xffffu, funnel & 0xffffu);
     \\        const float2 w = exl3_decode2(cw);
-    \\        acc[0][p * 2u] = fma(ins[p * 2u], w.x, acc[0][p * 2u]);
-    \\        acc[0][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[0][p * 2u + 1u]);
+    \\        const uint ai = p & 2u;
+    \\        acc[0][ai] = fma(ins[p * 2u], w.x, acc[0][ai]);
+    \\        acc[0][ai + 1u] = fma(ins[p * 2u + 1u], w.y, acc[0][ai + 1u]);
     \\      }
     \\    }
     \\  }
     \\  for (uint o = 0u; o < uint(OTPT); o++) {
-    \\    float clo = (acc[o][0] + acc[o][1]) + (acc[o][2] + acc[o][3]);
-    \\    float chi = (acc[o][4] + acc[o][5]) + (acc[o][6] + acc[o][7]);
+    \\    float clo = acc[o][0] + acc[o][1];
+    \\    float chi = acc[o][2] + acc[o][3];
     \\    clo += simd_shuffle_xor(clo, 1u);
     \\    chi += simd_shuffle_xor(chi, 1u);
     \\    clo += simd_shuffle_xor(clo, 2u);
@@ -2540,6 +2559,7 @@ pub const MID_SOURCE: [:0]const u8 =
     \\uint slot = uint(threadgroup_position_in_grid.y);
     \\ushort lane = thread_index_in_simdgroup;
     \\const uint eid = uint(slots[slot]);
+    \\if (eid >= uint(svhg_shape[0])) return;
     \\const uint base = block * 128u;
     \\const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
     \\const size_t sb = (size_t)eid * (size_t)(ODIM) + base;
@@ -6420,17 +6440,18 @@ fn groupFunnelStep(comptime size: u32, comptime mc: []const u8, comptime member_
         \\}
         \\
     ++ "#pragma clang loop unroll(full)\nfor (uint j = 0u; j < " ++ mc ++ "; j++) {\n  #pragma clang loop unroll(full)\n  for (uint u = 0u; u < 2u; u++) {\n    const auto q = " ++ member_ptr ++ " + u * SGS * TILE;\n" ++
-        \\    float ins[4];
-        \\    ins[0] = float(q[prow]);
-        \\    ins[1] = float(q[prow + 1u]);
-        \\    ins[2] = float(q[prow + 8u]);
-        \\    ins[3] = float(q[prow + 9u]);
+        \\    half ins[4];
+        \\    ins[0] = q[prow];
+        \\    ins[1] = q[prow + 1u];
+        \\    ins[2] = q[prow + 8u];
+        \\    ins[3] = q[prow + 9u];
         \\    #pragma clang loop unroll(full)
         \\    for (uint o = 0u; o < uint(OTPT); o++) {
         \\      #pragma clang loop unroll(full)
         \\      for (uint p = 0u; p < 4u; p++) {
-        \\        acc[j][o][p * 2u] = fma(ins[(p * 2u) & 3u], wq[u][o][p].x, acc[j][o][p * 2u]);
-        \\        acc[j][o][p * 2u + 1u] = fma(ins[(p * 2u + 1u) & 3u], wq[u][o][p].y, acc[j][o][p * 2u + 1u]);
+        \\        const uint ai = p & 2u;
+        \\        acc[j][o][ai] = fma(float(ins[(p * 2u) & 3u]), wq[u][o][p].x, acc[j][o][ai]);
+        \\        acc[j][o][ai + 1u] = fma(float(ins[(p * 2u + 1u) & 3u]), wq[u][o][p].y, acc[j][o][ai + 1u]);
         \\      }
         \\    }
         \\  }
@@ -6442,11 +6463,11 @@ fn groupFunnelStep(comptime size: u32, comptime mc: []const u8, comptime member_
         \\#pragma clang loop unroll(full)
         \\for (uint u = 0u; u < 2u; u++) {
         \\
-    ++ "  float ins[" ++ mc ++ "][4];\n  #pragma clang loop unroll(full)\n  for (uint j = 0u; j < " ++ mc ++ "; j++) {\n    const auto q = " ++ member_ptr ++ " + u * SGS * TILE;\n" ++
-        \\    ins[j][0] = float(q[prow]);
-        \\    ins[j][1] = float(q[prow + 1u]);
-        \\    ins[j][2] = float(q[prow + 8u]);
-        \\    ins[j][3] = float(q[prow + 9u]);
+    ++ "  half ins[" ++ mc ++ "][4];\n  #pragma clang loop unroll(full)\n  for (uint j = 0u; j < " ++ mc ++ "; j++) {\n    const auto q = " ++ member_ptr ++ " + u * SGS * TILE;\n" ++
+        \\    ins[j][0] = q[prow];
+        \\    ins[j][1] = q[prow + 1u];
+        \\    ins[j][2] = q[prow + 8u];
+        \\    ins[j][3] = q[prow + 9u];
         \\  }
         \\  #pragma clang loop unroll(full)
         \\  for (uint o = 0u; o < uint(OTPT); o++) {
@@ -6454,10 +6475,11 @@ fn groupFunnelStep(comptime size: u32, comptime mc: []const u8, comptime member_
         \\    for (uint p = 0u; p < 4u; p++) {
         \\      const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
         \\      const float2 w = exl3_decode2(cw);
+        \\      const uint ai = p & 2u;
         \\
     ++ "      #pragma clang loop unroll(full)\n      for (uint j = 0u; j < " ++ mc ++ "; j++) {\n" ++
-        \\        acc[j][o][p * 2u] = fma(ins[j][(p * 2u) & 3u], w.x, acc[j][o][p * 2u]);
-        \\        acc[j][o][p * 2u + 1u] = fma(ins[j][(p * 2u + 1u) & 3u], w.y, acc[j][o][p * 2u + 1u]);
+        \\        acc[j][o][ai] = fma(float(ins[j][(p * 2u) & 3u]), w.x, acc[j][o][ai]);
+        \\        acc[j][o][ai + 1u] = fma(float(ins[j][(p * 2u + 1u) & 3u]), w.y, acc[j][o][ai + 1u]);
         \\      }
         \\    }
         \\  }
@@ -6468,12 +6490,19 @@ fn groupFunnelStep(comptime size: u32, comptime mc: []const u8, comptime member_
 }
 
 /// The single-slot kernels' tile reduction for each of `mc` members, the first `m` stored. `y_at`
-/// indexes the output with `j`, `o` and `e`, the store's index within its 16-wide tile row.
-fn groupEpilogue(comptime mc: []const u8, comptime y_at: []const u8, comptime cast: []const u8) []const u8 {
-    return "for (uint j = 0u; j < " ++ mc ++ "; j++) {\n" ++
+/// indexes the output with `mj` (member slot), `o` and `e`, the store's index within its 16-wide tile row.
+fn groupEpilogue(comptime size: u32, comptime mc: []const u8, comptime y_at: []const u8, comptime cast: []const u8) []const u8 {
+    const mj_expr = if (size == 1)
+        "members[0]"
+    else if (size == 2)
+        "(j == 0u ? members[0] : members[1])"
+    else
+        "members[j]";
+    return "#pragma clang loop unroll(full)\nfor (uint j = 0u; j < " ++ mc ++ "; j++) {\n" ++
+        \\  #pragma clang loop unroll(full)
         \\  for (uint o = 0u; o < uint(OTPT); o++) {
-        \\    float clo = (acc[j][o][0] + acc[j][o][1]) + (acc[j][o][2] + acc[j][o][3]);
-        \\    float chi = (acc[j][o][4] + acc[j][o][5]) + (acc[j][o][6] + acc[j][o][7]);
+        \\    float clo = acc[j][o][0] + acc[j][o][1];
+        \\    float chi = acc[j][o][2] + acc[j][o][3];
         \\    clo += simd_shuffle_xor(clo, 1u);
         \\    chi += simd_shuffle_xor(chi, 1u);
         \\    clo += simd_shuffle_xor(clo, 2u);
@@ -6489,7 +6518,10 @@ fn groupEpilogue(comptime mc: []const u8, comptime y_at: []const u8, comptime ca
         \\  const uint j = t / (16u * uint(OTPT));
         \\  const uint o = (t >> 4u) % uint(OTPT);
         \\  const uint e = t & 15u;
+        \\  const uint mj = 
+    ++ mj_expr ++ ";\n" ++
         \\  float sum = 0.0f;
+        \\  #pragma clang loop unroll(full)
         \\  for (uint g = 0u; g < SGS; g++) {
         \\    sum += partial[((j * uint(OTPT) + o) * SGS + g) * 16u + e];
         \\  }
@@ -6510,8 +6542,7 @@ fn pairFunnelRung(comptime size: u32, comptime mc: []const u8) []const u8 {
 }
 
 fn pairEpilogueRung(comptime size: u32, comptime mc: []const u8) []const u8 {
-    _ = size;
-    return groupEpilogue(mc, "y[(size_t)(members[j] * uint(NSPLIT) + split) * (size_t)(ODIM) + (ot + o) * TILE + e]", "");
+    return groupEpilogue(size, mc, "y[(size_t)(mj * uint(NSPLIT) + split) * (size_t)(ODIM) + (ot + o) * TILE + e]", "");
 }
 
 /// `PAIR_GEMV_SOURCE`'s lane-funnel arm, grouped to `g` members. Members' prepared inputs are staged one
@@ -6546,7 +6577,7 @@ pub fn pairGroupedSource(comptime g: u32) [:0]const u8 {
         \\  const device half *suh = (proj == 0u) ? suhg : suhu;
         \\  const device ushort *trellis = (proj == 0u) ? tg : tu;
         \\  device float *y = (proj == 0u) ? yg : yu;
-        \\  float acc[GROUP][OTPT][8] = {};
+        \\  float acc[GROUP][OTPT][4] = {};
         \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * N);
         \\  const device uint *wp = trellis_e + ((size_t)(tk0 + sg) * (size_t)OT + ot) * PACKED_W;
         \\  for (uint c0 = tk0; c0 < tk1; c0 += CHUNK / TILE) {
@@ -6598,16 +6629,19 @@ pub fn pairGroupedSource(comptime g: u32) [:0]const u8 {
 }
 
 fn downGroupedBody(comptime size: u32, comptime mc: []const u8) []const u8 {
-    return "float acc[" ++ mc ++ "][OTPT][8] = {};\n" ++
+    return "float acc[" ++ mc ++ "][OTPT][4] = {};\n" ++
         \\const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * N);
         \\const device uint *wp = trellis_e + ((size_t)sg * (size_t)OT + ot) * PACKED_W;
+        \\const device half *pbase = middle + sg * TILE;
         \\
-    ++ "const device half *pm[" ++ mc ++ "];\nfor (uint j = 0u; j < " ++ mc ++ "; j++) pm[j] = middle + (size_t)members[j] * uint(IDIM) + sg * TILE;\n" ++
+    ++ "uint po[" ++ mc ++ "];\n#pragma clang loop unroll(full)\nfor (uint j = 0u; j < " ++ mc ++ "; j++) po[j] = members[j] * uint(IDIM);\n" ++
         \\for (uint tk = sg; tk < IT; tk += 2u * SGS) {
         \\
-    ++ groupFunnelStep(size, mc, "pm[j]") ++
-        "  for (uint j = 0u; j < " ++ mc ++ "; j++) pm[j] += 2u * SGS * TILE;\n}\n" ++
-        groupEpilogue(mc, "y[(size_t)members[j] * (size_t)(ODIM) + (ot + o) * TILE + e]", "half");
+    ++ groupFunnelStep(size, mc, "(pbase + po[j])") ++
+        \\  pbase += 2u * SGS * TILE;
+        \\}
+        \\
+    ++ groupEpilogue(size, mc, "y[(size_t)mj * (size_t)(ODIM) + (ot + o) * TILE + e]", "half");
 }
 
 /// `DOWN_PREPARED_SOURCE`'s lane-funnel arm, grouped to `g` members; each member reads its own lane-ordered middle.
@@ -6650,17 +6684,17 @@ fn laneQuadReads(comptime src: [:0]const u8) [:0]const u8 {
         out = metalReplaceFound(out, "const float in2 = float(" ++ r[0] ++ "2]);", "const float in2 = in4.z;");
         out = metalReplaceFound(out, "const float in3 = float(" ++ r[0] ++ "3]);", "const float in3 = in4.w;");
     }
-    if (std.mem.indexOf(u8, out, "ins[j][0] = float(q[prow]);") != null) {
-        out = metalReplaceAll(out, "ins[j][0] = float(q[prow]);", "const float4 in4 = float4(*((const device half4 *)(q + (lane & 3u) * 4u)));\n    ins[j][0] = in4.x;");
-        out = metalReplaceFound(out, "ins[j][1] = float(q[prow + 1u]);", "ins[j][1] = in4.y;");
-        out = metalReplaceFound(out, "ins[j][2] = float(q[prow + 8u]);", "ins[j][2] = in4.z;");
-        out = metalReplaceFound(out, "ins[j][3] = float(q[prow + 9u]);", "ins[j][3] = in4.w;");
+    if (std.mem.indexOf(u8, out, "ins[j][0] = q[prow];") != null) {
+        out = metalReplaceAll(out, "ins[j][0] = q[prow];", "const half4 in4 = *((const device half4 *)(q + (lane & 3u) * 4u));\n    ins[j][0] = in4.x;");
+        out = metalReplaceFound(out, "ins[j][1] = q[prow + 1u];", "ins[j][1] = in4.y;");
+        out = metalReplaceFound(out, "ins[j][2] = q[prow + 8u];", "ins[j][2] = in4.z;");
+        out = metalReplaceFound(out, "ins[j][3] = q[prow + 9u];", "ins[j][3] = in4.w;");
     }
-    if (std.mem.indexOf(u8, out, "ins[0] = float(q[prow]);") != null) {
-        out = metalReplaceAll(out, "ins[0] = float(q[prow]);", "const float4 in4 = float4(*((const device half4 *)(q + (lane & 3u) * 4u)));\n    ins[0] = in4.x;");
-        out = metalReplaceFound(out, "ins[1] = float(q[prow + 1u]);", "ins[1] = in4.y;");
-        out = metalReplaceFound(out, "ins[2] = float(q[prow + 8u]);", "ins[2] = in4.z;");
-        out = metalReplaceFound(out, "ins[3] = float(q[prow + 9u]);", "ins[3] = in4.w;");
+    if (std.mem.indexOf(u8, out, "ins[0] = q[prow];") != null) {
+        out = metalReplaceAll(out, "ins[0] = q[prow];", "const half4 in4 = *((const device half4 *)(q + (lane & 3u) * 4u));\n    ins[0] = in4.x;");
+        out = metalReplaceFound(out, "ins[1] = q[prow + 1u];", "ins[1] = in4.y;");
+        out = metalReplaceFound(out, "ins[2] = q[prow + 8u];", "ins[2] = in4.z;");
+        out = metalReplaceFound(out, "ins[3] = q[prow + 9u];", "ins[3] = in4.w;");
     }
     if (std.mem.indexOf(u8, out, "in4") == null) @compileError("no prepared read was rewritten");
     if (std.mem.indexOf(u8, out, "row0]") != null or std.mem.indexOf(u8, out, "q[prow]") != null) @compileError("a prepared read kept the natural layout");
@@ -6741,16 +6775,19 @@ fn pairPreparedGroupedBody(comptime size: u32, comptime mc: []const u8) []const 
     \\  const device ushort *trellis = (proj == 0u) ? tg : tu;
     \\  device float *y = (proj == 0u) ? yg : yu;
     \\
-    ++ "  float acc[" ++ mc ++ "][OTPT][8] = {};\n" ++
+    ++ "  float acc[" ++ mc ++ "][OTPT][4] = {};\n" ++
         \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * N);
         \\  const device uint *wp = trellis_e + ((size_t)(tk0 + sg) * (size_t)OT + ot) * PACKED_W;
+        \\  const device half *pbase = prep + (size_t)proj * uint(IDIM) + (tk0 + sg) * TILE;
         \\
-    ++ "  const device half *pm[" ++ mc ++ "];\n  for (uint j = 0u; j < " ++ mc ++ "; j++) pm[j] = prep + ((size_t)members[j] * 2u + proj) * uint(IDIM) + (tk0 + sg) * TILE;\n" ++
+    ++ "  uint po[" ++ mc ++ "];\n  #pragma clang loop unroll(full)\n  for (uint j = 0u; j < " ++ mc ++ "; j++) po[j] = members[j] * (2u * uint(IDIM));\n" ++
         \\  for (uint tk = tk0 + sg; tk < tk1; tk += 2u * SGS) {
         \\
-    ++ groupFunnelStep(size, mc, "pm[j]") ++
-        "    for (uint j = 0u; j < " ++ mc ++ "; j++) pm[j] += 2u * SGS * TILE;\n  }\n" ++
-        groupEpilogue(mc, "y[(size_t)(members[j] * uint(NSPLIT) + split) * (size_t)(ODIM) + (ot + o) * TILE + e]", "") ++
+    ++ groupFunnelStep(size, mc, "(pbase + po[j])") ++
+        \\    pbase += 2u * SGS * TILE;
+        \\  }
+        \\
+    ++ groupEpilogue(size, mc, "y[(size_t)(mj * uint(NSPLIT) + split) * (size_t)(ODIM) + (ot + o) * TILE + e]", "") ++
         \\}
         \\
     ;

@@ -289,6 +289,15 @@ pub const Model = struct {
     /// plans.
     ids_fixed: ?Arr = null,
     logits_turn: u1 = 0,
+    /// Last MoE routed output array retained across layers during prefill so the next layer waits only for
+    /// that pass before launching background SSD fills while its own attention/trunk run on GPU.
+    last_moe_acc: ?Arr = null,
+    /// Lead in layers ahead of `l` for speculative SSD expert prefetch (`0` = off, set when `--ssd-prefetch > 0`).
+    prefetch_lead_rows: u8 = 0,
+    prefetch_n: u8 = 12,
+    prefetch_m: u8 = 1,
+    /// Cached host copy of each MoE layer's router bias (`[E]` f32) for zero-readback prefetch ranking.
+    router_bias_host: [max_layers]?[]f32 = @splat(null),
     /// Temporary `[in, in]` BF16 identity matrix reused across layers during `initWith` for `decodeDense`; always freed before init returns.
     decode_eye: ?Arr = null,
     decode_eye_dim: usize = 0,
@@ -461,6 +470,7 @@ pub const Model = struct {
             try @import("../hc_kernels.zig").probeIdentity(s, config.hc_mult, config.dim);
             if (config.hc_mult == 4 and mlx.engine.side(.{s}) == .engine) try @import("hy4_hc.zig").probeForms(s, @intCast(config.dim));
         }
+        if (mlx.streamIsGpu(s)) try @import("hy4_index.zig").probeTopk(s);
         {
             const host = mlx.engine.enter(s);
             defer host.end();
@@ -510,8 +520,34 @@ pub const Model = struct {
         self.decode_eye_dim = 0;
     }
 
+    pub fn initPrefetchBias(self: *Model) !void {
+        for (0..self.config.layers) |l| {
+            const m = switch (self.layers[l].ffn) {
+                .moe => |moe| moe,
+                .dense => continue,
+            };
+            if (self.router_bias_host[l] != null) continue;
+            var o: Ops = .{ .s = self.s };
+            defer o.deinit();
+            const bf = if (mlx.mlx_array_dtype(m.router.bias) == .float32) try o.contiguous(m.router.bias) else try o.contiguous(try o.cast(m.router.bias, .float32));
+            try mlx.check(mlx.mlx_array_eval(bf));
+            const raw = try mlx.hostResult(f32, bf, null);
+            const copy = try self.gpa.alloc(f32, raw.len);
+            @memcpy(copy, raw);
+            self.router_bias_host[l] = copy;
+        }
+    }
+
+    fn freePrefetchBias(self: *Model) void {
+        for (&self.router_bias_host) |*slot| {
+            if (slot.*) |b| self.gpa.free(b);
+            slot.* = null;
+        }
+    }
+
     pub fn deinit(self: *Model) void {
         self.freeDecodeEye();
+        self.freePrefetchBias();
         if (self.recorded) |p| {
             p.deinit(self.gpa);
             self.recorded = null;
@@ -524,6 +560,7 @@ pub const Model = struct {
         self.freeLogitsBlocks();
         if (self.ids_fixed) |a| _ = mlx.mlx_array_free(a);
         self.ids_fixed = null;
+        self.dropLastMoeAcc();
         self.unpin();
         self.own.deinit();
         if (self.placeholder) |a| _ = mlx.mlx_array_free(a);
@@ -622,10 +659,18 @@ pub const Model = struct {
 
     /// Drops the request's state: the next `forward` starts at position 0.
     pub fn reset(self: *Model) void {
+        self.dropLastMoeAcc();
         const r = self.req();
         const was_bound = self.bound;
         r.reset();
         if (was_bound == r) self.bound = r;
+    }
+
+    fn dropLastMoeAcc(self: *Model) void {
+        if (self.last_moe_acc) |a| {
+            _ = mlx.mlx_array_free(a);
+            self.last_moe_acc = null;
+        }
     }
 
     pub fn dropHidden(self: *Model) void {
@@ -988,6 +1033,7 @@ pub const Model = struct {
         errdefer _ = mlx.mlx_array_free(hs);
         // A layer's rows are appended as it runs, so a forward that fails past its first layer leaves rows no position names.
         errdefer self.reset();
+        defer self.dropLastMoeAcc();
         // A layer's write-back may run the next layer's attention mix (`Passed.next`), which that layer then reads.
         var ahead: ?fwd.Mixed = null;
         defer freeMixed(ahead);
@@ -1002,6 +1048,11 @@ pub const Model = struct {
             hs = next.hs;
         }
         if (self.keep_hidden) try self.keepHidden(hs);
+        self.dropLastMoeAcc();
+        if (readout == .none and !mlx.engine.dryOn()) if (self.experts) |eng| if (eng.pendingReaders() > 0) {
+            try mlx.check(mlx.mlx_array_eval(hs));
+            eng.drainPendingReaders();
+        };
         const logits = try self.readoutStreams(hs, readout);
         errdefer if (readout != .none) {
             _ = mlx.mlx_array_free(logits);
@@ -3751,8 +3802,10 @@ pub const Model = struct {
         const placed = !in.whole and mlx.engine.isStream(self.s);
         const fuse_o_norm = mlx.streamIsGpu(self.s) and !in.whole and at == null and fwd.norm_kernel_on and fwd.mix_norm_on and fwd.hc_kernels_on;
         // A chunk whose W_o runs the sorted GEMM takes its rows prepared by the spans that write them.
+        const rem_o = @rem(t, span);
         const prep_o = placed and at == null and fuse_o_norm and fwd.chain_kernels_on and L.attn.o.stq != null and
-            @rem(t, span) == 0 and @rem(L.geometry.heads * L.geometry.v, 128) == 0 and exl3.trunk.gemmRows(@intCast(t), false);
+            (rem_o == 0 or (@rem(span, exl3.kernels.gemmWindowRows()) == 0 and exl3.trunk.gemmRows(@intCast(rem_o), false))) and
+            @rem(L.geometry.heads * L.geometry.v, 128) == 0 and exl3.trunk.gemmRows(@intCast(t), false);
         var rows_block: ?Arr = null;
         defer if (rows_block) |b| {
             _ = mlx.mlx_array_free(b);
@@ -4111,45 +4164,147 @@ fn cachePenalty(self: *Model, o: *Ops, engine: *expert_stream.Engine, l: usize, 
     return try o.own(try mlx.newData(host.ptr, &[_]c_int{@intCast(experts)}, .float32));
 }
 
+fn rankHy4Picks(logits: []const f32, bias: []const f32, penalty: ?[]const f32, out: []u16, best: []f32) void {
+    if (out.len == 0) return;
+    var filled: usize = 0;
+    for (logits, bias, 0..) |x, b, e| {
+        const sig = 1.0 / (1.0 + std.math.exp(-x));
+        const score = sig + b + (if (penalty) |p| p[e] else 0);
+        if (std.math.isNan(score)) continue;
+        if (filled == out.len and score <= best[filled - 1]) continue;
+        var at_i = if (filled < out.len) filled else filled - 1;
+        while (at_i > 0 and best[at_i - 1] < score) : (at_i -= 1) {
+            best[at_i] = best[at_i - 1];
+            out[at_i] = out[at_i - 1];
+        }
+        best[at_i] = score;
+        out[at_i] = @intCast(e);
+        if (filled < out.len) filled += 1;
+    }
+}
+
+fn issueHy4Prefetch(self: *const Model, engine: *expert_stream.Engine, pred_layer: usize, pred_logits: Arr, top_k: usize) void {
+    if (mlx.engine.dryOn()) return;
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    if (!mlx.engine.isStream(self.s)) mlx.check(mlx.mlx_array_eval(pred_logits)) catch return;
+    const logits = mlx.hostResult(f32, pred_logits, null) catch return;
+    const bias = self.router_bias_host[pred_layer] orelse return;
+    const rows: usize = @intCast(mlx.getShape(pred_logits)[0]);
+    const E = bias.len;
+    if (rows == 0 or rows > 16 or logits.len != rows * E) return;
+    var pen_stack: [512]f32 = undefined;
+    const pen: ?[]const f32 = if (E <= pen_stack.len and engine.prefetchPenalty(@intCast(pred_layer), pen_stack[0..E])) pen_stack[0..E] else null;
+    const cand_max: usize = 12;
+    const n: usize = @min(if (pen != null) @min(@as(usize, self.prefetch_n), top_k) else @as(usize, self.prefetch_n), cand_max, E);
+    if (n == 0) return;
+    var cand: [16 * cand_max]u16 = undefined;
+    var score: [16 * cand_max]f32 = undefined;
+    for (0..rows) |r| rankHy4Picks(logits[r * E ..][0..E], bias, pen, cand[r * n ..][0..n], score[r * n ..][0..n]);
+    engine.prefetch(@intCast(pred_layer), cand[0 .. rows * n], score[0 .. rows * n], rows, n, self.prefetch_m);
+}
+
 /// A streamed STQ layer's MoE: the picks in groups of distinct experts the layer's cache slots hold (no union
 /// workspace), each group's experts filled into slots of the stream's rate-group bank (`Prepared.ragged`, indexed by
 /// the slot ids in `remapped`); every [T, k] pick runs the clamped chain, a pick outside the group on the group's first
 /// slot at weight 0 (it adds exactly nothing), and the groups' sums add.
 fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.MoeGeometry, engine: *expert_stream.Engine, at: ?fwd.At) !Arr {
+    const dry = mlx.engine.dryOn();
+    const rows_in: usize = @intCast(mlx.getShape(x)[0]);
+    const pred_layer: ?usize = blk: {
+        if (at != null or self.prefetch_lead_rows == 0 or rows_in == 0 or rows_in > exl3.kernels.DECODE_ROWS_MAX) break :blk null;
+        const target = l + self.prefetch_lead_rows;
+        if (target >= self.config.layers or self.layers[target].ffn != .moe) break :blk null;
+        if (!dry and !engine.canPrefetch(@intCast(target))) break :blk null;
+        break :blk target;
+    };
     // `--expert-cache-bias`: a decode-width pick favours the experts the layer's cache holds; a prefill chunk is exact.
-    const pen = if (mlx.getShape(x)[0] <= exl3.kernels.DECODE_ROWS_MAX) try cachePenalty(self, o, engine, l, m.router) else null;
+    if (mlx.engine.isStream(o.s) and !dry and rows_in <= exl3.kernels.DECODE_ROWS_MAX and engine.cache_bias > 0 and self.prefetch_lead_rows > 0 and engine.prefetchPending(@intCast(l))) try mlx.engine.submit();
+    const pen = if (rows_in <= exl3.kernels.DECODE_ROWS_MAX) try cachePenalty(self, o, engine, l, m.router) else null;
     const r = try fwd.route(o, x, try fwd.cacheBiased(o, m.router, pen), g.top_k, g.scale);
+    const picks_c = if (mlx.mlx_array_dtype(r.picks) == .uint32) try o.contiguous(r.picks) else try o.contiguous(try o.cast(r.picks, .uint32));
+    // Predict layer `l + prefetch_lead_rows` router logits in pass 1 alongside `route(l)` so reading them after
+    // `prepareRoute(l)` needs zero GPU wait and lets background SSD prefetch overlap with GPU `routed(l) + Attn(l+1)`.
+    const pred_logits: ?Arr = if (pred_layer) |pl|
+        try o.contiguous(try fwd.linearF32(o, x, self.layers[pl].ffn.moe.router.weight))
+    else
+        null;
+    if (mlx.engine.isStream(o.s) and !dry) {
+        // Flush router before encoding `lat_down` + `moeShared` so `hostPicksAsync` wakes as soon as `router` finishes,
+        // overlapping `lat_down` + `moeShared` on GPU with `hostPicksAsync` and SSD fills.
+        try mlx.engine.submit();
+    }
     const experts: usize = @intCast(mlx.getShape(m.router.weight)[0]);
-    // The picks steer the groups: a dry recording makes them up and plans the most groups there can be (D20).
-    const host = try fwd.hostPicks(self.gpa, o, r.picks, @intCast(experts));
-    defer self.gpa.free(host);
-    if (at) |a| try a.tap.routes(a.tap.ctx, a.layer, host, r.weights);
     const slots_per_layer = engine.slotsPerLayer();
-    const max_groups = mostGroups(host.len, experts, slots_per_layer);
-    const groups = try expertGroups(self.gpa, host, slots_per_layer);
-    defer self.gpa.free(groups);
-    const n_groups = plan.bound(groupCount(groups), max_groups);
-    const occurrences = try self.gpa.alloc(u16, host.len);
-    defer self.gpa.free(occurrences);
-    const slots = try self.gpa.alloc(u32, host.len);
-    defer self.gpa.free(slots);
     const lat = try fwd.expertLatent(o, x, m.lat_down, at);
     try fwd.At.input(at, .expert_in, lat);
     const shape = mlx.getShape(r.weights);
     const dec = self.quant.expert.?;
-    const row_ids = try self.gpa.alloc(u32, @intCast(shape[0]));
-    defer self.gpa.free(row_ids);
-    for (row_ids, 0..) |*d, i| d.* = @intCast(i);
-    // Single-group decode fast path (`host.len <= slots_per_layer`): launch `lat_down` and `shared` on GPU so they
-    // overlap SSD expert fills in `prepareHost`, and skip the zero-init, all-ones weight mask, and redundant sum add.
-    if (max_groups == 1 and at == null) {
-        const shared = try fwd.moeShared(o, x, m, null);
-        var sum = try fwd.placedZeros(o.s, shape[0], 1, mlx.getShape(lat)[1]);
-        var handed = false;
-        errdefer if (!handed) {
-            _ = mlx.mlx_array_free(sum);
+    const use_split = at == null and shape[0] > exl3.kernels.DECODE_ROWS_MAX and engine.grouped_union.len == expert_stream.quant.component_count;
+    // Start the independent shared expert before blocking on `hostPicksAsync` so GPU runs it alongside router/SSD wait.
+    const shared_opt: ?Arr = if (at == null) try fwd.moeShared(o, x, m, null) else null;
+    if (mlx.engine.isStream(o.s) and !mlx.engine.dryOn()) try mlx.engine.submit();
+    const pre_async = use_split and shape[0] >= 512 and mlx.engine.isStream(o.s) and !mlx.engine.dryOn();
+    if (pre_async) {
+        if (self.last_moe_acc) |prev| {
+            self.last_moe_acc = null;
+            defer _ = mlx.mlx_array_free(prev);
+            try mlx.engine.waitWritten(prev);
+        } else if (engine.pendingReaders() > 0) {
+            try mlx.check(mlx.mlx_synchronize(o.s));
+        }
+        engine.drainPendingReaders();
+        try engine.startPrefillSplit(@intCast(l));
+    }
+    errdefer if (pre_async) engine.cancelPrefillSplit();
+    // The picks steer the groups: a dry recording makes them up and plans the most groups there can be (D20).
+    // Wide split prefill calls `hostPicks` (with `evalPoint`) so the arena host ring reclaims per-layer host asks
+    // and keeps `chunk 4096`; decode/verify calls `hostPicksAsync` to leave `lat_down` + `moeShared` in flight during SSD fills.
+    const host = if (use_split)
+        try fwd.hostPicks(self.gpa, o, picks_c, @intCast(experts))
+    else
+        try fwd.hostPicksAsync(self.gpa, o, picks_c, @intCast(experts));
+    defer self.gpa.free(host);
+    if (at) |a| try a.tap.routes(a.tap.ctx, a.layer, host, r.weights);
+    const occurrences = try self.gpa.alloc(u16, host.len);
+    defer self.gpa.free(occurrences);
+    const slots = try self.gpa.alloc(u32, host.len);
+    defer self.gpa.free(slots);
+    if (use_split) {
+        for (host, occurrences) |v, *d| d.* = @intCast(v);
+        var prepared = if (dry)
+            try engine.prepareDrySplit(@intCast(l), occurrences)
+        else if (pre_async)
+            try engine.finishPrefillSplit(occurrences)
+        else
+            try engine.prepareHostWide(@intCast(l), occurrences);
+        defer prepared.deinit();
+        const rb = prepared.ragged orelse {
+            std.log.err("hy_v4_flash: layer {d}'s streamed experts are not a rate-group bank", .{l});
+            return error.Hy4ExpertLayout;
         };
-        if (mlx.engine.isStream(o.s) and !mlx.engine.dryOn()) try mlx.engine.submit();
+        for (prepared.remapped, slots) |v, *d| d.* = v;
+        var ko: Ops = .{ .s = o.s };
+        defer ko.deinit();
+        const pk = try ko.own(mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .uint32));
+        const acc = try o.own(try hy4_stq.routed(ko.s, dec, g.swiglu_limit, rb, lat, pk, r.weights));
+        if (!dry and shape[0] >= 512 and l + 1 < self.config.layers and mlx.engine.isStream(o.s)) {
+            var keep_acc = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(keep_acc);
+            try mlx.check(mlx.mlx_array_set(&keep_acc, acc));
+            try mlx.engine.submit();
+            self.dropLastMoeAcc();
+            self.last_moe_acc = keep_acc;
+        }
+        return o.contiguous(try fwd.moeFinishWithShared(o, x, m, g, acc, shared_opt.?, null));
+    }
+    const max_groups = mostGroups(host.len, experts, slots_per_layer);
+    const groups = try expertGroups(self.gpa, host, slots_per_layer);
+    defer self.gpa.free(groups);
+    const n_groups = plan.bound(groupCount(groups), max_groups);
+    // Single-group decode fast path (`host.len <= slots_per_layer`): deferred slab release (`deferReader`) lets `acc`
+    // run directly with no zero-init, putAlong, or per-layer GPU wait, synchronized at the next layer's `hostPicks` or readout.
+    if (max_groups == 1 and at == null) {
         for (host, occurrences) |v, *d| d.* = @intCast(v);
         var prepared = try prepareRoute(engine, @intCast(l), occurrences, @min(host.len, slots_per_layer));
         defer prepared.deinit();
@@ -4161,14 +4316,17 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
         var go: Ops = .{ .s = o.s };
         defer go.deinit();
         const pk = try go.own(mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .uint32));
-        var ko: Ops = .{ .s = o.s };
-        defer ko.deinit();
-        const part = try ko.own(try hy4_stq.routed(ko.s, dec, g.swiglu_limit, rb, lat, pk, r.weights));
-        try fwd.landRows(&ko, &sum, part, row_ids);
-        handed = true;
-        const acc = try o.own(sum);
-        return o.contiguous(try fwd.moeFinishWithShared(o, x, m, g, acc, shared, null));
+        const acc = try o.own(try hy4_stq.routed(o.s, dec, g.swiglu_limit, rb, lat, pk, r.weights));
+        const fin = try o.contiguous(try fwd.moeFinishWithShared(o, x, m, g, acc, shared_opt.?, null));
+        if (pred_logits) |pl_arr| {
+            if (mlx.engine.isStream(o.s) and !dry) try mlx.engine.submit();
+            issueHy4Prefetch(self, engine, pred_layer.?, pl_arr, @intCast(g.top_k));
+        }
+        return fin;
     }
+    const row_ids = try self.gpa.alloc(u32, @intCast(shape[0]));
+    defer self.gpa.free(row_ids);
+    for (row_ids, 0..) |*d, i| d.* = @intCast(i);
     const mask_v = try self.gpa.alloc(f32, host.len);
     defer self.gpa.free(mask_v);
     var sum = try fwd.placedZeros(o.s, shape[0], 1, mlx.getShape(lat)[1]);
@@ -4176,7 +4334,9 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
     errdefer if (!handed) {
         _ = mlx.mlx_array_free(sum);
     };
-    // Every group runs every pick, those outside it at weight 0: a group's sizes are the picks'.
+    if (mlx.engine.isStream(o.s) and !mlx.engine.dryOn()) try mlx.engine.submit();
+    // Every group runs the static [T, k] pick tensors, masking out-of-group picks to sentinel `rb.experts` and weight 0
+    // so the prefill sort/window/GEMM chain executes active picks only.
     var gi: u32 = 0;
     while (gi < n_groups) : (gi += 1) {
         var first: u16 = 0;
@@ -4195,21 +4355,34 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
             std.log.err("hy_v4_flash: layer {d}'s streamed experts are not a rate-group bank", .{l});
             return error.Hy4ExpertLayout;
         };
-        for (prepared.remapped, slots) |v, *d| d.* = v;
+        const skip_slot: ?u32 = if (shape[0] > exl3.kernels.DECODE_ROWS_MAX) @intCast(rb.experts) else null;
+        for (prepared.remapped, groups, slots) |v, gv, *d| d.* = if (gv == gi) v else (skip_slot orelse v);
         var go: Ops = .{ .s = o.s };
         defer go.deinit();
         const pk = try go.own(mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .uint32));
         const mask = try go.own(mlx.mlx_array_new_data(mask_v.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .float32));
         const w = try go.binary(.mul, r.weights, mask);
-        // Read from the route's slots: landed (and so evaluated) before they are given back.
+        // Read from the route's slots: wait before `gi + 1` refills the layer's cache; the last group defers via `pending`.
         var ko: Ops = .{ .s = o.s };
         defer ko.deinit();
         const part = try ko.own(try hy4_stq.routed(ko.s, dec, g.swiglu_limit, rb, lat, pk, w));
-        try fwd.landRows(&ko, &sum, try ko.binary(.add, sum, part), row_ids);
+        const val = try ko.binary(.add, sum, part);
+        if (gi + 1 < n_groups) {
+            try fwd.landRows(&ko, &sum, val, row_ids);
+        } else {
+            try fwd.landRowsAsync(&ko, &sum, val, row_ids);
+        }
     }
     handed = true;
     const acc = try o.own(sum);
-    // Nothing waits at the layer's end: the next streamed layer's picks read (`hostPicks`) waits for it.
+    if (shared_opt) |sh| {
+        const fin = try o.contiguous(try fwd.moeFinishWithShared(o, x, m, g, acc, sh, null));
+        if (pred_logits) |pl_arr| {
+            if (mlx.engine.isStream(o.s) and !dry) try mlx.engine.submit();
+            issueHy4Prefetch(self, engine, pred_layer.?, pl_arr, @intCast(g.top_k));
+        }
+        return fin;
+    }
     return o.contiguous(try fwd.moeFinish(o, x, m, g, acc, at));
 }
 

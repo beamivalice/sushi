@@ -1171,3 +1171,26 @@ fans max, 3 minutes idle before each server. One binary built from `a65539e1` (S
 fans max, 3 minutes idle before each server. One binary built from `4a1f1f1b` (SHA `b5cd630a`).
 - Qwen 2.6bpw, MiMo and GLM ran 5–20% under their v1.2.2 rows that day; the released v1.2.2 binary, rerun the same day
   on 2K–32K, measured the same, so compare v1.2.3 against those same-day reruns, not against the v1.2.2 report.
+
+<a id="hy4-m1-max"></a>
+## Hy4-Flash STQ 2.25bpw on Apple M1 Max 32 GB (non-NAX)
+
+Streamed STQ 2.25bpw (`Hy4-Flash-Sushi-STQ-2.25bpw`, DFly2 drafting, kv8, `--ssd-budget-gb 18 --expert-cache-bias 0.1`),
+Apple M1 Max 32 GB (`applegpu_g13d`), ReleaseFast, `sushi bench --rungs 4k --code-only` (4,096 prompt + 128 decode,
+warm manifest, Nominal thermal state, 1,296 MHz GPU):
+
+| metric | throttled baseline | rebased `03e2b733` | M1 non-NAX opts (`--ssd-prefetch 0`) | M1 non-NAX opts (`--ssd-prefetch 50..70`) |
+|---|---|---|---|---|
+| cold prefill 4k (tok/s / TTFT) | 69.8 / 58.85 s | 194.9 / 21.17 s | 221–225 / 18.35–18.66 s | 221–225 / 18.35–18.66 s |
+| repeat prefill (31 new / 4065 cached) | 12.6–13.4 tok/s | 13.4 tok/s | 15.0 tok/s (2.19–2.39 s) | 15.0 tok/s |
+| decode `dfly2` (tok/s, median / peak) | 14.5 | 13.9 | 15.6 (90.1% accept) | 16.0 median / 16.3 peak (94.9% hit) |
+
+Standalone `engine-prof` (`2048r kv=0` prefill and `rows=1,3` decode/verify):
+- `2048r kv=0` prefill: 31,355 ms (65.3 tok/s) → 8,843 ms (231.6 tok/s on `03e2b733`) → **7,846.7 ms (261.0 tok/s, 4.00x baseline; 96.8% GPU busy, 4,762 dispatches vs 7,114)**.
+- `rows=1` decode: 78.12 ms (51.62 ms GPU busy, 42 waits).
+- `rows=3` verify: 98.82 ms (63.07 ms GPU busy, -17.5% vs 76.41 ms on `03e2b733`, 42 waits).
+
+Microbench highlights (`sushi-ubench` on Apple M1 Max):
+- `hy4_attn_simd_{range,picks}` (`V1-half`): `sliding-512x512` 8.62 ms (4.23 TF/s) vs 10.17 ms op chain (1.18x); `sparse-dense-512` 5.00 TF/s; 20/20 `f64` parity (`1.6e-7`–`3.2e-6` drift).
+- `GEMM_SIMDMAT_SOURCE` (`SMAT_RUN(MB_R)`): `flash_gate_up n36` 13,098 → 9,902 us (-24.4%, 1.32x, 6.78 TF/s); `attn_o [2560x6144]` 8,869 → 8,149 us (7.91 TF/s = 97% of dense BF16); PSO `maxThreads` 512 → 576/640.
+- Grouped decode (`acc[...][4]` + `half ins` + `pbase + po[mc]` + SROA `mj`): `rg_pair_prepared_g2_pair1_2_2` PSO `maxThreads` 576 → 768 (+50% active TGs/core), `g2_1` 704 → 1024, `down_g2_2` 640 → 832; `flash rows 3 carry 0` 325.7 → 317.5 us (-2.5%), `sized` -3% to -4.6%, bit-exact.

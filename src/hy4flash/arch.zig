@@ -120,9 +120,47 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
     }
     // DFly2, when the load keeps it: the shared drafter rounds over the model's own state (`hy4_drafter`).
     if (drafterOn(&config)) st.drafter = try @import("hy4_dfly.zig").Drafter.init(allocator, st.model.?, st.weights.?);
-    if (shell.expert_stream) |eng| try eng.awaitAsyncResidentLoad();
+    if (shell.expert_stream) |eng| {
+        try eng.awaitAsyncResidentLoad();
+        try startExpertPrefetch(eng, st.model.?, config.ssdPrefetchPct());
+    }
     if (@import("../cooler_side.zig").onEngine(&config)) mlx.engine.touchSync();
     return shell;
+}
+
+const prefetch_lead_rows: u8 = 1;
+
+fn startExpertPrefetch(engine: *@import("../expert_stream.zig").Engine, mdl: *@import("hy4_model.zig").Model, pct: u8) !void {
+    const log = @import("../log.zig");
+    if (pct == 0) {
+        log.info("[hy4] expert prefetch off (--ssd-prefetch 0)\n", .{});
+        return;
+    }
+    if (engine.plan.resident) {
+        log.info("[hy4] expert prefetch off (every routed expert is resident)\n", .{});
+        return;
+    }
+    const targets = engine.prefetchTargets(prefetch_lead_rows);
+    if (targets == 0) {
+        log.info("[hy4] expert prefetch off (no rate-grouped streamed layers)\n", .{});
+        return;
+    }
+    const probe = engine.probeReadRate() catch |e| {
+        log.warn("[hy4] expert prefetch off: the read-rate probe failed ({s})\n", .{@errorName(e)});
+        return;
+    };
+    if (probe.max_bps <= 0) {
+        log.warn("[hy4] expert prefetch off: the read-rate probe read nothing\n", .{});
+        return;
+    }
+    const credit = @import("../prefetch_plan.zig").PrefetchCredit.init(pct, probe.max_bps, targets);
+    engine.startPrefetch(credit) catch |e| {
+        log.warn("[hy4] expert prefetch off: {s}\n", .{@errorName(e)});
+        return;
+    };
+    try mdl.initPrefetchBias();
+    mdl.prefetch_lead_rows = prefetch_lead_rows;
+    log.info("[hy4] expert prefetch on: {d}% of {d:.1} GB/s (probe k2/k4/k8 {d:.1}/{d:.1}/{d:.1} GB/s, lead={d})\n", .{ pct, probe.max_bps / 1e9, probe.bps[0] / 1e9, probe.bps[1] / 1e9, probe.bps[2] / 1e9, prefetch_lead_rows });
 }
 
 /// DFly2 stays resident beside streamed experts in either of Hy4's expert layouts: the release's fused BF16 banks and an
@@ -383,7 +421,7 @@ pub fn ownsModuleDecodeState(xfm: Model) bool {
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
-    return .{ .stq_experts = config.expert_layout == .exl3_k4, .tile_major = config.expert_layout == .exl3_k4, .cache_bias = true };
+    return .{ .prefetch = true, .stq_experts = config.expert_layout == .exl3_k4, .tile_major = config.expert_layout == .exl3_k4, .cache_bias = true };
 }
 
 test "a model stamped as hy4flash is dispatched to hy4flash" {

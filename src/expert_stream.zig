@@ -2217,6 +2217,8 @@ pub const Engine = struct {
     staged_routes: u64 = 0,
     /// The next staged route marks the ranges its stages write instead of the slabs whole (`prepareHostStagedRanged`).
     range_marks: bool = false,
+    /// Defer `splitBank` until `finishPrefillSplit` so `fill_marks` clear before `concatenate` reads the scale slabs.
+    defer_split_bank: bool = false,
     forward_clock: Clock,
     last: Breakdown = .{},
     route_linear: RouteClass = .{},
@@ -2241,6 +2243,10 @@ pub const Engine = struct {
     async_task: ?*AsyncTask = null,
     resident_pending: bool = false,
     warm_done_async: bool = false,
+    /// Persistent background coordinator for overlapping prefill SSD fills (`startPrefillSplit` / `finishPrefillSplit`).
+    prefill_task: ?*PrefillTask = null,
+    prefill_prep: ?Prepared = null,
+    prefill_spans: ?[]io_mod.FillSpan = null,
 
     const AsyncKind = enum { resident, warm_cache };
     const AsyncTask = struct {
@@ -2250,6 +2256,41 @@ pub const Engine = struct {
         handled: bool = false,
         bytes: u64 = 0,
         elapsed_ns: u64 = 0,
+    };
+
+    const PrefillTask = struct {
+        thread: std.Thread = undefined,
+        mu: std.Io.Mutex = .init,
+        cv: std.Io.Condition = .init,
+        quit: bool = false,
+        has_job: bool = false,
+        done: bool = true,
+        pool: *io_mod.FillPool,
+        fds: []const std.c.fd_t,
+        plan: ?io_mod.FillPlan = null,
+        err: ?anyerror = null,
+        elapsed_ns: u64 = 0,
+
+        fn main(self: *PrefillTask) void {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+            while (!self.quit) {
+                while (!self.has_job and !self.quit) self.cv.wait(io, &self.mu) catch {};
+                if (self.quit) break;
+                self.has_job = false;
+                var plan = self.plan.?;
+                self.mu.unlock(io);
+                var clock = Clock.init();
+                const outcome = self.pool.run(self.fds, &plan);
+                const elapsed = clock.lap();
+                self.mu.lockUncancelable(io);
+                self.elapsed_ns = elapsed;
+                self.err = if (outcome) |_| null else |e| e;
+                self.done = true;
+                self.cv.broadcast(io);
+            }
+        }
     };
 
     pub fn pendingReaders(self: *const Engine) usize {
@@ -2461,6 +2502,7 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         self.abortAsyncTask();
+        self.stopPrefillTask();
         expert_stats.process.engine(false, self.plan.cache_bytes);
         self.publishLent(0);
         self.stopPrefetch();
@@ -2907,6 +2949,33 @@ pub const Engine = struct {
         return .{ .allocator = self.allocator, .gate = views.gate, .up = views.up, .down = views.down, .remapped = remapped, .raw_gate_up = gate_up, .raw_down = down };
     }
 
+    /// A dry recording's split bank for a staged wide route: cache + upper-bound spill pools per rate group.
+    pub fn prepareDrySplit(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
+        if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
+        const layer = &self.layers[layer_index];
+        if (!layer.active) return error.ExpertLayerAbsent;
+        if (layer.borrowed) return error.ExpertDryBorrowed;
+        const gl = layer.grouped orelse return self.prepareDry(layer_index, occurrences, true);
+        if (self.grouped_union.len != layer.slabs.len) return error.ExpertDryNoWorkspace;
+        var overflow: [quant.rate_group_limit]u32 = @splat(0);
+        var cache_base: [quant.rate_group_limit]u32 = @splat(0);
+        var at: u32 = 0;
+        var spills = false;
+        for (0..gl.groups.count) |g| {
+            const ov = gl.groups.keptOf(g) -| gl.slots[g];
+            overflow[g] = ov;
+            spills = spills or ov > 0;
+            cache_base[g] = at;
+            at += gl.slots[g] + ov;
+        }
+        if (!spills) return self.prepareDry(layer_index, occurrences, false);
+        const remapped = try self.allocator.alloc(u16, occurrences.len);
+        errdefer self.allocator.free(remapped);
+        for (occurrences, remapped) |expert, *d| d.* = @intCast(cache_base[gl.groups.groupOf(expert)]);
+        const bank = try self.splitBank(gl, overflow[0..gl.groups.count], self.s);
+        return .{ .allocator = self.allocator, .remapped = remapped, .quantized = true, .workspace = true, .ragged = bank, .split = bank };
+    }
+
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
         if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
         if (!self.layers[layer_index].active) return error.ExpertLayerAbsent;
@@ -2918,11 +2987,160 @@ pub const Engine = struct {
     /// `prepareHost` for a route only the per-group prefill GEMMs read (`rate_groups.moePrefill`): a rate-grouped layer
     /// whose group overflows its pool then reads its cached experts in place instead of copying them into the union.
     pub fn prepareHostWide(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
-        var prepared = try self.prepareWide(layer_index, occurrences);
+        self.defer_split_bank = true;
+        var prepared = blk: {
+            defer self.defer_split_bank = false;
+            break :blk try self.prepareWide(layer_index, occurrences);
+        };
         errdefer prepared.deinit();
         var unused: u8 = 0;
         try self.fillStaged(&prepared, &unused, noReady);
+        if (prepared.staged != null and prepared.ragged == null) _ = try self.stageBankOn(&prepared, self.s);
         return prepared;
+    }
+
+    fn ensurePrefillTask(self: *Engine) !*PrefillTask {
+        if (self.prefill_task) |task| return task;
+        const pool = self.io_pool orelse return error.MissingFillPool;
+        const task = try self.allocator.create(PrefillTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{ .pool = pool, .fds = self.fds };
+        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, PrefillTask.main, .{task});
+        self.prefill_task = task;
+        return task;
+    }
+
+    fn stopPrefillTask(self: *Engine) void {
+        self.cancelPrefillSplit();
+        const task = self.prefill_task orelse return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        task.mu.lockUncancelable(io);
+        task.quit = true;
+        task.cv.broadcast(io);
+        task.mu.unlock(io);
+        task.thread.join();
+        self.allocator.destroy(task);
+        self.prefill_task = null;
+    }
+
+    /// Resolves all `kept` experts of `layer_index` against its cache/union split bank and launches a non-blocking
+    /// background `FillPool` read for all missing experts while the layer's attention/trunk execute on GPU.
+    pub fn startPrefillSplit(self: *Engine, layer_index: u16) !void {
+        self.cancelPrefillSplit();
+        if (self.geometry.drop != null) return error.ExpertDropped;
+        self.defer_split_bank = true;
+        defer self.defer_split_bank = false;
+        const kept = self.geometry.kept();
+        const all = try self.allocator.alloc(u16, kept);
+        defer self.allocator.free(all);
+        for (all, 0..) |*d, i| d.* = @intCast(i);
+        var prepared = self.prepareWide(layer_index, all) catch |e| switch (e) {
+            error.SlabLeased => blk: {
+                _ = mlx.mlx_synchronize(self.s);
+                self.drainPendingReaders();
+                break :blk try self.prepareWide(layer_index, all);
+            },
+            else => return e,
+        };
+        errdefer prepared.deinit();
+        const st = prepared.staged orelse {
+            self.prefill_prep = prepared;
+            return;
+        };
+        var total_spans: usize = 0;
+        for (st.spans[0..st.stages()]) |list| total_spans += list.items.len;
+        if (total_spans == 0) {
+            self.prefill_prep = prepared;
+            return;
+        }
+        const spans = try self.allocator.alloc(io_mod.FillSpan, total_spans);
+        errdefer self.allocator.free(spans);
+        var at: usize = 0;
+        for (st.spans[0..st.stages()]) |list| {
+            @memcpy(spans[at..][0..list.items.len], list.items);
+            at += list.items.len;
+        }
+        const task = try self.ensurePrefillTask();
+        var plan = try io_mod.FillPlan.init(self.allocator, spans, COALESCE_MAX, task.pool.opts.workers, false);
+        errdefer plan.deinit();
+        self.prefill_spans = spans;
+        self.prefill_prep = prepared;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        task.mu.lockUncancelable(io);
+        task.plan = plan;
+        task.err = null;
+        task.elapsed_ns = 0;
+        task.done = false;
+        task.has_job = true;
+        task.cv.broadcast(io);
+        task.mu.unlock(io);
+    }
+
+    /// Joins an active `startPrefillSplit`, publishes filled slabs, and remaps `occurrences` via the split map.
+    pub fn finishPrefillSplit(self: *Engine, occurrences: []const u16) !Prepared {
+        if (self.prefill_task) |task| {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            task.mu.lockUncancelable(io);
+            while (!task.done) task.cv.wait(io, &task.mu) catch {};
+            var plan = task.plan;
+            task.plan = null;
+            const fill_err = task.err;
+            task.err = null;
+            const elapsed = task.elapsed_ns;
+            task.mu.unlock(io);
+            if (plan) |*p| p.deinit();
+            if (self.prefill_spans) |spans| {
+                var bytes: u64 = 0;
+                for (spans) |sv| bytes += sv.len;
+                self.fill_ns_total += elapsed;
+                if (self.prefill_prep) |*prep| if (prep.staged) |st| {
+                    self.layers[st.layer].stats.fill_ns += elapsed;
+                };
+                self.fill_bytes_total += bytes;
+                self.allocator.free(spans);
+                self.prefill_spans = null;
+            }
+            if (fill_err) |e| {
+                self.cancelPrefillSplit();
+                return e;
+            }
+        }
+        var prepared = self.prefill_prep orelse return error.MissingExpertSlab;
+        self.prefill_prep = null;
+        errdefer prepared.deinit();
+        if (prepared.staged) |st| {
+            try self.keepRead(st.layer, st.scale_reads.items);
+            st.scale_reads.clearRetainingCapacity();
+            try self.stageEnd(&prepared);
+            if (prepared.ragged == null) _ = try self.stageBankOn(&prepared, self.s);
+        }
+        const mapped = try self.allocator.alloc(u16, occurrences.len);
+        errdefer self.allocator.free(mapped);
+        for (occurrences, mapped) |e, *d| d.* = prepared.remapped[e];
+        self.allocator.free(prepared.remapped);
+        prepared.remapped = mapped;
+        return prepared;
+    }
+
+    pub fn cancelPrefillSplit(self: *Engine) void {
+        if (self.prefill_task) |task| {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            task.mu.lockUncancelable(io);
+            while (!task.done) task.cv.wait(io, &task.mu) catch {};
+            var plan = task.plan;
+            task.plan = null;
+            task.err = null;
+            task.mu.unlock(io);
+            if (plan) |*p| p.deinit();
+        }
+        if (self.prefill_spans) |spans| {
+            self.allocator.free(spans);
+            self.prefill_spans = null;
+        }
+        if (self.prefill_prep) |*prep| {
+            prep.deinit();
+            self.prefill_prep = null;
+        }
     }
 
     fn snapshotCache(self: *Engine, cache: *const GroupCache) !CacheSnapshot {
@@ -3047,6 +3265,16 @@ pub const Engine = struct {
     }
 
     /// Blocks until no prefetch job reads or writes `layer`'s cache.
+    pub fn prefetchPending(self: *const Engine, layer: u16) bool {
+        const pf = self.prefetcher orelse return false;
+        if (pf.live.load(.acquire) == 0) return false;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pf.mu.lockUncancelable(io);
+        const busy = prefetchTouches(pf, layer);
+        pf.mu.unlock(io);
+        return busy;
+    }
+
     pub fn prefetchWait(self: *Engine, layer: u16) void {
         const pf = self.prefetcher orelse return;
         if (pf.live.load(.acquire) == 0) return;
@@ -4431,6 +4659,11 @@ pub const Engine = struct {
         for (resolutions, 0..) |resolution, g| {
             overflow[g] = @intCast(resolution.declined);
             spills = spills or overflow[g] > 0;
+        }
+        for (resolutions, 0..) |_, g| {
+            // Keep every spillable rate group structural when any group spills so `splitBank` always produces the same
+            // pool count as `prepareDrySplit` (1 unused union slot if this chunk had 0 misses in group `g`).
+            if (spills and overflow[g] == 0 and gl.groups.keptOf(g) > gl.slots[g]) overflow[g] = 1;
             cache_base[g] = at;
             spill_base[g] = at + gl.slots[g];
             at += gl.slots[g] + overflow[g];
@@ -4487,8 +4720,8 @@ pub const Engine = struct {
         }
 
         st.overflow = overflow;
-        // A ranged route builds its bank on the engine once the scales have landed (`stageBank`): the bank concatenates them.
-        const bank: ?*Ragged = if (self.range_marks) null else try self.splitBank(gl, overflow[0..resolutions.len], self.s);
+        // A ranged or deferred-bank route builds its bank once scales land (`stageBank`): the bank concatenates them.
+        const bank: ?*Ragged = if (self.range_marks or self.defer_split_bank) null else try self.splitBank(gl, overflow[0..resolutions.len], self.s);
         errdefer if (bank) |b| {
             b.deinit();
             self.allocator.destroy(b);
@@ -4600,9 +4833,13 @@ pub const Engine = struct {
     /// The bank of a ranged route, made on the engine from the slab views and the scales that have landed: its slices and
     /// reshapes are views of the engine's, its concatenation of the scales one dispatch. Once per route.
     pub fn stageBank(self: *Engine, p: *Prepared) !*const Ragged {
+        return self.stageBankOn(p, mlx.engine.stream());
+    }
+
+    fn stageBankOn(self: *Engine, p: *Prepared, s: mlx.mlx_stream) !*const Ragged {
         if (p.ragged) |bank| return bank;
         const st = p.staged orelse return error.Dsv41StqLayerNotGrouped;
-        const bank = try self.splitBank(st.gl, st.overflow[0..st.groups], mlx.engine.stream());
+        const bank = try self.splitBank(st.gl, st.overflow[0..st.groups], s);
         p.ragged = bank;
         p.split = bank;
         return bank;

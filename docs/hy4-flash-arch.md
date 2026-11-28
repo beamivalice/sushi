@@ -251,9 +251,12 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     Hadamard-128 `W_o` prepare directly into the chunk's `W_o` buffer using a double-buffered `BM=64 x BN=128, BK=16,
     WM=2, WN=4` tile (256 threads, 32 barriers/TG, 2-pass `32x128` 8-SG parallel Hadamard-128 epilogue), warmed in
     `warmSpanTails` beside `hy4_chain.gatedPreparedInto`.
-  - The attention core of a wide span (more than 8 rows, on an M5) is `hy4_attn`, one launch a span on the matrix units
-    ([R5](#r5)): the scores over the 576-wide key row, the sink softmax in f32, the value sum over its first 512
-    channels. A decode row and a verify block (2..8 rows) never reach it: they keep the op chain's bytes.
+  - The attention core of a wide span (more than 8 rows) is `hy4_attn`, one launch a span on the matrix units
+    ([R5](#r5)): the NAX `matrix_g17` arm on M5+ and the `simdgroup_float8x8` (`V1-half`) arm on non-NAX M1–M4 GPUs.
+    It computes the scores over the 576-wide key row, the sink softmax in f32, and the value sum over the first 512
+    channels. A decode row and a verify block (2..8 rows) never reach it: they keep the op chain's bytes. At load,
+    `hy4_index.probeTopk` halves `sparse.topk_tg` and `pick_tg` where Metal caps a threadgroup below 1,024 threads
+    (e.g. M1/M2's 576 cap).
   - GLM's absorbed MLA (`glm5_attention.zig`) is the same math, but on MLX only.
 - **The composed forward's spans** (`hy4_model.layerFront`):
   - A chunk's attention runs in spans of `attn_span` (256) rows, `gathered_span` (32) on a sparse layer past its
@@ -437,6 +440,17 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     its cache lacks) to the bias row the launch reads (`fwd.cacheBiased`), in sigmoid units; on the tiny at 4 slots a
     layer it raises the decode's hit rate, and at n = 8 no decode route misses (`hy4_stq_test`). Lossy; KLD on the
     release pack not yet measured ([engine-expert-streaming](engine-expert-streaming.md#cache-bias)).
+  - **Streamed STQ pipelining and `--ssd-prefetch`** (`hy4_model.moeStqStreamed`, `expert_stream.zig`):
+    - Wide prefill chunks (`rows >= 512`) with a grouped union workspace overlap layer `l`'s SSD expert fills with GPU
+      attention/trunk via `startPrefillSplit` / `finishPrefillSplit`, waiting on the prior layer's `last_moe_acc` (or
+      pending readers) before reusing union slabs. Multi-group prefill routes mask out-of-group picks to sentinel
+      `rb.experts` so the sort/window/GEMM/combine/mid/reduce chain skips inactive slots.
+    - Decode and verify ticks submit `route(l)` first so `hostPicksAsync` overlaps with `lat_down` and `moeShared` on
+      the GPU; single-group decode skips zero-init/`putAlong` and defers slab release (`deferReader`) until the next
+      layer's readback or final readout.
+    - `--ssd-prefetch <0..100>` (`ExpertStreamTraits.prefetch = true`) predicts layer `l + prefetch_lead_rows` router
+      logits in pass 1 alongside `route(l)` and submits conservative `prefetch_m = 1` fills after `prepareRoute(l)` so
+      SSD prefetch overlaps with `routed(l)` and `Attention(l + 1)` without stalling `prefetchWait`.
   - The routed chain is the STQ rate-group chain with the clamped SwiGLU at 1536 × 1536, streamed through the expert
     cache from `--ssd-budget-gb` as DeepSeek's are ([engine-exl3-experts](engine-exl3-experts.md#rate-groups)). Both
     run tile-major: the resident bank is `raggedOwned(.pair_major)` and the stream's pools take the pack's tiles
@@ -1058,6 +1072,12 @@ seam is generalized first, as its own part, with every existing arch's bytes, bi
     the op chain, 9.5 in 256-row spans, 8.0 in one launch; gathered (32 heads, 2,048 picks a row) 55.4 for the chain
     with its gather in 32-row spans, 18.7 in 32-row spans and 16.8 in 256-row spans, reading the store at BF16 (read
     in the kernel from kv8 it took 34.8 to 41.3: a key row's dequantize costs more than its dot).
+  - Non-NAX (`M1`–`M4`) GPUs run the `simdgroup_float8x8` arm (`sushi_hy4_attn_simd_{range,picks}`, `V1-half`):
+    `NSG = L/32` simdgroups (16 SGs = 512 threads at `L = 512`), `HB = 16` heads, `KT = 16` keys, `DT = 4` (32 latent
+    cols/SG), rope folded into SGs `0..R/8-1` (zero idle rope SG during `PV`), bitwise BF16→F32 unpack, padded
+    `sp[NSG * 16 * 17]` (~18.4 KiB TG memory), and exact IEEE f32 `simdgroup_float8x8` MMA. On Apple M1 Max
+    (`sushi-ubench`), `sliding-512x512` runs in 8.62 ms (4.23 TF/s) vs 10.17 ms for the op chain (1.18x),
+    `sparse-dense-512` reaches 5.00 TF/s, and all 20/20 `hy4 attn` cells pass `f64` parity (`1.6e-7`–`3.2e-6` drift).
 - **Not a seam**:
   - The router (`moe.biasRouting` already takes an arch's numbers).
   - The rate-group chain (width and clamp are data).

@@ -3,8 +3,10 @@
 //! sum, one key a group of `IH` lanes (a head each, its dot over the channels in order) and the heads summed in order
 //! by the key's first lane: the bytes of the two rope launches and the score launch, with no rotated copy of the keys.
 const std = @import("std");
+const log = @import("../log.zig");
 const mlx = @import("../mlx.zig");
 const Arr = mlx.mlx_array;
+const Ops = @import("../mlx_ops.zig").Ops;
 const kcfg = @import("hy4_kcfg.zig");
 const sparse = @import("../sparse_select.zig");
 
@@ -569,10 +571,76 @@ pub fn wideScoresSg(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr, wscale: f32, p
     return out;
 }
 
+/// Probes `sparse.topk_tg` (shared with `sparse.topkIndices*`) and `pick_tg` (`sushi_hy4_index_pick`), halving each
+/// while Metal rejects the launch's threadgroup size on constrained GPUs (e.g. 576 cap on M1/M2).
+pub fn probeTopk(s: mlx.mlx_stream) !void {
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+    defer mlx.expected_refusal = null;
+    const widest = sparse.topk_tg;
+    const saved_pick_tg = pick_tg;
+    errdefer {
+        sparse.topk_tg = widest;
+        pick_tg = saved_pick_tg;
+    }
+    while (true) {
+        mlx.expected_refusal = if (sparse.topk_tg > 32) "Thread group size" else null;
+        probeSparseTopkOnce(s) catch |e| {
+            if (e != error.MlxError or sparse.topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            sparse.topk_tg /= 2;
+            continue;
+        };
+        if (sparse.topk_tg < widest) log.info("[hy4] top-k kernels run {d} threads a group on this GPU (widest {d})\n", .{ sparse.topk_tg, widest });
+        break;
+    }
+    var cur_pick = saved_pick_tg orelse sparse.topk_tg;
+    const pick_widest = cur_pick;
+    while (true) {
+        pick_tg = cur_pick;
+        mlx.expected_refusal = if (cur_pick > 32) "Thread group size" else null;
+        probePickOnce(s) catch |e| {
+            if (e != error.MlxError or cur_pick <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            cur_pick /= 2;
+            continue;
+        };
+        if (cur_pick < pick_widest) log.info("[hy4] index pick runs {d} threads a group on this GPU (widest {d})\n", .{ cur_pick, pick_widest });
+        if (cur_pick == sparse.topk_tg) pick_tg = null;
+        return;
+    }
+}
+
+fn probeSparseTopkOnce(s: mlx.mlx_stream) !void {
+    var o: Ops = .{ .s = s };
+    defer o.deinit();
+    const zeros: [64]f32 = @splat(0);
+    const x = try o.own(try mlx.newData(&zeros, &[_]c_int{ 1, 64 }, .float32));
+    const lens_v = [_]i32{64};
+    const lens = try o.own(try mlx.newData(&lens_v, &[_]c_int{ 1, 1 }, .int32));
+    const one = try o.own(try sparse.topkIndicesSplit(s, x, 4, 1));
+    const split = try o.own(try sparse.topkIndicesSplit(s, x, 4, 2));
+    const below = try o.own(try sparse.topkIndicesBelow(s, x, 1, 4, lens));
+    try mlx.check(mlx.mlx_array_eval(one));
+    try mlx.check(mlx.mlx_array_eval(split));
+    try mlx.check(mlx.mlx_array_eval(below));
+}
+
+fn probePickOnce(s: mlx.mlx_stream) !void {
+    var o: Ops = .{ .s = s };
+    defer o.deinit();
+    const zeros: [64]f32 = @splat(0);
+    const x = try o.own(try mlx.newData(&zeros, &[_]c_int{ 1, 64 }, .float32));
+    const p = try pick(s, x, 4, 0, 256, 4);
+    const pg = try o.own(p.groups);
+    const pr = try o.own(p.rows);
+    const pk = try o.own(p.keep);
+    try mlx.check(mlx.mlx_array_eval(pg));
+    try mlx.check(mlx.mlx_array_eval(pr));
+    try mlx.check(mlx.mlx_array_eval(pk));
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const Ops = @import("../mlx_ops.zig").Ops;
 const hy4_rope = @import("hy4_rope.zig");
 
 fn randomArr(o: *Ops, shape: []const c_int, seed: u64, sc: f64) !Arr {
@@ -775,4 +843,23 @@ test "hy4 index: simdgroup_float8x8 wide prefill scores match wideScores to f32 
         }
         try testing.expect(max_err < 1e-4);
     }
+}
+
+test "hy4 index: probeTopk succeeds on GPU and halves down from an oversized threadgroup width" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const saved_topk = sparse.topk_tg;
+    const saved_pick = pick_tg;
+    defer {
+        sparse.topk_tg = saved_topk;
+        pick_tg = saved_pick;
+    }
+    sparse.topk_tg = 2048;
+    pick_tg = 2048;
+    try probeTopk(es);
+    try testing.expect(sparse.topk_tg <= 1024 and sparse.topk_tg >= 32);
+    if (pick_tg) |pt| try testing.expect(pt <= 1024 and pt >= 32);
 }

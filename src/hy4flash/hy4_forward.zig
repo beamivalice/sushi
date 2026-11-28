@@ -630,11 +630,23 @@ pub fn moe(gpa: std.mem.Allocator, o: *Ops, x: Arr, w: Moe, g: MoeGeometry, at: 
 /// shape, made up in a dry recording: the resident route bounds the groups they make (`hy4_expert_mv.plan`). Without, a
 /// plain readback, which a dry recording refuses: a streamed route's groups follow the picks.
 pub fn hostPicks(gpa: std.mem.Allocator, o: *Ops, picks: Arr, result: ?u32) ![]u32 {
-    const c = try o.contiguous(try o.cast(picks, .int32));
+    const c = if (mlx.mlx_array_dtype(picks) == .uint32) try o.contiguous(picks) else try o.contiguous(try o.cast(picks, .uint32));
     try mlx.check(mlx.mlx_array_eval(c));
-    const raw = if (result) |experts| try mlx.hostResult(i32, c, experts) else (mlx.mlx_array_data_int32(c) orelse return error.HostRead)[0..mlx.mlx_array_size(c)];
+    const raw = if (result) |experts| try mlx.hostResult(u32, c, experts) else (mlx.mlx_array_data_uint32(c) orelse return error.HostRead)[0..mlx.mlx_array_size(c)];
     const out = try gpa.alloc(u32, raw.len);
-    for (raw, out) |v, *d| d.* = @intCast(v);
+    @memcpy(out, raw);
+    return out;
+}
+
+/// Like `hostPicks`, but reads contiguous `uint32` picks directly and waits only on the pass that wrote `picks`
+/// (`core.hostRead` via `mlx.hostResult`), skipping `evalPoint` (`syncState`) so later submitted GPU passes
+/// (e.g. `lat_down` + `moeShared`) run concurrently with host SSD fills.
+pub fn hostPicksAsync(gpa: std.mem.Allocator, o: *Ops, picks: Arr, result: ?u32) ![]u32 {
+    const c = if (mlx.mlx_array_dtype(picks) == .uint32) try o.contiguous(picks) else try o.contiguous(try o.cast(picks, .uint32));
+    if (!mlx.engine.isStream(o.s)) try mlx.check(mlx.mlx_array_eval(c));
+    const raw = if (result) |experts| try mlx.hostResult(u32, c, experts) else (mlx.mlx_array_data_uint32(c) orelse return error.HostRead)[0..mlx.mlx_array_size(c)];
+    const out = try gpa.alloc(u32, raw.len);
+    @memcpy(out, raw);
     return out;
 }
 
@@ -868,13 +880,17 @@ pub fn placeExperts(gpa: std.mem.Allocator, s: mlx.mlx_stream, placed: *Arr, lat
 /// `sum` [T, L] set to `value` [T, L] row by row (`ids` 0..T-1) and evaluated: on the engine in `sum`'s own bytes, so a
 /// `plan.choose` arm that writes it hands up nothing it made.
 pub fn landRows(o: *Ops, sum: *Arr, value: Arr, ids: []const u32) !void {
+    try landRowsAsync(o, sum, value, ids);
+    if (mlx.engine.isStream(o.s)) return mlx.check(mlx.mlx_array_eval(sum.*));
+}
+
+/// `landRows` without the synchronous GPU wait: safe when the caller defers releasing backing slabs until a downstream
+/// dependency (e.g. next layer's `hostPicks` or forward readout) synchronizes the stream.
+pub fn landRowsAsync(o: *Ops, sum: *Arr, value: Arr, ids: []const u32) !void {
     const t: c_int = @intCast(ids.len);
     const l = mlx.getShape(value)[1];
     const at = try o.broadcast(try o.reshape(try o.own(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{t}, 1, .uint32)), &.{ t, 1 }), &.{ t, l });
-    if (mlx.engine.isStream(o.s)) {
-        try mlx.engine.putAlongInPlace(sum.*, at, value, 0);
-        return mlx.check(mlx.mlx_array_eval(sum.*));
-    }
+    if (mlx.engine.isStream(o.s)) return mlx.engine.putAlongInPlace(sum.*, at, value, 0);
     const put = try o.slot();
     try mlx.check(mlx.mlx_put_along_axis(put, sum.*, at, value, 0, o.s));
     const next = try o.result(put.*);
