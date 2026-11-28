@@ -1992,3 +1992,1023 @@ test "stock metallib: shared SIMD FC specs resolve valid parameters, reject OOB,
     mtp_st_bad[5] = .{ .name = "SG", .value = .{ .int = 1 } }; // SPLIT=1 requires even SG >= 2
     try testing.expect(!catalog.resolve("mtp_serial_qmv8_rows_stream", &mtp_st_ins, &.{.bfloat16}, &mtp_st_bad, &res));
 }
+
+test "stock metallib: fused EXL3 FC resolution, slot disjointness, PSO headroom, and GPU bit-exact decode" {
+    try @import("../mlx.zig").requireGpu();
+    const dev = try metal.device();
+    const l = try lib(dev);
+    const names = try l.functionNames(testing.allocator);
+    defer {
+        for (names) |s| testing.allocator.free(s);
+        testing.allocator.free(names);
+    }
+    var have: std.StringHashMapUnmanaged(void) = .empty;
+    defer have.deinit(testing.allocator);
+    for (names) |s| try have.put(testing.allocator, s, {});
+    const catalog = @import("../metallib_catalog.zig");
+
+    const assertDisjointFcs = struct {
+        fn check(r: *const catalog.Resolved) !void {
+            for (1..r.n_ints) |i| try testing.expect(r.ints[i - 1].index < r.ints[i].index);
+            for (1..r.n_flags) |i| try testing.expect(r.flags[i - 1].index < r.flags[i].index);
+        }
+    }.check;
+    const specializeMaxThreads = struct {
+        fn run(d: *const metal.Device, lib_h: metal.Library, r: *const catalog.Resolved) !usize {
+            var fbuf: [512]u8 = undefined;
+            const fname = try std.fmt.bufPrintSentinel(&fbuf, "{s}", .{r.fnName()}, 0);
+            var flags: [catalog.max_fc_bools]metal.Flag = undefined;
+            for (r.flagSlice(), 0..) |f, i| flags[i] = .{ .index = f.index, .value = f.value };
+            var ints_fc: [catalog.max_fc_ints]metal.IntConstant = undefined;
+            for (r.intSlice(), 0..) |c, i| ints_fc[i] = .{ .index = c.index, .value = c.value };
+            const p = try d.pipelineOfConstants(lib_h, fname, flags[0..r.n_flags], ints_fc[0..r.n_ints]);
+            return p.max_threads;
+        }
+    }.run;
+
+    const has_nax = @import("sushi_exl3").device.current().has(.matrix_g17);
+    var res: catalog.Resolved = undefined;
+    var nbuf: [192]u8 = undefined;
+
+    // 1. Resolution + disjoint FC slots + live PSO headroom across all 4 (Part A, Part B) codebook pairings,
+    //    all SIMD modes (lane/one/shared_rows 2 & 3), snax (UNR 1 & 2), and rg_fold/gated_fold (affine & trellis).
+    const fz_down_ins = [_]catalog.RuntimeInput{
+        .{ .name = "middle", .dtype = .float16, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "slots", .dtype = .uint32, .scalar = false },
+        .{ .name = "meta", .dtype = .uint32, .scalar = false },
+        .{ .name = "s_x", .dtype = .float16, .scalar = false },
+        .{ .name = "s_trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "s_slots", .dtype = .uint32, .scalar = false },
+    };
+    const fz_down_snax_ins = [_]catalog.RuntimeInput{
+        .{ .name = "middle", .dtype = .float16, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "slots", .dtype = .uint32, .scalar = false },
+        .{ .name = "meta", .dtype = .uint32, .scalar = false },
+        .{ .name = "s_x", .dtype = .float16, .scalar = false },
+        .{ .name = "s_trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "s_svh", .dtype = .float16, .scalar = false },
+    };
+    const gated_down_ins = [_]catalog.RuntimeInput{
+        .{ .name = "ig", .dtype = .float32, .scalar = false },
+        .{ .name = "iu", .dtype = .float32, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "svhg", .dtype = .float16, .scalar = false },
+        .{ .name = "svhu", .dtype = .float16, .scalar = false },
+        .{ .name = "suhd", .dtype = .float16, .scalar = false },
+        .{ .name = "slots", .dtype = .uint32, .scalar = false },
+        .{ .name = "s_x", .dtype = .bfloat16, .scalar = false },
+        .{ .name = "s_w", .dtype = .uint32, .scalar = false },
+        .{ .name = "s_sc", .dtype = .bfloat16, .scalar = false },
+        .{ .name = "s_bi", .dtype = .bfloat16, .scalar = false },
+    };
+    const gated_down_tr_ins = [_]catalog.RuntimeInput{
+        .{ .name = "ig", .dtype = .float32, .scalar = false },
+        .{ .name = "iu", .dtype = .float32, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "svhg", .dtype = .float16, .scalar = false },
+        .{ .name = "svhu", .dtype = .float16, .scalar = false },
+        .{ .name = "suhd", .dtype = .float16, .scalar = false },
+        .{ .name = "slots", .dtype = .uint32, .scalar = false },
+        .{ .name = "s_x", .dtype = .bfloat16, .scalar = false },
+        .{ .name = "s_trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "s_suh", .dtype = .float16, .scalar = false },
+        .{ .name = "s_svh", .dtype = .float16, .scalar = false },
+        .{ .name = "s_g1", .dtype = .float32, .scalar = false },
+        .{ .name = "s_g1svh", .dtype = .float16, .scalar = false },
+        .{ .name = "s_sigmoid", .dtype = .bfloat16, .scalar = false },
+    };
+    const rg_down_tr_ins = [_]catalog.RuntimeInput{
+        .{ .name = "ig", .dtype = .float32, .scalar = false },
+        .{ .name = "iu", .dtype = .float32, .scalar = false },
+        .{ .name = "trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "svhg", .dtype = .float16, .scalar = false },
+        .{ .name = "svhu", .dtype = .float16, .scalar = false },
+        .{ .name = "suhd", .dtype = .float16, .scalar = false },
+        .{ .name = "slots", .dtype = .uint32, .scalar = false },
+        .{ .name = "meta", .dtype = .uint32, .scalar = false },
+        .{ .name = "s_x", .dtype = .bfloat16, .scalar = false },
+        .{ .name = "s_trellis", .dtype = .uint16, .scalar = false },
+        .{ .name = "s_suh", .dtype = .float16, .scalar = false },
+        .{ .name = "s_svh", .dtype = .float16, .scalar = false },
+        .{ .name = "s_g1", .dtype = .float32, .scalar = false },
+        .{ .name = "s_g1svh", .dtype = .float16, .scalar = false },
+        .{ .name = "s_sigmoid", .dtype = .bfloat16, .scalar = false },
+    };
+
+    const AbPair = struct { a_tag: []const u8, a_cls: []const u8, b_tag: []const u8, b_is_p1: bool, b_rates: []const i32 };
+    const ab_pairs = [_]AbPair{
+        // Include previously-unserved scalar rates (18, 34, 66, 98, 126) + boundary PAIR1 rates
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0_64x0", .b_tag = "spec1_w15", .b_is_p1 = false, .b_rates = &.{ 16, 18, 34, 64, 66, 80, 98, 126, 128 } },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0_64x0", .b_tag = "pair1_w16", .b_is_p1 = true, .b_rates = &.{ 24, 32, 42, 46, 56, 64 } },
+        .{ .a_tag = "pair1_w16", .a_cls = "24x0_32x0_40x0", .b_tag = "spec1_w15", .b_is_p1 = false, .b_rates = &.{ 16, 34, 64, 80, 96, 128 } },
+        .{ .a_tag = "pair1_w16", .a_cls = "24x0_32x0_40x0", .b_tag = "pair1_w16", .b_is_p1 = true, .b_rates = &.{ 24, 26, 32, 42, 46, 56, 64 } },
+    };
+
+    for (ab_pairs) |ab| {
+        const b_dig = if (ab.b_is_p1) "" else "_t37f72431";
+        for (ab.b_rates) |bn| {
+            // Check fz_down SIMD modes: lane, one, shared_rows(2), shared_rows(3)
+            for ([_]struct { suf: []const u8, sr: i32 }{
+                .{ .suf = "", .sr = 2 },
+                .{ .suf = "_one", .sr = 2 },
+                .{ .suf = "_shared_rows", .sr = 2 },
+                .{ .suf = "_shared_rows", .sr = 3 },
+            }) |m| {
+                const nm = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g0{s}_tm", .{ ab.a_tag, ab.b_tag, bn, b_dig, ab.a_cls, m.suf });
+                const targs = [_]catalog.RuntimeTarg{
+                    .{ .name = "OTPT", .value = .{ .int = 2 } },
+                    .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+                    .{ .name = "IDIM", .value = .{ .int = 2304 } },
+                    .{ .name = "ODIM", .value = .{ .int = 5120 } },
+                    .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+                    .{ .name = "S_IDIM", .value = .{ .int = 2304 } },
+                    .{ .name = "S_ODIM", .value = .{ .int = 5120 } },
+                    .{ .name = "S_NHW", .value = .{ .int = bn } },
+                    .{ .name = "S_ROWS", .value = .{ .int = 6 } },
+                    .{ .name = "S_SHARED_ROWS", .value = .{ .int = m.sr } },
+                    .{ .name = "FZ_AX", .value = .{ .int = 160 } },
+                    .{ .name = "FZ_AY", .value = .{ .int = 6 } },
+                    .{ .name = "FZ_BX", .value = .{ .int = 160 } },
+                    .{ .name = "FZ_BY", .value = .{ .int = 2 } },
+                    .{ .name = "FZ_NA", .value = .{ .int = 960 } },
+                    .{ .name = "FZ_NB", .value = .{ .int = 320 } },
+                    .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+                };
+                try testing.expect(catalog.resolve(nm, &fz_down_ins, &.{ .float16, .float16 }, &targs, &res));
+                try testing.expect(have.contains(res.fnName()));
+                try assertDisjointFcs(&res);
+                if (bn == ab.b_rates[0] or bn == 64 or bn == ab.b_rates[ab.b_rates.len - 1]) {
+                    try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
+                }
+            }
+
+            // Check fz_down_snax (UNR=1 & UNR=2) and rg_fold_down_tr + gated_fold_down_tr
+            if (has_nax) {
+                for ([_]i32{ 1, 2 }) |unr| {
+                    const nm = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g2_snax_tm", .{ ab.a_tag, ab.b_tag, bn, b_dig, ab.a_cls });
+                    const targs = [_]catalog.RuntimeTarg{
+                        .{ .name = "GROUP", .value = .{ .int = 2 } },
+                        .{ .name = "OTPT", .value = .{ .int = 2 } },
+                        .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+                        .{ .name = "IDIM", .value = .{ .int = 2304 } },
+                        .{ .name = "ODIM", .value = .{ .int = 5120 } },
+                        .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+                        .{ .name = "NSLOTS", .value = .{ .int = 36 } },
+                        .{ .name = "S_IDIM", .value = .{ .int = 2304 } },
+                        .{ .name = "S_ODIM", .value = .{ .int = 5120 } },
+                        .{ .name = "S_ROWS", .value = .{ .int = 6 } },
+                        .{ .name = "S_GROUPS", .value = .{ .int = 1 } },
+                        .{ .name = "S_TGRP", .value = .{ .int = 4 } },
+                        .{ .name = "S_KPH", .value = .{ .int = 1 } },
+                        .{ .name = "S_NSPLIT", .value = .{ .int = 2 } },
+                        .{ .name = "S_CHUNK", .value = .{ .int = 512 } },
+                        .{ .name = "S_FOLD", .value = .{ .int = 0 } },
+                        .{ .name = "S_NHW", .value = .{ .int = bn } },
+                        .{ .name = "S_SB1", .value = .{ .int = 5120 } },
+                        .{ .name = "S_SB2", .value = .{ .int = 5120 } },
+                        .{ .name = "S_SB3", .value = .{ .int = 5120 } },
+                        .{ .name = "S_UNR", .value = .{ .int = unr } },
+                        .{ .name = "S_R32", .value = .{ .int = 1 } },
+                        .{ .name = "S_SW", .value = .{ .int = 1 } },
+                        .{ .name = "FZ_AX", .value = .{ .int = 160 } },
+                        .{ .name = "FZ_AY", .value = .{ .int = 18 } },
+                        .{ .name = "FZ_BX", .value = .{ .int = 40 } },
+                        .{ .name = "FZ_BY", .value = .{ .int = 2 } },
+                        .{ .name = "FZ_NA", .value = .{ .int = 2880 } },
+                        .{ .name = "FZ_NB", .value = .{ .int = 80 } },
+                        .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+                    };
+                    try testing.expect(catalog.resolve(nm, &fz_down_snax_ins, &.{ .float16, .float32 }, &targs, &res));
+                    try testing.expect(have.contains(res.fnName()));
+                    try assertDisjointFcs(&res);
+                    if (bn == ab.b_rates[0] or bn == 64 or bn == ab.b_rates[ab.b_rates.len - 1]) {
+                        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
+                    }
+                }
+
+                // rg_fold_down_tr (mixed A + single-rate B)
+                {
+                    const nm = try std.fmt.bufPrint(&nbuf, "sushi_rg_fold_down_{s}_{s}_tm_tr_{s}_n{d}_{d}{s}", .{ ab.a_tag, ab.a_cls, ab.b_tag, bn, bn, b_dig });
+                    const targs = [_]catalog.RuntimeTarg{
+                        .{ .name = "OTPT", .value = .{ .int = 2 } },
+                        .{ .name = "NSPLIT", .value = .{ .int = 2 } },
+                        .{ .name = "IDIM", .value = .{ .int = 640 } },
+                        .{ .name = "ODIM", .value = .{ .int = 2560 } },
+                        .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+                        .{ .name = "S_IDIM", .value = .{ .int = 640 } },
+                        .{ .name = "S_ODIM", .value = .{ .int = 2560 } },
+                        .{ .name = "S_ROWS", .value = .{ .int = 4 } },
+                        .{ .name = "S_GROUPS", .value = .{ .int = 1 } },
+                        .{ .name = "S_TGRP", .value = .{ .int = 4 } },
+                        .{ .name = "S_KPH", .value = .{ .int = 1 } },
+                        .{ .name = "S_NSPLIT", .value = .{ .int = 2 } },
+                        .{ .name = "S_CHUNK", .value = .{ .int = 256 } },
+                        .{ .name = "S_FOLD", .value = .{ .int = 0 } },
+                        .{ .name = "S_NHW", .value = .{ .int = bn } },
+                        .{ .name = "S_SB1", .value = .{ .int = 2560 } },
+                        .{ .name = "S_SB2", .value = .{ .int = 2560 } },
+                        .{ .name = "S_SB3", .value = .{ .int = 2560 } },
+                        .{ .name = "S_UNR", .value = .{ .int = 2 } },
+                        .{ .name = "S_R32", .value = .{ .int = 1 } },
+                        .{ .name = "S_SW", .value = .{ .int = 1 } },
+                        .{ .name = "S_GNSPLIT", .value = .{ .int = 2 } },
+                        .{ .name = "S_GODIM", .value = .{ .int = 1280 } },
+                        .{ .name = "S_GWIDTH", .value = .{ .int = 640 } },
+                        .{ .name = "FZ_AX", .value = .{ .int = 80 } },
+                        .{ .name = "FZ_AY", .value = .{ .int = 10 } },
+                        .{ .name = "FZ_BX", .value = .{ .int = 20 } },
+                        .{ .name = "FZ_BY", .value = .{ .int = 2 } },
+                        .{ .name = "FZ_NA", .value = .{ .int = 800 } },
+                        .{ .name = "FZ_NB", .value = .{ .int = 40 } },
+                        .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+                    };
+                    try testing.expect(catalog.resolve(nm, &rg_down_tr_ins, &.{ .float16, .float32 }, &targs, &res));
+                    try testing.expect(have.contains(res.fnName()));
+                    try assertDisjointFcs(&res);
+                    if (bn == ab.b_rates[0] or bn == 64) {
+                        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
+                    }
+                }
+
+                // gated_fold_down_tr (single-rate A + single-rate B)
+                {
+                    const an: i32 = if (std.mem.startsWith(u8, ab.a_tag, "pair1")) 40 else 34;
+                    const nm = try std.fmt.bufPrint(&nbuf, "sushi_gated_fold_down_{s}_tr_{s}_n{d}_{d}{s}", .{ ab.a_tag, ab.b_tag, bn, bn, b_dig });
+                    const targs = [_]catalog.RuntimeTarg{
+                        .{ .name = "OTPT", .value = .{ .int = 2 } },
+                        .{ .name = "IDIM", .value = .{ .int = 640 } },
+                        .{ .name = "ODIM", .value = .{ .int = 2560 } },
+                        .{ .name = "NSPLIT", .value = .{ .int = 2 } },
+                        .{ .name = "NHW", .value = .{ .int = an } },
+                        .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+                        .{ .name = "S_IDIM", .value = .{ .int = 640 } },
+                        .{ .name = "S_ODIM", .value = .{ .int = 2560 } },
+                        .{ .name = "S_ROWS", .value = .{ .int = 4 } },
+                        .{ .name = "S_GROUPS", .value = .{ .int = 1 } },
+                        .{ .name = "S_TGRP", .value = .{ .int = 4 } },
+                        .{ .name = "S_KPH", .value = .{ .int = 1 } },
+                        .{ .name = "S_NSPLIT", .value = .{ .int = 2 } },
+                        .{ .name = "S_CHUNK", .value = .{ .int = 256 } },
+                        .{ .name = "S_FOLD", .value = .{ .int = 0 } },
+                        .{ .name = "S_NHW", .value = .{ .int = bn } },
+                        .{ .name = "S_SB1", .value = .{ .int = 2560 } },
+                        .{ .name = "S_SB2", .value = .{ .int = 2560 } },
+                        .{ .name = "S_SB3", .value = .{ .int = 2560 } },
+                        .{ .name = "S_UNR", .value = .{ .int = 2 } },
+                        .{ .name = "S_R32", .value = .{ .int = 1 } },
+                        .{ .name = "S_SW", .value = .{ .int = 1 } },
+                        .{ .name = "S_GNSPLIT", .value = .{ .int = 2 } },
+                        .{ .name = "S_GODIM", .value = .{ .int = 1280 } },
+                        .{ .name = "S_GWIDTH", .value = .{ .int = 640 } },
+                        .{ .name = "FZ_AX", .value = .{ .int = 80 } },
+                        .{ .name = "FZ_AY", .value = .{ .int = 10 } },
+                        .{ .name = "FZ_BX", .value = .{ .int = 20 } },
+                        .{ .name = "FZ_BY", .value = .{ .int = 2 } },
+                        .{ .name = "FZ_NA", .value = .{ .int = 800 } },
+                        .{ .name = "FZ_NB", .value = .{ .int = 40 } },
+                        .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+                    };
+                    try testing.expect(catalog.resolve(nm, &gated_down_tr_ins, &.{ .float16, .float32 }, &targs, &res));
+                    try testing.expect(have.contains(res.fnName()));
+                    try assertDisjointFcs(&res);
+                    if (bn == ab.b_rates[0] or bn == 64) {
+                        try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check gated_fold affine across previously-unserved scalar rate (n=34) and all 21 PAIR1 rates (24..64)
+    {
+        var p1_n: i32 = 24;
+        while (p1_n <= 64) : (p1_n += 2) {
+            const targs = [_]catalog.RuntimeTarg{
+                .{ .name = "OTPT", .value = .{ .int = 2 } },
+                .{ .name = "IDIM", .value = .{ .int = 640 } },
+                .{ .name = "ODIM", .value = .{ .int = 2560 } },
+                .{ .name = "NSPLIT", .value = .{ .int = 2 } },
+                .{ .name = "NHW", .value = .{ .int = p1_n } },
+                .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+                .{ .name = "S_K", .value = .{ .int = 640 } },
+                .{ .name = "S_N", .value = .{ .int = 2560 } },
+                .{ .name = "S_GS", .value = .{ .int = 64 } },
+                .{ .name = "S_FAST", .value = .{ .int = 1 } },
+                .{ .name = "FZ_AX", .value = .{ .int = 80 } },
+                .{ .name = "FZ_AY", .value = .{ .int = 10 } },
+                .{ .name = "FZ_BX", .value = .{ .int = 160 } },
+                .{ .name = "FZ_BY", .value = .{ .int = 1 } },
+                .{ .name = "FZ_NA", .value = .{ .int = 800 } },
+                .{ .name = "FZ_NB", .value = .{ .int = 160 } },
+                .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+            };
+            try testing.expect(catalog.resolve("sushi_gated_fold_down_pair1_w16", &gated_down_ins, &.{ .float16, .bfloat16 }, &targs, &res));
+            try testing.expect(have.contains(res.fnName()));
+            try assertDisjointFcs(&res);
+            if (p1_n == 24 or p1_n == 42 or p1_n == 56 or p1_n == 64) {
+                try testing.expect((try specializeMaxThreads(dev, l, &res)) >= 640);
+            }
+        }
+    }
+
+    // Negative guards: mismatched S_NHW, bad S_SHARED_ROWS, odd/OOB rates, out-of-table std1/spec1-w16 rates,
+    // codebook/digest mismatches, and SNAX geometry / TG SRAM overflow caps.
+    {
+        var bad_targs = [_]catalog.RuntimeTarg{
+            .{ .name = "OTPT", .value = .{ .int = 1 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "IDIM", .value = .{ .int = 128 } },
+            .{ .name = "ODIM", .value = .{ .int = 128 } },
+            .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+            .{ .name = "S_IDIM", .value = .{ .int = 128 } },
+            .{ .name = "S_ODIM", .value = .{ .int = 128 } },
+            .{ .name = "S_NHW", .value = .{ .int = 32 } },
+            .{ .name = "S_ROWS", .value = .{ .int = 6 } },
+            .{ .name = "S_SHARED_ROWS", .value = .{ .int = 2 } },
+            .{ .name = "FZ_AX", .value = .{ .int = 1 } },
+            .{ .name = "FZ_AY", .value = .{ .int = 1 } },
+            .{ .name = "FZ_BX", .value = .{ .int = 1 } },
+            .{ .name = "FZ_BY", .value = .{ .int = 1 } },
+            .{ .name = "FZ_NA", .value = .{ .int = 1 } },
+            .{ .name = "FZ_NB", .value = .{ .int = 1 } },
+            .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+        };
+        // S_NHW=32 mismatches name _n64
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_spair1_w16_n64_32x0_g0_shared_rows", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        // Bad S_SHARED_ROWS=4
+        bad_targs[7].value = .{ .int = 64 };
+        bad_targs[9].value = .{ .int = 4 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_spair1_w16_n64_32x0_g0_shared_rows", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        // Out-of-range PAIR1 rate n=66
+        bad_targs[7].value = .{ .int = 66 };
+        bad_targs[9].value = .{ .int = 2 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_spair1_w16_n66_32x0_g0_shared_rows", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        // Odd scalar rate n=33 and out-of-range scalar rates n=14, n=130
+        bad_targs[7].value = .{ .int = 33 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_smcg_w16_n33_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        bad_targs[7].value = .{ .int = 14 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_smcg_w16_n14_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        bad_targs[7].value = .{ .int = 130 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_smcg_w16_n130_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        // std1 (`c5dba171`) and spec1-w16 (`753ffa03`) only cover 24..64: reject out-of-table rates on Part B and Part A
+        bad_targs[7].value = .{ .int = 16 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_sstd1_w15_n16_tc5dba171_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_sspec1_w16_n16_t753ffa03_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        bad_targs[7].value = .{ .int = 66 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_sstd1_w15_n66_tc5dba171_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_sspec1_w16_n66_t753ffa03_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        bad_targs[7].value = .{ .int = 32 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_std1_w15_tc5dba171_smcg_w16_n32_16x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_std1_w15_tc5dba171_smcg_w16_n32_80x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_spec1_w16_t753ffa03_smcg_w16_n32_16x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_spec1_w16_t753ffa03_smcg_w16_n32_80x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        // Codebook/digest mismatches (spec1 + std1 digest, std1 + spec1 digest, spec1 + pair1 digest)
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_spec1_w15_tc5dba171_smcg_w16_n32_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_std1_w15_t37f72431_smcg_w16_n32_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_sspec1_w16_n32_tc089b4eb_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_sspec1_w15_n32_tc5dba171_32x0_g0", &fz_down_ins, &.{ .float16, .float16 }, &bad_targs, &res));
+
+        // SNAX geometry guards: S_ROWS=17, S_UNR=3, S_GROUPS=2 on fz_down_snax, and PREP_F TG overflow on fz_pair_snax / rg_fold_down_tr
+        var bad_snax = [_]catalog.RuntimeTarg{
+            .{ .name = "OTPT", .value = .{ .int = 1 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "IDIM", .value = .{ .int = 128 } },
+            .{ .name = "ODIM", .value = .{ .int = 128 } },
+            .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+            .{ .name = "S_IDIM", .value = .{ .int = 128 } },
+            .{ .name = "S_ODIM", .value = .{ .int = 128 } },
+            .{ .name = "S_ROWS", .value = .{ .int = 17 } },
+            .{ .name = "S_GROUPS", .value = .{ .int = 1 } },
+            .{ .name = "S_TGRP", .value = .{ .int = 4 } },
+            .{ .name = "S_KPH", .value = .{ .int = 1 } },
+            .{ .name = "S_NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "S_CHUNK", .value = .{ .int = 128 } },
+            .{ .name = "S_FOLD", .value = .{ .int = 0 } },
+            .{ .name = "S_NHW", .value = .{ .int = 32 } },
+            .{ .name = "S_SB1", .value = .{ .int = 128 } },
+            .{ .name = "S_SB2", .value = .{ .int = 128 } },
+            .{ .name = "S_SB3", .value = .{ .int = 128 } },
+            .{ .name = "S_UNR", .value = .{ .int = 2 } },
+            .{ .name = "S_R32", .value = .{ .int = 1 } },
+            .{ .name = "S_SW", .value = .{ .int = 1 } },
+            .{ .name = "FZ_AX", .value = .{ .int = 1 } },
+            .{ .name = "FZ_AY", .value = .{ .int = 1 } },
+            .{ .name = "FZ_BX", .value = .{ .int = 1 } },
+            .{ .name = "FZ_BY", .value = .{ .int = 1 } },
+            .{ .name = "FZ_NA", .value = .{ .int = 1 } },
+            .{ .name = "FZ_NB", .value = .{ .int = 1 } },
+            .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+        };
+        // S_ROWS=17 > ROW_CAP(16)
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_smcg_w16_n32_32x0_g0_snax", &fz_down_snax_ins, &.{ .float16, .float32 }, &bad_snax, &res));
+        // S_UNR=3 > 2
+        bad_snax[7].value = .{ .int = 16 };
+        bad_snax[18].value = .{ .int = 3 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_smcg_w16_n32_32x0_g0_snax", &fz_down_snax_ins, &.{ .float16, .float32 }, &bad_snax, &res));
+        // S_GROUPS=2 on fz_down_snax (ignored in ROWS_NAX_PREPPED_SOURCE)
+        bad_snax[18].value = .{ .int = 2 };
+        bad_snax[8].value = .{ .int = 2 };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_down_pair1_w16_smcg_w16_n32_32x0_g0_snax", &fz_down_snax_ins, &.{ .float16, .float32 }, &bad_snax, &res));
+        // PREP_F TG overflow (`S_ROWS * S_CHUNK = 16 * 512 = 8192 > 4096`) on fz_pair_snax
+        const fz_pair_snax_ins = [_]catalog.RuntimeInput{
+            .{ .name = "prep", .dtype = .float16, .scalar = false },
+            .{ .name = "tg", .dtype = .uint16, .scalar = false },
+            .{ .name = "tu", .dtype = .uint16, .scalar = false },
+            .{ .name = "slots", .dtype = .uint32, .scalar = false },
+            .{ .name = "meta", .dtype = .uint32, .scalar = false },
+            .{ .name = "s_x", .dtype = .bfloat16, .scalar = false },
+            .{ .name = "s_tg", .dtype = .uint16, .scalar = false },
+            .{ .name = "s_tu", .dtype = .uint16, .scalar = false },
+            .{ .name = "s_suhg", .dtype = .float16, .scalar = false },
+            .{ .name = "s_suhu", .dtype = .float16, .scalar = false },
+        };
+        const bad_pair_snax = [_]catalog.RuntimeTarg{
+            .{ .name = "OTPT", .value = .{ .int = 1 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "TOPK", .value = .{ .int = 1 } },
+            .{ .name = "IDIM", .value = .{ .int = 128 } },
+            .{ .name = "ODIM", .value = .{ .int = 128 } },
+            .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+            .{ .name = "S_IDIM", .value = .{ .int = 128 } },
+            .{ .name = "S_ODIM", .value = .{ .int = 128 } },
+            .{ .name = "S_ROWS", .value = .{ .int = 16 } },
+            .{ .name = "S_GROUPS", .value = .{ .int = 1 } },
+            .{ .name = "S_TGRP", .value = .{ .int = 4 } },
+            .{ .name = "S_KPH", .value = .{ .int = 1 } },
+            .{ .name = "S_NSPLIT", .value = .{ .int = 1 } },
+            .{ .name = "S_CHUNK", .value = .{ .int = 512 } },
+            .{ .name = "S_FOLD", .value = .{ .int = 0 } },
+            .{ .name = "S_NHW", .value = .{ .int = 32 } },
+            .{ .name = "S_SB1", .value = .{ .int = 128 } },
+            .{ .name = "S_SB2", .value = .{ .int = 128 } },
+            .{ .name = "S_SB3", .value = .{ .int = 128 } },
+            .{ .name = "S_UNR", .value = .{ .int = 2 } },
+            .{ .name = "S_R32", .value = .{ .int = 1 } },
+            .{ .name = "S_SW", .value = .{ .int = 1 } },
+            .{ .name = "FZ_AX", .value = .{ .int = 1 } },
+            .{ .name = "FZ_AY", .value = .{ .int = 1 } },
+            .{ .name = "FZ_BX", .value = .{ .int = 1 } },
+            .{ .name = "FZ_BY", .value = .{ .int = 1 } },
+            .{ .name = "FZ_NA", .value = .{ .int = 1 } },
+            .{ .name = "FZ_NB", .value = .{ .int = 1 } },
+            .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+        };
+        try testing.expect(!catalog.resolve("sushi_exl3_fz_pair_pair1_w16_smcg_w16_n32_32x32_g0_snax", &fz_pair_snax_ins, &.{ .float32, .float32, .float32, .float32 }, &bad_pair_snax, &res));
+        // PREP_F TG overflow on rg_fold_down_tr (`S_ROWS * S_CHUNK = 16 * 512 > 4096`)
+        const bad_rg_tr = [_]catalog.RuntimeTarg{
+            .{ .name = "OTPT", .value = .{ .int = 2 } },
+            .{ .name = "NSPLIT", .value = .{ .int = 2 } },
+            .{ .name = "IDIM", .value = .{ .int = 640 } },
+            .{ .name = "ODIM", .value = .{ .int = 2560 } },
+            .{ .name = "FUNNEL", .value = .{ .int = 1 } },
+            .{ .name = "S_IDIM", .value = .{ .int = 640 } },
+            .{ .name = "S_ODIM", .value = .{ .int = 2560 } },
+            .{ .name = "S_ROWS", .value = .{ .int = 16 } },
+            .{ .name = "S_GROUPS", .value = .{ .int = 1 } },
+            .{ .name = "S_TGRP", .value = .{ .int = 4 } },
+            .{ .name = "S_KPH", .value = .{ .int = 1 } },
+            .{ .name = "S_NSPLIT", .value = .{ .int = 2 } },
+            .{ .name = "S_CHUNK", .value = .{ .int = 512 } },
+            .{ .name = "S_FOLD", .value = .{ .int = 0 } },
+            .{ .name = "S_NHW", .value = .{ .int = 32 } },
+            .{ .name = "S_SB1", .value = .{ .int = 2560 } },
+            .{ .name = "S_SB2", .value = .{ .int = 2560 } },
+            .{ .name = "S_SB3", .value = .{ .int = 2560 } },
+            .{ .name = "S_UNR", .value = .{ .int = 2 } },
+            .{ .name = "S_R32", .value = .{ .int = 1 } },
+            .{ .name = "S_SW", .value = .{ .int = 1 } },
+            .{ .name = "S_GNSPLIT", .value = .{ .int = 2 } },
+            .{ .name = "S_GODIM", .value = .{ .int = 1280 } },
+            .{ .name = "S_GWIDTH", .value = .{ .int = 640 } },
+            .{ .name = "FZ_AX", .value = .{ .int = 80 } },
+            .{ .name = "FZ_AY", .value = .{ .int = 10 } },
+            .{ .name = "FZ_BX", .value = .{ .int = 20 } },
+            .{ .name = "FZ_BY", .value = .{ .int = 2 } },
+            .{ .name = "FZ_NA", .value = .{ .int = 800 } },
+            .{ .name = "FZ_NB", .value = .{ .int = 40 } },
+            .{ .name = "FZ_B_FIRST", .value = .{ .int = 0 } },
+        };
+        try testing.expect(!catalog.resolve("sushi_rg_fold_down_pair1_w16_32x0_tr_mcg_w16_n32_32", &rg_down_tr_ins, &.{ .float16, .float32 }, &bad_rg_tr, &res));
+    }
+
+    // 2. Live GPU bit-for-bit decode verification on converted fused Part B (SIMD lane/one/shared_rows + NAX snax)
+    //    and single-rate Part A (`gated_fold_down`).
+    const kernel_mod = @import("kernel.zig");
+    const exl3_mod = @import("sushi_exl3");
+    const format = exl3_mod.format;
+
+    // Lane-ordered [16, 128] identity prefix: row r places 1.0h at `lane_slot(r)` in k-tile 0.
+    var lane_eye128: [16 * 128]u16 = @splat(0);
+    var plain_eye128: [16 * 128]u16 = @splat(0);
+    for (0..16) |r| {
+        const half_i = r >> 3;
+        const q = (r & 7) >> 1;
+        const p = r & 1;
+        lane_eye128[r * 128 + q * 4 + half_i * 2 + p] = 0x3C00; // 1.0h
+        plain_eye128[r * 128 + r] = 0x3C00; // 1.0h
+    }
+    const x_lane16 = try core.fromHost(std.mem.sliceAsBytes(&lane_eye128), .float16, &.{ 16, 128 });
+    defer core.release(x_lane16);
+    const x_lane6 = try core.fromHost(std.mem.sliceAsBytes(lane_eye128[0 .. 6 * 128]), .float16, &.{ 6, 128 });
+    defer core.release(x_lane6);
+    const x_lane1 = try core.fromHost(std.mem.sliceAsBytes(lane_eye128[0..128]), .float16, &.{ 1, 128 });
+    defer core.release(x_lane1);
+    const x_plain16 = try core.fromHost(std.mem.sliceAsBytes(&plain_eye128), .float16, &.{ 16, 128 });
+    defer core.release(x_plain16);
+
+    const zeros16_u32: [16]u32 = @splat(0);
+    const slots16_t = try core.fromHost(std.mem.sliceAsBytes(&zeros16_u32), .uint32, &.{16});
+    defer core.release(slots16_t);
+    const meta_dummy_t = try core.fromHost(std.mem.sliceAsBytes(&zeros16_u32), .uint32, &.{16});
+    defer core.release(meta_dummy_t);
+    const ones128_f16: [128]u16 = @splat(0x3C00);
+    const svh128_t = try core.fromHost(std.mem.sliceAsBytes(&ones128_f16), .float16, &.{128});
+    defer core.release(svh128_t);
+
+    const readU16 = struct {
+        fn f(t: *const Tensor) ![]const u16 {
+            const b = try core.hostRead(t);
+            return std.mem.bytesAsSlice(u16, @as([]align(2) const u8, @alignCast(b)));
+        }
+    }.f;
+    const readF32 = struct {
+        fn f(t: *const Tensor) ![]const f32 {
+            const b = try core.hostRead(t);
+            return std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(b)));
+        }
+    }.f;
+
+    var prng = std.Random.DefaultPrng.init(0xF2_E413_01);
+    const rnd = prng.random();
+    var tr_buf: [64 * 128]u16 = undefined;
+    var want_tiles: [8][format.TILE_VALUES]u16 = undefined;
+    const fz_in_names = &[_][]const u8{ "middle", "trellis", "slots", "meta", "s_x", "s_trellis", "s_slots" };
+    const fz_snax_in_names = &[_][]const u8{ "middle", "trellis", "slots", "meta", "s_x", "s_trellis", "s_svh" };
+
+    const FzCase = struct { a_tag: []const u8, a_cls: []const u8, b_tag: []const u8, b_dig: []const u8, dec: format.Decode, rates: []const u32 };
+    const fz_cases = [_]FzCase{
+        // All 4 (Part A, Part B) pairings (`ap1_bsc`, `asc_bp1`, `asc_bsc`, `ap1_bp1`) and all 6 Part B codebooks.
+        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "spec1_w15", .b_dig = "_t37f72431", .dec = format.Decode.tabled(.spec1, .w15), .rates = &.{ 16, 34, 56, 64, 80, 96, 128 } },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "pair1_w16", .b_dig = "", .dec = .{ .codebook = .pair1, .window = .w16 }, .rates = &.{ 24, 32, 42, 46, 56, 64 } },
+        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "mcg_w16", .b_dig = "", .dec = .{ .codebook = .mcg, .window = .w16 }, .rates = &.{ 16, 48, 64, 128 } },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "mul1_w16", .b_dig = "", .dec = .{ .codebook = .mul1, .window = .w16 }, .rates = &.{ 16, 64 } },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "alpha_w16", .b_dig = "", .dec = .{ .codebook = .alpha, .window = .w16 }, .rates = &.{ 32, 80 } },
+        .{ .a_tag = "spec1_w15_t37f72431", .a_cls = "32x0", .b_tag = "std1_w15", .b_dig = "_tc5dba171", .dec = format.Decode.tabled(.std1, .w15), .rates = &.{ 24, 64 } },
+        .{ .a_tag = "pair1_w16", .a_cls = "32x0", .b_tag = "pair1_w16", .b_dig = "", .dec = .{ .codebook = .pair1, .window = .w16 }, .rates = &.{ 24, 42, 64 } },
+    };
+
+    for (fz_cases) |fc| {
+        for (fc.rates) |n| {
+            const rate: format.Rate = .{ .n = n };
+            const n_c: c_int = @intCast(n);
+            const slice_8 = tr_buf[0 .. 8 * n];
+            for (slice_8) |*w| w.* = rnd.int(u16);
+            for (0..8) |ti| format.decodeTile(slice_8[ti * n .. (ti + 1) * n], rate, fc.dec, &want_tiles[ti]);
+
+            // Layout [1, IT=8, OT=1, n] for lane / shared_rows (k=0..7, tile 0 = want_tiles[0])
+            const tr_1 = try core.fromHost(std.mem.sliceAsBytes(slice_8), .uint16, &.{ 1, 8, 1, n_c });
+            defer core.release(tr_1);
+            // Layout [1, IT=8, OT=2, n] for _one (k=0 has tile 0 = want_tiles[0] and tile 1 = want_tiles[1])
+            const slice_16 = tr_buf[0 .. 16 * n];
+            for (slice_16[8 * n ..]) |*w| w.* = 0;
+            const tr_2 = try core.fromHost(std.mem.sliceAsBytes(slice_16), .uint16, &.{ 1, 8, 2, n_c });
+            defer core.release(tr_2);
+
+            // (a) Part B `_lane` (FC_I34 = 0)
+            {
+                const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g0", .{ fc.a_tag, fc.b_tag, n, fc.b_dig, fc.a_cls });
+                const def = try kernel_mod.Def.create(kn, fz_in_names, &.{ "y", "s_y" }, "", "", true, false);
+                var cfg: kernel_mod.Config = .{ .grid = .{ 16 * 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                try cfg.addOutput(&.{ 1, 16 }, .float16);
+                try cfg.addOutput(&.{ 16, 16 }, .float16);
+                try cfg.addTemplate("OTPT", .{ .int = 1 });
+                try cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                try cfg.addTemplate("IDIM", .{ .int = 128 });
+                try cfg.addTemplate("ODIM", .{ .int = 16 });
+                try cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                try cfg.addTemplate("S_IDIM", .{ .int = 128 });
+                try cfg.addTemplate("S_ODIM", .{ .int = 16 });
+                try cfg.addTemplate("S_NHW", .{ .int = n_c });
+                try cfg.addTemplate("S_ROWS", .{ .int = 16 });
+                try cfg.addTemplate("S_SHARED_ROWS", .{ .int = 2 });
+                try cfg.addTemplate("FZ_AX", .{ .int = 1 });
+                try cfg.addTemplate("FZ_AY", .{ .int = 1 });
+                try cfg.addTemplate("FZ_BX", .{ .int = 1 });
+                try cfg.addTemplate("FZ_BY", .{ .int = 16 });
+                try cfg.addTemplate("FZ_NA", .{ .int = 0 });
+                try cfg.addTemplate("FZ_NB", .{ .int = 16 });
+                try cfg.addTemplate("FZ_B_FIRST", .{ .int = 1 });
+                var outs: [2]*Tensor = undefined;
+                try kernel_mod.launch(def, &.{ x_lane16, tr_1, slots16_t, meta_dummy_t, x_lane16, tr_1, slots16_t }, &cfg, &outs);
+                defer core.release(outs[0]);
+                defer core.release(outs[1]);
+                const got = try readU16(outs[1]);
+                try testing.expectEqualSlices(u16, &want_tiles[0], got);
+            }
+
+            // (b) Part B `_one` (FC_I34 = 1): 1 row × 2 output tiles (32 cols)
+            {
+                const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g0_one", .{ fc.a_tag, fc.b_tag, n, fc.b_dig, fc.a_cls });
+                const def = try kernel_mod.Def.create(kn, fz_in_names, &.{ "y", "s_y" }, "", "", true, false);
+                var cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                try cfg.addOutput(&.{ 1, 16 }, .float16);
+                try cfg.addOutput(&.{ 1, 32 }, .float16);
+                try cfg.addTemplate("OTPT", .{ .int = 1 });
+                try cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                try cfg.addTemplate("IDIM", .{ .int = 128 });
+                try cfg.addTemplate("ODIM", .{ .int = 16 });
+                try cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                try cfg.addTemplate("S_IDIM", .{ .int = 128 });
+                try cfg.addTemplate("S_ODIM", .{ .int = 32 });
+                try cfg.addTemplate("S_NHW", .{ .int = n_c });
+                try cfg.addTemplate("S_ROWS", .{ .int = 1 });
+                try cfg.addTemplate("S_SHARED_ROWS", .{ .int = 2 });
+                try cfg.addTemplate("FZ_AX", .{ .int = 1 });
+                try cfg.addTemplate("FZ_AY", .{ .int = 1 });
+                try cfg.addTemplate("FZ_BX", .{ .int = 1 });
+                try cfg.addTemplate("FZ_BY", .{ .int = 1 });
+                try cfg.addTemplate("FZ_NA", .{ .int = 0 });
+                try cfg.addTemplate("FZ_NB", .{ .int = 1 });
+                try cfg.addTemplate("FZ_B_FIRST", .{ .int = 1 });
+                var outs: [2]*Tensor = undefined;
+                try kernel_mod.launch(def, &.{ x_lane1, tr_2, slots16_t, meta_dummy_t, x_lane1, tr_2, slots16_t }, &cfg, &outs);
+                defer core.release(outs[0]);
+                defer core.release(outs[1]);
+                const got = try readU16(outs[1]);
+                try testing.expectEqualSlices(u16, want_tiles[0][0..16], got[0..16]);
+                try testing.expectEqualSlices(u16, want_tiles[1][0..16], got[16..32]);
+            }
+
+            // (c) Part B `_shared_rows` for both S_SHARED_ROWS=2 (FC_I34=2) and S_SHARED_ROWS=3 (FC_I34=3)
+            for ([_]struct { sr: i32, by: i32 }{ .{ .sr = 2, .by = 3 }, .{ .sr = 3, .by = 2 } }) |sr| {
+                const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g0_shared_rows", .{ fc.a_tag, fc.b_tag, n, fc.b_dig, fc.a_cls });
+                const def = try kernel_mod.Def.create(kn, fz_in_names, &.{ "y", "s_y" }, "", "", true, false);
+                var cfg: kernel_mod.Config = .{ .grid = .{ sr.by * 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                try cfg.addOutput(&.{ 1, 16 }, .float16);
+                try cfg.addOutput(&.{ 6, 16 }, .float16);
+                try cfg.addTemplate("OTPT", .{ .int = 1 });
+                try cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                try cfg.addTemplate("IDIM", .{ .int = 128 });
+                try cfg.addTemplate("ODIM", .{ .int = 16 });
+                try cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                try cfg.addTemplate("S_IDIM", .{ .int = 128 });
+                try cfg.addTemplate("S_ODIM", .{ .int = 16 });
+                try cfg.addTemplate("S_NHW", .{ .int = n_c });
+                try cfg.addTemplate("S_ROWS", .{ .int = 6 });
+                try cfg.addTemplate("S_SHARED_ROWS", .{ .int = sr.sr });
+                try cfg.addTemplate("FZ_AX", .{ .int = 1 });
+                try cfg.addTemplate("FZ_AY", .{ .int = 1 });
+                try cfg.addTemplate("FZ_BX", .{ .int = 1 });
+                try cfg.addTemplate("FZ_BY", .{ .int = sr.by });
+                try cfg.addTemplate("FZ_NA", .{ .int = 0 });
+                try cfg.addTemplate("FZ_NB", .{ .int = sr.by });
+                try cfg.addTemplate("FZ_B_FIRST", .{ .int = 1 });
+                var outs: [2]*Tensor = undefined;
+                try kernel_mod.launch(def, &.{ x_lane6, tr_1, slots16_t, meta_dummy_t, x_lane6, tr_1, slots16_t }, &cfg, &outs);
+                defer core.release(outs[0]);
+                defer core.release(outs[1]);
+                const got = try readU16(outs[1]);
+                try testing.expectEqualSlices(u16, want_tiles[0][0 .. 6 * 16], got);
+            }
+
+            // (d) Part B `_snax` (`exl3_fz_nax`, both S_UNR=1 and S_UNR=2): 16×128 NAX decode matches host bit-for-bit
+            if (has_nax) {
+                const slice_64 = tr_buf[0 .. 64 * n];
+                for (slice_64[8 * n ..]) |*w| w.* = 0;
+                const tr_nax = try core.fromHost(std.mem.sliceAsBytes(slice_64), .uint16, &.{ 8, 8, n_c });
+                defer core.release(tr_nax);
+                for ([_]i32{ 1, 2 }) |unr| {
+                    const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{s}_g0_snax", .{ fc.a_tag, fc.b_tag, n, fc.b_dig, fc.a_cls });
+                    const def = try kernel_mod.Def.create(kn, fz_snax_in_names, &.{ "y", "s_y" }, "", "", true, false);
+                    var cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                    try cfg.addOutput(&.{ 1, 16 }, .float16);
+                    try cfg.addOutput(&.{ 16, 128 }, .float32);
+                    try cfg.addTemplate("OTPT", .{ .int = 1 });
+                    try cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                    try cfg.addTemplate("IDIM", .{ .int = 128 });
+                    try cfg.addTemplate("ODIM", .{ .int = 16 });
+                    try cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                    try cfg.addTemplate("S_IDIM", .{ .int = 128 });
+                    try cfg.addTemplate("S_ODIM", .{ .int = 128 });
+                    try cfg.addTemplate("S_ROWS", .{ .int = 16 });
+                    try cfg.addTemplate("S_GROUPS", .{ .int = 1 });
+                    try cfg.addTemplate("S_TGRP", .{ .int = 4 });
+                    try cfg.addTemplate("S_KPH", .{ .int = 1 });
+                    try cfg.addTemplate("S_NSPLIT", .{ .int = 1 });
+                    try cfg.addTemplate("S_CHUNK", .{ .int = 128 });
+                    try cfg.addTemplate("S_FOLD", .{ .int = 0 });
+                    try cfg.addTemplate("S_NHW", .{ .int = n_c });
+                    try cfg.addTemplate("S_SB1", .{ .int = 128 });
+                    try cfg.addTemplate("S_SB2", .{ .int = 128 });
+                    try cfg.addTemplate("S_SB3", .{ .int = 128 });
+                    try cfg.addTemplate("S_UNR", .{ .int = unr });
+                    try cfg.addTemplate("S_R32", .{ .int = 1 });
+                    try cfg.addTemplate("S_SW", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_AX", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_AY", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_BX", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_BY", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_NA", .{ .int = 0 });
+                    try cfg.addTemplate("FZ_NB", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_B_FIRST", .{ .int = 1 });
+                    var outs: [2]*Tensor = undefined;
+                    try kernel_mod.launch(def, &.{ x_plain16, tr_1, slots16_t, meta_dummy_t, x_plain16, tr_nax, svh128_t }, &cfg, &outs);
+                    defer core.release(outs[0]);
+                    defer core.release(outs[1]);
+                    const got = try readF32(outs[1]);
+                    for (0..16) |r| {
+                        for (0..8) |ti| {
+                            for (0..16) |c| {
+                                const want_f: f32 = @floatCast(@as(f16, @bitCast(want_tiles[ti][r * 16 + c])));
+                                try testing.expectEqual(want_f, got[r * 128 + ti * 16 + c]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // (e) Part A single-rate `FC_NHW` (`sushi_gated_fold_down`) matches standalone `sushi_exl3_k4_down_fused` bit-for-bit
+    //     across both scalar (`spec1`) and `pair1` (direct `fc_pair1_*` constants).
+    {
+        var ig_buf: [128]f32 = undefined;
+        var iu_buf: [128]f32 = undefined;
+        for (&ig_buf, &iu_buf) |*g, *u| {
+            g.* = (rnd.float(f32) - 0.5) * 2.0;
+            u.* = (rnd.float(f32) - 0.5) * 2.0;
+        }
+        const ig_t = try core.fromHost(std.mem.sliceAsBytes(&ig_buf), .float32, &.{ 1, 128 });
+        defer core.release(ig_t);
+        const iu_t = try core.fromHost(std.mem.sliceAsBytes(&iu_buf), .float32, &.{ 1, 128 });
+        defer core.release(iu_t);
+        const slot1_t = try core.fromHost(std.mem.sliceAsBytes(&[_]u32{0}), .uint32, &.{1});
+        defer core.release(slot1_t);
+        const bf_dummy: [16]u16 = @splat(0);
+        const bf_t = try core.fromHost(std.mem.sliceAsBytes(&bf_dummy), .bfloat16, &.{16});
+        defer core.release(bf_t);
+        const gf_in_names = &[_][]const u8{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots", "s_x", "s_w", "s_sc", "s_bi" };
+        const df_in_names = &[_][]const u8{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" };
+
+        const GfCase = struct { df_suf: []const u8, gf_tag: []const u8, rates: []const u32 };
+        for ([_]GfCase{
+            .{ .df_suf = "_spec1_w15_t37f72431", .gf_tag = "spec1_w15_t37f72431", .rates = &.{ 16, 34, 64, 96, 128 } },
+            .{ .df_suf = "_pair1", .gf_tag = "pair1_w16", .rates = &.{ 24, 32, 42, 46, 56, 64 } },
+        }) |gc| {
+            const df_def = try kernel_mod.Def.create(try std.fmt.bufPrint(&nbuf, "sushi_exl3_k4_down_fused{s}", .{gc.df_suf}), df_in_names, &.{"y"}, "", "", true, false);
+            var nbuf2: [128]u8 = undefined;
+            const gf_def = try kernel_mod.Def.create(try std.fmt.bufPrint(&nbuf2, "sushi_gated_fold_down_{s}", .{gc.gf_tag}), gf_in_names, &.{ "y", "s_y" }, "", "", true, false);
+            for (gc.rates) |n| {
+                const n_c: c_int = @intCast(n);
+                const slice = tr_buf[0 .. 8 * n];
+                for (slice) |*w| w.* = rnd.int(u16);
+                const tr_t = try core.fromHost(std.mem.sliceAsBytes(slice), .uint16, &.{ 1, 8, 1, n_c });
+                defer core.release(tr_t);
+
+                var df_cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                try df_cfg.addOutput(&.{ 1, 16 }, .float16);
+                try df_cfg.addTemplate("OTPT", .{ .int = 1 });
+                try df_cfg.addTemplate("IDIM", .{ .int = 128 });
+                try df_cfg.addTemplate("ODIM", .{ .int = 16 });
+                try df_cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                try df_cfg.addTemplate("NHW", .{ .int = n_c });
+                try df_cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                var df_out: [1]*Tensor = undefined;
+                try kernel_mod.launch(df_def, &.{ ig_t, iu_t, tr_t, svh128_t, svh128_t, svh128_t, slot1_t }, &df_cfg, &df_out);
+                defer core.release(df_out[0]);
+
+                var gf_cfg: kernel_mod.Config = .{ .grid = .{ 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                try gf_cfg.addOutput(&.{ 1, 16 }, .float16);
+                try gf_cfg.addOutput(&.{ 1, 16 }, .bfloat16);
+                try gf_cfg.addTemplate("OTPT", .{ .int = 1 });
+                try gf_cfg.addTemplate("IDIM", .{ .int = 128 });
+                try gf_cfg.addTemplate("ODIM", .{ .int = 16 });
+                try gf_cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                try gf_cfg.addTemplate("NHW", .{ .int = n_c });
+                try gf_cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                try gf_cfg.addTemplate("S_K", .{ .int = 128 });
+                try gf_cfg.addTemplate("S_N", .{ .int = 16 });
+                try gf_cfg.addTemplate("S_GS", .{ .int = 64 });
+                try gf_cfg.addTemplate("S_FAST", .{ .int = 0 });
+                try gf_cfg.addTemplate("FZ_AX", .{ .int = 1 });
+                try gf_cfg.addTemplate("FZ_AY", .{ .int = 1 });
+                try gf_cfg.addTemplate("FZ_BX", .{ .int = 1 });
+                try gf_cfg.addTemplate("FZ_BY", .{ .int = 1 });
+                try gf_cfg.addTemplate("FZ_NA", .{ .int = 1 });
+                try gf_cfg.addTemplate("FZ_NB", .{ .int = 0 });
+                try gf_cfg.addTemplate("FZ_B_FIRST", .{ .int = 0 });
+                var gf_out: [2]*Tensor = undefined;
+                try kernel_mod.launch(gf_def, &.{ ig_t, iu_t, tr_t, svh128_t, svh128_t, svh128_t, slot1_t, bf_t, slots16_t, bf_t, bf_t }, &gf_cfg, &gf_out);
+                defer core.release(gf_out[0]);
+                defer core.release(gf_out[1]);
+
+                const want_u16 = try readU16(df_out[0]);
+                const got_u16 = try readU16(gf_out[0]);
+                try testing.expectEqualSlices(u16, want_u16, got_u16);
+            }
+        }
+    }
+
+    // (f) Simultaneous Part A + Part B (`FZ_NA > 0 && FZ_NB > 0`) live GPU bit-exact decode on BOTH
+    //     cross-pairings (`ap1_bsc` and `asc_bp1`) for `fz_down` (SIMD), `fz_down_snax` (NAX), and `fz_pair` (SIMD),
+    //     proving zero Part A / Part B FC or `EXL3_LANE_FIRST` / `FC_B15` cross-contamination in the same dispatch.
+    {
+        var prep_lane32: [32 * 128]u16 = @splat(0);
+        for (0..16) |r| {
+            @memcpy(prep_lane32[(2 * r) * 128 .. (2 * r + 1) * 128], lane_eye128[r * 128 .. (r + 1) * 128]);
+            @memcpy(prep_lane32[(2 * r + 1) * 128 .. (2 * r + 2) * 128], lane_eye128[r * 128 .. (r + 1) * 128]);
+        }
+        const prep_lane32_t = try core.fromHost(std.mem.sliceAsBytes(&prep_lane32), .float16, &.{ 32, 128 });
+        defer core.release(prep_lane32_t);
+
+        const CrossCase = struct {
+            a_tag: []const u8,
+            a_dec: format.Decode,
+            a_n_g: u32,
+            a_n_u: u32,
+            b_tag: []const u8,
+            b_dig: []const u8,
+            b_dec: format.Decode,
+            b_n: u32,
+        };
+        const cross_cases = [_]CrossCase{
+            // Part A = PAIR1 (`EXL3_LANE_FIRST=1`), Part B = scalar (`FC_B15=false`)
+            .{ .a_tag = "pair1_w16", .a_dec = .{ .codebook = .pair1, .window = .w16 }, .a_n_g = 40, .a_n_u = 56, .b_tag = "spec1_w15", .b_dig = "_t37f72431", .b_dec = format.Decode.tabled(.spec1, .w15), .b_n = 34 },
+            // Part A = scalar (`EXL3_LANE_FIRST=0`), Part B = PAIR1 (`FC_B15=true`)
+            .{ .a_tag = "spec1_w15_t37f72431", .a_dec = format.Decode.tabled(.spec1, .w15), .a_n_g = 34, .a_n_u = 80, .b_tag = "pair1_w16", .b_dig = "", .b_dec = .{ .codebook = .pair1, .window = .w16 }, .b_n = 42 },
+        };
+        const fz_pair_in_names = &[_][]const u8{ "prep", "tg", "tu", "slots", "meta", "s_xg", "s_xu", "s_tg", "s_tu", "s_slots" };
+
+        var tr_ag_buf: [8 * 128]u16 = undefined;
+        var tr_au_buf: [8 * 128]u16 = undefined;
+        var tr_bg_buf: [64 * 128]u16 = undefined;
+        var tr_bu_buf: [8 * 128]u16 = undefined;
+        var want_ag: [format.TILE_VALUES]u16 = undefined;
+        var want_au: [format.TILE_VALUES]u16 = undefined;
+        var want_bg: [8][format.TILE_VALUES]u16 = undefined;
+        var want_bu: [format.TILE_VALUES]u16 = undefined;
+
+        for (cross_cases) |cc| {
+            const ag_slice = tr_ag_buf[0 .. 8 * cc.a_n_g];
+            const au_slice = tr_au_buf[0 .. 8 * cc.a_n_u];
+            const bg_slice = tr_bg_buf[0 .. 8 * cc.b_n];
+            const bu_slice = tr_bu_buf[0 .. 8 * cc.b_n];
+            for (ag_slice) |*w| w.* = rnd.int(u16);
+            for (au_slice) |*w| w.* = rnd.int(u16);
+            for (bg_slice) |*w| w.* = rnd.int(u16);
+            for (bu_slice) |*w| w.* = rnd.int(u16);
+
+            format.decodeTile(ag_slice[0..cc.a_n_g], .{ .n = cc.a_n_g }, cc.a_dec, &want_ag);
+            format.decodeTile(au_slice[0..cc.a_n_u], .{ .n = cc.a_n_u }, cc.a_dec, &want_au);
+            for (0..8) |ti| format.decodeTile(bg_slice[ti * cc.b_n .. (ti + 1) * cc.b_n], .{ .n = cc.b_n }, cc.b_dec, &want_bg[ti]);
+            format.decodeTile(bu_slice[0..cc.b_n], .{ .n = cc.b_n }, cc.b_dec, &want_bu);
+
+            const tr_ag = try core.fromHost(std.mem.sliceAsBytes(ag_slice), .uint16, &.{ 1, 8, 1, @as(c_int, @intCast(cc.a_n_g)) });
+            defer core.release(tr_ag);
+            const tr_au = try core.fromHost(std.mem.sliceAsBytes(au_slice), .uint16, &.{ 1, 8, 1, @as(c_int, @intCast(cc.a_n_u)) });
+            defer core.release(tr_au);
+            const tr_bg = try core.fromHost(std.mem.sliceAsBytes(bg_slice), .uint16, &.{ 1, 8, 1, @as(c_int, @intCast(cc.b_n)) });
+            defer core.release(tr_bg);
+            const tr_bu = try core.fromHost(std.mem.sliceAsBytes(bu_slice), .uint16, &.{ 1, 8, 1, @as(c_int, @intCast(cc.b_n)) });
+            defer core.release(tr_bu);
+
+            const meta_words = [_]u32{ cc.a_n_g, cc.a_n_u, cc.a_n_g, 0, 0, 0, 0, 0 };
+            const meta_t = try core.fromHost(std.mem.sliceAsBytes(&meta_words), .uint32, &.{8});
+            defer core.release(meta_t);
+
+            for ([_]i32{ 0, 1 }) |b_first| {
+                // (f.1) Simultaneous `fz_down` (SIMD): Part A [16,16] f16 + Part B [16,16] f16
+                {
+                    const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{d}x0_g0", .{ cc.a_tag, cc.b_tag, cc.b_n, cc.b_dig, cc.a_n_g });
+                    const def = try kernel_mod.Def.create(kn, fz_in_names, &.{ "y", "s_y" }, "", "", true, false);
+                    var cfg: kernel_mod.Config = .{ .grid = .{ (16 + 16) * 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                    try cfg.addOutput(&.{ 16, 16 }, .float16);
+                    try cfg.addOutput(&.{ 16, 16 }, .float16);
+                    try cfg.addTemplate("OTPT", .{ .int = 1 });
+                    try cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                    try cfg.addTemplate("IDIM", .{ .int = 128 });
+                    try cfg.addTemplate("ODIM", .{ .int = 16 });
+                    try cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                    try cfg.addTemplate("S_IDIM", .{ .int = 128 });
+                    try cfg.addTemplate("S_ODIM", .{ .int = 16 });
+                    try cfg.addTemplate("S_NHW", .{ .int = @as(c_int, @intCast(cc.b_n)) });
+                    try cfg.addTemplate("S_ROWS", .{ .int = 16 });
+                    try cfg.addTemplate("S_SHARED_ROWS", .{ .int = 2 });
+                    try cfg.addTemplate("FZ_AX", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_AY", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_BX", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_BY", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_NA", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_NB", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_B_FIRST", .{ .int = b_first });
+                    var outs: [2]*Tensor = undefined;
+                    try kernel_mod.launch(def, &.{ x_plain16, tr_ag, slots16_t, meta_t, x_lane16, tr_bg, slots16_t }, &cfg, &outs);
+                    defer core.release(outs[0]);
+                    defer core.release(outs[1]);
+                    try testing.expectEqualSlices(u16, &want_ag, try readU16(outs[0]));
+                    try testing.expectEqualSlices(u16, &want_bg[0], try readU16(outs[1]));
+                }
+
+                // (f.2) Simultaneous `fz_pair` (SIMD): Part A gate+up (different rates via FC_I46/FC_I47) + Part B gate+up
+                {
+                    const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_pair_{s}_s{s}_n{d}{s}_{d}x{d}_g0", .{ cc.a_tag, cc.b_tag, cc.b_n, cc.b_dig, cc.a_n_g, cc.a_n_u });
+                    const def = try kernel_mod.Def.create(kn, fz_pair_in_names, &.{ "yg", "yu", "s_yg", "s_yu" }, "", "", true, false);
+                    var cfg: kernel_mod.Config = .{ .grid = .{ (16 + 32) * 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                    try cfg.addOutput(&.{ 16, 16 }, .float32);
+                    try cfg.addOutput(&.{ 16, 16 }, .float32);
+                    try cfg.addOutput(&.{ 16, 16 }, .float16);
+                    try cfg.addOutput(&.{ 16, 16 }, .float16);
+                    try cfg.addTemplate("OTPT", .{ .int = 1 });
+                    try cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                    try cfg.addTemplate("TOPK", .{ .int = 1 });
+                    try cfg.addTemplate("IDIM", .{ .int = 128 });
+                    try cfg.addTemplate("ODIM", .{ .int = 16 });
+                    try cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                    try cfg.addTemplate("S_IDIM", .{ .int = 128 });
+                    try cfg.addTemplate("S_ODIM", .{ .int = 16 });
+                    try cfg.addTemplate("S_NHW", .{ .int = @as(c_int, @intCast(cc.b_n)) });
+                    try cfg.addTemplate("S_ROWS", .{ .int = 16 });
+                    try cfg.addTemplate("S_SHARED_ROWS", .{ .int = 2 });
+                    try cfg.addTemplate("FZ_AX", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_AY", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_BX", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_BY", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_NA", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_NB", .{ .int = 32 });
+                    try cfg.addTemplate("FZ_B_FIRST", .{ .int = b_first });
+                    var outs: [4]*Tensor = undefined;
+                    try kernel_mod.launch(def, &.{ prep_lane32_t, tr_ag, tr_au, slots16_t, meta_t, x_lane16, x_lane16, tr_bg, tr_bu, slots16_t }, &cfg, &outs);
+                    defer core.release(outs[0]);
+                    defer core.release(outs[1]);
+                    defer core.release(outs[2]);
+                    defer core.release(outs[3]);
+                    const got_ag = try readF32(outs[0]);
+                    const got_au = try readF32(outs[1]);
+                    for (0..format.TILE_VALUES) |idx| {
+                        try testing.expectEqual(@as(f32, @floatCast(@as(f16, @bitCast(want_ag[idx])))), got_ag[idx]);
+                        try testing.expectEqual(@as(f32, @floatCast(@as(f16, @bitCast(want_au[idx])))), got_au[idx]);
+                    }
+                    try testing.expectEqualSlices(u16, &want_bg[0], try readU16(outs[2]));
+                    try testing.expectEqualSlices(u16, &want_bu, try readU16(outs[3]));
+                }
+
+                // (f.3) Simultaneous `fz_down_snax` (NAX): Part A [16,16] f16 + Part B [16,128] f32
+                if (has_nax) {
+                    const bg_nax_slice = tr_bg_buf[0 .. 64 * cc.b_n];
+                    for (bg_nax_slice[8 * cc.b_n ..]) |*w| w.* = 0;
+                    const tr_bg_nax = try core.fromHost(std.mem.sliceAsBytes(bg_nax_slice), .uint16, &.{ 8, 8, @as(c_int, @intCast(cc.b_n)) });
+                    defer core.release(tr_bg_nax);
+                    const kn = try std.fmt.bufPrint(&nbuf, "sushi_exl3_fz_down_{s}_s{s}_n{d}{s}_{d}x0_g0_snax", .{ cc.a_tag, cc.b_tag, cc.b_n, cc.b_dig, cc.a_n_g });
+                    const def = try kernel_mod.Def.create(kn, fz_snax_in_names, &.{ "y", "s_y" }, "", "", true, false);
+                    var cfg: kernel_mod.Config = .{ .grid = .{ (16 + 1) * 128, 1, 1 }, .group = .{ 128, 1, 1 } };
+                    try cfg.addOutput(&.{ 16, 16 }, .float16);
+                    try cfg.addOutput(&.{ 16, 128 }, .float32);
+                    try cfg.addTemplate("OTPT", .{ .int = 1 });
+                    try cfg.addTemplate("NSPLIT", .{ .int = 1 });
+                    try cfg.addTemplate("IDIM", .{ .int = 128 });
+                    try cfg.addTemplate("ODIM", .{ .int = 16 });
+                    try cfg.addTemplate("FUNNEL", .{ .int = 1 });
+                    try cfg.addTemplate("S_IDIM", .{ .int = 128 });
+                    try cfg.addTemplate("S_ODIM", .{ .int = 128 });
+                    try cfg.addTemplate("S_ROWS", .{ .int = 16 });
+                    try cfg.addTemplate("S_GROUPS", .{ .int = 1 });
+                    try cfg.addTemplate("S_TGRP", .{ .int = 4 });
+                    try cfg.addTemplate("S_KPH", .{ .int = 1 });
+                    try cfg.addTemplate("S_NSPLIT", .{ .int = 1 });
+                    try cfg.addTemplate("S_CHUNK", .{ .int = 128 });
+                    try cfg.addTemplate("S_FOLD", .{ .int = 0 });
+                    try cfg.addTemplate("S_NHW", .{ .int = @as(c_int, @intCast(cc.b_n)) });
+                    try cfg.addTemplate("S_SB1", .{ .int = 128 });
+                    try cfg.addTemplate("S_SB2", .{ .int = 128 });
+                    try cfg.addTemplate("S_SB3", .{ .int = 128 });
+                    try cfg.addTemplate("S_UNR", .{ .int = 2 });
+                    try cfg.addTemplate("S_R32", .{ .int = 1 });
+                    try cfg.addTemplate("S_SW", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_AX", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_AY", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_BX", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_BY", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_NA", .{ .int = 16 });
+                    try cfg.addTemplate("FZ_NB", .{ .int = 1 });
+                    try cfg.addTemplate("FZ_B_FIRST", .{ .int = b_first });
+                    var outs: [2]*Tensor = undefined;
+                    try kernel_mod.launch(def, &.{ x_plain16, tr_ag, slots16_t, meta_t, x_plain16, tr_bg_nax, svh128_t }, &cfg, &outs);
+                    defer core.release(outs[0]);
+                    defer core.release(outs[1]);
+                    try testing.expectEqualSlices(u16, &want_ag, try readU16(outs[0]));
+                    const got_b = try readF32(outs[1]);
+                    for (0..16) |r| {
+                        for (0..8) |ti| {
+                            for (0..16) |c| {
+                                const want_f: f32 = @floatCast(@as(f16, @bitCast(want_bg[ti][r * 16 + c])));
+                                try testing.expectEqual(want_f, got_b[r * 128 + ti * 16 + c]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
