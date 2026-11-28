@@ -108,10 +108,12 @@ pub const Stq = struct {
         const in = sh[sh.len - 1];
         const dt = mlx.mlx_array_dtype(x);
         const rows: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(in))));
-        const x2 = try sc.reshape(x, &.{ rows, in });
+        const on_engine = mlx.engine.isStream(sc.s);
+        const x2 = if (on_engine and sh.len == 2) x else try sc.reshape(x, &.{ rows, in });
         // The geo pins bf16 launches.
         const bound = if (self.geo != null and dt == .bfloat16) try exl3.linear.linearGeo(sc.s, x2, rows, self.p, self.geo.?, self.dec, .{ .rows = sc.rows }) else null;
-        const y = try sc.keep(bound orelse try exl3.linear.linearWith(sc.s, x2, self.p, self.dec, .{ .rows = sc.rows }));
+        const y = try sc.keep(bound orelse try exl3.linear.linearWith(sc.s, x2, self.p, self.dec, .{ .rows = sc.rows, .decoded_billed = true, .decoded_max_weights = 1 << 26 }));
+        if (on_engine and sh.len == 2 and mlx.mlx_array_dtype(y) == dt) return y;
         var shape: [8]c_int = undefined;
         @memcpy(shape[0..sh.len], sh);
         shape[sh.len - 1] = @intCast(self.outDim());
@@ -120,7 +122,9 @@ pub const Stq = struct {
 
     /// `x` `[G, rows, in]`, bank g serving `x[g]`.
     pub fn applyGrouped(self: Stq, sc: *Scope, x: A) !A {
-        return sc.astype(try sc.keep(try exl3.linear.linearGroupedWith(sc.s, x, self.p, self.dec, .{ .rows = sc.rows })), mlx.mlx_array_dtype(x));
+        const dt = mlx.mlx_array_dtype(x);
+        const y = try sc.keep(try exl3.linear.linearGroupedWith(sc.s, x, self.p, self.dec, .{ .rows = sc.rows, .decoded_billed = true, .decoded_max_weights = 1 << 26 }));
+        return if (mlx.mlx_array_dtype(y) == dt) y else sc.astype(y, dt);
     }
 };
 
@@ -1961,8 +1965,13 @@ const Running = struct {
 /// mask or none) keeps only its blocks of `bs` keys. With `kb` > 0 it also returns this layer's candidate mask, the
 /// same fold over the block maxima (`lens` pins each query's newest block as `candidateMask` does).
 pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize, tile: usize, mask: A, bs: usize, kb: usize, lens: A) !Streamed {
+    return indexStreamMode(sc, rows, nb, q, w, wscale, p0, r, k, tile, mask, bs, kb, lens, false);
+}
+
+fn indexStreamMode(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize, tile: usize, mask: A, bs: usize, kb: usize, lens: A, ids_only: bool) !Streamed {
     std.debug.assert(tile % kernels.indexKeyTile(rows.dtype) == 0 and (bs == 0 or tile % bs == 0));
     const n_blocks = if (bs > 0) (nb + bs - 1) / bs else 0;
+    const q_cast = try sc.astype(q, rows.dtype);
     var picks = Running{};
     defer picks.free();
     var blocks = Running{};
@@ -1972,7 +1981,7 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
         const t1 = @min(nb, t0 + tile);
         var ts = sc.child();
         defer ts.deinit();
-        var scores = try kernels.indexScoresTile(&ts, q, try rows.rowsIn(&ts, t0, t1), w, wscale, p0, r, t0);
+        var scores = try kernels.indexScoresTile(&ts, q_cast, try rows.rowsIn(&ts, t0, t1), w, wscale, p0, r, t0);
         var next_blocks = Running{};
         errdefer next_blocks.free();
         if (kb > 0) {
@@ -1990,7 +1999,9 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
         var next = try picks.folded(&ts, scores, t0, k);
         errdefer next.free();
         const done = [_]A{ next.ids, next.vals, next_blocks.ids, next_blocks.vals };
-        try evalAll(if (kb > 0) &done else done[0..2]);
+        const ev = if (kb > 0) &done else done[0..2];
+        // On Cooler, submitting the pass frees the tile's pool buffers for the next tile without draining the GPU.
+        if (mlx.engine.isStream(sc.s)) try submitAll(ev) else try evalAll(ev);
         picks.free();
         picks = next;
         if (kb > 0) {
@@ -2002,6 +2013,7 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
     picks.ids = none;
     if (kb == 0) return .{ .idx = idx, .cand = none };
     const reach = try sc.op2(mlx.mlx_greater, blocks.vals, try sc.f(-std.math.inf(f32)));
+    if (ids_only) return .{ .idx = idx, .cand = try sc.where(reach, blocks.ids, try sc.i(-1)) };
     var o = mlx.mlx_array_new();
     const cand = try sc.res(mlx.mlx_put_along_axis(&o, try sc.zeros(&.{ ci(dim(lens, 0)), ci(n_blocks) }, .bool_), blocks.ids, reach, -1, sc.s), &o);
     return .{ .idx = idx, .cand = cand };
@@ -2040,16 +2052,7 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
     var idx: A = undefined;
     // The scan's top-k launch gives the picks already masked to each query's groups.
     var below = none;
-    if (streamsIndex(sc, m, Ls, nb)) {
-        _ = index_streams.fetchAdd(1, .monotonic);
-        const kb = if (is_source and (nb + bs - 1) / bs > c.cand_blocks) c.cand_blocks else 0;
-        const got = try indexStream(sc, rows, nb, q, wts, wscale, p0, r, kk, m.index_stream_tile, if (masked) cand.* else none, bs, kb, lens);
-        if (is_source) {
-            if (cand.ctx != null) _ = mlx.mlx_array_free(cand.*);
-            cand.* = if (kb > 0) sc.out(got.cand) else none;
-        }
-        idx = got.idx;
-    } else if (masked and mlx.mlx_array_dtype(cand.*) == .int32) {
+    if (masked and mlx.mlx_array_dtype(cand.*) == .int32 and rows.pack != null) {
         const pk = rows.pack.?;
         const keys = try sc.slice(rows.buf.array, 0, 0, nb);
         const key_scales = try sc.slice(rows.sbuf.array, 0, 0, nb);
@@ -2058,6 +2061,16 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
         else
             try kernels.indexScoresGather(sc, q, keys, key_scales, wts, wscale, p0, r, pk.mode, pk.group, cand.*, bs);
         idx = try kernels.candidateKeys(sc, try topkRows(sc, m, scores, kk), cand.*, bs);
+    } else if (streamsIndex(sc, m, Ls, nb)) {
+        _ = index_streams.fetchAdd(1, .monotonic);
+        const kb = if (is_source and (nb + bs - 1) / bs > c.cand_blocks) c.cand_blocks else 0;
+        const ids_only = kb > 0 and rows.pack != null and m.trace == null and (c.cand_blocks -| 1) * bs >= c.index_topk and nb > 2 * kb * bs and indexNaxOn(m, rows.pack.?, q, nb, true);
+        const got = try indexStreamMode(sc, rows, nb, q, wts, wscale, p0, r, kk, m.index_stream_tile, if (masked) cand.* else none, bs, kb, lens, ids_only);
+        if (is_source) {
+            if (cand.ctx != null) _ = mlx.mlx_array_free(cand.*);
+            cand.* = if (kb > 0) sc.out(got.cand) else none;
+        }
+        idx = got.idx;
     } else {
         const packed_scan = rows.pack != null and narrowIndex(sc, m, Ls, nb);
         var scores = if (packed_scan) blk: { // [Ls, nb]
@@ -2371,13 +2384,14 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         const dh = try decodeHeads(sc, m, st, li, h, L, in, q_flat, p0, sh, if (ride) |rs| rs.z else null, .{});
         return decodeOut(sc, m, li, dh, ride);
     }
-    const q_proj = try sc.reshape(q_flat, &.{ ci(L), ci(H), ci(hd) });
-    const joint = fus and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_proj) == mlx.mlx_array_dtype(in[1]);
+    const joint = fus and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_flat) == mlx.mlx_array_dtype(in[1]);
     const window = c.window;
-    const rk: ?kernels.QKv = if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
-    const q = if (rk) |r| r.q else try ropeQ(sc, m, q_proj, rope, pos, false, .none, null);
+    const ip_q = joint and rd > 0 and try kernels.ropeTailInPlace(sc, q_flat, rope, pos, L, H, hd, rd);
+    const q_proj = try sc.reshape(q_flat, &.{ ci(L), ci(H), ci(hd) });
+    const rk: ?kernels.QKv = if (joint and !ip_q) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
+    const q = if (ip_q) q_proj else if (rk) |r| r.q else try ropeQ(sc, m, q_proj, rope, pos, false, .none, null);
     if (pf) |p| try p.mark(.q, &.{ qr, q });
-    const kv = if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
+    const kv = if (ip_q) try kernels.kvRow(sc, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
     if (pf) |p| try p.mark(.kv_row, &.{kv});
 
     if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, in[2], sh, null);
@@ -2486,6 +2500,13 @@ fn attentionDecodeFused(sc: *Scope, m: *const Model, st: *State, li: usize, h: A
     if (ls.win.dt != mlx.mlx_array_dtype(h) or ls.win.width != hd or hd % 8 != 0) return null;
     const eps = try kernels.hcEps(sc, c.eps, c.hc_eps);
     const norm: exl3.project_rows.Norm = .{ .w = ly.q_norm, .eps = eps, .cols = sh_in.cols[1] };
+    const use_ip = mlx.engine.isStream(sc.s) and mlx.engine.isOurs(ls.win.buf.array);
+    const qout_ip: A = if (use_ip) blk: {
+        const core = @import("../tensor/core.zig");
+        const qt = try core.freshOut(mlx.mlx_array_dtype(h), &.{ ci(L), sh_in.cols[1] });
+        errdefer core.release(qt);
+        break :blk try sc.keep(core.handle(qt));
+    } else none;
     const kr: exl3.project_rows.KvRing = .{
         .kw = ly.kv_norm,
         .freqs = rope,
@@ -2495,14 +2516,15 @@ fn attentionDecodeFused(sc: *Scope, m: *const Model, st: *State, li: usize, h: A
         .kv_dim = ci(hd),
         .rd = ci(rd),
         .qat = m.qat_on,
+        .qout_in_place = qout_ip,
     };
     const qr_ring = try exl3.linear.linearSharedNormedRing(sc.s, h, sh_in, qa.dec, .{ .rows = sc.rows }, norm, kr) orelse return null;
-    const qr = sc.keep(qr_ring.q) catch |e| {
+    const qr = if (qr_ring.in_place) qout_ip else sc.keep(qr_ring.q) catch |e| {
         _ = mlx.mlx_array_free(qr_ring.q);
         _ = mlx.mlx_array_free(qr_ring.ring);
         return e;
     };
-    const next_ring = sc.keep(qr_ring.ring) catch |e| {
+    const next_ring = if (qr_ring.in_place) none else sc.keep(qr_ring.ring) catch |e| {
         _ = mlx.mlx_array_free(qr_ring.ring);
         return e;
     };
@@ -2513,7 +2535,7 @@ fn attentionDecodeFused(sc: *Scope, m: *const Model, st: *State, li: usize, h: A
         break :blk try kernels.ropeTail(sc, qp, rope, pos, rd, false, .none, null);
     };
     if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, none, sh, null);
-    ls.win.replace(sc.out(next_ring));
+    if (!qr_ring.in_place) ls.win.replace(sc.out(next_ring));
     const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false, null);
     if (width_probe) |t| {
         try t.put("a_q_{d}", .{li}, q);
@@ -2538,6 +2560,7 @@ fn attentionDecodeFused(sc: *Scope, m: *const Model, st: *State, li: usize, h: A
         .mixes = if (ride) |rs| .{ .z = rs.z, .hc = c.hc_mult, .iters = c.hc_iters, .eps = eps } else null,
         .split = &rode_split,
         .apart = m.attn_apart,
+        .nax = m.attn_nax,
         .groups = if (m.tap == null and m.trace == null and width_probe == null and c.heads % c.o_groups == 0) c.o_groups else 0,
         .grouped = &grouped,
     });
@@ -2645,6 +2668,7 @@ fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usiz
         .mixes = if (z) |zz| .{ .z = zz, .hc = c.hc_mult, .iters = c.hc_iters, .eps = try kernels.hcEps(sc, c.eps, c.hc_eps) } else null,
         .split = &rode_split,
         .apart = m.attn_apart,
+        .nax = m.attn_nax,
         .groups = if (m.tap == null and m.trace == null and width_probe == null and c.heads % c.o_groups == 0) c.o_groups else 0,
         .grouped = &grouped,
     });
@@ -2851,7 +2875,7 @@ fn attnQuery(sc: *Scope, m: *const Model, ly: *const Layer, h: A, max_rows: usiz
 /// A DSpark stage's attention for the draft block `h` `[B, dim]`: every row sees the stage's window of committed main
 /// rows and every row of the block, its own too (there is no causal mask). With `ds.batch`, hoists `attnQuery`,
 /// `wq_b`, RoPE, `windowRow`, and `attnOut` once across all requests' draft blocks.
-fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0: usize) !A {
+fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0: usize, ride: ?RideSplit) !A {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const B = dim(h, 0);
@@ -2880,10 +2904,36 @@ fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0:
     const in = try attnQuery(sc, m, ly, h, exl3.project_rows.PROJECT_ROWS_MAX);
     const qr = in[0];
     try tapInput(m, li, .q_lora, qr);
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const can_nax = ds.pos.ctx == null and ds.band.ctx == null and m.tap == null and m.trace == null and
+        fusedOn(sc, m) and mlx.engine.isStream(sc.s) and c.rope_dim > 0 and
+        m.act == .bfloat16 and mlx.mlx_array_dtype(ds.keys) == .bfloat16 and
+        kernels.attnDecodeNaxFits(c.heads, hd, m.act, m.act, false, 0) and kernels.attnEpilogueFits(c.heads, hd, c.o_groups) and kernels.kvRowFits(hd);
+    if (can_nax) {
+        const q_flat = if (ly.wq_b.stq) |qb|
+            (if (try exl3.linear.linearRope(sc.s, qr, qb.p, qb.dec, .{ .rows = sc.rows }, .{ .freqs = rope, .pos = pos, .hd = ci(hd), .rd = ci(c.rope_dim) })) |y| try sc.keep(y) else null)
+        else
+            null;
+        const q = if (q_flat) |qf|
+            try sc.reshape(qf, &.{ ci(B), ci(c.heads), ci(hd) })
+        else
+            try ropeQ(sc, m, try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(B), ci(c.heads), ci(hd) }), rope, pos, false, .none, null);
+        const kv_blk = try kernels.kvRow(sc, in[1], ly.kv_norm, rope, pos, c.rope_dim, c.eps, m.qat_on);
+        const mixes: ?kernels.StageMixes = if (ride) |rs| .{ .z = rs.z, .hc = c.hc_mult, .iters = c.hc_iters, .eps = try kernels.hcEps(sc, c.eps, c.hc_eps) } else null;
+        var sp: ?kernels.HcSplit = null;
+        const heads_g = try kernels.attnDsparkNax(sc, q, ds.keys, kv_blk, ly.sink, p0, scale, rope, c.rope_dim, m.qat_on, c.o_groups, mixes, &sp);
+        if (ride) |rs| if (sp) |s| {
+            rs.out.* = .{ .pre = s.pre, .post = s.post, .comb = s.comb };
+            var exp: ExpandReq = .{ .e = .{ .x = rs.x, .post = s.post, .comb = s.comb } };
+            const y = try attnOutGrouped(sc, m, li, ly, heads_g, &exp);
+            rs.expanded.* = exp.done;
+            return y;
+        };
+        return attnOutGrouped(sc, m, li, ly, heads_g, null);
+    }
     const q = try ropeQ(sc, m, try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(B), ci(c.heads), ci(hd) }), rope, pos, false, .none, null);
     const keys = try sc.concat(&.{ ds.keys, try windowRow(sc, m, ly, in[1], rope, pos) }, 0);
     const band = if (ds.band.ctx != null) ds.band else try sc.ge(try sc.zeros(&.{ ci(B), ci(dim(keys, 0)) }, .float32), try sc.f(0));
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const heads = try attnCore(sc, ly.sink, q, keys, band, none, none, scale, m.act);
     return attnOut(sc, m, li, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null), false, null);
 }
@@ -3403,8 +3453,12 @@ fn residentLayer(m: *const Model, li: usize) bool {
 /// nothing reads the sum.
 fn foldsExpand(m: *const Model, sh: *const Shared, li: usize, x1: A) bool {
     const rows = dim(x1, 0);
-    return m.fused and mlx.streamIsGpu(m.s) and (sh.spec_on or (residentLayer(m, li) and m.layers[li].shared[0].stq != null)) and sh.img.ctx == null and m.experts == .hook and m.cfg.expert_dec != null and
-        li < m.cfg.layers and rows <= exl3.kernels.DECODE_ROWS_MAX and m.trace == null and m.tap == null and prof(m, rows) == null and
+    const resident_or_dspark = if (li < m.cfg.layers)
+        (sh.spec_on or (residentLayer(m, li) and m.layers[li].shared[0].stq != null)) and m.experts == .hook
+    else
+        m.dspark != null and m.layers[li].shared[0].stq != null;
+    return m.fused and mlx.streamIsGpu(m.s) and resident_or_dspark and sh.img.ctx == null and m.cfg.expert_dec != null and
+        rows <= exl3.kernels.DECODE_ROWS_MAX and m.trace == null and m.tap == null and prof(m, rows) == null and
         kernels.hcExpandServes(x1) and mlx.mlx_array_dtype(x1) == m.act;
 }
 
@@ -3420,7 +3474,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
     if (expand) |e| if (!foldsExpand(m, sh, li, e.x)) return error.Dsv41ExpandNotFolded;
     if (c.expert_dec) |dec| {
         if (li >= c.layers) {
-            return sc.astype(try stqRouted(sc, dec, @intFromFloat(c.swiglu_limit), &m.dspark.?.stq[li - c.layers], h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } }), m.act);
+            return sc.astype(try stqRouted(sc, dec, @intFromFloat(c.swiglu_limit), &m.dspark.?.stq[li - c.layers], h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li, .expand = expand } }), m.act);
         }
         const hk = switch (m.experts) {
             .resident => return error.Dsv41StqExpertsStream,
@@ -3481,7 +3535,8 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
 /// per copy plus a shared value, and the gate is the sigmoid of the signed sqrt of a per-copy
 /// normalized stream-key dot.
 fn engramApply(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A) !A {
-    const wkv_in = try sc.astype(try sc.reshape(rows, &.{ ci(dim(x, 0)), -1 }), m.act);
+    const reshaped = try sc.reshape(rows, &.{ ci(dim(x, 0)), -1 });
+    const wkv_in = if (mlx.mlx_array_dtype(reshaped) == m.act) reshaped else try sc.astype(reshaped, m.act);
     try tapInput(m, e.layer, .engram_in, wkv_in);
     const kv = try e.wkv.apply(sc, wkv_in);
     // One threadgroup a (row, copy) at any width: the op chain's f32 intermediates are ~670 MB each at 8192 rows.
@@ -3552,7 +3607,14 @@ fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?HcPrev, cpre: A, hc: *const Hc,
         const eps = try kernels.hcEps(sc, c.eps, c.hc_eps);
         const hw = kernels.HcWeights{ .fn_w = hc.fn_w, .scale = hc.scale, .base = hc.base };
         if (dim(x, 0) <= NARROW_ROWS) {
-            const kex: ?kernels.HcExpand = if (ex) |e| .{ .y = e.y, .prev = if (e.prev.sp) |s| .{ .split = .{ .pre = s.pre, .post = s.post, .comb = s.comb } } else .{ .z = .{ .z = e.prev.z, .iters = c.hc_iters } } } else null;
+            if (ex == null and mlx.engine.isStream(sc.s) and kernels.hcStageFastFits(x, hw)) {
+                const st = try kernels.hcStageFast(sc, x, cpre, norm_w, hw, eps);
+                return .{ .mix = .{ .z = st.z }, .h = st.h, .x1 = st.x1 };
+            }
+            const kex: ?kernels.HcExpand = if (ex) |e| blk: {
+                const s_opt = e.prev.sp orelse if (dim(e.prev.z, 1) != (2 + c.hc_mult) * c.hc_mult) try e.prev.split(sc, m) else null;
+                break :blk .{ .y = e.y, .prev = if (s_opt) |s| .{ .split = .{ .pre = s.pre, .post = s.post, .comb = s.comb } } else .{ .z = .{ .z = e.prev.z, .iters = c.hc_iters } } };
+            } else null;
             const st = try kernels.hcStage(sc, x, kex, cpre, norm_w, hw, eps);
             return .{ .mix = .{ .z = st.z }, .h = st.h, .x1 = st.x1 };
         }
@@ -3643,7 +3705,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         var rode: ?qat_mod.Split = null;
         const ride: ?RideSplit = if (pa.mix.sp == null) .{ .z = pa.mix.z, .out = &rode, .x = x, .expanded = &expanded } else null;
         const o = if (ds) |d|
-            try dsparkAttention(&asc, m, li, h, d, p0)
+            try dsparkAttention(&asc, m, li, h, d, p0, ride)
         else if (segs.len > 0)
             try attentionRows(&asc, m, li, h, segs, ride)
         else
@@ -5107,9 +5169,6 @@ fn layerInput(m: *Model, p: *Pass, li: usize, sc: *Scope, ev: *std.ArrayList(A),
     if (m.cfg.engram.layerAt(li)) |ei| {
         const hs = &m.hash.?;
         const nc = hs.cols();
-        const mine = try gpa.alloc(u32, L * nc);
-        defer gpa.free(mine);
-        for (0..L) |t| @memcpy(mine[t * nc ..][0..nc], p.rows[(t * hs.n_layers + ei) * nc ..][0..nc]);
         const e = &m.engrams[ei];
         const io = std.Io.Threaded.global_single_threaded.io();
         const t0 = std.Io.Timestamp.now(io, .boot);
@@ -5120,11 +5179,17 @@ fn layerInput(m: *Model, p: *Pass, li: usize, sc: *Scope, ev: *std.ArrayList(A),
             p.engram_rows[ei] = if (p.engram_pf) |pf| blk: {
                 const raw = try pf.take(p.p0, ei, 0);
                 defer raw.deinit(gpa);
-                break :blk sc.out(try sc.keep(try e.table.dequant(raw, mine.len, m.s)));
-            } else if (try e.table.tryReadCached(gpa, mine)) |raw| blk: {
-                defer raw.deinit(gpa);
-                break :blk sc.out(try sc.keep(try e.table.dequant(raw, mine.len, m.s)));
-            } else sc.out(try sc.keep(try e.table.gather(gpa, mine, m.s))); // [L * cols, head_dim]
+                break :blk sc.out(try sc.keep(try e.table.dequantAs(raw, L * nc, m.act, m.s)));
+            } else blk: {
+                const mine = try gpa.alloc(u32, L * nc);
+                defer gpa.free(mine);
+                for (0..L) |t| @memcpy(mine[t * nc ..][0..nc], p.rows[(t * hs.n_layers + ei) * nc ..][0..nc]);
+                if (try e.table.tryReadCached(gpa, mine)) |raw| {
+                    defer raw.deinit(gpa);
+                    break :blk sc.out(try sc.keep(try e.table.dequantAs(raw, mine.len, m.act, m.s)));
+                }
+                break :blk sc.out(try sc.keep(try e.table.gatherAs(gpa, mine, m.act, m.s))); // [L * cols, head_dim]
+            };
         }
         const table_rows = p.engram_rows[ei];
         const nx = sc.out(try engramWrite(sc, m, e, p.x, table_rows, p.img));
@@ -5526,7 +5591,7 @@ fn joinedEngram(sc: *Scope, m: *Model, ps: []const Pass, rows: *JoinedRows, li: 
         rows.engram_rows[ei] = if (rows.engram_pf) |pf| blk: {
             const raw = try pf.take(0, ei, 0);
             defer raw.deinit(m.gpa);
-            break :blk sc.out(try sc.keep(try e.table.dequant(raw, total_tokens * cols, m.s)));
+            break :blk sc.out(try sc.keep(try e.table.dequantAs(raw, total_tokens * cols, m.act, m.s)));
         } else blk: {
             const ids = try sc.a.alloc(u32, total_tokens * cols);
             defer sc.a.free(ids);
@@ -5540,11 +5605,11 @@ fn joinedEngram(sc: *Scope, m: *Model, ps: []const Pass, rows: *JoinedRows, li: 
             }
             if (try e.table.tryReadCached(sc.a, ids)) |raw| {
                 defer raw.deinit(sc.a);
-                break :blk sc.out(try sc.keep(try e.table.dequant(raw, ids.len, m.s)));
+                break :blk sc.out(try sc.keep(try e.table.dequantAs(raw, ids.len, m.act, m.s)));
             }
             // Hand off the open GPU pass before reading Engram table rows from SSD so GPU work overlaps disk I/O.
             if (mlx.engine.isStream(m.s)) try mlx.engine.submit();
-            break :blk sc.out(try sc.keep(try e.table.gather(sc.a, ids, m.s)));
+            break :blk sc.out(try sc.keep(try e.table.gatherAs(sc.a, ids, m.act, m.s)));
         };
     }
     return try engramApply(sc, m, e, x, rows.engram_rows[ei]);
@@ -6109,7 +6174,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, B: u32, meter: ?*@import("
     const fused = fusedOn(&sc, m);
     for (0..B) |k| {
         if (fused) {
-            const step = try kernels.markovStep(&sc, logits, ds.markov_head, ds.markov_embed, cur, hout, ds.conf, k);
+            const step = try kernels.markovStepWith(&sc, logits, ds.markov_head, ds.markov_embed, cur, hout, ds.conf, k, with_heads);
             rows[k] = step.row;
             if (with_conf) confs[k] = step.conf;
             cur = step.pick;
@@ -6239,7 +6304,7 @@ pub fn draftBatch(
         var cur = try sc.reshape(try sc.i(@intCast(t1)), &.{1});
         for (0..b) |k| {
             if (fused) {
-                const step = try kernels.markovStep(&sc, lg_i, ds.markov_head, ds.markov_embed, cur, h_i, ds.conf, k);
+                const step = try kernels.markovStepWith(&sc, lg_i, ds.markov_head, ds.markov_embed, cur, h_i, ds.conf, k, with_heads);
                 rows_all[r0 + k] = step.row;
                 if (with_conf) confs_all[r0 + k] = step.conf;
                 cur = step.pick;
@@ -9546,6 +9611,148 @@ test "dsv41 fused normedRing and linearRope match ropeKvRing bit-for-bit at r=1 
             try testing.expectEqualSlices(u8, try hostBytes(&sc, ref_qr), try hostBytes(&sc, got_qr));
             try testing.expectEqualSlices(u8, try hostBytes(&sc, ref_rk.ring), try hostBytes(&sc, got_ring));
             try testing.expectEqualSlices(u8, try hostBytes(&sc, ref_rk.q), try hostBytes(&sc, got_q));
+        }
+    }
+}
+
+test "dsv41 fused normedRing in-place matches out-of-place bit-for-bit and CoWs shared rings on Cooler" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    const alloc = testing.allocator;
+    const core = @import("../tensor/core.zig");
+    const dec = exl3.kernels.SPEC1_W15;
+    try dec.requireTable();
+    defer exl3.kernels.setDecodeParams(.mul1);
+
+    var sc = Scope.plain(alloc, s);
+    defer sc.deinit();
+
+    const in_dim: c_int = 5120;
+    const q_dim: c_int = 1280;
+    const kv_dim: c_int = 512;
+    const tot_dim: c_int = q_dim + kv_dim;
+    const rd: usize = 64;
+    const cap: usize = 32;
+    const eps_f: f32 = 1e-6;
+    const eps = try kernels.hcEps(&sc, eps_f, eps_f);
+
+    const mk = struct {
+        fn u16s(a: std.mem.Allocator, shape: []const c_int, seed: u64) !A {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(u16, n);
+            defer a.free(buf);
+            var prng = std.Random.DefaultPrng.init(seed);
+            prng.random().bytes(std.mem.sliceAsBytes(buf));
+            return mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .uint16);
+        }
+        fn signs(a: std.mem.Allocator, shape: []const c_int, seed: u64) !A {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(u16, n);
+            defer a.free(buf);
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rnd = prng.random();
+            for (buf) |*v| v.* = if (rnd.boolean()) 0x3C00 else 0xBC00;
+            return mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float16);
+        }
+        fn gauss(scope: *Scope, shape: []const c_int, seed: u64, dt: mlx.mlx_dtype) !A {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try scope.a.alloc(f32, n);
+            defer scope.a.free(buf);
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rnd = prng.random();
+            for (buf) |*v| v.* = @floatCast(rnd.floatNorm(f64) * 0.5);
+            const f = try scope.floats(buf, shape);
+            return if (dt == .float32) f else scope.astype(f, dt);
+        }
+    };
+
+    const sh_in: exl3.linear.Shared = .{
+        .p = .{
+            .trellis = try sc.keep(try mk.u16s(alloc, &.{ 1, @divExact(in_dim, 16), @divExact(tot_dim, 16), 80 }, 0xa101)),
+            .suh = try sc.keep(try mk.signs(alloc, &.{ 2, in_dim }, 0xa102)),
+            .svh = try sc.keep(try mk.signs(alloc, &.{ 1, tot_dim }, 0xa103)),
+        },
+        .cols = .{ 0, q_dim, tot_dim, tot_dim, tot_dim },
+        .count = 2,
+    };
+    const q_norm = try mk.gauss(&sc, &.{q_dim}, 0xa301, .bfloat16);
+    const kv_norm = try mk.gauss(&sc, &.{kv_dim}, 0xa302, .bfloat16);
+    const freqs = try mk.gauss(&sc, &.{@divExact(rd, 2)}, 0xa303, .float32);
+    const ring_base = try mk.gauss(&sc, &.{ @intCast(cap), kv_dim }, 0xa304, .bfloat16);
+    const ring_base_bytes = try hostBytes(&sc, ring_base);
+
+    for ([_]c_int{ 1, 6 }) |L| {
+        const h = try mk.gauss(&sc, &.{ L, in_dim }, 0xa400 + @as(u64, @intCast(L)), .bfloat16);
+        var pos_d: [6]i32 = undefined;
+        for (0..@as(usize, @intCast(L))) |i| pos_d[i] = @intCast(29 + i);
+        const pos = try sc.ints(pos_d[0..@intCast(L)], &.{L});
+        const norm: exl3.project_rows.Norm = .{ .w = q_norm, .eps = eps, .cols = q_dim };
+
+        for ([_]bool{ false, true }) |qat| {
+            // Out-of-place reference on Cooler.
+            const ref = (try exl3.linear.linearSharedNormedRing(s, h, sh_in, dec, .{ .rows = .{ .exact = false } }, norm, .{
+                .kw = kv_norm,
+                .freqs = freqs,
+                .pos = pos,
+                .ring = ring_base,
+                .cap = @intCast(cap),
+                .kv_dim = kv_dim,
+                .rd = @intCast(rd),
+                .qat = qat,
+            })).?;
+            const ref_q = try sc.keep(ref.q);
+            const ref_ring = try sc.keep(ref.ring);
+            try testing.expect(!ref.in_place);
+            const want_q = try hostBytes(&sc, ref_q);
+            const want_ring = try hostBytes(&sc, ref_ring);
+
+            // 1. Sole-owned ring: in-place update modifies ring directly without copying.
+            const sole_ring = try mk.gauss(&sc, &.{ @intCast(cap), kv_dim }, 0xa304, .bfloat16);
+            const qt1 = try core.freshOut(.bfloat16, &.{ L, q_dim });
+            const qout1 = try sc.keep(core.handle(qt1));
+            const ip1 = (try exl3.linear.linearSharedNormedRing(s, h, sh_in, dec, .{ .rows = .{ .exact = false } }, norm, .{
+                .kw = kv_norm,
+                .freqs = freqs,
+                .pos = pos,
+                .ring = sole_ring,
+                .cap = @intCast(cap),
+                .kv_dim = kv_dim,
+                .rd = @intCast(rd),
+                .qat = qat,
+                .qout_in_place = qout1,
+            })).?;
+            try testing.expect(ip1.in_place);
+            try testing.expectEqualSlices(u8, want_q, try hostBytes(&sc, qout1));
+            try testing.expectEqualSlices(u8, want_ring, try hostBytes(&sc, sole_ring));
+
+            // 2. Shared ring (refcount > 1): CoW preserves snapshot while updated ring matches reference.
+            const shared_ring = try mk.gauss(&sc, &.{ @intCast(cap), kv_dim }, 0xa304, .bfloat16);
+            const snap_alias = try sc.reshape(shared_ring, &.{ @intCast(cap), kv_dim });
+            const qt2 = try core.freshOut(.bfloat16, &.{ L, q_dim });
+            const qout2 = try sc.keep(core.handle(qt2));
+            const ip2 = (try exl3.linear.linearSharedNormedRing(s, h, sh_in, dec, .{ .rows = .{ .exact = false } }, norm, .{
+                .kw = kv_norm,
+                .freqs = freqs,
+                .pos = pos,
+                .ring = shared_ring,
+                .cap = @intCast(cap),
+                .kv_dim = kv_dim,
+                .rd = @intCast(rd),
+                .qat = qat,
+                .qout_in_place = qout2,
+            })).?;
+            try testing.expect(ip2.in_place);
+            try testing.expectEqualSlices(u8, want_q, try hostBytes(&sc, qout2));
+            try testing.expectEqualSlices(u8, want_ring, try hostBytes(&sc, shared_ring));
+            try testing.expectEqualSlices(u8, ring_base_bytes, try hostBytes(&sc, snap_alias));
         }
     }
 }

@@ -766,14 +766,14 @@ test "dsv41 forward cap: a wide forward's row term is the shape sum of its wides
     // pools reads these less the three spill pools. The release: layer 14 (the same roles) over ten pools (the STQ
     // pack's combined chain) or the FP4 experts' sorted gather.
     for ([_]Case{
-        .{ .c = &tiny, .rows = 512, .shapes = 22_872_064 },
-        .{ .c = &tiny, .rows = 2048, .shapes = 89_899_008 },
-        .{ .c = &tiny, .rows = 8192, .shapes = 358_449_152 },
-        .{ .c = &rel_stq, .rows = 363, .shapes = 499_957_760 },
-        .{ .c = &rel_stq, .rows = 2048, .shapes = 2_696_380_416 },
-        .{ .c = &rel_stq, .rows = 4096, .shapes = 5_391_433_728 },
-        .{ .c = &rel_stq, .rows = 8192, .shapes = 10_775_347_200 },
-        .{ .c = &rel, .rows = 2048, .shapes = 1_333_067_776 },
+        .{ .c = &tiny, .rows = 512, .shapes = 21_692_416 },
+        .{ .c = &tiny, .rows = 2048, .shapes = 85_180_416 },
+        .{ .c = &tiny, .rows = 8192, .shapes = 339_574_784 },
+        .{ .c = &rel_stq, .rows = 363, .shapes = 485_801_984 },
+        .{ .c = &rel_stq, .rows = 2048, .shapes = 2_620_882_944 },
+        .{ .c = &rel_stq, .rows = 4096, .shapes = 5_240_438_784 },
+        .{ .c = &rel_stq, .rows = 8192, .shapes = 10_473_357_312 },
+        .{ .c = &rel, .rows = 2048, .shapes = 1_257_570_304 },
     }) |k| {
         const got = k.c.forwardCap(k.rows, k.rows) - BILL_MARGIN_BYTES;
         errdefer std.debug.print("{d} rows: shape sum {d}\n", .{ k.rows, got });
@@ -787,12 +787,12 @@ test "dsv41 forward cap: a resident plan's route makes no spill pool, so its wid
     var rel_stq = try releaseStqForTest();
     const Case = struct { c: *Config, rows: u64, shapes: u64 };
     for ([_]Case{
-        .{ .c = &tiny, .rows = 512, .shapes = 20_267_008 },
-        .{ .c = &tiny, .rows = 8192, .shapes = 282_918_912 },
-        .{ .c = &rel_stq, .rows = 363, .shapes = 433_356_800 },
-        .{ .c = &rel_stq, .rows = 2048, .shapes = 2_327_232_512 },
-        .{ .c = &rel_stq, .rows = 4096, .shapes = 4_653_219_840 },
-        .{ .c = &rel_stq, .rows = 8192, .shapes = 9_298_886_656 },
+        .{ .c = &tiny, .rows = 512, .shapes = 18_825_216 },
+        .{ .c = &tiny, .rows = 8192, .shapes = 264_044_544 },
+        .{ .c = &rel_stq, .rows = 363, .shapes = 419_201_024 },
+        .{ .c = &rel_stq, .rows = 2048, .shapes = 2_251_735_040 },
+        .{ .c = &rel_stq, .rows = 4096, .shapes = 4_502_224_896 },
+        .{ .c = &rel_stq, .rows = 8192, .shapes = 8_996_896_768 },
     }) |k| {
         k.c.spill_pools = true;
         const streamed = k.c.forwardCap(k.rows, k.rows) - BILL_MARGIN_BYTES;

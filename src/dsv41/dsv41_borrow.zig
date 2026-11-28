@@ -729,7 +729,7 @@ test "dsv41 borrow: at the budget-115 and 117 geometries no chunk releases a poo
         try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048 + 511, 1 << 20), headroom));
         // At 117 the headroom is ~4.6 GB, over what a 2048-row chunk holds on the engine; under it, one pool goes.
         try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 4_600_000_000));
-        try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 2_900_000_000));
+        try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 2_800_000_000));
     }
 }
 

@@ -167,10 +167,61 @@ pub const PACK_SOURCE: [:0]const u8 =
     \\const uint gid = thread_position_in_grid.x;
     \\if (gid >= uint(x_shape[0]) * uint(x_shape[1]) / uint(G)) return;
     \\const uint base = gid * uint(G);
-    \\float amax = 0.0f;
-    \\for (uint k = 0; k < uint(G); ++k) amax = max(amax, fabs(float(x[base + k])));
     \\const float cands[7] = {6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f};
     \\uint sb = MODE == 1 ? 127u : 0x38u;
+    \\if (uint(G) <= 32u) {
+    \\  float xv[32];
+    \\  float amax = 0.0f;
+    \\  for (uint k = 0; k < uint(G); ++k) {
+    \\    const float v = float(x[base + k]);
+    \\    xv[k] = v;
+    \\    amax = max(amax, fabs(v));
+    \\  }
+    \\  uchar nib[32];
+    \\  bool found = false;
+    \\  if (amax == 0.0f) {
+    \\    scales[gid] = uchar(sb);
+    \\    for (uint k = 0; k < uint(G); k += 2u) {
+    \\      const uint lo = signbit(xv[k]) ? 8u : 0u;
+    \\      const uint hi = signbit(xv[k + 1u]) ? 8u : 0u;
+    \\      codes[(base + k) / 2u] = uchar(lo | (hi << 4));
+    \\    }
+    \\    return;
+    \\  }
+    \\  for (uint c = 0; c < 7u; ++c) {
+    \\    const uint b = scale_byte(precise::divide(amax, cands[c]), MODE);
+    \\    if (b > 255u) continue;
+    \\    const float s = scale_of(b, MODE);
+    \\    const bool fast_inv = !(MODE == 1 && b >= 254u);
+    \\    const float inv_s = fast_inv ? (MODE == 1 ? as_type<float>((254u - clamp(b, 1u, 253u)) << 23) : (1.0f / s)) : 0.0f;
+    \\    bool exact = true;
+    \\    for (uint k = 0; k < uint(G); ++k) {
+    \\      const float v = xv[k];
+    \\      const float a = fabs(v);
+    \\      const float r = fast_inv ? (a * inv_s) : precise::divide(a, s);
+    \\      const uint mc = (r < 2.25f) ? uint(rint(r * 2.0f)) : ((r < 3.5f) ? 5u : ((r < 5.0f) ? 6u : 7u));
+    \\      if (mc >= 8u || E2M1[mc] * s != a) { exact = false; break; }
+    \\      nib[k] = uchar(mc | (signbit(v) ? 8u : 0u));
+    \\    }
+    \\    if (exact) { sb = b; found = true; break; }
+    \\  }
+    \\  scales[gid] = uchar(sb);
+    \\  if (found) {
+    \\    for (uint k = 0; k < uint(G); k += 2u) {
+    \\      codes[(base + k) / 2u] = uchar(uint(nib[k]) | (uint(nib[k + 1u]) << 4));
+    \\    }
+    \\    return;
+    \\  }
+    \\  const float s = scale_of(sb, MODE);
+    \\  for (uint k = 0; k < uint(G); k += 2u) {
+    \\    const uint lo = code_of(precise::divide(xv[k], s));
+    \\    const uint hi = code_of(precise::divide(xv[k + 1u], s));
+    \\    codes[(base + k) / 2u] = uchar((lo & 15u) | ((hi & 15u) << 4));
+    \\  }
+    \\  return;
+    \\}
+    \\float amax = 0.0f;
+    \\for (uint k = 0; k < uint(G); ++k) amax = max(amax, fabs(float(x[base + k])));
     \\if (amax > 0.0f) {
     \\  for (uint c = 0; c < 7u; ++c) {
     \\    const uint b = scale_byte(precise::divide(amax, cands[c]), MODE);

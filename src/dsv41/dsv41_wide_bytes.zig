@@ -92,7 +92,7 @@ fn passHeld(t: *Tally, c: *const Config, li: usize, rows: u64, p0: u64) void {
     t.t(1, rows * hc * f32b);
     var engram_read: u64 = 0;
     for (c.engram.layers[0..c.engram.n]) |l| engram_read += @intFromBool(l <= li);
-    t.t(engram_read, rows * c.engram.cols() * c.engram.head_dim * f32b);
+    t.t(engram_read, rows * c.engram.cols() * c.engram.head_dim * act);
     // `Shared.index` keeps the first eight distinct position and length arrays: the chunk's, the groups', then two a span.
     var arrays: u64 = 1;
     t.t(1, rows * i32b);
@@ -153,12 +153,11 @@ fn packedRows(t: *Tally, n: u64, w: u64, group: u64) void {
     t.t(1, n * w / group);
 }
 
-/// The gated write of the n-gram rows (`engramApply`): the rows as one bf16 row each, `wkv`'s keys and value and the new
-/// stream; the gate kernel's three constants, or the op chain's eight f32 copies of the stream, the f32 value, sixteen
-/// per-copy f32 scalars, the sign mask and four constants.
+/// The gated write of the n-gram rows (`engramApply`): `wkv`'s keys and value (over the bf16 rows `passHeld`
+/// already dequantized) and the new stream; the gate kernel's three constants, or the op chain's eight f32 copies
+/// of the stream, the f32 value, sixteen per-copy f32 scalars, the sign mask and four constants.
 fn engramWrite(t: *Tally, c: *const Config, L: u64) void {
     const hc: u64 = c.hc_mult;
-    t.t(1, L * c.engram.cols() * c.engram.head_dim * act);
     t.t(1, L * (hc + 1) * c.dim * act);
     if (armsOf(c).engram_fused) {
         t.t(1, L * hc * c.dim * act);
@@ -216,10 +215,11 @@ fn attention(c: *const Config, li: usize, L: u64, p0: u64) u64 {
     const H: u64 = c.heads;
     const hd: u64 = c.head_dim;
     var t: Tally = .{};
-    // `wq_a` and `q_norm`, `wkv` and the rotated window rows, `wq_b` and the rotated queries, the rotation's eps.
+    // `wq_a` and `q_norm`, `wkv` and the rotated window rows, `wq_b` (rotated in-place when `ropeTailInPlace` serves), the rotation's eps.
+    const q_in_place = c.rope_dim > 0 and c.rope_dim % 2 == 0 and hd % 32 == 0 and hd <= 4096;
     t.t(2, L * c.q_lora * act);
     t.t(2, L * hd * act);
-    t.t(2, L * H * hd * act);
+    t.t(if (q_in_place) 1 else 2, L * H * hd * act);
     t.t(1, 4);
     compress(&t, c, li, L);
     const n_spans = (L + cfg_mod.attn_span - 1) / cfg_mod.attn_span;
@@ -246,9 +246,19 @@ fn attention(c: *const Config, li: usize, L: u64, p0: u64) u64 {
         out.t(1, L * H * hd * act);
     }
     out.t(1, L * c.o_groups * c.o_lora * act);
-    out.t(1, L * c.dim * act);
+    const wo_a_dec = decodedTrunkWeight(c, L, H * hd * c.o_lora);
+    const wo_b_out = pool_class.poolBytes(@intCast(L * c.dim * act));
+    const wo_b_dec = decodedTrunkWeight(c, L, @as(u64, c.o_groups) * c.o_lora * c.dim);
+    out.bytes += @max(wo_a_dec, wo_b_out + wo_b_dec);
     const last_heads = if (grouped) 0 else (L - last) * H * hd * act;
     return t.bytes + heads.bytes + @max(span, last_heads + out.bytes);
+}
+
+/// Transient f16 bank decoded once by `trunk_gemm.decodeDense` when `Stq.apply` / `Stq.applyGrouped` takes the
+/// decoded NAX GEMM path (`decoded_max_weights = 1 << 26` for wide prefill `L >= DECODED_MIN_ROWS`).
+fn decodedTrunkWeight(c: *const Config, L: u64, weights: u64) u64 {
+    if (c.trunk_dec == null or L < @as(u64, @intCast(sushi_exl3.trunk_gemm.DECODED_MIN_ROWS)) or weights > (1 << 26)) return 0;
+    return pool_class.poolBytes(@intCast(weights * 2));
 }
 
 /// Whether the wide heads come from the one-pass kernel with its store's epilogue (`attnFusedFits`, `attnEpilogueFits`).
@@ -448,10 +458,17 @@ fn fp4Routed(c: *const Config, L: u64) u64 {
 }
 
 test "dsv41 wide attention prices one grouped head buffer across prefill spans" {
+    const std = @import("std");
     const c = try cfg_mod.releaseStqForTest();
     const rows = 8192;
-    const input_bytes = 2 * rows * (1280 + 512 + 64 * 512) * 2 + pool_class.page_bytes;
+    const input_bytes = rows * (2 * 1280 + 2 * 512 + 64 * 512) * 2 + pool_class.page_bytes;
     const head_bytes = rows * 64 * 512 * 2;
-    const projection_bytes = rows * (8 * 1024 + 5120) * 2;
-    try @import("std").testing.expectEqual(@as(u64, input_bytes + head_bytes + projection_bytes), attention(&c, 0, rows, 0));
+    const wo_b_decoded = pool_class.poolBytes(8 * 1024 * 5120 * 2);
+    const projection_bytes = rows * (8 * 1024 + 5120) * 2 + wo_b_decoded;
+    try std.testing.expectEqual(@as(u64, input_bytes + head_bytes + projection_bytes), attention(&c, 0, rows, 0));
+    // Below DECODED_MIN_ROWS (512), decoded dense does not run; on release STQ at L >= 1024, routed dominates attn even at p=1.
+    try std.testing.expectEqual(@as(u64, 0), decodedTrunkWeight(&c, 512, 8 * 1024 * 5120));
+    for ([_]u64{ 1024, 2048, 8192 }) |L| {
+        try std.testing.expect(attention(&c, 0, L, 0) < routed(&c, L, 1));
+    }
 }

@@ -234,13 +234,27 @@ pub const GATE_SOURCE =
     \\const int l = threadgroup_position_in_grid.y;
     \\const int E = w_shape[0], D = w_shape[1];
     \\if (e >= E) return;
-    \\const device auto* wr = w + size_t(e) * D;
-    \\const device auto* xr = x + size_t(l) * D;
+    \\using XElem = metal::remove_const_t<metal::remove_addrspace_t<metal::remove_reference_t<decltype(x[0])>>>;
+    \\using WElem = metal::remove_const_t<metal::remove_addrspace_t<metal::remove_reference_t<decltype(w[0])>>>;
+    \\const device WElem* wr = w + size_t(e) * D;
+    \\const device XElem* xr = x + size_t(l) * D;
     \\float acc = 0.0f;
-    \\for (int k = lane * 8; k < D; k += 256)
-    \\  for (int j = 0; j < 8; ++j) acc += float(xr[k + j]) * float(wr[k + j]);
+    \\for (int k = int(lane) * 8; k < D; k += 256) {
+    \\  const metal::vec<XElem, 4> x0 = *(const device metal::vec<XElem, 4>*)(xr + k);
+    \\  const metal::vec<XElem, 4> x1 = *(const device metal::vec<XElem, 4>*)(xr + k + 4);
+    \\  const metal::vec<WElem, 4> w0 = *(const device metal::vec<WElem, 4>*)(wr + k);
+    \\  const metal::vec<WElem, 4> w1 = *(const device metal::vec<WElem, 4>*)(wr + k + 4);
+    \\  acc += float(x0.x) * float(w0.x);
+    \\  acc += float(x0.y) * float(w0.y);
+    \\  acc += float(x0.z) * float(w0.z);
+    \\  acc += float(x0.w) * float(w0.w);
+    \\  acc += float(x1.x) * float(w1.x);
+    \\  acc += float(x1.y) * float(w1.y);
+    \\  acc += float(x1.z) * float(w1.z);
+    \\  acc += float(x1.w) * float(w1.w);
+    \\}
     \\acc = metal::simd_sum(acc);
-    \\if (lane == 0) logits[size_t(l) * E + e] = acc;
+    \\if (lane == 0u) logits[size_t(l) * E + e] = acc;
 ;
 
 /// One row a threadgroup, one expert a thread: sqrt-softplus scores, the bias-picked top K (lowest index on ties),
@@ -279,6 +293,41 @@ const ROUTE_BODY =
     \\}
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\const int nc = int((threads_per_threadgroup.x + 31) / 32) * K;
+    \\if (nc <= 128) {
+    \\  if (sg == 0u) {
+    \\    float lv[4];
+    \\    int li[4];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int c = 0; c < 4; ++c) {
+    \\      const int j = int(lane) + c * 32;
+    \\      lv[c] = j < nc ? t_cv[j] : -INFINITY;
+    \\      li[c] = j < nc ? t_ci[j] : 0x7fffffff;
+    \\    }
+    \\    float sum = 0.0f;
+    \\    for (int r = 0; r < K; ++r) {
+    \\      float mv = lv[0];
+    \\      int mi = li[0];
+    \\      #pragma clang loop unroll(full)
+    \\      for (int c = 1; c < 4; ++c) {
+    \\        if (lv[c] > mv || (lv[c] == mv && li[c] < mi)) { mv = lv[c]; mi = li[c]; }
+    \\      }
+    \\      const float bv = metal::simd_max(mv);
+    \\      const int bi = metal::simd_min(mv == bv ? mi : 0x7fffffff);
+    \\      if (lane == 0u) { t_pick[r] = bi; sum += t_s[bi]; }
+    \\      #pragma clang loop unroll(full)
+    \\      for (int c = 0; c < 4; ++c) { if (li[c] == bi) { lv[c] = -INFINITY; li[c] = 0x7fffffff; } }
+    \\    }
+    \\    if (lane == 0u) {
+    \\      const float div = NORM ? sum + 1e-20f : 1.0f;
+    \\      for (int r = 0; r < K; ++r) {
+    \\        idx[l * K + r] = uint(t_pick[r]);
+    \\        ROUTE_SLOT(l * K + r, t_pick[r]);
+    \\        wts[l * K + r] = t_s[t_pick[r]] / div * scal[0];
+    \\      }
+    \\    }
+    \\  }
+    \\  return;
+    \\}
     \\if (e < nc) {
     \\  const float cv = t_cv[e];
     \\  const int ci = t_ci[e];
@@ -828,7 +877,7 @@ fn attnDecBody(comptime packed_comp: bool) [:0]const u8 {
         \\const int lo = metal::max(0, pos - window + 1);
         \\const int nw = pos - lo + 1;
         \\float qv[V], acc[V];
-        \\for (int v = 0; v < V; ++v) { qv[v] = float(q[(i * H + h) * D + lane * V + v]); acc[v] = 0.0f; }
+        \\for (int v = 0; v < V; ++v) { qv[v] = float(q[(size_t(i) * H + h) * D + lane * V + v]); acc[v] = 0.0f; }
         \\float mx = -INFINITY, den = 0.0f;
         \\const float scale = scal[0];
         \\const int Ki = meta[6] > 0 ? metal::min(K, (pos + 1) / meta[6]) : K;
@@ -838,26 +887,49 @@ fn attnDecBody(comptime packed_comp: bool) [:0]const u8 {
         \\  float kv[V], dot = 0.0f;
         ++ (if (packed_comp)
             \\  if (t < nw) {
-            \\    const device KT* row = ring + size_t((lo + t) % cap) * D;
-            \\    for (int v = 0; v < V; ++v) { kv[v] = float(row[lane * V + v]); dot += qv[v] * kv[v]; }
+            \\    const device KT* rp = ring + size_t((lo + t) % cap) * D + lane * V;
+            \\    if (V % 4 == 0) {
+            \\      #pragma clang loop unroll(full)
+            \\      for (int v = 0; v + 4 <= V; v += 4) {
+            \\        const metal::vec<KT, 4> u = *(const device metal::vec<KT, 4>*)(rp + v);
+            \\        kv[v] = float(u.x); kv[v + 1] = float(u.y); kv[v + 2] = float(u.z); kv[v + 3] = float(u.w);
+            \\      }
+            \\    } else {
+            \\      for (int v = 0; v < V; ++v) kv[v] = float(rp[v]);
+            \\    }
+            \\    for (int v = 0; v < V; ++v) dot += qv[v] * kv[v];
             \\  } else {
             \\    const int c = topk[i * K + t - nw];
             \\    if (c < 0 || c >= nc) continue;
             \\    const device uchar* cp = ccodes + size_t(c) * (D / 2) + lane * (V / 2);
             \\    const device uchar* sc_row = cscales + size_t(c) * (D / G);
             \\    const float sc0 = (G >= V) ? scale_of(uint(sc_row[(lane * V) / G]), MODE) : 0.0f;
-            \\    for (int b = 0; b < V / 2; ++b) {
-            \\      const float sv = (G >= V) ? sc0 : scale_of(uint(sc_row[(lane * V + b * 2) / G]), MODE);
-            \\      const uint byte = uint(cp[b]);
-            \\      const float lv = E2M1[byte & 7u] * sv;
-            \\      const float hv = E2M1[(byte >> 4) & 7u] * sv;
-            \\      const float v0 = float(KT((byte & 8u) ? -lv : lv));
-            \\      const float v1 = float(KT((byte & 128u) ? -hv : hv));
-            \\      kv[2 * b] = v0;
-            \\      kv[2 * b + 1] = v1;
-            \\      dot += qv[2 * b] * v0;
-            \\      dot += qv[2 * b + 1] * v1;
+            \\    if (V % 8 == 0) {
+            \\      #pragma clang loop unroll(full)
+            \\      for (int b = 0; b + 4 <= V / 2; b += 4) {
+            \\        const uint word = *(const device uint*)(cp + b);
+            \\        #pragma clang loop unroll(full)
+            \\        for (int j = 0; j < 4; ++j) {
+            \\          const int bi = b + j;
+            \\          const float sv = (G >= V) ? sc0 : scale_of(uint(sc_row[(lane * V + bi * 2) / G]), MODE);
+            \\          const uint byte = (word >> (j * 8)) & 0xffu;
+            \\          const float lv = E2M1[byte & 7u] * sv;
+            \\          const float hv = E2M1[(byte >> 4) & 7u] * sv;
+            \\          kv[2 * bi] = float(KT((byte & 8u) ? -lv : lv));
+            \\          kv[2 * bi + 1] = float(KT((byte & 128u) ? -hv : hv));
+            \\        }
+            \\      }
+            \\    } else {
+            \\      for (int b = 0; b < V / 2; ++b) {
+            \\        const float sv = (G >= V) ? sc0 : scale_of(uint(sc_row[(lane * V + b * 2) / G]), MODE);
+            \\        const uint byte = uint(cp[b]);
+            \\        const float lv = E2M1[byte & 7u] * sv;
+            \\        const float hv = E2M1[(byte >> 4) & 7u] * sv;
+            \\        kv[2 * b] = float(KT((byte & 8u) ? -lv : lv));
+            \\        kv[2 * b + 1] = float(KT((byte & 128u) ? -hv : hv));
+            \\      }
             \\    }
+            \\    for (int v = 0; v < V; ++v) dot += qv[v] * kv[v];
             \\  }
         else
             \\  const device KT* row;
@@ -867,8 +939,18 @@ fn attnDecBody(comptime packed_comp: bool) [:0]const u8 {
             \\    if (c < 0 || c >= nc) continue;
             \\    row = comp + size_t(c) * D;
             \\  }
-            \\  for (int v = 0; v < V; ++v) { kv[v] = float(row[lane * V + v]); dot += qv[v] * kv[v]; }
-        ) ++
+            \\  const device KT* rp = row + lane * V;
+            \\  if (V % 4 == 0) {
+            \\    #pragma clang loop unroll(full)
+            \\    for (int v = 0; v + 4 <= V; v += 4) {
+            \\      const metal::vec<KT, 4> u = *(const device metal::vec<KT, 4>*)(rp + v);
+            \\      kv[v] = float(u.x); kv[v + 1] = float(u.y); kv[v + 2] = float(u.z); kv[v + 3] = float(u.w);
+            \\    }
+            \\  } else {
+            \\    for (int v = 0; v < V; ++v) kv[v] = float(rp[v]);
+            \\  }
+            \\  for (int v = 0; v < V; ++v) dot += qv[v] * kv[v];
+        ) ++ "\n" ++
         \\  const float s = metal::simd_sum(dot) * scale;
         \\  const float nm = metal::max(mx, s);
         \\  const float corr = metal::precise::exp(mx - nm), p = metal::precise::exp(s - nm);
@@ -920,6 +1002,15 @@ const UNROPE_HEADER =
     \\}
 ;
 
+pub const HEAD_AT_HEADER =
+    \\// Head h of row i among L rows: `[L, H]`, or grouped `[OG, L, H / OG]` as an output projection's banks read it.
+    \\inline size_t dsv41_head_at(int i, int h, int H, int L, int OG) {
+    \\  if (OG == 0) return size_t(i) * H + h;
+    \\  const int per = H / metal::max(OG, 1);
+    \\  return (size_t(h / per) * L + i) * per + h % per;
+    \\}
+;
+
 /// UNROPE_HEADER and the fp8 activation round trip of a simdgroup's 32 channels (one dsv41_qat group), for the
 /// kernels that write the heads attnOut rounds next.
 pub const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
@@ -930,13 +1021,7 @@ pub const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
     \\  const float s = qat_scale<0>(metal::simd_max(metal::fabs(float(v))));
     \\  return static_cast<OT>(qat_round<0>(float(v), s));
     \\}
-    \\// Head h of row i among L rows: `[L, H]`, or grouped `[OG, L, H / OG]` as an output projection's banks read it.
-    \\inline size_t dsv41_head_at(int i, int h, int H, int L, int OG) {
-    \\  if (OG == 0) return size_t(i) * H + h;
-    \\  const int per = H / metal::max(OG, 1);
-    \\  return (size_t(h / per) * L + i) * per + h % per;
-    \\}
-;
+++ "\n" ++ HEAD_AT_HEADER;
 
 /// Before a decode attention's body: one more threadgroup a row, past the heads', splits the row's hyper-connection
 /// mixes `z` (`HC_SPLIT_BODY`). The attention neither waits for it nor feeds it, and outlasts it.
@@ -1046,6 +1131,12 @@ pub fn attnSplits(rows: usize) usize {
     return @max(1, @min(8, rows / 160));
 }
 
+/// Threadgroups a (row, 16-head NAX block) splits its `rows` into: 5 full 16-row tiles per split at 640 rows
+/// (8 splits → 32 TGs at L=1, 192 TGs at L=6) and 2 splits on 128-row window-only layers.
+pub fn attnNaxSplits(rows: usize) usize {
+    return @max(1, @min(16, (rows + 79) / 80));
+}
+
 pub const DecodeArgs = struct {
     /// `[L, H, D]` roped queries.
     q: A,
@@ -1085,6 +1176,8 @@ pub const DecodeArgs = struct {
     /// Where rows can take two split counts (`ratio`), launch row 0 apart from the rows after it as those are: how a
     /// load warms their launches at a context that holds one count.
     apart: bool = false,
+    /// When true and `attnDecodeNaxFits` holds, run Q·K and P·V over the 16-head MQA tiles on the NAX matrix units.
+    nax: bool = false,
 };
 
 /// The mixes `z` `[L, (2 + hc) * hc]` of a hyper-connection stage and what splits them; `eps` is `hcEps`.
@@ -1095,6 +1188,14 @@ pub fn attnDecodeFits(d: usize) bool {
     return d % 32 == 0 and d <= 1024;
 }
 
+/// Whether `attnDecode` can serve Q·K and P·V on the NAX matrix units (`HB = 16`, `NSG = 8`, `KT = 16`).
+pub fn attnDecodeNaxFits(h: usize, d: usize, q_dt: mlx.mlx_dtype, ring_dt: mlx.mlx_dtype, packed_comp: bool, pack_group: usize) bool {
+    if (!nax_gate.verifyQmmNaxAvailable() or h % 16 != 0 or d % (8 * 32) != 0 or d > 1024) return false;
+    if ((q_dt != .bfloat16 and q_dt != .float16) or q_dt != ring_dt) return false;
+    if (packed_comp and (pack_group < 8 or pack_group % 8 != 0 or d % pack_group != 0)) return false;
+    return true;
+}
+
 /// Whether `attnDecode` can unpack FP4 compressed rows in registers for head dim `d` and scale group `group`.
 pub fn attnDecodePackedFits(d: usize, group: usize) bool {
     if (!attnDecodeFits(d) or group < 2 or group % 2 != 0) return false;
@@ -1103,8 +1204,9 @@ pub fn attnDecodePackedFits(d: usize, group: usize) bool {
 }
 
 /// The splits row `r` of the block takes: those of its one-row step.
-fn rowSplits(a: DecodeArgs, K: usize, r: usize) usize {
-    return attnSplits(a.window + if (a.ratio > 0) @min(K, (a.p0 + r + 1) / a.ratio) else K);
+fn rowSplits(a: DecodeArgs, K: usize, r: usize, use_nax: bool) usize {
+    const rows = a.window + if (a.ratio > 0) @min(K, (a.p0 + r + 1) / a.ratio) else K;
+    return if (use_nax) attnNaxSplits(rows) else attnSplits(rows);
 }
 
 /// The heads `[L, H, D]` of a decode block, softmax over window and selected rows with the sink, inverse-rotated.
@@ -1113,13 +1215,15 @@ fn rowSplits(a: DecodeArgs, K: usize, r: usize) usize {
 pub fn attnDecode(sc: *Scope, a: DecodeArgs) !A {
     const K = if (a.topk.ctx != null) dim(a.topk, 1) else 0;
     const L = dim(a.q, 0);
+    const packed_comp = K > 0 and a.comp_scales.ctx != null;
+    const use_nax = a.nax and mlx.engine.isStream(sc.s) and attnDecodeNaxFits(dim(a.q, 1), dim(a.q, 2), mlx.mlx_array_dtype(a.q), mlx.mlx_array_dtype(a.ring), packed_comp, a.pack_group);
     var parts: [16]A = undefined;
     var np: usize = 0;
     var r0: usize = 0;
     while (r0 < L) {
-        const s0 = rowSplits(a, K, r0);
+        const s0 = rowSplits(a, K, r0, use_nax);
         var r1 = r0 + 1;
-        while (r1 < L and rowSplits(a, K, r1) == s0 and !(a.apart and a.ratio > 0 and K > 0 and r1 == 1)) r1 += 1;
+        while (r1 < L and rowSplits(a, K, r1, use_nax) == s0 and !(a.apart and a.ratio > 0 and K > 0 and r1 == 1)) r1 += 1;
         if (r0 == 0 and r1 == L) return attnDecodeSplit(sc, a, s0);
         var g = a;
         g.groups = 0;
@@ -1155,6 +1259,9 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     };
     // A riding split takes one more threadgroup a row, past the heads'.
     const ride = a.mixes;
+    if (a.nax and mlx.engine.isStream(sc.s) and attnDecodeNaxFits(H, D, mlx.mlx_array_dtype(a.q), kt, packed_comp, a.pack_group)) {
+        return attnDecodeNaxSplit(sc, a, splits, L, H, D, kt, packed_comp, comp, ids, meta, scal, freqs, og, out_shape);
+    }
     const grid: Grid = .{ (H + @intFromBool(ride != null)) * attn_dec_nsg * 32, L, splits };
     const tg: Grid = .{ attn_dec_nsg * 32, 1, 1 };
     // The split count is the grid's depth, read by the kernels, so a context crossing a split step compiles nothing.
@@ -1268,11 +1375,11 @@ const ATTN_FUSED_HEAD =
     \\const int wp = meta[0], window = meta[1], K = meta[2], nc = meta[3];
     \\const int H = q_shape[1];
     \\const int c1 = wp + l, c0 = metal::max(0, c1 - window + 1), nw = c1 - c0 + 1, total = nw + K;
-    \\constexpr int RT = HB / 8, DS = D / NSG, DT = DS / 8, KC = KT / 8, NT = NSG * 32, TPH = NT / HB, NJ = KT / TPH;
+    \\constexpr int RT = HB / 8, DS = D / NSG, DT = DS / 8, KC = KT / 8, NT = NSG * 32, TPH = NT / HB, NJ = KT / TPH, KT_STRIDE = D;
     \\const int d0 = int(sg) * DS;
     \\const short qid = short(lane) / 4;
     \\const short fm = (qid & 4) + ((short(lane) / 2) % 4), fn = (qid & 2) * 2 + (short(lane) % 2) * 2;
-    \\threadgroup T kt[KT * D];
+    \\threadgroup T kt[KT * KT_STRIDE];
     \\threadgroup float sp[NSG * HB * KT];
     \\threadgroup T ph[HB * KT], pl[HB * KT];
     \\threadgroup float cr[HB], rl[HB];
@@ -1297,7 +1404,7 @@ const ATTN_FUSED_LOAD_ROWS =
     \\    metal::uint4 v = metal::uint4(0);
     \\    if (src >= 0) v = ((const device metal::uint4*)(keys + size_t(src) * D))[cc];
     \\    else if (src != -1) v = ((const device metal::uint4*)(comp + size_t(-2 - src) * D))[cc];
-    \\    ((threadgroup metal::uint4*)kt)[i] = v;
+    \\    ((threadgroup metal::uint4*)(kt + j * KT_STRIDE))[cc] = v;
     \\  }
 ;
 
@@ -1308,19 +1415,25 @@ const ATTN_FUSED_LOAD_FP4 =
     \\    const int j = i / (D / 8), cc = i % (D / 8), src = source_row(j);
     \\    if (src < -1) {
     \\      const size_t row = size_t(-2 - src);
-    \\      const device uchar* cp = ccodes + row * (D / 2) + cc * 4;
+    \\      const uint packed = ((const device uint*)(ccodes + row * (D / 2)))[cc];
     \\      const float s = scale_of(uint(cscales[row * (D / G) + cc * 8 / G]), MODE);
+    \\      metal::vec<T, 4> lo, hi;
     \\      #pragma clang loop unroll(full)
-    \\      for (int e = 0; e < 8; ++e) {
-    \\        const uint byte = uint(cp[e / 2]);
-    \\        const uint code = (e & 1) ? byte >> 4 : byte & 15u;
-    \\        const float v = E2M1[code & 7u] * s;
-    \\        kt[j * D + cc * 8 + e] = static_cast<T>((code & 8u) ? -v : v);
+    \\      for (int e = 0; e < 4; ++e) {
+    \\        const uint c0 = (packed >> (e * 4)) & 15u;
+    \\        const float v0 = E2M1[c0 & 7u] * s;
+    \\        lo[e] = static_cast<T>((c0 & 8u) ? -v0 : v0);
+    \\        const uint c1 = (packed >> ((e + 4) * 4)) & 15u;
+    \\        const float v1 = E2M1[c1 & 7u] * s;
+    \\        hi[e] = static_cast<T>((c1 & 8u) ? -v1 : v1);
     \\      }
+    \\      threadgroup metal::vec<T, 4>* dst4 = (threadgroup metal::vec<T, 4>*)(kt + j * KT_STRIDE + cc * 8);
+    \\      dst4[0] = lo;
+    \\      dst4[1] = hi;
     \\    } else {
     \\      metal::uint4 v = metal::uint4(0);
     \\      if (src >= 0) v = ((const device metal::uint4*)(keys + size_t(src) * D))[cc];
-    \\      ((threadgroup metal::uint4*)kt)[i] = v;
+    \\      ((threadgroup metal::uint4*)(kt + j * KT_STRIDE))[cc] = v;
     \\    }
     \\  }
 ;
@@ -1485,39 +1598,113 @@ const ATTN_NAX_HEAD =
     \\const int wp = meta[0], window = meta[1], K = meta[2], nc = meta[3];
     \\const int H = q_shape[1];
     \\const int c1 = wp + l, c0 = metal::max(0, c1 - window + 1), nw = c1 - c0 + 1, total = nw + K;
-    \\constexpr int DS = D / NSG, QS = DS / 32, OF = DS / 16, NT = NSG * 32, TPH = NT / HB, NJ = KT / TPH;
+    \\constexpr int HBLK = HB / 16, DS = D / NSG, QS = DS / 32, OF = DS / 16, NT = NSG * 32, TPH = NT / HB, NJ = KT / TPH, SP_STRIDE = HB + 4;
     \\const int d0 = int(sg) * DS;
-    \\threadgroup T kt[KT * D];
-    \\threadgroup float sp[NSG * HB * KT];
+    \\threadgroup float sp[NSG * KT * SP_STRIDE];
     \\threadgroup T ph[HB * KT], pl[HB * KT];
     \\threadgroup float cr[HB], rl[HB];
     \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
     \\float m = sink[h0 + hh], lsum = 1.0f;
     \\const float scale = scal[0];
-    \\T qt[QS][16];
-    \\float o[OF * 8];
+    \\T qt[HBLK][QS][16];
+    \\float o[HBLK][OF * 8];
     \\#pragma clang loop unroll(full)
-    \\for (int ks = 0; ks < QS; ++ks)
+    \\for (int hb = 0; hb < HBLK; ++hb) {
     \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < 16; ++i) qt[ks][i] = q[(size_t(l) * H + h0 + dsv41_nax_c(lane, i % 8)) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_r(lane, i % 8)];
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < OF * 8; ++i) o[i] = 0.0f;
+    \\  for (int ks = 0; ks < QS; ++ks)
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < 16; ++i) qt[hb][ks][i] = q[(size_t(l) * H + h0 + hb * 16 + dsv41_nax_c(lane, i % 8)) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_r(lane, i % 8)];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < OF * 8; ++i) o[hb][i] = 0.0f;
+    \\}
+    \\const short nr0 = dsv41_nax_r(lane, 0), nc0 = dsv41_nax_c(lane, 0);
 ;
 
-const ATTN_NAX_TAIL =
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  float s[8];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < 8; ++i) s[i] = 0.0f;
+/// Direct-to-register key fragment load for NAX attention (unpacked `keys` + `comp`): each simdgroup loads only its
+/// own `DS`-channel slice directly into `kf`, avoiding threadgroup staging (`kt`) and 2 threadgroup barriers per tile.
+const ATTN_NAX_LOAD_ROWS =
+    \\  const int src0 = source_row(int(nr0)), src1 = source_row(int(nr0) + 8);
+    \\  const device T* rowp0 = (src0 >= 0) ? (keys + size_t(src0) * D) : ((src0 != -1) ? (comp + size_t(-2 - src0) * D) : nullptr);
+    \\  const device T* rowp1 = (src1 >= 0) ? (keys + size_t(src1) * D) : ((src1 != -1) ? (comp + size_t(-2 - src1) * D) : nullptr);
     \\  T kf[QS][16];
     \\  #pragma clang loop unroll(full)
     \\  for (int ks = 0; ks < QS; ++ks) {
-    \\    #pragma clang loop unroll(full)
-    \\    for (int i = 0; i < 16; ++i) kf[ks][i] = kt[dsv41_nax_r(lane, i % 8) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_c(lane, i % 8)];
-    \\    dsv41_nax_mma<16, 32>(s, kf[ks], qt[ks]);
+    \\    const int kd = d0 + ks * 32 + int(nc0);
+    \\    const metal::vec<T, 4> k0 = rowp0 ? *(const device metal::vec<T, 4>*)(rowp0 + kd) : metal::vec<T, 4>(T(0));
+    \\    const metal::vec<T, 4> k1 = rowp1 ? *(const device metal::vec<T, 4>*)(rowp1 + kd) : metal::vec<T, 4>(T(0));
+    \\    const metal::vec<T, 4> k2 = rowp0 ? *(const device metal::vec<T, 4>*)(rowp0 + kd + 16) : metal::vec<T, 4>(T(0));
+    \\    const metal::vec<T, 4> k3 = rowp1 ? *(const device metal::vec<T, 4>*)(rowp1 + kd + 16) : metal::vec<T, 4>(T(0));
+    \\    kf[ks][0] = k0[0]; kf[ks][1] = k0[1]; kf[ks][2] = k0[2]; kf[ks][3] = k0[3];
+    \\    kf[ks][4] = k1[0]; kf[ks][5] = k1[1]; kf[ks][6] = k1[2]; kf[ks][7] = k1[3];
+    \\    kf[ks][8] = k2[0]; kf[ks][9] = k2[1]; kf[ks][10] = k2[2]; kf[ks][11] = k2[3];
+    \\    kf[ks][12] = k3[0]; kf[ks][13] = k3[1]; kf[ks][14] = k3[2]; kf[ks][15] = k3[3];
     \\  }
+;
+
+/// Direct-to-register key fragment load for NAX attention with FP4-packed compressed rows (`keys` + `ccodes`/`cscales`).
+const ATTN_NAX_LOAD_FP4 =
+    \\  constexpr float E2M1_S[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+    \\  const int src0 = source_row(int(nr0)), src1 = source_row(int(nr0) + 8);
+    \\  T kf[QS][16];
     \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + dsv41_nax_c(lane, i)) * KT + dsv41_nax_r(lane, i)] = s[i];
+    \\  for (int ks = 0; ks < QS; ++ks) {
+    \\    const int kd = d0 + ks * 32 + int(nc0);
+    \\    metal::vec<T, 4> k0 = metal::vec<T, 4>(T(0)), k2 = metal::vec<T, 4>(T(0));
+    \\    if (src0 < -1) {
+    \\      const size_t r0 = size_t(-2 - src0);
+    \\      const ushort p0 = *(const device ushort*)(ccodes + r0 * (D / 2) + kd / 2);
+    \\      const ushort p2 = *(const device ushort*)(ccodes + r0 * (D / 2) + (kd + 16) / 2);
+    \\      const float sc0 = scale_of(uint(cscales[r0 * (D / G) + kd / G]), MODE);
+    \\      const float sc2 = (G >= 32) ? sc0 : scale_of(uint(cscales[r0 * (D / G) + (kd + 16) / G]), MODE);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int e = 0; e < 4; ++e) {
+    \\        k0[e] = static_cast<T>(E2M1_S[(p0 >> (e * 4)) & 15u] * sc0);
+    \\        k2[e] = static_cast<T>(E2M1_S[(p2 >> (e * 4)) & 15u] * sc2);
+    \\      }
+    \\    } else if (src0 >= 0) {
+    \\      const device T* rp = keys + size_t(src0) * D + kd;
+    \\      k0 = *(const device metal::vec<T, 4>*)rp;
+    \\      k2 = *(const device metal::vec<T, 4>*)(rp + 16);
+    \\    }
+    \\    metal::vec<T, 4> k1 = metal::vec<T, 4>(T(0)), k3 = metal::vec<T, 4>(T(0));
+    \\    if (src1 < -1) {
+    \\      const size_t r1 = size_t(-2 - src1);
+    \\      const ushort p1 = *(const device ushort*)(ccodes + r1 * (D / 2) + kd / 2);
+    \\      const ushort p3 = *(const device ushort*)(ccodes + r1 * (D / 2) + (kd + 16) / 2);
+    \\      const float sc1 = scale_of(uint(cscales[r1 * (D / G) + kd / G]), MODE);
+    \\      const float sc3 = (G >= 32) ? sc1 : scale_of(uint(cscales[r1 * (D / G) + (kd + 16) / G]), MODE);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int e = 0; e < 4; ++e) {
+    \\        k1[e] = static_cast<T>(E2M1_S[(p1 >> (e * 4)) & 15u] * sc1);
+    \\        k3[e] = static_cast<T>(E2M1_S[(p3 >> (e * 4)) & 15u] * sc3);
+    \\      }
+    \\    } else if (src1 >= 0) {
+    \\      const device T* rp = keys + size_t(src1) * D + kd;
+    \\      k1 = *(const device metal::vec<T, 4>*)rp;
+    \\      k3 = *(const device metal::vec<T, 4>*)(rp + 16);
+    \\    }
+    \\    kf[ks][0] = k0[0]; kf[ks][1] = k0[1]; kf[ks][2] = k0[2]; kf[ks][3] = k0[3];
+    \\    kf[ks][4] = k1[0]; kf[ks][5] = k1[1]; kf[ks][6] = k1[2]; kf[ks][7] = k1[3];
+    \\    kf[ks][8] = k2[0]; kf[ks][9] = k2[1]; kf[ks][10] = k2[2]; kf[ks][11] = k2[3];
+    \\    kf[ks][12] = k3[0]; kf[ks][13] = k3[1]; kf[ks][14] = k3[2]; kf[ks][15] = k3[3];
+    \\  }
+;
+
+const ATTN_NAX_TAIL =
+    \\  float s[HBLK][8];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int hb = 0; hb < HBLK; ++hb)
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < 8; ++i) s[hb][i] = 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int ks = 0; ks < QS; ++ks)
+    \\    #pragma clang loop unroll(full)
+    \\    for (int hb = 0; hb < HBLK; ++hb) dsv41_nax_mma<16, 32>(s[hb], kf[ks], qt[hb][ks]);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int hb = 0; hb < HBLK; ++hb) {
+    \\    *(threadgroup float4*)(sp + (int(sg) * KT + int(nr0)) * SP_STRIDE + hb * 16 + int(nc0)) = float4(s[hb][0], s[hb][1], s[hb][2], s[hb][3]);
+    \\    *(threadgroup float4*)(sp + (int(sg) * KT + int(nr0) + 8) * SP_STRIDE + hb * 16 + int(nc0)) = float4(s[hb][4], s[hb][5], s[hb][6], s[hb][7]);
+    \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  float sv[NJ], tmax = -INFINITY;
     \\  for (int jj = 0; jj < NJ; ++jj) {
@@ -1525,7 +1712,8 @@ const ATTN_NAX_TAIL =
     \\    float v = -INFINITY;
     \\    if (source_row(j) != -1) {
     \\      float a = 0.0f;
-    \\      for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + j];
+    \\      #pragma clang loop unroll(full)
+    \\      for (int g = 0; g < NSG; ++g) a += sp[(g * KT + j) * SP_STRIDE + hh];
     \\      v = a * scale;
     \\    }
     \\    sv[jj] = v;
@@ -1548,66 +1736,79 @@ const ATTN_NAX_TAIL =
     \\  if (sub == 0) cr[hh] = corr;
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < OF * 8; ++i) o[i] *= cr[dsv41_nax_r(lane, i % 8)];
-    \\  T ah[8], al[8];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < 8; ++i) { ah[i] = ph[dsv41_nax_r(lane, i) * KT + dsv41_nax_c(lane, i)]; al[i] = pl[dsv41_nax_r(lane, i) * KT + dsv41_nax_c(lane, i)]; }
-    \\  #pragma clang loop unroll(full)
-    \\  for (int g = 0; g < QS; ++g) {
-    \\    dsv41_nax_mma<32, 16>(o + g * 16, al, kf[g]);
-    \\    dsv41_nax_mma<32, 16>(o + g * 16, ah, kf[g]);
+    \\  for (int hb = 0; hb < HBLK; ++hb) {
+    \\    const float cr0 = cr[hb * 16 + int(nr0)], cr1 = cr[hb * 16 + int(nr0) + 8];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int f = 0; f < OF; ++f) {
+    \\      o[hb][f * 8 + 0] *= cr0; o[hb][f * 8 + 1] *= cr0; o[hb][f * 8 + 2] *= cr0; o[hb][f * 8 + 3] *= cr0;
+    \\      o[hb][f * 8 + 4] *= cr1; o[hb][f * 8 + 5] *= cr1; o[hb][f * 8 + 6] *= cr1; o[hb][f * 8 + 7] *= cr1;
+    \\    }
+    \\    const metal::vec<T, 4> ah0 = *(const threadgroup metal::vec<T, 4>*)(ph + (hb * 16 + int(nr0)) * KT + int(nc0));
+    \\    const metal::vec<T, 4> ah1 = *(const threadgroup metal::vec<T, 4>*)(ph + (hb * 16 + int(nr0) + 8) * KT + int(nc0));
+    \\    const metal::vec<T, 4> al0 = *(const threadgroup metal::vec<T, 4>*)(pl + (hb * 16 + int(nr0)) * KT + int(nc0));
+    \\    const metal::vec<T, 4> al1 = *(const threadgroup metal::vec<T, 4>*)(pl + (hb * 16 + int(nr0) + 8) * KT + int(nc0));
+    \\    const T ah[8] = { ah0[0], ah0[1], ah0[2], ah0[3], ah1[0], ah1[1], ah1[2], ah1[3] };
+    \\    const T al[8] = { al0[0], al0[1], al0[2], al0[3], al1[0], al1[1], al1[2], al1[3] };
+    \\    #pragma clang loop unroll(full)
+    \\    for (int g = 0; g < QS; ++g) {
+    \\      dsv41_nax_mma<32, 16>(o[hb] + g * 16, al, kf[g]);
+    \\      dsv41_nax_mma<32, 16>(o[hb] + g * 16, ah, kf[g]);
+    \\    }
     \\  }
     \\}
     \\if (sub == 0) rl[hh] = 1.0f / lsum;
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\const int cc0 = dsv41_nax_c(lane, 0);
     \\#pragma clang loop unroll(full)
-    \\for (int hs = 0; hs < 2; ++hs) {
-    \\  const int row = dsv41_nax_r(lane, hs * 4);
-    \\  const float inv = rl[row];
-    \\  const int head = h0 + row;
-    \\  if (EPI) {
-    \\    float v[OF][4];
-    \\    #pragma clang loop unroll(full)
-    \\    for (int f = 0; f < OF; ++f) {
+    \\for (int hb = 0; hb < HBLK; ++hb) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int hs = 0; hs < 2; ++hs) {
+    \\    const int row = hb * 16 + dsv41_nax_r(lane, hs * 4);
+    \\    const float inv = rl[row];
+    \\    const int head = h0 + row;
+    \\    if (EPI) {
+    \\      float v[OF][4];
     \\      #pragma clang loop unroll(full)
-    \\      for (int j = 0; j < 4; ++j) v[f][j] = float(OT(o[f * 8 + hs * 4 + j] * inv));
-    \\      #pragma clang loop unroll(full)
-    \\      for (int p = 0; p < 2; ++p) {
-    \\        const int c = d0 + f * 16 + cc0 + p * 2;
-    \\        if (RD > 0 && c >= D - RD) dsv41_rope_pair<OT>(v[f][p * 2], v[f][p * 2 + 1], meta[4] + l, freqs[(c - (D - RD)) / 2]);
-    \\      }
-    \\    }
-    \\    if (QAT) {
-    \\      #pragma clang loop unroll(full)
-    \\      for (int g = 0; g < OF / 2; ++g) {
-    \\        float amax = 0.0f;
+    \\      for (int f = 0; f < OF; ++f) {
     \\        #pragma clang loop unroll(full)
-    \\        for (int f = g * 2; f < g * 2 + 2; ++f)
-    \\          #pragma clang loop unroll(full)
-    \\          for (int j = 0; j < 4; ++j) amax = metal::max(amax, metal::abs(v[f][j]));
-    \\        amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
-    \\        amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
-    \\        const float sc = qat_scale<0>(amax);
+    \\        for (int j = 0; j < 4; ++j) v[f][j] = float(OT(o[hb][f * 8 + hs * 4 + j] * inv));
     \\        #pragma clang loop unroll(full)
-    \\        for (int f = g * 2; f < g * 2 + 2; ++f)
-    \\          #pragma clang loop unroll(full)
-    \\          for (int j = 0; j < 4; ++j) v[f][j] = float(static_cast<OT>(qat_round<0>(v[f][j], sc)));
+    \\        for (int p = 0; p < 2; ++p) {
+    \\          const int c = d0 + f * 16 + cc0 + p * 2;
+    \\          if (RD > 0 && c >= D - RD) dsv41_rope_pair<OT>(v[f][p * 2], v[f][p * 2 + 1], meta[4] + l, freqs[(c - (D - RD)) / 2]);
+    \\        }
     \\      }
-    \\    }
-    \\    #pragma clang loop unroll(full)
-    \\    for (int f = 0; f < OF; ++f) {
-    \\      const int flat = head * D + d0 + f * 16 + cc0;
-    \\      device OT* dst = out + (size_t(flat / GIN) * meta[5] + meta[6] + l) * GIN + flat % GIN;
+    \\      if (QAT) {
+    \\        #pragma clang loop unroll(full)
+    \\        for (int g = 0; g < OF / 2; ++g) {
+    \\          float amax = 0.0f;
+    \\          #pragma clang loop unroll(full)
+    \\          for (int f = g * 2; f < g * 2 + 2; ++f)
+    \\            #pragma clang loop unroll(full)
+    \\            for (int j = 0; j < 4; ++j) amax = metal::max(amax, metal::abs(v[f][j]));
+    \\          amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
+    \\          amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
+    \\          const float sc = qat_scale<0>(amax);
+    \\          #pragma clang loop unroll(full)
+    \\          for (int f = g * 2; f < g * 2 + 2; ++f)
+    \\            #pragma clang loop unroll(full)
+    \\            for (int j = 0; j < 4; ++j) v[f][j] = float(static_cast<OT>(qat_round<0>(v[f][j], sc)));
+    \\        }
+    \\      }
     \\      #pragma clang loop unroll(full)
-    \\      for (int j = 0; j < 4; ++j) dst[j] = OT(v[f][j]);
-    \\    }
-    \\  } else {
-    \\    device OT* dst = out + (size_t(l) * H + head) * D + d0 + cc0;
-    \\    #pragma clang loop unroll(full)
-    \\    for (int f = 0; f < OF; ++f)
+    \\      for (int f = 0; f < OF; ++f) {
+    \\        const int flat = head * D + d0 + f * 16 + cc0;
+    \\        device OT* dst = out + (size_t(flat / GIN) * meta[5] + meta[6] + l) * GIN + flat % GIN;
+    \\        #pragma clang loop unroll(full)
+    \\        for (int j = 0; j < 4; ++j) dst[j] = OT(v[f][j]);
+    \\      }
+    \\    } else {
+    \\      device OT* dst = out + (size_t(l) * H + head) * D + d0 + cc0;
     \\      #pragma clang loop unroll(full)
-    \\      for (int j = 0; j < 4; ++j) dst[f * 16 + j] = OT(o[f * 8 + hs * 4 + j] * inv);
+    \\      for (int f = 0; f < OF; ++f)
+    \\        #pragma clang loop unroll(full)
+    \\        for (int j = 0; j < 4; ++j) dst[f * 16 + j] = OT(o[hb][f * 8 + hs * 4 + j] * inv);
+    \\    }
     \\  }
     \\}
 ;
@@ -1647,14 +1848,475 @@ const ATTN_TILE_SHUFFLE =
 
 pub const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
 pub const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
-pub const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_NAX_TAIL;
-pub const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SHUFFLE ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_NAX_TAIL;
+pub const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SHUFFLE ++ ATTN_NAX_LOAD_ROWS ++ ATTN_NAX_TAIL;
+pub const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SHUFFLE ++ ATTN_NAX_LOAD_FP4 ++ ATTN_NAX_TAIL;
 
 var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE, .header = ATTN_EPI_HEADER };
 var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
 
 var attn_nax_def = Def{ .name = "dsv41_attn_nax", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_NAX_SOURCE, .header = ATTN_NAX_HEADER ++ ATTN_EPI_HEADER };
 var attn_nax_fp4_def = Def{ .name = "dsv41_attn_nax_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_NAX_FP4_SOURCE, .header = ATTN_NAX_HEADER ++ ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
+
+/// Decode attention over `HB = 16` MQA heads per threadgroup on the NAX matrix units (`KT = 16`, `NSG = 8`),
+/// either single-pass (`!split_k`, with inverse RoPE + optional FP8 QAT + grouped output) or split-K (`split_k`,
+/// writing `pacc`/`pm`/`pl` for `dsv41_attn_merge`). `meta = {p0, L, K, window, cap, nc, ratio}`.
+fn attnDecNaxSource(comptime packed_comp: bool, comptime split_k: bool, comptime ride: bool) [:0]const u8 {
+    return (if (ride)
+        \\if (threadgroup_position_in_grid.x == uint(q_shape[1] / HB)) {
+        \\#pragma clang fp contract(off)
+        \\  if (simdgroup_index_in_threadgroup != 0u || threadgroup_position_in_grid.z != 0u) return;
+        \\  const int l = threadgroup_position_in_grid.y;
+    ++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
+        \\  return;
+        \\}
+    else
+        "") ++ "\n" ++
+        \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+        \\const ushort lane = thread_index_in_simdgroup;
+        \\const int l = threadgroup_position_in_grid.y, h0 = threadgroup_position_in_grid.x * HB;
+        \\const int p0 = meta[0], K = meta[2], window = meta[3], cap = meta[4], nc = meta[5];
+        \\const int H = q_shape[1];
+        \\const int pos = p0 + l;
+        \\const int lo = metal::max(0, pos - window + 1);
+        \\const int nw = pos - lo + 1;
+        \\const int Ki = meta[6] > 0 ? metal::min(K, (pos + 1) / meta[6]) : K;
+        \\const int S = int(threadgroups_per_grid.z), sp_idx = threadgroup_position_in_grid.z;
+        \\const int chunk = (nw + Ki + S - 1) / S;
+        \\const int t_lo = sp_idx * chunk, t_hi = metal::min(nw + Ki, t_lo + chunk);
+        \\const device T* keys = ring;
+        \\constexpr int DS = D / NSG, QS = DS / 32, OF = DS / 16, NT = NSG * 32, TPH = NT / HB;
+        \\const int d0 = int(sg) * DS;
+        \\threadgroup float sp[NSG * HB * KT];
+        \\threadgroup T t_ph[HB * KT], t_pl[HB * KT];
+        \\threadgroup float cr[HB];
+        ++ (if (split_k)
+            ""
+        else
+            "\n" ++
+                \\threadgroup float rl[HB];
+        ) ++ "\n" ++
+        \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
+        ++ (if (split_k)
+            \\float m = -INFINITY, lsum = 0.0f;
+        else
+            \\float m = sink[h0 + hh], lsum = 1.0f;
+        ) ++ "\n" ++
+        \\const float scale = scal[0];
+        \\T qt[QS][16];
+        \\float o[OF * 8];
+        \\#pragma clang loop unroll(full)
+        \\for (int ks = 0; ks < QS; ++ks)
+        \\  #pragma clang loop unroll(full)
+        \\  for (int i = 0; i < 16; ++i) qt[ks][i] = q[(size_t(l) * H + h0 + dsv41_nax_c(lane, i % 8)) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_r(lane, i % 8)];
+        \\#pragma clang loop unroll(full)
+        \\for (int i = 0; i < OF * 8; ++i) o[i] = 0.0f;
+        \\const short nr0 = dsv41_nax_r(lane, 0), nc0 = dsv41_nax_c(lane, 0);
+        \\for (int t0 = t_lo; t0 < t_hi; t0 += KT) {
+        \\  const int t = t0 + int(lane % KT);
+        \\  int row_source = -1;
+        \\  if (t < t_hi) {
+        \\    if (t < nw) row_source = (lo + t) % cap;
+        \\    else {
+        \\      const int c = topk[size_t(l) * K + t - nw];
+        \\      if (c >= 0 && c < nc) row_source = -2 - c;
+        \\    }
+        \\  }
+        \\  if (!metal::simd_any(row_source != -1)) continue;
+        \\  auto source_row = [&](int j) { return metal::simd_shuffle(row_source, ushort(j)); };
+        ++ "\n" ++ (if (packed_comp) ATTN_NAX_LOAD_FP4 else ATTN_NAX_LOAD_ROWS) ++ "\n" ++
+        \\  float s[8];
+        \\  #pragma clang loop unroll(full)
+        \\  for (int i = 0; i < 8; ++i) s[i] = 0.0f;
+        \\  #pragma clang loop unroll(full)
+        \\  for (int ks = 0; ks < QS; ++ks) dsv41_nax_mma<16, 32>(s, kf[ks], qt[ks]);
+        \\  #pragma clang loop unroll(full)
+        \\  for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + dsv41_nax_c(lane, i)) * KT + dsv41_nax_r(lane, i)] = s[i];
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  float v = -INFINITY;
+        \\  if (source_row(sub) != -1) {
+        \\    float a = 0.0f;
+        \\    #pragma clang loop unroll(full)
+        \\    for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + sub];
+        \\    v = a * scale;
+        \\  }
+        \\  float tmax = v;
+        \\  for (int off = TPH / 2; off > 0; off >>= 1) tmax = metal::max(tmax, metal::simd_shuffle_xor(tmax, ushort(off)));
+        \\  const float mn = metal::max(m, tmax);
+        \\  const float corr = (m > -INFINITY) ? metal::precise::exp(m - mn) : 0.0f;
+        \\  const float p = (v > -INFINITY) ? metal::precise::exp(v - mn) : 0.0f;
+        \\  const T hi = T(p);
+        \\  float psum = p;
+        \\  t_ph[hh * KT + sub] = hi;
+        \\  t_pl[hh * KT + sub] = T(p - float(hi));
+        \\  for (int off = TPH / 2; off > 0; off >>= 1) psum += metal::simd_shuffle_xor(psum, ushort(off));
+        \\  lsum = lsum * corr + psum;
+        \\  m = mn;
+        \\  if (sub == 0) cr[hh] = corr;
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  const float cr0 = cr[int(nr0)], cr1 = cr[int(nr0) + 8];
+        \\  #pragma clang loop unroll(full)
+        \\  for (int f = 0; f < OF; ++f) {
+        \\    o[f * 8 + 0] *= cr0; o[f * 8 + 1] *= cr0; o[f * 8 + 2] *= cr0; o[f * 8 + 3] *= cr0;
+        \\    o[f * 8 + 4] *= cr1; o[f * 8 + 5] *= cr1; o[f * 8 + 6] *= cr1; o[f * 8 + 7] *= cr1;
+        \\  }
+        \\  const metal::vec<T, 4> ah0 = *(const threadgroup metal::vec<T, 4>*)(t_ph + int(nr0) * KT + int(nc0));
+        \\  const metal::vec<T, 4> ah1 = *(const threadgroup metal::vec<T, 4>*)(t_ph + (int(nr0) + 8) * KT + int(nc0));
+        \\  const metal::vec<T, 4> al0 = *(const threadgroup metal::vec<T, 4>*)(t_pl + int(nr0) * KT + int(nc0));
+        \\  const metal::vec<T, 4> al1 = *(const threadgroup metal::vec<T, 4>*)(t_pl + (int(nr0) + 8) * KT + int(nc0));
+        \\  const T ah[8] = { ah0[0], ah0[1], ah0[2], ah0[3], ah1[0], ah1[1], ah1[2], ah1[3] };
+        \\  const T al[8] = { al0[0], al0[1], al0[2], al0[3], al1[0], al1[1], al1[2], al1[3] };
+        \\  #pragma clang loop unroll(full)
+        \\  for (int g = 0; g < QS; ++g) {
+        \\    dsv41_nax_mma<32, 16>(o + g * 16, al, kf[g]);
+        \\    dsv41_nax_mma<32, 16>(o + g * 16, ah, kf[g]);
+        \\  }
+        \\}
+        ++ "\n" ++ (if (split_k)
+            \\if (sub == 0) {
+            \\  const size_t base = (size_t(l) * H + h0 + hh) * S + sp_idx;
+            \\  pm[base] = m;
+            \\  pl[base] = lsum;
+            \\}
+            \\const int cc0 = dsv41_nax_c(lane, 0);
+            \\#pragma clang loop unroll(full)
+            \\for (int hs = 0; hs < 2; ++hs) {
+            \\  const int head = h0 + dsv41_nax_r(lane, hs * 4);
+            \\  const size_t base = (size_t(l) * H + head) * S + sp_idx;
+            \\  device float* dst = pacc + base * D + d0 + cc0;
+            \\  #pragma clang loop unroll(full)
+            \\  for (int f = 0; f < OF; ++f)
+            \\    #pragma clang loop unroll(full)
+            \\    for (int j = 0; j < 4; ++j) dst[f * 16 + j] = o[f * 8 + hs * 4 + j];
+            \\}
+        else
+            \\if (sub == 0) rl[hh] = 1.0f / lsum;
+            \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            \\const int cc0 = dsv41_nax_c(lane, 0);
+            \\#pragma clang loop unroll(full)
+            \\for (int hs = 0; hs < 2; ++hs) {
+            \\  const int row = dsv41_nax_r(lane, hs * 4);
+            \\  const float inv = rl[row];
+            \\  const int head = h0 + row;
+            \\  float v[OF][4];
+            \\  #pragma clang loop unroll(full)
+            \\  for (int f = 0; f < OF; ++f) {
+            \\    #pragma clang loop unroll(full)
+            \\    for (int j = 0; j < 4; ++j) v[f][j] = float(OT(o[f * 8 + hs * 4 + j] * inv));
+            \\    #pragma clang loop unroll(full)
+            \\    for (int p = 0; p < 2; ++p) {
+            \\      const int c = d0 + f * 16 + cc0 + p * 2;
+            \\      if (RD > 0 && c >= D - RD) dsv41_rope_pair<OT>(v[f][p * 2], v[f][p * 2 + 1], pos, freqs[(c - (D - RD)) / 2]);
+            \\    }
+            \\  }
+            \\  if (QAT) {
+            \\    #pragma clang loop unroll(full)
+            \\    for (int g = 0; g < OF / 2; ++g) {
+            \\      float amax = 0.0f;
+            \\      #pragma clang loop unroll(full)
+            \\      for (int f = g * 2; f < g * 2 + 2; ++f)
+            \\        #pragma clang loop unroll(full)
+            \\        for (int j = 0; j < 4; ++j) amax = metal::max(amax, metal::abs(v[f][j]));
+            \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
+            \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
+            \\      const float sc = qat_scale<0>(amax);
+            \\      #pragma clang loop unroll(full)
+            \\      for (int f = g * 2; f < g * 2 + 2; ++f)
+            \\        #pragma clang loop unroll(full)
+            \\        for (int j = 0; j < 4; ++j) v[f][j] = float(static_cast<OT>(qat_round<0>(v[f][j], sc)));
+            \\    }
+            \\  }
+            \\  device OT* dst_head = out + dsv41_head_at(l, head, H, meta[1], OG) * D + d0 + cc0;
+            \\  #pragma clang loop unroll(full)
+            \\  for (int f = 0; f < OF; ++f)
+            \\    #pragma clang loop unroll(full)
+            \\    for (int j = 0; j < 4; ++j) dst_head[f * 16 + j] = OT(v[f][j]);
+            \\}
+        );
+}
+
+pub const ATTN_DEC_NAX_EPI_HEADER = ATTN_NAX_HEADER ++ ATTN_EPI_HEADER ++ "\n" ++ HEAD_AT_HEADER;
+pub const ATTN_DEC_NAX_SOURCE = attnDecNaxSource(false, false, false);
+pub const ATTN_SPLIT_NAX_SOURCE = attnDecNaxSource(false, true, false);
+pub const ATTN_DEC_NAX_RIDE_SOURCE = attnDecNaxSource(false, false, true);
+pub const ATTN_SPLIT_NAX_RIDE_SOURCE = attnDecNaxSource(false, true, true);
+pub const ATTN_DEC_NAX_PACKED_SOURCE = attnDecNaxSource(true, false, false);
+pub const ATTN_SPLIT_NAX_PACKED_SOURCE = attnDecNaxSource(true, true, false);
+pub const ATTN_DEC_NAX_PACKED_RIDE_SOURCE = attnDecNaxSource(true, false, true);
+pub const ATTN_SPLIT_NAX_PACKED_RIDE_SOURCE = attnDecNaxSource(true, true, true);
+
+/// Non-causal DSpark draft attention over `HB = 16` MQA heads per threadgroup on the NAX matrix units (`KT = 16`,
+/// `NSG = 8`): every row of `q` `[B, H, D]` attends to all `nw + B` keys (`win` `[nw, D]` followed by `blk` `[B, D]`)
+/// with fused sink, inverse tail RoPE, optional FP8 QAT, and direct grouped output `[og, B, H/og * D]`.
+/// `meta = {p0, B, nw}`.
+fn attnDsparkNaxSource(comptime ride: bool) [:0]const u8 {
+    return (if (ride)
+        \\if (threadgroup_position_in_grid.x == uint(q_shape[1] / HB)) {
+        \\#pragma clang fp contract(off)
+        \\  if (simdgroup_index_in_threadgroup != 0u) return;
+        \\  const int l = threadgroup_position_in_grid.y;
+    ++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
+        \\  return;
+        \\}
+    else
+        "") ++ "\n" ++
+        \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+        \\const ushort lane = thread_index_in_simdgroup;
+        \\const int l = threadgroup_position_in_grid.y, h0 = threadgroup_position_in_grid.x * HB;
+        \\const int p0 = meta[0], B = meta[1], nw = meta[2], total = nw + B;
+        \\const int H = q_shape[1];
+        \\const int pos = p0 + l;
+        \\constexpr int DS = D / NSG, QS = DS / 32, OF = DS / 16, NT = NSG * 32, TPH = NT / HB;
+        \\const int d0 = int(sg) * DS;
+        \\threadgroup float sp[NSG * HB * KT];
+        \\threadgroup T t_ph[HB * KT], t_pl[HB * KT];
+        \\threadgroup float cr[HB], rl[HB];
+        \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
+        \\float m = sink[h0 + hh], lsum = 1.0f;
+        \\const float scale = scal[0];
+        \\T qt[QS][16];
+        \\float o[OF * 8];
+        \\#pragma clang loop unroll(full)
+        \\for (int ks = 0; ks < QS; ++ks)
+        \\  #pragma clang loop unroll(full)
+        \\  for (int i = 0; i < 16; ++i) qt[ks][i] = q[(size_t(l) * H + h0 + dsv41_nax_c(lane, i % 8)) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_r(lane, i % 8)];
+        \\#pragma clang loop unroll(full)
+        \\for (int i = 0; i < OF * 8; ++i) o[i] = 0.0f;
+        \\const short nr0 = dsv41_nax_r(lane, 0), nc0 = dsv41_nax_c(lane, 0);
+        \\for (int t0 = 0; t0 < total; t0 += KT) {
+        \\  const int t_r0 = t0 + int(nr0), t_r1 = t_r0 + 8;
+        \\  const device T* rowp0 = (t_r0 < total) ? ((t_r0 < nw) ? (win + size_t(t_r0) * D) : (blk + size_t(t_r0 - nw) * D)) : nullptr;
+        \\  const device T* rowp1 = (t_r1 < total) ? ((t_r1 < nw) ? (win + size_t(t_r1) * D) : (blk + size_t(t_r1 - nw) * D)) : nullptr;
+        \\  float s[8];
+        \\  #pragma clang loop unroll(full)
+        \\  for (int i = 0; i < 8; ++i) s[i] = 0.0f;
+        \\  T kf[QS][16];
+        \\  #pragma clang loop unroll(full)
+        \\  for (int ks = 0; ks < QS; ++ks) {
+        \\    const int kd = d0 + ks * 32 + int(nc0);
+        \\    const metal::vec<T, 4> k0 = rowp0 ? *(const device metal::vec<T, 4>*)(rowp0 + kd) : metal::vec<T, 4>(T(0));
+        \\    const metal::vec<T, 4> k1 = rowp1 ? *(const device metal::vec<T, 4>*)(rowp1 + kd) : metal::vec<T, 4>(T(0));
+        \\    const metal::vec<T, 4> k2 = rowp0 ? *(const device metal::vec<T, 4>*)(rowp0 + kd + 16) : metal::vec<T, 4>(T(0));
+        \\    const metal::vec<T, 4> k3 = rowp1 ? *(const device metal::vec<T, 4>*)(rowp1 + kd + 16) : metal::vec<T, 4>(T(0));
+        \\    kf[ks][0] = k0[0]; kf[ks][1] = k0[1]; kf[ks][2] = k0[2]; kf[ks][3] = k0[3];
+        \\    kf[ks][4] = k1[0]; kf[ks][5] = k1[1]; kf[ks][6] = k1[2]; kf[ks][7] = k1[3];
+        \\    kf[ks][8] = k2[0]; kf[ks][9] = k2[1]; kf[ks][10] = k2[2]; kf[ks][11] = k2[3];
+        \\    kf[ks][12] = k3[0]; kf[ks][13] = k3[1]; kf[ks][14] = k3[2]; kf[ks][15] = k3[3];
+        \\    dsv41_nax_mma<16, 32>(s, kf[ks], qt[ks]);
+        \\  }
+        \\  #pragma clang loop unroll(full)
+        \\  for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + dsv41_nax_c(lane, i)) * KT + dsv41_nax_r(lane, i)] = s[i];
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  float v = -INFINITY;
+        \\  if (t0 + sub < total) {
+        \\    float a = 0.0f;
+        \\    #pragma clang loop unroll(full)
+        \\    for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + sub];
+        \\    v = a * scale;
+        \\  }
+        \\  float tmax = v;
+        \\  for (int off = TPH / 2; off > 0; off >>= 1) tmax = metal::max(tmax, metal::simd_shuffle_xor(tmax, ushort(off)));
+        \\  const float mn = metal::max(m, tmax);
+        \\  const float corr = (m > -INFINITY) ? metal::precise::exp(m - mn) : 0.0f;
+        \\  const float p = (v > -INFINITY) ? metal::precise::exp(v - mn) : 0.0f;
+        \\  const T hi = T(p);
+        \\  float psum = p;
+        \\  t_ph[hh * KT + sub] = hi;
+        \\  t_pl[hh * KT + sub] = T(p - float(hi));
+        \\  for (int off = TPH / 2; off > 0; off >>= 1) psum += metal::simd_shuffle_xor(psum, ushort(off));
+        \\  lsum = lsum * corr + psum;
+        \\  m = mn;
+        \\  if (sub == 0) cr[hh] = corr;
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  const float cr0 = cr[int(nr0)], cr1 = cr[int(nr0) + 8];
+        \\  #pragma clang loop unroll(full)
+        \\  for (int f = 0; f < OF; ++f) {
+        \\    o[f * 8 + 0] *= cr0; o[f * 8 + 1] *= cr0; o[f * 8 + 2] *= cr0; o[f * 8 + 3] *= cr0;
+        \\    o[f * 8 + 4] *= cr1; o[f * 8 + 5] *= cr1; o[f * 8 + 6] *= cr1; o[f * 8 + 7] *= cr1;
+        \\  }
+        \\  const metal::vec<T, 4> ah0 = *(const threadgroup metal::vec<T, 4>*)(t_ph + int(nr0) * KT + int(nc0));
+        \\  const metal::vec<T, 4> ah1 = *(const threadgroup metal::vec<T, 4>*)(t_ph + (int(nr0) + 8) * KT + int(nc0));
+        \\  const metal::vec<T, 4> al0 = *(const threadgroup metal::vec<T, 4>*)(t_pl + int(nr0) * KT + int(nc0));
+        \\  const metal::vec<T, 4> al1 = *(const threadgroup metal::vec<T, 4>*)(t_pl + (int(nr0) + 8) * KT + int(nc0));
+        \\  const T ah[8] = { ah0[0], ah0[1], ah0[2], ah0[3], ah1[0], ah1[1], ah1[2], ah1[3] };
+        \\  const T al[8] = { al0[0], al0[1], al0[2], al0[3], al1[0], al1[1], al1[2], al1[3] };
+        \\  #pragma clang loop unroll(full)
+        \\  for (int g = 0; g < QS; ++g) {
+        \\    dsv41_nax_mma<32, 16>(o + g * 16, al, kf[g]);
+        \\    dsv41_nax_mma<32, 16>(o + g * 16, ah, kf[g]);
+        \\  }
+        \\}
+        \\if (sub == 0) rl[hh] = 1.0f / lsum;
+        \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\const int cc0 = dsv41_nax_c(lane, 0);
+        \\#pragma clang loop unroll(full)
+        \\for (int hs = 0; hs < 2; ++hs) {
+        \\  const int row = dsv41_nax_r(lane, hs * 4);
+        \\  const float inv = rl[row];
+        \\  const int head = h0 + row;
+        \\  float v[OF][4];
+        \\  #pragma clang loop unroll(full)
+        \\  for (int f = 0; f < OF; ++f) {
+        \\    #pragma clang loop unroll(full)
+        \\    for (int j = 0; j < 4; ++j) v[f][j] = float(OT(o[f * 8 + hs * 4 + j] * inv));
+        \\    #pragma clang loop unroll(full)
+        \\    for (int p = 0; p < 2; ++p) {
+        \\      const int c = d0 + f * 16 + cc0 + p * 2;
+        \\      if (RD > 0 && c >= D - RD) dsv41_rope_pair<OT>(v[f][p * 2], v[f][p * 2 + 1], pos, freqs[(c - (D - RD)) / 2]);
+        \\    }
+        \\  }
+        \\  if (QAT) {
+        \\    #pragma clang loop unroll(full)
+        \\    for (int g = 0; g < OF / 2; ++g) {
+        \\      float amax = 0.0f;
+        \\      #pragma clang loop unroll(full)
+        \\      for (int f = g * 2; f < g * 2 + 2; ++f)
+        \\        #pragma clang loop unroll(full)
+        \\        for (int j = 0; j < 4; ++j) amax = metal::max(amax, metal::abs(v[f][j]));
+        \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
+        \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
+        \\      const float sc = qat_scale<0>(amax);
+        \\      #pragma clang loop unroll(full)
+        \\      for (int f = g * 2; f < g * 2 + 2; ++f)
+        \\        #pragma clang loop unroll(full)
+        \\        for (int j = 0; j < 4; ++j) v[f][j] = float(static_cast<OT>(qat_round<0>(v[f][j], sc)));
+        \\    }
+        \\  }
+        \\  device OT* dst_head = out + dsv41_head_at(l, head, H, B, OG) * D + d0 + cc0;
+        \\  #pragma clang loop unroll(full)
+        \\  for (int f = 0; f < OF; ++f)
+        \\    #pragma clang loop unroll(full)
+        \\    for (int j = 0; j < 4; ++j) dst_head[f * 16 + j] = OT(v[f][j]);
+        \\}
+    ;
+}
+
+pub const ATTN_DSPARK_NAX_SOURCE = attnDsparkNaxSource(false);
+pub const ATTN_DSPARK_NAX_RIDE_SOURCE = attnDsparkNaxSource(true);
+var attn_dspark_nax_def = Def{ .name = "dsv41_attn_dspark_nax", .ins = &.{ "q", "win", "blk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DSPARK_NAX_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER };
+var attn_dspark_nax_ride_def = Def{ .name = "dsv41_attn_dspark_nax_ride", .ins = &.{ "q", "win", "blk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_DSPARK_NAX_RIDE_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER };
+
+/// Non-causal DSpark draft attention on the NAX matrix units: `q` `[B, H, D]`, `win` `[W, D]` (may have W=0), `blk` `[B, D]`,
+/// returning grouped `[og, B, H / og * D]` (or `[B, H, D]` when `og == 0`) with fused inverse RoPE and optional FP8 QAT.
+pub fn attnDsparkNax(
+    sc: *Scope,
+    q: A,
+    win: A,
+    blk: A,
+    sink: A,
+    p0: usize,
+    scale: f32,
+    freqs: A,
+    rd: usize,
+    qat_fp8: bool,
+    og: usize,
+    mixes: ?StageMixes,
+    split_out: ?*?HcSplit,
+) !A {
+    const B = dim(q, 0);
+    const H = dim(q, 1);
+    const D = dim(q, 2);
+    const nw = dim(win, 0);
+    const dt = mlx.mlx_array_dtype(q);
+    const hb: usize = 16;
+    const nsg: usize = 8;
+    const tile_k: usize = 16;
+    const win_in = if (nw > 0) win else blk;
+    const meta_v = [_]i32{ ci(p0), ci(B), ci(nw) };
+    const meta = try sc.ints(&meta_v, &.{meta_v.len});
+    const scal = try f32Const(sc, &.{scale});
+    const fr = if (rd > 0) freqs else try sc.zeros(&.{1}, .float32);
+    const out_shape: []const c_int = if (og > 0) &.{ ci(og), ci(B), ci(H / og * D) } else &.{ ci(B), ci(H), ci(D) };
+    const grid: Grid = .{ (H / hb + @intFromBool(mixes != null)) * nsg * 32, B, 1 };
+    const tg: Grid = .{ nsg * 32, 1, 1 };
+    const tm = [_]Tmpl{
+        .{ .name = "D", .v = ci(D) },
+        .{ .name = "HB", .v = ci(hb) },
+        .{ .name = "NSG", .v = ci(nsg) },
+        .{ .name = "KT", .v = ci(tile_k) },
+        .{ .name = "RD", .v = ci(rd) },
+        .{ .name = "QAT", .v = @intFromBool(qat_fp8) },
+        .{ .name = "OG", .v = ci(og) },
+    };
+    const dts: []const TDtype = &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = dt } };
+    const out = [_]OutSpec{.{ .shape = out_shape, .dt = dt }};
+    var o: [4]A = undefined;
+    if (mixes) |r| {
+        const rides = [_]Tmpl{ .{ .name = "HC", .v = ci(r.hc) }, .{ .name = "ITERS", .v = ci(r.iters) } };
+        const split_outs = [_]OutSpec{
+            .{ .shape = &.{ ci(B), ci(r.hc) }, .dt = .float32 },
+            .{ .shape = &.{ ci(B), ci(r.hc) }, .dt = .float32 },
+            .{ .shape = &.{ ci(B), ci(r.hc), ci(r.hc) }, .dt = .float32 },
+        };
+        try launch(sc, &attn_dspark_nax_ride_def, &.{ q, win_in, blk, sink, meta, scal, fr, r.z, r.eps }, &(out ++ split_outs), grid, tg, &(tm ++ rides), dts, &o);
+        if (split_out) |sp| sp.* = .{ .pre = o[1], .post = o[2], .comb = o[3] };
+    } else {
+        try launch(sc, &attn_dspark_nax_def, &.{ q, win_in, blk, sink, meta, scal, fr }, &out, grid, tg, &tm, dts, o[0..1]);
+    }
+    return o[0];
+}
+
+var attn_dec_nax_def = Def{ .name = "dsv41_attn_dec_nax", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_NAX_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER };
+var attn_split_nax_def = Def{ .name = "dsv41_attn_split_nax", .ins = &.{ "q", "ring", "comp", "topk", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_NAX_SOURCE, .header = ATTN_NAX_HEADER };
+var attn_dec_nax_ride_def = Def{ .name = "dsv41_attn_dec_nax_ride", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_DEC_NAX_RIDE_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER };
+var attn_split_nax_ride_def = Def{ .name = "dsv41_attn_split_nax_ride", .ins = &.{ "q", "ring", "comp", "topk", "meta", "scal", "z", "eps" }, .outs = &.{ "pacc", "pm", "pl", "pre", "post", "comb" }, .source = ATTN_SPLIT_NAX_RIDE_SOURCE, .header = ATTN_NAX_HEADER };
+var attn_dec_nax_packed_def = Def{ .name = "dsv41_attn_dec_nax_packed", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_NAX_PACKED_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
+var attn_split_nax_packed_def = Def{ .name = "dsv41_attn_split_nax_packed", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_NAX_PACKED_SOURCE, .header = ATTN_NAX_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
+var attn_dec_nax_packed_ride_def = Def{ .name = "dsv41_attn_dec_nax_packed_ride", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_DEC_NAX_PACKED_RIDE_SOURCE, .header = ATTN_DEC_NAX_EPI_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
+var attn_split_nax_packed_ride_def = Def{ .name = "dsv41_attn_split_nax_packed_ride", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "meta", "scal", "z", "eps" }, .outs = &.{ "pacc", "pm", "pl", "pre", "post", "comb" }, .source = ATTN_SPLIT_NAX_PACKED_RIDE_SOURCE, .header = ATTN_NAX_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
+
+fn attnDecodeNaxSplit(sc: *Scope, a: DecodeArgs, splits: usize, L: usize, H: usize, D: usize, kt: mlx.mlx_dtype, packed_comp: bool, comp: A, ids: A, meta: A, scal: A, freqs: A, og: usize, out_shape: []const c_int) !A {
+    const ride = a.mixes;
+    const hb: usize = 16;
+    const nsg: usize = 8;
+    const tile_k: usize = 16;
+    const grid: Grid = .{ (H / hb + @intFromBool(ride != null)) * nsg * 32, L, splits };
+    const tg: Grid = .{ nsg * 32, 1, 1 };
+    const common = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "HB", .v = ci(hb) }, .{ .name = "NSG", .v = ci(nsg) }, .{ .name = "KT", .v = ci(tile_k) } };
+    const pack_tm = [_]Tmpl{ .{ .name = "G", .v = ci(a.pack_group) }, .{ .name = "MODE", .v = qat_mod.packMode(a.pack_mode) } };
+    const hc = if (ride) |r| r.hc else 0;
+    const rides = [_]Tmpl{ .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(if (ride) |r| r.iters else 0) } };
+    const split_outs = [_]OutSpec{
+        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc), ci(hc) }, .dt = .float32 },
+    };
+    if (splits == 1) {
+        const tm = common ++ [_]Tmpl{ .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) }, .{ .name = "OG", .v = ci(og) } };
+        const dts: []const TDtype = &.{ .{ .name = "T", .dt = kt }, .{ .name = "OT", .dt = a.out_dt } };
+        const out = [_]OutSpec{.{ .shape = out_shape, .dt = a.out_dt }};
+        var o: [4]A = undefined;
+        if (packed_comp) {
+            if (ride) |r| {
+                try launch(sc, &attn_dec_nax_packed_ride_def, &.{ a.q, a.ring, a.comp, a.comp_scales, ids, a.sink, meta, scal, freqs, r.z, r.eps }, &(out ++ split_outs), grid, tg, &(tm ++ pack_tm ++ rides), dts, &o);
+                if (a.split) |sp| sp.* = .{ .pre = o[1], .post = o[2], .comb = o[3] };
+            } else try launch(sc, &attn_dec_nax_packed_def, &.{ a.q, a.ring, a.comp, a.comp_scales, ids, a.sink, meta, scal, freqs }, &out, grid, tg, &(tm ++ pack_tm), dts, o[0..1]);
+        } else if (ride) |r| {
+            try launch(sc, &attn_dec_nax_ride_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs, r.z, r.eps }, &(out ++ split_outs), grid, tg, &(tm ++ rides), dts, &o);
+            if (a.split) |sp| sp.* = .{ .pre = o[1], .post = o[2], .comb = o[3] };
+        } else try launch(sc, &attn_dec_nax_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs }, &out, grid, tg, &tm, dts, o[0..1]);
+        return o[0];
+    }
+    const part_outs = [_]OutSpec{
+        .{ .shape = &.{ ci(L), ci(H), ci(splits), ci(D) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(H), ci(splits) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(H), ci(splits) }, .dt = .float32 },
+    };
+    var parts: [6]A = undefined;
+    if (packed_comp) {
+        if (ride) |r| {
+            try launch(sc, &attn_split_nax_packed_ride_def, &.{ a.q, a.ring, a.comp, a.comp_scales, ids, meta, scal, r.z, r.eps }, &(part_outs ++ split_outs), grid, tg, &(common ++ pack_tm ++ rides), &.{.{ .name = "T", .dt = kt }}, &parts);
+            if (a.split) |sp| sp.* = .{ .pre = parts[3], .post = parts[4], .comb = parts[5] };
+        } else try launch(sc, &attn_split_nax_packed_def, &.{ a.q, a.ring, a.comp, a.comp_scales, ids, meta, scal }, &part_outs, grid, tg, &(common ++ pack_tm), &.{.{ .name = "T", .dt = kt }}, parts[0..3]);
+    } else if (ride) |r| {
+        try launch(sc, &attn_split_nax_ride_def, &.{ a.q, a.ring, comp, ids, meta, scal, r.z, r.eps }, &(part_outs ++ split_outs), grid, tg, &(common ++ rides), &.{.{ .name = "T", .dt = kt }}, &parts);
+        if (a.split) |sp| sp.* = .{ .pre = parts[3], .post = parts[4], .comb = parts[5] };
+    } else try launch(sc, &attn_split_nax_def, &.{ a.q, a.ring, comp, ids, meta, scal }, &part_outs, grid, tg, &common, &.{.{ .name = "T", .dt = kt }}, parts[0..3]);
+    var o: [1]A = undefined;
+    try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = out_shape, .dt = a.out_dt }}, .{ D, H, L }, .{ D, 1, 1 }, &.{
+        .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) }, .{ .name = "OG", .v = ci(og) },
+    }, &.{.{ .name = "OT", .dt = a.out_dt }}, &o);
+    return o[0];
+}
 
 const fused_hb = 16;
 const fused_nsg = 8;
@@ -1732,9 +2394,10 @@ fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const 
     }
     var tmpl: [10]Tmpl = undefined;
     const og = if (epi) |e| e.og else 1;
+    const hb: usize = if ((def == &attn_nax_def or def == &attn_nax_fp4_def) and H % 32 == 0) 32 else fused_hb;
     const base = [_]Tmpl{
         .{ .name = "D", .v = ci(D) },
-        .{ .name = "HB", .v = fused_hb },
+        .{ .name = "HB", .v = ci(hb) },
         .{ .name = "NSG", .v = fused_nsg },
         .{ .name = "KT", .v = fused_kt },
         .{ .name = "EPI", .v = @intFromBool(epi != null) },
@@ -1746,7 +2409,7 @@ fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const 
     @memcpy(tmpl[base.len..][0..extra.len], extra);
     var o: [1]A = undefined;
     const out_shape: [3]c_int = if (epi != null) .{ ci(og), ci(rows), ci(H * D / og) } else .{ ci(L), ci(H), ci(D) };
-    try launch(sc, def, ins[0..n], &.{.{ .shape = &out_shape, .dt = out_dt, .into = if (span) |part| part.into else null }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
+    try launch(sc, def, ins[0..n], &.{.{ .shape = &out_shape, .dt = out_dt, .into = if (span) |part| part.into else null }}, .{ H / hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
     return o[0];
 }
 
@@ -2041,11 +2704,12 @@ const IDX_NAX_COMMON =
     \\metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\const int sq = sqr[l];
     \\const int seen = (meta[0] + l + 1) / meta[1];
+    \\const int it_n = meta[2];
     \\threadgroup float4* sc4 = scr + sg * 256;
     \\threadgroup float* sc = (threadgroup float*)sc4;
     \\const threadgroup float* wr = wtp + sg * 32;
-    \\const int tile0 = threadgroup_position_in_grid.x * (SPR * IT * 32);
-    \\for (int it = 0; it < IT; ++it) {
+    \\const int tile0 = threadgroup_position_in_grid.x * (SPR * it_n * 32);
+    \\for (int it = 0; it < it_n; ++it) {
     \\  const int n0 = tile0 + (it * SPR + ks) * 32;
     \\  if (n0 >= NC) break;
     \\  const int n = n0 + int(lane);
@@ -2158,7 +2822,6 @@ const nax_steps = 8;
 fn naxScores(sc: *Scope, def: *Def, q: A, codes: A, scales: A, w: A, wscale: f32, p0: usize, ratio: usize, blocks: ?A, bs: usize) !A {
     const L = dim(q, 0);
     const nc = if (blocks) |b| dim(b, 1) * bs else dim(codes, 0);
-    const meta = try sc.ints(&.{ ci(p0), ci(ratio) }, &.{2});
     var prep: [3]A = undefined;
     const wsc = try f32Const(sc, &.{wscale});
     try launch(sc, &idx_nax_prep_def, &.{ q, w, wsc }, &.{
@@ -2166,12 +2829,24 @@ fn naxScores(sc: *Scope, def: *Def, q: A, codes: A, scales: A, w: A, wscale: f32
     }, .{ L * 128, 1, 1 }, .{ 128, 1, 1 }, &.{}, &.{}, &prep);
     const t = naxTiling(L);
     const nsg = t.rb * t.spr;
-    const tiles = (nc + t.spr * nax_steps * 32 - 1) / (t.spr * nax_steps * 32);
+    const row_blocks = (L + t.rb - 1) / t.rb;
+    // Scale `it` down at shorter contexts so the grid keeps all GPU cores busy (passed via `meta[2]` so one PSO serves all contexts).
+    const it: usize = blk: {
+        var step: usize = nax_steps;
+        while (step > 1) {
+            const nt = (nc + t.spr * step * 32 - 1) / (t.spr * step * 32);
+            if (nt * row_blocks >= 128) break;
+            step /= 2;
+        }
+        break :blk step;
+    };
+    const meta = try sc.ints(&.{ ci(p0), ci(ratio), ci(it) }, &.{3});
+    const tiles = (nc + t.spr * it * 32 - 1) / (t.spr * it * 32);
     var o: [1]A = undefined;
     const fixed = [_]A{ prep[0], prep[1], prep[2], q, codes, scales, w, meta, wsc };
     const ins: []const A = if (blocks) |b| &(fixed ++ [_]A{b}) else &fixed;
-    try launch(sc, def, ins, &.{.{ .shape = &.{ ci(L), ci(nc) }, .dt = .float32 }}, .{ tiles * nsg * 32, (L + t.rb - 1) / t.rb, 1 }, .{ nsg * 32, 1, 1 }, &.{
-        .{ .name = "RB", .v = ci(t.rb) }, .{ .name = "SPR", .v = ci(t.spr) }, .{ .name = "IT", .v = nax_steps }, .{ .name = "BS", .v = ci(bs) },
+    try launch(sc, def, ins, &.{.{ .shape = &.{ ci(L), ci(nc) }, .dt = .float32 }}, .{ tiles * nsg * 32, row_blocks, 1 }, .{ nsg * 32, 1, 1 }, &.{
+        .{ .name = "RB", .v = ci(t.rb) }, .{ .name = "SPR", .v = ci(t.spr) }, .{ .name = "BS", .v = ci(bs) },
     }, &.{}, &o);
     return o[0];
 }
@@ -2290,49 +2965,107 @@ pub fn indexScoresTile(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, 
 // ── DSpark draft ─────────────────────────────────────────────────────────
 
 /// One token of the draft's Markov chain, a thread a vocabulary row: row `step` of `logits` plus the bigram bias (the
-/// bias row of `prev` in `embed` against the row of `head`), the threadgroup's first maximum, and from threadgroup 0
-/// the confidence logit of the block row and the bias row against `cw`.
+/// bias row of `prev` in `embed` against the row of `head`), the threadgroup's first maximum via SIMD reduction, and
+/// from threadgroup 0 the confidence logit of the block row and the bias row against `cw`. Writes `row` only when
+/// `WRITE_ROW != 0`.
 pub const MARKOV_ROW_SOURCE =
     \\const uint tid = thread_index_in_threadgroup, tgx = threadgroup_position_in_grid.x;
+    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int V = logits_shape[1], D = hout_shape[1], k = step[0];
     \\const device T* me = embed + size_t(prev[0]) * R;
+    \\threadgroup float t_me[512];
+    \\if (R <= 512) {
+    \\  for (int j = int(tid); j < R; j += TG) t_me[j] = float(me[j]);
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
     \\const int v = int(tgx) * TG + int(tid);
     \\float val = -INFINITY;
     \\if (v < V) {
     \\  const device T* w = head + size_t(v) * R;
     \\  float4 s = 0.0f;
     \\  int j = 0;
-    \\  for (; j + 4 <= R; j += 4) s = metal::fma(float4(float(w[j]), float(w[j + 1]), float(w[j + 2]), float(w[j + 3])), float4(float(me[j]), float(me[j + 1]), float(me[j + 2]), float(me[j + 3])), s);
-    \\  for (; j < R; ++j) s.x = metal::fma(float(w[j]), float(me[j]), s.x);
+    \\  if (R <= 512) {
+    \\    if ((R & 3) == 0) {
+    \\      for (; j + 4 <= R; j += 4) {
+    \\        const metal::vec<T, 4> wv = *(const device metal::vec<T, 4>*)(w + j);
+    \\        const float4 mv = *(const threadgroup float4*)(t_me + j);
+    \\        s = metal::fma(float4(float(wv.x), float(wv.y), float(wv.z), float(wv.w)), mv, s);
+    \\      }
+    \\    } else {
+    \\      for (; j + 4 <= R; j += 4) s = metal::fma(float4(float(w[j]), float(w[j + 1]), float(w[j + 2]), float(w[j + 3])), *(const threadgroup float4*)(t_me + j), s);
+    \\      for (; j < R; ++j) s.x = metal::fma(float(w[j]), t_me[j], s.x);
+    \\    }
+    \\  } else {
+    \\    if ((R & 3) == 0) {
+    \\      for (; j + 4 <= R; j += 4) {
+    \\        const metal::vec<T, 4> wv = *(const device metal::vec<T, 4>*)(w + j);
+    \\        const metal::vec<T, 4> mv = *(const device metal::vec<T, 4>*)(me + j);
+    \\        s = metal::fma(float4(float(wv.x), float(wv.y), float(wv.z), float(wv.w)), float4(float(mv.x), float(mv.y), float(mv.z), float(mv.w)), s);
+    \\      }
+    \\    } else {
+    \\      for (; j + 4 <= R; j += 4) s = metal::fma(float4(float(w[j]), float(w[j + 1]), float(w[j + 2]), float(w[j + 3])), float4(float(me[j]), float(me[j + 1]), float(me[j + 2]), float(me[j + 3])), s);
+    \\      for (; j < R; ++j) s.x = metal::fma(float(w[j]), float(me[j]), s.x);
+    \\    }
+    \\  }
     \\  val = logits[size_t(k) * V + v] + ((s.x + s.y) + (s.z + s.w));
-    \\  row[v] = val;
+    \\  if (WRITE_ROW) row[v] = val;
     \\}
-    \\threadgroup float tv[TG], tc[TG];
-    \\tv[tid] = val;
+    \\threadgroup float sg_val[TG / 32], sg_c[TG / 32];
+    \\threadgroup int sg_idx[TG / 32];
+    \\const float smx = metal::simd_max(val);
+    \\const int sbi = metal::simd_min(val == smx ? int(tid) : 0x7fffffff);
+    \\if (lane == 0u) { sg_val[sg] = smx; sg_idx[sg] = sbi; }
     \\if (tgx == 0u) {
     \\  float c = 0.0f;
-    \\  for (int i = tid; i < D + R; i += TG) c = metal::fma(i < D ? float(hout[size_t(k) * D + i]) : float(me[i - D]), cw[i], c);
-    \\  tc[tid] = c;
+    \\  for (int i = int(tid); i < D + R; i += TG) {
+    \\    const float xv = i < D ? float(hout[size_t(k) * D + i]) : (R <= 512 ? t_me[i - D] : float(me[i - D]));
+    \\    c = metal::fma(xv, cw[i], c);
+    \\  }
+    \\  c = metal::simd_sum(c);
+    \\  if (lane == 0u) sg_c[sg] = c;
     \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (tid != 0u) return;
-    \\int best = 0;
-    \\for (int i = 1; i < TG; ++i) if (tv[i] > tv[best]) best = i;
-    \\part_val[tgx] = tv[best];
-    \\part_idx[tgx] = int(tgx) * TG + best;
-    \\if (tgx != 0u) return;
-    \\float c = 0.0f;
-    \\for (int i = 0; i < TG; ++i) c += tc[i];
-    \\conf[0] = c;
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (sg == 0u) {
+    \\  const float lv = lane < (TG / 32u) ? sg_val[lane] : -INFINITY;
+    \\  const int li = lane < (TG / 32u) ? sg_idx[lane] : 0x7fffffff;
+    \\  const float bmx = metal::simd_max(lv);
+    \\  const int bbi = metal::simd_min(lv == bmx ? li : 0x7fffffff);
+    \\  if (lane == 0u) {
+    \\    part_val[tgx] = bmx;
+    \\    part_idx[tgx] = int(tgx) * TG + bbi;
+    \\  }
+    \\  if (tgx == 0u) {
+    \\    const float cs = metal::simd_sum(lane < (TG / 32u) ? sg_c[lane] : 0.0f);
+    \\    if (lane == 0u) conf[0] = cs;
+    \\  }
+    \\}
 ;
 
-/// The first maximum over the threadgroups' maxima, which arrive in vocabulary order.
+/// The first maximum over the threadgroups' maxima, which arrive in vocabulary order, reduced across 256 threads.
 pub const MARKOV_PICK_SOURCE =
-    \\if (thread_position_in_grid.x != 0u) return;
+    \\const uint tid = thread_index_in_threadgroup;
+    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int n = part_val_shape[0];
-    \\int best = 0;
-    \\for (int i = 1; i < n; ++i) if (part_val[i] > part_val[best]) best = i;
-    \\pick[0] = part_idx[best];
+    \\float bv = -INFINITY;
+    \\int bi = 0x7fffffff;
+    \\for (int i = int(tid); i < n; i += 256) {
+    \\  const float v = part_val[i];
+    \\  const int idx = part_idx[i];
+    \\  if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
+    \\}
+    \\const float smx = metal::simd_max(bv);
+    \\const int sbi = metal::simd_min(bv == smx ? bi : 0x7fffffff);
+    \\threadgroup float sg_val[8];
+    \\threadgroup int sg_idx[8];
+    \\if (lane == 0u) { sg_val[sg] = smx; sg_idx[sg] = sbi; }
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (sg == 0u) {
+    \\  const float lv = lane < 8u ? sg_val[lane] : -INFINITY;
+    \\  const int li = lane < 8u ? sg_idx[lane] : 0x7fffffff;
+    \\  const float bmx = metal::simd_max(lv);
+    \\  const int bbi = metal::simd_min(lv == bmx ? li : 0x7fffffff);
+    \\  if (lane == 0u) pick[0] = bbi;
+    \\}
 ;
 
 var markov_row_def = Def{ .name = "dsv41_markov_row", .ins = &.{ "logits", "head", "embed", "prev", "hout", "cw", "step" }, .outs = &.{ "row", "part_val", "part_idx", "conf" }, .source = MARKOV_ROW_SOURCE };
@@ -2346,22 +3079,228 @@ pub const MarkovStep = struct { row: A, pick: A, conf: A };
 /// and the confidence of row `k` of `hout` (`[B, dim]`) and that bias row against `cw` (`[1, dim + rank]` f32). `head` is
 /// read as stored: half the bytes of the f32 copy a matmul would take, and the chain is those bytes five times a draft.
 pub fn markovStep(sc: *Scope, logits: A, head: A, embed: A, prev: A, hout: A, cw: A, k: usize) !MarkovStep {
+    return markovStepWith(sc, logits, head, embed, prev, hout, cw, k, true);
+}
+
+/// `markovStep`, skipping the `[1, vocab]` score buffer write when `write_row` is false.
+pub fn markovStepWith(sc: *Scope, logits: A, head: A, embed: A, prev: A, hout: A, cw: A, k: usize, write_row: bool) !MarkovStep {
     const tg: usize = 256;
     const v = dim(logits, 1);
     const groups = (v + tg - 1) / tg;
     var o: [4]A = undefined;
     try launch(sc, &markov_row_def, &.{ logits, head, embed, prev, hout, cw, try sc.ints(&.{ci(k)}, &.{1}) }, &.{
-        .{ .shape = &.{ 1, ci(v) }, .dt = .float32 }, .{ .shape = &.{ci(groups)}, .dt = .float32 }, .{ .shape = &.{ci(groups)}, .dt = .int32 }, .{ .shape = &.{1}, .dt = .float32 },
-    }, .{ groups * tg, 1, 1 }, .{ tg, 1, 1 }, &.{ .{ .name = "R", .v = ci(dim(head, 1)) }, .{ .name = "TG", .v = ci(tg) } }, &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(head) }, .{ .name = "HT", .dt = mlx.mlx_array_dtype(hout) } }, &o);
+        .{ .shape = &.{ 1, if (write_row) ci(v) else 1 }, .dt = .float32 }, .{ .shape = &.{ci(groups)}, .dt = .float32 }, .{ .shape = &.{ci(groups)}, .dt = .int32 }, .{ .shape = &.{1}, .dt = .float32 },
+    }, .{ groups * tg, 1, 1 }, .{ tg, 1, 1 }, &.{ .{ .name = "R", .v = ci(dim(head, 1)) }, .{ .name = "TG", .v = ci(tg) }, .{ .name = "WRITE_ROW", .v = @intFromBool(write_row) } }, &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(head) }, .{ .name = "HT", .dt = mlx.mlx_array_dtype(hout) } }, &o);
     var pick: [1]A = undefined;
-    try launch(sc, &markov_pick_def, &.{ o[1], o[2] }, &.{.{ .shape = &.{1}, .dt = .int32 }}, .{ 1, 1, 1 }, .{ 1, 1, 1 }, &.{}, &.{}, &pick);
+    try launch(sc, &markov_pick_def, &.{ o[1], o[2] }, &.{.{ .shape = &.{1}, .dt = .int32 }}, .{ 256, 1, 1 }, .{ 256, 1, 1 }, &.{}, &.{}, &pick);
     return .{ .row = o[0], .pick = pick[0], .conf = o[3] };
 }
 
 // ── hyper-connections ────────────────────────────────────────────────────
 
-const HC_SPLIT_GLOBAL = hck.HC_SPLIT_GLOBAL;
+/// The split of row `l` of `z` into the output arrays. Accepts either materialized mixes `[L, (2+HC)*HC]` or
+/// stream-split partials `[L, ((2+HC)*HC + 1) * (HC + 1)]` produced by `HC_STAGE_FAST_SOURCE` (reducing the
+/// `HC` stream partials + `rsqrt` + `base` in simdgroup 0 with zero extra dispatch).
+const HC_SPLIT_GLOBAL =
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const int hc_mix = (2 + HC) * HC;
+    \\threadgroup float t_zr[64];
+    \\if (z_shape[1] == (hc_mix + 1) * (HC + 1)) {
+    \\  const device float* zp = z + size_t(l) * size_t(z_shape[1]);
+    \\  const device float* sp_row = zp + hc_mix * (HC + 1);
+    \\  float sq = 0.0f;
+    \\  for (int i = 0; i < HC; ++i) sq += sp_row[i];
+    \\  const float inv_rms = metal::precise::rsqrt(sq * sp_row[HC] + eps[0]);
+    \\  for (int m = int(lane); m < hc_mix; m += 32) {
+    \\    const device float* mp = zp + m * (HC + 1);
+    \\    float a = 0.0f;
+    \\    for (int i = 0; i < HC; ++i) a += mp[i];
+    \\    t_zr[m] = a * inv_rms + mp[HC];
+    \\  }
+    \\} else {
+    \\  const device float* zp = z + size_t(l) * hc_mix;
+    \\  for (int m = int(lane); m < hc_mix; m += 32) t_zr[m] = zp[m];
+    \\}
+    \\metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\const threadgroup float* zr = t_zr;
+    \\#define HC_SPLIT_PRE(i, v) pre[l * HC + (i)] = (v)
+    \\#define HC_SPLIT_POST(i, v) post[l * HC + (i)] = (v)
+    \\#define HC_SPLIT_COMB(i, v) comb[l * HC * HC + (i)] = (v)
+    \\
+;
 const HC_SPLIT_BODY = hck.HC_SPLIT_BODY;
+pub const HC_SPLIT_PART_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const int l = threadgroup_position_in_grid.y;
+++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY;
+
+/// Fast decode-width plain hyper-connection stage (`HC = 4, MIX = 24, D <= 8192, D % 4 == 0`):
+/// splits the 24 mixes across the 4 streams (`96` TGs + `nr` norm TGs, `256` threads/TG) with coalesced `float4`
+/// loads and multi-row `fn` weight reuse (`RBLK <= 8`), writing compact stream partials `[L, 125]` reduced inside
+/// the downstream riding HC split (`HC_SPLIT_GLOBAL`) with zero extra dispatch.
+pub const HC_STAGE_FAST_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint role = threadgroup_position_in_grid.x;
+    \\const int l0 = int(threadgroup_position_in_grid.y) * RBLK;
+    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    \\const int L = x_shape[0], D = x_shape[2];
+    \\const int nr = metal::min(RBLK, L - l0);
+    \\threadgroup float t_m[16][8];
+    \\if (int(role) < RBLK) {
+    \\  const int l = l0 + int(role);
+    \\  if (l >= L) return;
+    \\  const device T* xr = x + size_t(l) * 4 * D;
+    \\  float cp[4];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int j = 0; j < 4; ++j) cp[j] = cpre[l * 4 + j];
+    \\  float ss = 0.0f, sq0 = 0.0f, sq1 = 0.0f, sq2 = 0.0f, sq3 = 0.0f;
+    \\  T hv[8][4];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int c = 0; c < 8; ++c) {
+    \\    const int d = int(tid) * 4 + c * 1024;
+    \\    if (d < D) {
+    \\      const metal::vec<T, 4> x0 = *(const device metal::vec<T, 4>*)(xr + d);
+    \\      const metal::vec<T, 4> x1 = *(const device metal::vec<T, 4>*)(xr + D + d);
+    \\      const metal::vec<T, 4> x2 = *(const device metal::vec<T, 4>*)(xr + 2 * D + d);
+    \\      const metal::vec<T, 4> x3 = *(const device metal::vec<T, 4>*)(xr + 3 * D + d);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int k = 0; k < 4; ++k) {
+    \\        const float v0 = float(x0[k]), v1 = float(x1[k]), v2 = float(x2[k]), v3 = float(x3[k]);
+    \\        sq0 = metal::fma(v0, v0, sq0);
+    \\        sq1 = metal::fma(v1, v1, sq1);
+    \\        sq2 = metal::fma(v2, v2, sq2);
+    \\        sq3 = metal::fma(v3, v3, sq3);
+    \\        const T h = T(cp[0] * v0 + cp[1] * v1 + cp[2] * v2 + cp[3] * v3);
+    \\        hv[c][k] = h;
+    \\        ss += float(h) * float(h);
+    \\      }
+    \\    }
+    \\  }
+    \\  ss = metal::simd_sum(ss);
+    \\  sq0 = metal::simd_sum(sq0); sq1 = metal::simd_sum(sq1); sq2 = metal::simd_sum(sq2); sq3 = metal::simd_sum(sq3);
+    \\  if (lane == 0u) { t_m[0][sg] = ss; t_m[1][sg] = sq0; t_m[2][sg] = sq1; t_m[3][sg] = sq2; t_m[4][sg] = sq3; }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  float tot = 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int g = 0; g < 8; ++g) tot += t_m[0][g];
+    \\  const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int c = 0; c < 8; ++c) {
+    \\    const int d = int(tid) * 4 + c * 1024;
+    \\    if (d < D) {
+    \\      const metal::vec<T, 4> wv = *(const device metal::vec<T, 4>*)(w + d);
+    \\      metal::vec<T, 4> ov;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int k = 0; k < 4; ++k) ov[k] = wv[k] * T(float(hv[c][k]) * inv);
+    \\      *(device metal::vec<T, 4>*)(h_out + size_t(l) * D + d) = ov;
+    \\    }
+    \\  }
+    \\  if (tid < 4u) {
+    \\    float s = 0.0f;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int g = 0; g < 8; ++g) s += t_m[1 + tid][g];
+    \\    z_part[size_t(l) * 125 + 24 * 5 + int(tid)] = s;
+    \\  } else if (tid == 4u) {
+    \\    z_part[size_t(l) * 125 + 24 * 5 + 4] = 1.0f / float(4 * D);
+    \\  }
+    \\  return;
+    \\}
+    \\const int idx = int(role) - RBLK;
+    \\const int m0 = (idx >> 2) * 2, i = idx & 3;
+    \\const device float* fr0 = fn + (size_t(m0) * 4 + i) * D;
+    \\const device float* fr1 = fn + (size_t(m0 + 1) * 4 + i) * D;
+    \\if (RBLK == 1) {
+    \\  const device T* xr = x + (size_t(l0) * 4 + i) * D;
+    \\  float dd0 = 0.0f, dd1 = 0.0f;
+    \\  for (int d = int(tid) * 4; d < D; d += 1024) {
+    \\    const float4 fv0 = *(const device float4*)(fr0 + d);
+    \\    const float4 fv1 = *(const device float4*)(fr1 + d);
+    \\    const metal::vec<T, 4> xv = *(const device metal::vec<T, 4>*)(xr + d);
+    \\    const float x0 = float(xv[0]), x1 = float(xv[1]), x2 = float(xv[2]), x3 = float(xv[3]);
+    \\    dd0 = metal::fma(x0, fv0[0], dd0); dd1 = metal::fma(x0, fv1[0], dd1);
+    \\    dd0 = metal::fma(x1, fv0[1], dd0); dd1 = metal::fma(x1, fv1[1], dd1);
+    \\    dd0 = metal::fma(x2, fv0[2], dd0); dd1 = metal::fma(x2, fv1[2], dd1);
+    \\    dd0 = metal::fma(x3, fv0[3], dd0); dd1 = metal::fma(x3, fv1[3], dd1);
+    \\  }
+    \\  dd0 = metal::simd_sum(dd0);
+    \\  dd1 = metal::simd_sum(dd1);
+    \\  if (lane == 0u) { t_m[0][sg] = dd0; t_m[1][sg] = dd1; }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (tid < 2u) {
+    \\    const int m = m0 + int(tid);
+    \\    float a = 0.0f;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int g = 0; g < 8; ++g) a += t_m[tid][g];
+    \\    const float sc = scale[m < 4 ? 0 : (m < 8 ? 1 : 2)];
+    \\    z_part[size_t(l0) * 125 + m * 5 + i] = a * sc;
+    \\    if (i == 0) z_part[size_t(l0) * 125 + m * 5 + 4] = base[m];
+    \\  }
+    \\  return;
+    \\}
+    \\float dd0[8], dd1[8];
+    \\#pragma clang loop unroll(full)
+    \\for (int r = 0; r < 8; ++r) { dd0[r] = 0.0f; dd1[r] = 0.0f; }
+    \\for (int d = int(tid) * 4; d < D; d += 1024) {
+    \\  const float4 fv0 = *(const device float4*)(fr0 + d);
+    \\  const float4 fv1 = *(const device float4*)(fr1 + d);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int r = 0; r < 8; ++r) {
+    \\    if (r < RBLK && l0 + r < L) {
+    \\      const metal::vec<T, 4> xv = *(const device metal::vec<T, 4>*)(x + (size_t(l0 + r) * 4 + i) * D + d);
+    \\      const float x0 = float(xv[0]), x1 = float(xv[1]), x2 = float(xv[2]), x3 = float(xv[3]);
+    \\      dd0[r] = metal::fma(x0, fv0[0], dd0[r]); dd1[r] = metal::fma(x0, fv1[0], dd1[r]);
+    \\      dd0[r] = metal::fma(x1, fv0[1], dd0[r]); dd1[r] = metal::fma(x1, fv1[1], dd1[r]);
+    \\      dd0[r] = metal::fma(x2, fv0[2], dd0[r]); dd1[r] = metal::fma(x2, fv1[2], dd1[r]);
+    \\      dd0[r] = metal::fma(x3, fv0[3], dd0[r]); dd1[r] = metal::fma(x3, fv1[3], dd1[r]);
+    \\    }
+    \\  }
+    \\}
+    \\#pragma clang loop unroll(full)
+    \\for (int r = 0; r < 8; ++r) {
+    \\  if (r < RBLK && l0 + r < L) {
+    \\    const float v0 = metal::simd_sum(dd0[r]);
+    \\    const float v1 = metal::simd_sum(dd1[r]);
+    \\    if (lane == 0u) { t_m[r][sg] = v0; t_m[8 + r][sg] = v1; }
+    \\  }
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (int(tid) < nr * 2) {
+    \\  const int r = int(tid) % nr;
+    \\  const int k = int(tid) / nr;
+    \\  const int m = m0 + k;
+    \\  float a = 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int g = 0; g < 8; ++g) a += t_m[k * 8 + r][g];
+    \\  const float sc = scale[m < 4 ? 0 : (m < 8 ? 1 : 2)];
+    \\  z_part[size_t(l0 + r) * 125 + m * 5 + i] = a * sc;
+    \\  if (i == 0) z_part[size_t(l0 + r) * 125 + m * 5 + 4] = base[m];
+    \\}
+;
+
+var hc_stage_fast_def = Def{ .name = "dsv41_hc_stage_fast", .ins = &.{ "x", "fn", "w", "cpre", "scale", "base", "eps" }, .outs = &.{ "h_out", "z_part" }, .source = HC_STAGE_FAST_SOURCE };
+var hc_split_part_def = Def{ .name = "dsv41_hc_split_part", .ins = &.{ "z", "eps" }, .outs = &.{ "pre", "post", "comb" }, .source = HC_SPLIT_PART_SOURCE };
+
+pub fn hcStageFastFits(x: A, hw: HcWeights) bool {
+    const D = dim(x, 2);
+    return dim(x, 1) == 4 and dim(hw.fn_w, 0) == 24 and D % 4 == 0 and D <= 8192;
+}
+
+/// Fast plain decode hyper-connection stage (`ex == null`): returns `h` `[L, D]` and stream partials `z` `[L, 125]`.
+pub fn hcStageFast(sc: *Scope, x: A, cpre: A, norm_w: A, hw: HcWeights, eps: A) !HcStaged {
+    const L = dim(x, 0);
+    const D = dim(x, 2);
+    const dt = mlx.mlx_array_dtype(x);
+    const rblk: usize = @min(L, 8);
+    const l_tgs = (L + rblk - 1) / rblk;
+    const tgs_x = rblk + 48;
+    var o: [2]A = undefined;
+    try launch(sc, &hc_stage_fast_def, &.{ x, hw.fn_w, norm_w, cpre, hw.scale, hw.base, eps }, &.{
+        .{ .shape = &.{ ci(L), ci(D) }, .dt = dt },
+        .{ .shape = &.{ ci(L), 125 }, .dt = .float32 },
+    }, .{ tgs_x * 256, l_tgs, 1 }, .{ 256, 1, 1 }, &.{.{ .name = "RBLK", .v = ci(rblk) }}, &.{.{ .name = "T", .dt = dt }}, &o);
+    return .{ .h = o[0], .z = o[1], .x1 = x };
+}
+
 pub const hc_tg_widest = hck.hc_tg_widest;
 pub const HcMixTile = hck.HcMixTile;
 pub const HcWeights = hck.HcWeights;
@@ -2395,8 +3334,19 @@ pub fn hcStage(sc: *Scope, x: A, ex: ?HcExpand, cpre: A, norm_w: A, hw: HcWeight
     return r;
 }
 
-/// The split of mixes `z` `[L, (2 + hc) * hc]` (scale and base already applied).
+/// The split of mixes `z` `[L, (2 + hc) * hc]` (scale and base already applied), or stream partials `[L, ((2+hc)*hc+1)*(hc+1)]`.
 pub fn hcSplitZ(sc: *Scope, z: A, hc: usize, iters: usize, eps: A) !HcSplit {
+    const mix = (2 + hc) * hc;
+    if (dim(z, 1) == (mix + 1) * (hc + 1)) {
+        const L = dim(z, 0);
+        var o: [3]A = undefined;
+        try launch(sc, &hc_split_part_def, &.{ z, eps }, &.{
+            .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+            .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+            .{ .shape = &.{ ci(L), ci(hc), ci(hc) }, .dt = .float32 },
+        }, .{ 32, L, 1 }, .{ 32, 1, 1 }, &.{ .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(iters) } }, &.{}, &o);
+        return .{ .pre = o[0], .post = o[1], .comb = o[2] };
+    }
     const r = try hck.splitZ(sc.s, z, hc, iters, eps);
     try keepAll(sc, &.{ r.pre, r.post, r.comb });
     return r;
@@ -3729,6 +4679,51 @@ test "dsv41 index scores: key slices scored at their offset are the whole list's
     }
 }
 
+test "dsv41 index scores: IH=32 IHD=128 bf16 tile NAX kernel matches f64 truth across non-aligned rows, causal boundary, and key0 offset" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const IH = 32;
+    const IHD = 128;
+    const nb = 1024;
+    const ratio = 2;
+    for ([_]struct { L: usize, p0: usize }{ .{ .L = 25, .p0 = 1500 }, .{ .L = 64, .p0 = 1600 } }) |c| {
+        const q = try sc.astype(try sc.astype(try randn(&sc, &.{ ci(c.L), IH, IHD }, .float32, 151 + c.L, 1.5), .bfloat16), .float32);
+        const keys = try sc.astype(try randn(&sc, &.{ nb, IHD }, .float32, 152 + c.L, 1.5), .bfloat16);
+        const w = try sc.astype(try randn(&sc, &.{ ci(c.L), IH }, .float32, 153 + c.L, 1.0), .bfloat16);
+        const wscale: f32 = 1.0 / @sqrt(@as(f32, IHD)) / @sqrt(@as(f32, IH));
+        const got = try hostOf(&sc, try indexScoresTile(&sc, q, keys, w, wscale, c.p0, ratio, 0));
+        const comp = try hostOf(&sc, try composedIndexScores(&sc, q, keys, w, wscale, c.p0, ratio));
+        const qh = try sc_mod.hostF32(q);
+        const kh = try hostOf(&sc, keys);
+        const wh = try hostOf(&sc, w);
+        var gv: std.ArrayList(f32) = .empty;
+        defer gv.deinit(testing.allocator);
+        var cv: std.ArrayList(f32) = .empty;
+        defer cv.deinit(testing.allocator);
+        var tv: std.ArrayList(f64) = .empty;
+        defer tv.deinit(testing.allocator);
+        for (0..c.L) |l| for (0..nb) |n| {
+            const seen = (c.p0 + l + 1) / ratio;
+            const i = l * nb + n;
+            if (n >= seen) {
+                try testing.expect(std.math.isNegativeInf(got[i]) and std.math.isNegativeInf(comp[i]));
+                continue;
+            }
+            var s: f64 = 0;
+            for (0..IH) |h| {
+                var d: f64 = 0;
+                for (0..IHD) |j| d += @as(f64, qh[(l * IH + h) * IHD + j]) * kh[n * IHD + j];
+                s += @as(f64, wh[l * IH + h]) * wscale * @max(d, 0);
+            }
+            try gv.append(testing.allocator, got[i]);
+            try cv.append(testing.allocator, comp[i]);
+            try tv.append(testing.allocator, s);
+        };
+        try expectNoWorse("index tile nax vs truth", relErr(gv.items, tv.items), relErr(cv.items, tv.items));
+    }
+}
+
 test "dsv41 index scores: the scalar kernel over packed keys gives the unpacked keys' scores bit for bit" {
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
@@ -4005,6 +5000,41 @@ test "dsv41 hc mix NAX trial: the release shape passes it, a zero bar and a stre
     try testing.expect(!try arm_trial.run(mlx.gpuStream(), hcMixNaxTrial, .{ testing.allocator, mlx.gpuStream(), 4, 40, hc_mix_nax_bar }));
 }
 
+test "dsv41 hcStageFast: matches hcStage + hcSplitZ across L=1,6,10 (including routeSplitSlots ride) and is width-exact" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const d = try hcData(&sc, 10, .bfloat16);
+    try testing.expect(hcStageFastFits(d.x, d.hw));
+    const ref_st = try hcStage(&sc, d.x, null, d.cpre, d.w, d.hw, d.eps);
+    const ref_sp = try hcSplitZ(&sc, ref_st.z, 4, 20, d.eps);
+    const fast_all = try hcStageFast(&sc, d.x, d.cpre, d.w, d.hw, d.eps);
+    const fast_sp = try hcSplitZ(&sc, fast_all.z, 4, 20, d.eps);
+    try expectLe("hcStageFast h", relErrF(try hostOf(&sc, fast_all.h), try hostOf(&sc, ref_st.h)), 1e-2);
+    try expectLe("hcStageFast pre", relErrF(try sc_mod.hostF32(fast_sp.pre), try sc_mod.hostF32(ref_sp.pre)), 1e-5);
+    try expectLe("hcStageFast post", relErrF(try sc_mod.hostF32(fast_sp.post), try sc_mod.hostF32(ref_sp.post)), 1e-5);
+    try expectLe("hcStageFast comb", relErrF(try sc_mod.hostF32(fast_sp.comb), try sc_mod.hostF32(ref_sp.comb)), 1e-5);
+    // Width-exactness: L=1 and L=6 rows must be bit-identical to L=10 slices.
+    const h10 = try hostOf(&sc, fast_all.h);
+    const p10 = try sc_mod.hostF32(fast_sp.comb);
+    for ([_]usize{ 1, 6 }) |L| {
+        const sub = try hcStageFast(&sc, try sc.slice(d.x, 0, 0, L), try sc.slice(d.cpre, 0, 0, L), d.w, d.hw, d.eps);
+        const sub_sp = try hcSplitZ(&sc, sub.z, 4, 20, d.eps);
+        try expectBitEqual("hcStageFast h width", try hostOf(&sc, sub.h), h10[0 .. L * d.d]);
+        try expectBitEqual("hcStageFast comb width", try sc_mod.hostF32(sub_sp.comb), p10[0 .. L * 16]);
+    }
+    // Riding inside routeSplitSlots with z_part [10, 125].
+    const logits = try randn(&sc, &.{ 10, 384 }, .float32, 191, 1.0);
+    const bias = try randn(&sc, &.{ 1, 384 }, .float32, 192, 0.2);
+    var map_h: [384]i32 = undefined;
+    for (&map_h, 0..) |*v, i| v.* = @intCast(i);
+    const map = try sc.ints(&map_h, &.{384});
+    const rs = try routeSplitSlots(&sc, logits, bias, 6, true, 1.0, fast_all.z, 4, 20, d.eps, map);
+    try expectBitEqual("hcStageFast ride pre", try sc_mod.hostF32(rs.split.pre), try sc_mod.hostF32(fast_sp.pre));
+    try expectBitEqual("hcStageFast ride post", try sc_mod.hostF32(rs.split.post), try sc_mod.hostF32(fast_sp.post));
+    try expectBitEqual("hcStageFast ride comb", try sc_mod.hostF32(rs.split.comb), try sc_mod.hostF32(fast_sp.comb));
+}
+
 test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
@@ -4139,6 +5169,77 @@ test "dsv41 draft: a Markov step's kernel gives the op chain's pick, and its sco
     flat[300] = 1;
     flat[301] = 1;
     try testing.expectEqual(@as(i32, 300), (try sc_mod.hostI32((try markovStep(&sc, try sc.floats(&flat, &.{ 1, v }), zeros, zeros, at, hout, cw, 0)).pick))[0]);
+    const no_row = try markovStepWith(&sc, try sc.floats(&flat, &.{ 1, v }), zeros, zeros, at, hout, cw, 0, false);
+    try testing.expectEqual(@as(i32, 300), (try sc_mod.hostI32(no_row.pick))[0]);
+    try testing.expectEqual(@as(c_int, 1), mlx.getShape(no_row.row)[1]);
+}
+
+test "dsv41 draft: attnDsparkNax matches attnCore + inverse RoPE + QAT + grouped layout (W=0 and W>0, plain and ride)" {
+    try mlx.requireGpu();
+    if (!nax_gate.verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const H: usize = 64;
+    const D: usize = 512;
+    const rd: usize = 64;
+    const og: usize = 8;
+    const B: usize = 5;
+    const p0: usize = 19;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    const s = mlx.engine.stream();
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    var prng = std.Random.DefaultPrng.init(0x201);
+    const r = prng.random();
+    const fill = struct {
+        fn make(a: std.mem.Allocator, rng: std.Random, n: usize, sd: f32) ![]f32 {
+            const buf = try a.alloc(f32, n);
+            for (buf) |*v| v.* = rng.floatNorm(f32) * sd;
+            return buf;
+        }
+    }.make;
+    const freqs = try ropeFreqs(&sc);
+    const pos = try positions(&sc, @intCast(p0), B, 1);
+    const sink_h = try fill(testing.allocator, r, H, 1.0);
+    defer testing.allocator.free(sink_h);
+    const q_h = try fill(testing.allocator, r, B * H * D, 0.5);
+    defer testing.allocator.free(q_h);
+    const blk_h = try fill(testing.allocator, r, B * D, 0.5);
+    defer testing.allocator.free(blk_h);
+    const z_h = try fill(testing.allocator, r, B * 24, 0.5);
+    defer testing.allocator.free(z_h);
+    const win_h = try fill(testing.allocator, r, 37 * D, 0.5);
+    defer testing.allocator.free(win_h);
+    const sink = try sc.floats(sink_h, &.{ 1, ci(H), 1 });
+    const q = try sc.astype(try sc.floats(q_h, &.{ ci(B), ci(H), ci(D) }), .bfloat16);
+    const blk = try sc.astype(try sc.floats(blk_h, &.{ ci(B), ci(D) }), .bfloat16);
+    const z = try sc.floats(z_h, &.{ ci(B), 24 });
+    const eps = try hcEps(&sc, 1e-6, 1e-6);
+    for ([_]usize{ 0, 37 }) |W| {
+        const win = if (W == 0) try sc.zeros(&.{ 0, ci(D) }, .bfloat16) else try sc.astype(try sc.floats(win_h, &.{ ci(W), ci(D) }), .bfloat16);
+        const keys = if (W == 0) blk else try sc.concat(&.{ win, blk }, 0);
+        const band = try sc.ge(try sc.zeros(&.{ ci(B), ci(W + B) }, .float32), try sc.f(0));
+        const ref_heads = try model.attnCore(&sc, sink, q, keys, band, sc_mod.none, sc_mod.none, scale, .bfloat16);
+        const ref_rot = try ropeTail(&sc, ref_heads, freqs, pos, rd, true, .none, null);
+        const ref_g = try sc.transpose(try sc.reshape(ref_rot, &.{ ci(B), ci(og), ci(H * D / og) }), &.{ 1, 0, 2 });
+        var sp: ?HcSplit = null;
+        const got = try attnDsparkNax(&sc, q, win, blk, sink, p0, scale, freqs, rd, false, og, .{ .z = z, .hc = 4, .iters = 20, .eps = eps }, &sp);
+        try testing.expect(sp != null);
+        const want_h = try hostOf(&sc, ref_g);
+        const got_h = try hostOf(&sc, got);
+        try expectLe("dspark nax attn", relErrF(got_h, want_h), 1.0 / 64.0);
+        // Fused FP8 QAT epilogue must match standalone QAT on the unquantized kernel output bit for bit.
+        const got_qat = try attnDsparkNax(&sc, q, win, blk, sink, p0, scale, freqs, rd, true, og, null, null);
+        const ref_qat = try qat_mod.qat(&sc, got, .fp8_ue8m0, 32);
+        try expectBitEqual("dspark nax qat", try hostOf(&sc, got_qat), try hostOf(&sc, ref_qat));
+        const ref_sp = try hcSplitZ(&sc, z, 4, 20, eps);
+        try expectBitEqual("dspark ride pre", try hostOf(&sc, sp.?.pre), try hostOf(&sc, ref_sp.pre));
+        try expectBitEqual("dspark ride post", try hostOf(&sc, sp.?.post), try hostOf(&sc, ref_sp.post));
+        try expectBitEqual("dspark ride comb", try hostOf(&sc, sp.?.comb), try hostOf(&sc, ref_sp.comb));
+    }
 }
 
 test "dsv41 kernels: a new row count, pick count, split count or context width compiles no new Metal library" {
@@ -4410,6 +5511,112 @@ test "dsv41 attnDecode packed FP4 matches unpackPicks + attnDecode bit for bit a
                 try expectBitEqual("attnDecode packed post", try sc_mod.hostF32(sp_got.?.post), try sc_mod.hostF32(sp_want.?.post));
                 try expectBitEqual("attnDecode packed comb", try sc_mod.hostF32(sp_got.?.comb), try sc_mod.hostF32(sp_want.?.comb));
             }
+        }
+    }
+}
+
+test "dsv41 attnDecode NAX: matches ALU decode within attn_nax_bar across splits, rides and FP4, and is bit-exact across row widths" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits() or !nax_gate.verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const scope = mlx.engine.enter(mlx.engine.stream());
+    defer scope.end();
+    var sc = Scope.plain(testing.allocator, mlx.engine.stream());
+    defer sc.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xA779);
+    const rand = prng.random();
+    const fill = struct {
+        fn f32s(a: std.mem.Allocator, r: std.Random, n: usize, scale: f32) ![]f32 {
+            const buf = try a.alloc(f32, n);
+            for (buf) |*v| v.* = (r.float(f32) * 2.0 - 1.0) * scale;
+            return buf;
+        }
+    };
+
+    const H: usize = 64;
+    const D: usize = 512;
+    const rd: usize = 64;
+    const L: usize = 6;
+    const window: usize = 128;
+    const K: usize = 128;
+    const nc: usize = 192;
+    const q_h = try fill.f32s(testing.allocator, rand, L * H * D, 0.5);
+    defer testing.allocator.free(q_h);
+    const ring_h = try fill.f32s(testing.allocator, rand, (window + 16) * D, 0.5);
+    defer testing.allocator.free(ring_h);
+    const comp_h = try fill.f32s(testing.allocator, rand, nc * D, 0.5);
+    defer testing.allocator.free(comp_h);
+    const sink_h = try fill.f32s(testing.allocator, rand, H, 1.0);
+    defer testing.allocator.free(sink_h);
+    const freqs_h = try fill.f32s(testing.allocator, rand, rd / 2, 0.25);
+    defer testing.allocator.free(freqs_h);
+    const z_h = try fill.f32s(testing.allocator, rand, L * 24, 1.0);
+    defer testing.allocator.free(z_h);
+    const q = try sc.astype(try sc.floats(q_h, &.{ ci(L), ci(H), ci(D) }), .bfloat16);
+    const ring = try sc.astype(try sc.floats(ring_h, &.{ ci(window + 16), ci(D) }), .bfloat16);
+    const comp_raw = try sc.astype(try sc.floats(comp_h, &.{ ci(nc), ci(D) }), .bfloat16);
+    const comp_q = try qat_mod.qat(&sc, comp_raw, .fp4_e4m3, 16);
+    const pk = try qat_mod.packFp4(&sc, comp_q, .fp4_e4m3, 16);
+    const sink = try sc.floats(sink_h, &.{ 1, ci(H), 1 });
+    const freqs = try sc.floats(freqs_h, &.{ci(rd / 2)});
+    const z = try sc.floats(z_h, &.{ ci(L), 24 });
+    const eps = try hcEps(&sc, 1e-6, 1e-6);
+    const topk_h = try testing.allocator.alloc(i32, L * K);
+    defer testing.allocator.free(topk_h);
+    for (topk_h, 0..) |*v, idx| v.* = if (idx % 17 == 0) -1 else @intCast(rand.uintLessThan(usize, nc));
+    const topk = try sc.ints(topk_h, &.{ ci(L), ci(K) });
+    const u = try qat_mod.unpackPicks(&sc, pk.codes, pk.scales, topk, .fp4_e4m3, 16, .bfloat16);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+
+    // Precision vs ALU across splits=1 and splits=4 (f32 output before bf16 rounding, and bf16 with QAT + ride + grouped).
+    for ([_]usize{ 1, 4 }) |splits| {
+        const ref_f32 = try hostOf(&sc, try attnDecodeSplit(&sc, .{
+            .q = q, .ring = ring, .comp = u.rows, .topk = u.ids, .sink = sink,
+            .p0 = window + 4, .window = window, .scale = scale, .freqs = freqs, .rd = rd,
+            .out_dt = .float32, .nax = false,
+        }, splits));
+        const nax_f32 = try hostOf(&sc, try attnDecodeSplit(&sc, .{
+            .q = q, .ring = ring, .comp = u.rows, .topk = u.ids, .sink = sink,
+            .p0 = window + 4, .window = window, .scale = scale, .freqs = freqs, .rd = rd,
+            .out_dt = .float32, .nax = true,
+        }, splits));
+        try testing.expect(maxRelDiff(nax_f32, ref_f32) <= attn_nax_bar);
+
+        // Unpacked vs packed FP4 on NAX must agree bit-for-bit, with ride and grouped output.
+        var sp_u: ?HcSplit = null;
+        var sp_p: ?HcSplit = null;
+        const mixes: StageMixes = .{ .z = z, .hc = 4, .iters = 20, .eps = eps };
+        const out_u = try attnDecodeSplit(&sc, .{
+            .q = q, .ring = ring, .comp = u.rows, .topk = u.ids, .sink = sink,
+            .p0 = window + 4, .window = window, .scale = scale, .freqs = freqs, .rd = rd,
+            .qat_fp8 = true, .out_dt = .bfloat16, .groups = 8, .mixes = mixes, .split = &sp_u, .nax = true,
+        }, splits);
+        const out_p = try attnDecodeSplit(&sc, .{
+            .q = q, .ring = ring, .comp = pk.codes, .comp_scales = pk.scales, .comp_n = nc,
+            .pack_mode = .fp4_e4m3, .pack_group = 16, .topk = topk, .sink = sink,
+            .p0 = window + 4, .window = window, .scale = scale, .freqs = freqs, .rd = rd,
+            .qat_fp8 = true, .out_dt = .bfloat16, .groups = 8, .mixes = mixes, .split = &sp_p, .nax = true,
+        }, splits);
+        try expectBitEqual("attnDecode NAX packed out", try hostOf(&sc, out_p), try hostOf(&sc, out_u));
+        try expectBitEqual("attnDecode NAX ride comb", try sc_mod.hostF32(sp_p.?.comb), try sc_mod.hostF32(sp_u.?.comb));
+
+        // Width-exactness: row r of the L=6 launch matches the 1-row launch bit-for-bit.
+        const multi = try hostOf(&sc, try attnDecodeSplit(&sc, .{
+            .q = q, .ring = ring, .comp = u.rows, .topk = u.ids, .sink = sink,
+            .p0 = window + 4, .window = window, .scale = scale, .freqs = freqs, .rd = rd,
+            .qat_fp8 = true, .out_dt = .bfloat16, .nax = true,
+        }, splits));
+        const row_elems = H * D;
+        for ([_]usize{ 0, 2, 5 }) |r| {
+            const single = try hostOf(&sc, try attnDecodeSplit(&sc, .{
+                .q = try sc.slice(q, 0, r, r + 1), .ring = ring, .comp = u.rows, .topk = try sc.slice(u.ids, 0, r, r + 1), .sink = sink,
+                .p0 = window + 4 + r, .window = window, .scale = scale, .freqs = freqs, .rd = rd,
+                .qat_fp8 = true, .out_dt = .bfloat16, .nax = true,
+            }, splits));
+            try expectBitEqual("attnDecode NAX width-exact", multi[r * row_elems ..][0..row_elems], single);
         }
     }
 }
