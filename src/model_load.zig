@@ -3385,7 +3385,11 @@ pub const PrefillUbenchResult = struct {
 };
 
 fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig, tok: *Tokenizer) void {
-    const n = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_PREFILL_UBENCH").?, 0), 10) catch 3);
+    const iters = parsePrefillUbenchIters(std.mem.sliceTo(std.c.getenv("SUSHI_PREFILL_UBENCH").?, 0));
+    if (iters.capped) {
+        log.warn("[prefill-ubench] SUSHI_PREFILL_UBENCH={d} capped at {d} iterations (use SUSHI_PREFILL_UBENCH_ROWS for token count)\n", .{ iters.asked, iters.n });
+    }
+    const n = iters.n;
     const asked: usize = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ROWS")) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 2025 else 2025;
     const kv: usize = if (std.c.getenv("SUSHI_PREFILL_UBENCH_KV")) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0 else 0;
     const pick = scheduler_mod.prefill_ubench_chunk orelse {
@@ -3517,6 +3521,30 @@ pub fn runPrefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, tok: ?*Tokenizer,
         }
     }
     return res;
+}
+
+/// Upper bound on `SUSHI_PREFILL_UBENCH=<N>` iterations so passing a token count (e.g. `4096`)
+/// instead of an iteration count does not run thousands of cold prefill chunks.
+const PREFILL_UBENCH_MAX_ITERS: usize = 64;
+
+const PrefillUbenchIters = struct { n: usize, capped: bool, asked: usize };
+
+fn parsePrefillUbenchIters(raw: []const u8) PrefillUbenchIters {
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch return .{ .n = 3, .capped = false, .asked = 3 };
+    const clamped = @max(1, parsed);
+    if (clamped > PREFILL_UBENCH_MAX_ITERS) {
+        return .{ .n = PREFILL_UBENCH_MAX_ITERS, .capped = true, .asked = clamped };
+    }
+    return .{ .n = clamped, .capped = false, .asked = clamped };
+}
+
+test "prefill ubench iteration parser caps token-sized values and keeps normal counts" {
+    const t = std.testing;
+    try t.expectEqual(PrefillUbenchIters{ .n = 3, .capped = false, .asked = 3 }, parsePrefillUbenchIters("3"));
+    try t.expectEqual(PrefillUbenchIters{ .n = 1, .capped = false, .asked = 1 }, parsePrefillUbenchIters("0"));
+    try t.expectEqual(PrefillUbenchIters{ .n = 3, .capped = false, .asked = 3 }, parsePrefillUbenchIters("bad"));
+    try t.expectEqual(PrefillUbenchIters{ .n = 64, .capped = false, .asked = 64 }, parsePrefillUbenchIters("64"));
+    try t.expectEqual(PrefillUbenchIters{ .n = 64, .capped = true, .asked = 4096 }, parsePrefillUbenchIters("4096"));
 }
 
 /// `_ARMS` list: each comma-separated entry is an arm, `0` the reference, anything else the shipped one.
