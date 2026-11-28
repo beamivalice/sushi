@@ -1053,6 +1053,15 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
         current = next;
     }
 
+    // The engine keeps no key sequence: a stacked unseeded batch draws on the engine's own kernel, one key
+    // per row from the request's root (MLX's global RNG, a null key, is refused there and would fail every
+    // slot in the group). Measured 3/3 and 4/4 where it was 1/3 and 1/4.
+    if (mlx.engine.isStream(s)) {
+        const drawn = try engineDrawPrepared(current, p0, s);
+        _ = mlx.mlx_array_free(current);
+        owned = false;
+        return drawn;
+    }
     const key = seedKey(p0);
     defer _ = mlx.mlx_array_free(key);
     var sampled = mlx.mlx_array_new();
@@ -1129,6 +1138,22 @@ pub fn seedKey(sampling: SamplingParams) mlx.mlx_array {
     var key = mlx.mlx_array_new();
     _ = mlx.mlx_random_key(&key, seed +% sampling.draw *% 0x9E3779B97F4A7C15);
     return key;
+}
+
+/// A draw over rows already temperature-scaled and filtered (`sampleRowsLazy`'s `current`): the engine's own
+/// kernel with no further filtering, one key per row from the request's root. MLX is asked for nothing — a null
+/// key is refused by the engine's dispatcher, and `mlx_random_key` would hand the arena to MLX mid-tick, which
+/// puts the engine at rest and refuses the rest of the draw (both measured).
+fn engineDrawPrepared(rows2d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    const root = sampling.draw_root orelse {
+        _ = mlx.engine.refuse("sampler draw", "a draw on the engine needs the request's draw root for its key");
+        return error.EngineDrawNeedsRoot;
+    };
+    const n: usize = @intCast(mlx.getShape(rows2d)[0]);
+    var keys: [sampler_draw.max_rows][2]u32 = undefined;
+    if (n > keys.len) return error.SamplerDrawUnsupported;
+    for (keys[0..n], 0..) |*k, j| k.* = random.drawKey(root, sampling.draw +% j);
+    return sampler_draw.rows(rows2d, 1.0, 1.0, 0, 0, keys[0..n], s);
 }
 
 pub const SampleResult = struct {
