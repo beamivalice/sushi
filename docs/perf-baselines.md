@@ -958,6 +958,82 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## DeepSeek-V4.1 and Hy4-Flash STQ N=1 resident baselines after SPEC1 + PAIR1 (`06fd493b`, M5 Ultra 256 GB)
+
+Apple M5 Ultra 256 GB, AC power, ReleaseFast, `taskpolicy -a`, GPU lock per arm, shipping defaults (TF32 on, private SSD
+prefix cache, no cooldown), `sushi bench` (`--tokens 256` code, `128` prose), zero late compiles (`compiled=0`) and zero
+`PlanMiss` across every rung; commit `06fd493b` (binary SHA-256 `ea1377081937b0ee`, `sushi.metallib` SHA-256
+`abd94929959e1602`, `175.8 MiB`, `11,128` functions — after DS41 Landing 1, Hy4 Landing 2, `SPEC1` MMA `* 4096.0h` fold
++ `FC_NHW` leaf arms, and `PAIR1` 21-rate decode + direct pair constants).
+
+### DeepSeek-V4.1-Flash STQ 2.7bpw (`06fd493b` vs Landing 1 `68db642b` and v1.8.0 `7c8d11d1`)
+
+Warm repeat-load on `06fd493b`: Spec ON (`dspark`) `21.4 s` (`1,455` pipelines from manifest, `0 ms` warm forwards);
+Spec OFF (`--no-mtp`) `20.0 s` (`1,299` pipelines from manifest, `0 ms` warm forwards). Code `4k` prefill cells below come
+from the clean warm-loaded `4k` re-stamp (`2,773` Spec ON, `3,080` Spec OFF; the initial cold-boot `4k` request had
+startup contention while `8k..128k` and all prose/decode cells were clean).
+
+Spec ON (`dspark`), tok/s (prefill = window ending at rung, net of restore; decode = median of 3 samples):
+
+| rung | code prefill (`06fd493b`) | `68db642b` | `v1.8.0` | prose prefill (`06fd493b`) | `68db642b` | `v1.8.0` | code decode (`06fd493b`) | `68db642b` | `v1.8.0` | prose decode (`06fd493b`) | `68db642b` | `v1.8.0` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 2,773 | 2,685 | 2,643 | 2,256 | 2,140 | 2,078 | 139.4 | 137.5 | 129.0 | 73.9 | 73.3 | 70.6 |
+| 8k | 2,937 | 2,838 | 2,771 | 2,332 | 2,242 | 2,167 | 186.8 | 184.9 | 167.0 | 99.0 | 98.0 | 90.8 |
+| 16k | 3,127 | 2,977 | 2,983 | 2,488 | 2,464 | 2,356 | 141.8 | 139.6 | 124.6 | 76.0 | 77.0 | 74.2 |
+| 32k | 3,243 | 3,033 | 3,044 | 2,503 | 2,394 | 2,383 | 175.0 | 173.3 | 152.9 | 81.3 | 80.6 | 78.4 |
+| 64k | 3,228 | 3,065 | 2,873 | 2,558 | 2,418 | 2,194 | 172.1 | 170.0 | 143.2 | 70.5 | 69.8 | 71.0 |
+| 128k | 3,087 | 2,994 | 2,453 | 2,428 | 2,389 | 1,976 | 130.1 | 128.9 | 120.0 | 78.5 | 78.1 | 78.7 |
+
+Spec OFF (`--no-mtp`), tok/s (`06fd493b` vs `68db642b` and `b18faea6` code `4k/32k/128k`):
+
+| rung | code prefill (`06fd493b`) | `68db642b` | `b18faea6` | prose prefill (`06fd493b`) | `68db642b` | code decode (`06fd493b`) | `68db642b` | `b18faea6` | prose decode (`06fd493b`) | `68db642b` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 3,080 | 2,871 | 2,842 | 2,298 | 2,262 | 68.5 | 67.6 | 63.4 | 68.7 | 67.6 |
+| 8k | 2,947 | 2,883 | · | 2,378 | 2,323 | 68.7 | 67.6 | · | 67.8 | 67.6 |
+| 16k | 3,143 | 3,022 | · | 2,467 | 2,459 | 68.3 | 67.2 | · | 68.1 | 67.2 |
+| 32k | 3,273 | 3,189 | 3,034 | 2,483 | 2,496 | 68.0 | 66.9 | 63.0 | 68.0 | 66.9 |
+| 64k | 3,222 | 3,176 | · | 2,556 | 2,501 | 67.4 | 66.2 | · | 67.3 | 66.3 |
+| 128k | 3,095 | 3,048 | 2,332 | 2,460 | 2,401 | 66.5 | 65.6 | 61.3 | 66.5 | 65.6 |
+
+- Against v1.8.0 (`7c8d11d1`), Spec ON beats every code and prose prefill rung (`+4.8%` to `+25.8%` code, `+5.0%` to
+  `+22.9%` prose) and every code decode rung (`+8.1%` to `+20.2%`, mean `157.5` vs `139.5 tok/s`, `+13.0%`).
+- Incremental `SPEC1` + `PAIR1` gain over Landing 1 (`68db642b`): Spec ON code prefill `+3.1%` to `+6.9%` and code
+  decode `+0.9%` to `+1.6%` across all 6 rungs; Spec OFF code decode `+1.3%` to `+1.8%` across all 6 rungs (`+7.9%` to
+  `+8.5%` over `b18faea6`).
+
+### Hy4-Flash STQ 4bpw (`06fd493b` vs Landing 2 `75a20f8b` and `b18faea6`)
+
+Server flags: `--kv-quant 8` (Spec ON `dfly2`) and `--kv-quant 8 --no-mtp` (Spec OFF). Spec ON `code 128k` ran under
+`Heavy` thermal pressure (`1,661 tok/s`, vs `1,714 tok/s` at `Nominal` in Spec OFF).
+
+Spec ON (`dfly2`), tok/s:
+
+| rung | code prefill (`06fd493b`) | `75a20f8b` | `b18faea6` | prose prefill (`06fd493b`) | `75a20f8b` | `b18faea6` | code decode (`06fd493b`) | `75a20f8b` | `b18faea6` | prose decode (`06fd493b`) | `75a20f8b` | `b18faea6` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 2,007 | 1,981 | 1,931 | 1,766 | 1,753 | 1,702 | 176.1 | 175.4 | 142.6 | 75.8 | 74.9 | 68.9 |
+| 8k | 1,964 | 1,951 | 1,931 | 1,755 | 1,746 | 1,718 | 163.3 | 163.5 | 114.6 | 99.5 | 98.9 | 89.6 |
+| 16k | 1,949 | 1,939 | 1,898 | 1,855 | 1,848 | 1,817 | 129.2 | 128.2 | 116.1 | 67.3 | 66.7 | 67.0 |
+| 32k | 1,910 | 1,902 | 1,836 | 1,873 | 1,869 | 1,765 | 148.8 | 148.5 | 102.5 | 80.1 | 79.2 | 69.5 |
+| 64k | 1,838 | 1,830 | 1,710 | 1,824 | 1,818 | 1,691 | 108.6 | 107.6 | 72.6 | 66.9 | 65.7 | 63.3 |
+| 128k | 1,661 | 1,692 | 1,506 | 1,710 | 1,707 | 1,504 | 120.7 | 119.1 | 96.5 | 64.1 | 63.4 | 62.1 |
+
+Spec OFF (`--kv-quant 8 --no-mtp`), tok/s (`Nominal` across every rung):
+
+| rung | code prefill (`06fd493b`) | `75a20f8b` | `b18faea6` | prose prefill (`06fd493b`) | `75a20f8b` | code decode (`06fd493b`) | `75a20f8b` | `b18faea6` | prose decode (`06fd493b`) | `75a20f8b` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 2,048 | 2,027 | 1,993 | 2,012 | 1,978 | 67.3 | 66.4 | 67.3 | 67.2 | 66.3 |
+| 8k | 1,990 | 1,972 | · | 1,959 | 1,934 | 67.2 | 66.1 | · | 67.2 | 66.3 |
+| 16k | 1,968 | 1,921 | · | 1,959 | 1,929 | 66.8 | 66.1 | · | 66.9 | 66.1 |
+| 32k | 1,928 | 1,907 | 1,843 | 1,946 | 1,930 | 66.3 | 65.6 | 66.2 | 66.4 | 65.4 |
+| 64k | 1,846 | 1,833 | · | 1,874 | 1,852 | 64.9 | 64.4 | · | 65.2 | 64.3 |
+| 128k | 1,714 | 1,705 | 1,511 | 1,731 | 1,723 | 62.9 | 62.1 | 62.6 | 62.8 | 60.5 |
+
+- Against `b18faea6`, Spec ON beats every code and prose rung in both prefill (`+1.7%` to `+13.7%`) and decode (code
+  `+11.3%` to `+49.6%`, mean `141.1` vs `107.5 tok/s`, `+31.3%`; prose `+0.4%` to `+15.3%`).
+- Incremental `SPEC1` + `PAIR1` gain over Landing 2 (`75a20f8b`): Spec OFF beats `75a20f8b` on all 24 cells (code decode
+  `+0.8%` to `+1.7%`, prose decode `+1.2%` to `+3.8%`, prefill `+0.5%` to `+2.4%`); Spec ON beats `75a20f8b` on all 6
+  prose decode rungs (`+0.6%` to `+1.8%`), all 6 prose prefill rungs, and 5 of 6 code decode/prefill rungs.
+
 ## Hy4-Flash STQ 4bpw N=1 resident round (`75a20f8b`, Landing 2 on M5 Ultra 256 GB)
 
 Apple M5 Ultra 256 GB, AC power, ReleaseFast, `taskpolicy -a`, GPU lock, warm `book-<hash>.bin` + `archive.bin` +
