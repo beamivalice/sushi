@@ -958,6 +958,54 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## DeepSeek-V4.1-Flash STQ 2.7bpw N=1 resident baseline after FC metallib + DS41 speed waves (`dd2cfe79`, M5 Ultra 256 GB)
+
+Apple M5 Ultra 256 GB, AC power, ReleaseFast, `taskpolicy -a`, GPU lock, quiet box (`QUIET`), shipping defaults (TF32
+on, private SSD prefix cache, no cooldown), `sushi bench` (`--tokens 256` code, `128` prose), zero late compiles
+(`compiled=0`) and zero `PlanMiss` across every rung; commit `dd2cfe79` (binary SHA-256 `56e7b881f6abae25`,
+`sushi.metallib` SHA-256 `9863d38c2dd9abb3`, `104.61 MiB`, `7,348` functions — down `-61.0%` from `268 MB` after all 5
+Cooler FC metallib conversions, static bill + unified D97 arena `1055b11d` with resident no-alias fix `dd2cfe79`, EXL3
+prefill/decode speed Wave 1 `816338c5`, and DS41 arch speed Wave 2 `35e3cb0d`).
+
+Warm repeat-load on `dd2cfe79`: Spec ON (`dspark`) `16.2 s` (`1,457` pipelines from binary archive in `59 ms`, `0 ms`
+warm forwards, model bill `195.3 GB` of `245.8 GB`); Spec OFF (`--no-mtp`) `16.8 s` (`1,301` pipelines in `78 ms`,
+`0 ms` warm forwards, model bill `190.8 GB` of `245.7 GB`). All Spec ON code rungs ran `Nominal` at `1620 MHz`; Spec ON
+`prose 16k` prefill ladder ran under `Heavy` thermal pressure (`1510 MHz`, `2,500 tok/s`, vs `2,690 tok/s` at `Nominal`
+in Spec OFF).
+
+Spec ON (`dspark`), tok/s (prefill = window ending at rung, net of restore; decode = median of 3 samples):
+
+| rung | code prefill (`dd2cfe79`) | `06fd493b` | `v1.8.0` | prose prefill (`dd2cfe79`) | `06fd493b` | `v1.8.0` | code decode (`dd2cfe79`) | `06fd493b` | `v1.8.0` | prose decode (`dd2cfe79`) | `06fd493b` | `v1.8.0` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 3,040 | 2,773 | 2,643 | 2,389 | 2,256 | 2,078 | 151.2 | 139.4 | 129.0 | 84.2 | 73.9 | 70.6 |
+| 8k | 3,133 | 2,937 | 2,771 | 2,349 | 2,332 | 2,167 | 197.9 | 186.8 | 167.0 | 100.7 | 99.0 | 90.8 |
+| 16k | 3,445 | 3,127 | 2,983 | 2,500 | 2,488 | 2,356 | 140.6 | 141.8 | 124.6 | 75.7 | 76.0 | 74.2 |
+| 32k | 3,608 | 3,243 | 3,044 | 2,607 | 2,503 | 2,383 | 183.1 | 175.0 | 152.9 | 87.7 | 81.3 | 78.4 |
+| 64k | 3,563 | 3,228 | 2,873 | 2,714 | 2,558 | 2,194 | 166.9 | 172.1 | 143.2 | 75.9 | 70.5 | 71.0 |
+| 128k | 3,394 | 3,087 | 2,453 | 2,647 | 2,428 | 1,976 | 139.3 | 130.1 | 120.0 | 77.2 | 78.5 | 78.7 |
+
+Spec OFF (`--no-mtp`), tok/s (`dd2cfe79` vs `06fd493b` and `b18faea6` code `4k/32k/128k`):
+
+| rung | code prefill (`dd2cfe79`) | `06fd493b` | `b18faea6` | prose prefill (`dd2cfe79`) | `06fd493b` | code decode (`dd2cfe79`) | `06fd493b` | `b18faea6` | prose decode (`dd2cfe79`) | `06fd493b` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 3,038 | 3,080 | 2,842 | 2,405 | 2,298 | 70.0 | 68.5 | 63.4 | 70.0 | 68.7 |
+| 8k | 3,167 | 2,947 | · | 2,423 | 2,378 | 69.9 | 68.7 | · | 69.9 | 67.8 |
+| 16k | 3,455 | 3,143 | · | 2,690 | 2,467 | 69.5 | 68.3 | · | 69.6 | 68.1 |
+| 32k | 3,613 | 3,273 | 3,034 | 2,725 | 2,483 | 69.1 | 68.0 | 63.0 | 69.2 | 68.0 |
+| 64k | 3,574 | 3,222 | · | 2,730 | 2,556 | 68.4 | 67.4 | · | 68.5 | 67.3 |
+| 128k | 3,409 | 3,095 | 2,332 | 2,663 | 2,460 | 67.6 | 66.5 | 61.3 | 67.7 | 66.5 |
+
+- Against `06fd493b` (post-SPEC1/PAIR1), Spec ON code prefill improves `+6.7%` to `+11.3%` on all 6 rungs (peaking at
+  `3,608 tok/s` at `32k` and `3,394 tok/s` at `128k`, `+38.4%` over `v1.8.0`); mean Spec ON code decode rises `157.5 ->
+  163.2 tok/s` (`+3.6%`, peaking at `197.9 tok/s` at `8k`, `+17.0%` mean over `v1.8.0`); Spec ON prose decode jumps
+  `+7.7%` to `+13.9%` at `4k/32k/64k`.
+- Spec OFF beats `06fd493b` on 23 of 24 cells (code decode `70.0 -> 67.6 tok/s`, `+1.5%` to `+2.2%`; prose decode
+  `70.0 -> 67.7 tok/s`, `+1.8%` to `+3.1%`; `8k..128k` code prefill `+7.5%` to `+10.9%`, peaking at `3,613 tok/s`;
+  all 6 prose prefill rungs `+1.9%` to `+9.7%`).
+- 8-category 16x512 KLD (`deepseek-v41-flash-1017-native-cp16-cooler-v2`, `MLX_ENABLE_TF32=0`): `0.056938` all-positions
+  (`94.37%` top-1, cosine `0.9711`) and `0.032055` to-first-EOS (`94.80%` top-1, cosine `0.9798`, `6,347` positions) —
+  `-5.2%` better than the `0.060060` reference.
+
 ## DeepSeek-V4.1 and Hy4-Flash STQ N=1 resident baselines after SPEC1 + PAIR1 (`06fd493b`, M5 Ultra 256 GB)
 
 Apple M5 Ultra 256 GB, AC power, ReleaseFast, `taskpolicy -a`, GPU lock per arm, shipping defaults (TF32 on, private SSD
