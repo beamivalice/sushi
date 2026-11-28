@@ -74,12 +74,12 @@ cp "$ROOT/scripts/gpu-lock.sh" "$REPO/scripts/" 2> /dev/null
 printf '%s\n' 'const test_log = b.option([]const u8, "test-log", "");' 'const cut = b.option(bool, "fixture-cut", "");' \
   'const skip = b.option([]const []const u8, "test-skip-step", "");' > "$REPO/build.zig"
 echo 'tracked, as the real lib/ is' > "$REPO/lib/stb_image.h"
-# The guards wait for the test step to start: run before it instead of beside it, they find it never did.
+# The guards wait for the unified build step to start: run sequentially after it instead of beside it, they find it never did.
 cat > "$REPO/tests/hermetic_guards.sh" << 'EOF'
 #!/bin/bash
 echo $$ > "$STUB_CALLS.guards.pid"
-for _ in $(seq 50); do [ -e "$STUB_CALLS.test-started" ] && break; sleep 0.1; done
-beside=no; [ -e "$STUB_CALLS.test-started" ] && beside=yes
+for _ in $(seq 50); do [ -e "$STUB_CALLS.build-started" ] && break; sleep 0.1; done
+beside=no; [ -e "$STUB_CALLS.build-started" ] && beside=yes
 echo "guards $PWD python3=$(command -v python3) untracked=$([ -e tests/untracked_marker ] && echo yes || echo no) zcache=${ZIG_LOCAL_CACHE_DIR:-none} beside=$beside" >> "$STUB_CALLS"
 sleep "${STUB_GUARDS_SLEEP:-0}"
 [ "${STUB_FAIL:-}" != guards ]
@@ -89,19 +89,21 @@ cat > "$REPO/.zig-toolchain/zig" << 'EOF'
 #!/bin/bash
 if [ "$1" = version ]; then echo 0.17.1; exit 0; fi
 step=$2
+case " $* " in *" test-build "*) step=build ;; esac
 mlx_src=$([ -f lib/mlx-src/mlx/backend/metal/kernels/utils.h ] && echo yes || echo no)
 gs_out=$(git status --porcelain --untracked-files=no 2>&1) || gs_out="ERR:$gs_out"
 git_status=$([ -z "$gs_out" ] && echo clean || echo "dirty:$gs_out")
 echo "zig $step $PWD mlx_src=$mlx_src git_status=$git_status QWEN4_STQ_TINY=${QWEN4_STQ_TINY:-unset} DSV41_EPI_TINY=${DSV41_EPI_TINY:-unset} args=$*" >> "$STUB_CALLS"
+if [ "$step" = build ]; then touch "$STUB_CALLS.build-started"; fi
 [ "${STUB_FAIL:-}" = "$step" ] && { echo "error: stub $step failed"; exit 1; }
-# test-build + test-plan: the two binaries (their bytes from STUB_BIN_<name>) and the plan beside them.
-if [ "$step" = test-build ]; then
+# unified build (lint + ubench + test-build + test-plan): the two binaries (their bytes from STUB_BIN_<name>) and the plan beside them.
+if [ "$step" = build ]; then
   mkdir -p zig-out/tests zig-out/lib
   printf '%s' "${STUB_BIN_HOST:-host v1}" > zig-out/tests/test-host
   printf '%s' "${STUB_BIN_REST:-rest v1}" > zig-out/tests/test-rest
   printf '%s' "${STUB_METALLIB:-metallib v1}" > zig-out/lib/sushi.metallib
-  printf '%s' '[{"step":"test-host","binary":"tests/test-host","env":[["SUSHI_TEST_STEP","test-host"]]},' \
-    '{"step":"test-rest","binary":"tests/test-rest","env":[["SUSHI_TEST_STEP","test-rest"]]}]' > zig-out/test-plan.json
+  printf '%s' '[{"step":"test-host","binary":"tests/test-host","metallib":false,"env":[["SUSHI_TEST_STEP","test-host"]]},' \
+    '{"step":"test-rest","binary":"tests/test-rest","metallib":true,"env":[["SUSHI_TEST_STEP","test-rest"]]}]' > zig-out/test-plan.json
 fi
 if [ "$step" = test ]; then
   touch "$STUB_CALLS.test-started"
@@ -175,7 +177,7 @@ ok "the record holds the tests passed" "$(field "$REC" build_summary.tests_passe
 ok "  the tests total" "$(field "$REC" build_summary.tests_total)" "3"
 ok "  the skips" "$(field "$REC" build_summary.skipped)" "1"
 ok "  the steps succeeded" "$(field "$REC" build_summary.steps_succeeded)" "22"
-for s in lint guards ubench test; do
+for s in build guards test; do
   ok "the record holds $s's minutes" "$(field "$REC" minutes.$s > /dev/null && echo yes || echo no)" "yes"
 done
 ok "the record holds the slowest test first" "$(field "$REC" test_times.0.test)" 'second: "quoted" test'
@@ -193,16 +195,15 @@ has "the gate names its budget" "$OUT" "test budget 72 GiB (hw.memsize 128 GiB)"
 has "the test step declares the Qwen cut that the fixture envs name" "$(grep '^zig test ' "$CALLS")" "-Dfixture-cut=true"
 ok "  and keeps zig's default job count on the M5 row" "$(grep '^zig test ' "$CALLS" | grep -c -- ' -j')" "0"
 has "the record holds a summary line" "$(field "$REC" summary)" "2/3 tests passed"
-ZIGS="$(grep '^zig ' "$CALLS" | cut -d' ' -f2 | tr '\n' ' ')"
-ok "lint, then ubench, then the test binaries and plan, then the test step" "$(grep -E '^zig ' "$CALLS" | cut -d' ' -f1-2 | tr '\n' ',')" "zig lint,zig ubench,zig test-build,zig test,"
-has "  the binaries and plan built with the test step's flags" "$(grep '^zig test-build ' "$CALLS")" "args=build test-build test-plan -Doptimize=ReleaseFast"
+ok "unified build front-end, then the test step" "$(grep -E '^zig ' "$CALLS" | cut -d' ' -f1-2 | tr '\n' ',')" "zig build,zig test,"
+has "  the unified build runs lint, ubench, test-build and test-plan with the test step's flags" "$(grep '^zig build ' "$CALLS")" "args=build lint ubench test-build test-plan -Doptimize=ReleaseFast"
 ok "the gate keeps each run step's key" "$(cut -f1 "$GATE_DIR/$SHA1.logs/step-keys.tsv" 2> /dev/null | tr '\n' ',')" "test-host,test-rest,"
-ok "the steps run in the gate dir's one worktree path, so a rebuild of the same code is the same binary" "$(sed -n 's/^zig lint \([^ ]*\) .*/\1/p' "$CALLS")" "$GATE_DIR/worktree"
-has "the worktree borrows lib/mlx-src/mlx for sushi.metallib" "$(grep '^zig lint ' "$CALLS")" "mlx_src=yes"
-has "  while keeping git status clean on the submodule path" "$(grep '^zig lint ' "$CALLS")" "git_status=clean"
-has "the guards run beside the test step" "$(grep '^guards ' "$CALLS")" "beside=yes"
-ok "every step runs under taskpolicy -a" "$(grep -c '^taskpolicy ' "$CALLS")" "5"
-WT_DIR="$(sed -n 's/^zig lint \([^ ]*\) .*/\1/p' "$CALLS")"
+ok "the steps run in the gate dir's one worktree path, so a rebuild of the same code is the same binary" "$(sed -n 's/^zig build \([^ ]*\) .*/\1/p' "$CALLS")" "$GATE_DIR/worktree"
+has "the worktree borrows lib/mlx-src/mlx for sushi.metallib" "$(grep '^zig build ' "$CALLS")" "mlx_src=yes"
+has "  while keeping git status clean on the submodule path" "$(grep '^zig build ' "$CALLS")" "git_status=clean"
+has "the guards run immediately beside the build and test steps" "$(grep '^guards ' "$CALLS")" "beside=yes"
+ok "every step runs under taskpolicy -a" "$(grep -c '^taskpolicy ' "$CALLS")" "3"
+WT_DIR="$(sed -n 's/^zig build \([^ ]*\) .*/\1/p' "$CALLS")"
 ok "the steps run outside the checkout" "$([ -n "$WT_DIR" ] && [ "$WT_DIR" != "$REPO" ] && echo yes || echo no)" "yes"
 has "the guards run in a tree without the checkout's untracked files" "$(grep '^guards ' "$CALLS")" "untracked=no"
 has "the guards run with the PyYAML python3 first on PATH" "$(grep '^guards ' "$CALLS")" "python3=$TMP/py-yes/python3"
@@ -210,7 +211,7 @@ has "the guards' own zig build keeps its cache in the gate dir" "$(grep '^guards
 has "the test step sees the fixture envs" "$(grep '^zig test ' "$CALLS")" "QWEN4_STQ_TINY=$QWEN_TINY"
 has "  DSV41_EPI_TINY among them" "$(grep '^zig test ' "$CALLS")" "DSV41_EPI_TINY=$TMP/models/tiny-models/dsv41-epi-tiny"
 ok "the record names DSV41_EPI_TINY's fixture" "$(field "$REC" fixtures.DSV41_EPI_TINY)" "$TMP/models/tiny-models/dsv41-epi-tiny"
-for s in lint ubench test; do
+for s in build test; do
   has "zig build $s keeps its cache in the gate dir" "$(grep "^zig $s " "$CALLS")" "--cache-dir $GATE_DIR/zig-cache"
 done
 ok "the worktree is removed" "$(worktrees)" "1"
@@ -218,11 +219,12 @@ ok "  and its directory" "$([ -n "$WT_DIR" ] && [ -e "$WT_DIR" ] && echo yes || 
 
 echo "── a failing step ──"
 rm -rf "$GATE_DIR"
-gate STUB_FAIL=ubench -- HEAD
+gate STUB_FAIL=build STUB_GUARDS_SLEEP=30 -- HEAD
 ok "a failed step exits non-zero" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
-has "  naming the step" "$OUT" "step 'ubench' failed"
+has "  naming the step" "$OUT" "step 'build' failed"
 ok "  writing no record" "$(ls "$GATE_DIR"/*.json 2> /dev/null | wc -l | tr -d ' ')" "0"
 ok "  and running no later step" "$(grep -c '^zig test ' "$CALLS")" "0"
+ok "  stopping the guards still running beside it" "$(kill -0 "$(cat "$CALLS.guards.pid")" 2> /dev/null && echo alive || echo gone)" "gone"
 ok "  and removing its worktree" "$(worktrees)" "1"
 
 gate STUB_FAIL=a-test STUB_GUARDS_SLEEP=30 -- HEAD
@@ -240,6 +242,12 @@ has "  naming them" "$OUT" "step 'guards' failed"
 ok "  writing no record" "$(ls "$GATE_DIR"/*.json 2> /dev/null | wc -l | tr -d ' ')" "0"
 
 echo "── the test budget ──"
+gate STUB_MEMSIZE=274877906944 -- HEAD
+has "a 256 GiB box takes the Ultra row's 144 GiB" "$(grep '^zig test ' "$CALLS")" "--maxrss 154618822656"
+has "  and names it" "$OUT" "test budget 144 GiB (hw.memsize 256 GiB)"
+ok "  and keeps zig's default job count on the Ultra row" "$(grep '^zig test ' "$CALLS" | grep -c -- ' -j')" "0"
+gate STUB_MEMSIZE=206158430208 -- HEAD
+has "a 192 GiB box takes the Ultra row's 144 GiB" "$(grep '^zig test ' "$CALLS")" "--maxrss 154618822656"
 gate STUB_MEMSIZE=34359738368 -- HEAD
 has "a 32 GiB box takes the M1 row's 20 GiB" "$(grep '^zig test ' "$CALLS")" "--maxrss 21474836480"
 has "  and its 8 jobs" "$(grep '^zig test ' "$CALLS")" " -j8 "
@@ -305,13 +313,13 @@ ok "  the record counts the reused tests, zig having run none" "$(field "$CREC" 
 ok "  the passes" "$(field "$CREC" build_summary.tests_passed)" "2"
 ok "  the total" "$(field "$CREC" build_summary.tests_total)" "3"
 ok "  the skips" "$(field "$CREC" build_summary.skipped)" "1"
-ok "  lint and the guards still run" "$(grep -c -E '^(zig lint|guards) ' "$CALLS")" "2"
+ok "  the unified build and the guards still run" "$(grep -c -E '^(zig build|guards) ' "$CALLS")" "2"
 gate STUB_BIN_REST="rest v2" -- --continue "$PRIOR" HEAD
 ok "a step whose binary changed runs again" "$(skips)" "test-host,"
 ok "  and the record lists only the reused one" "$(field "$GATE_DIR/$SHA3.json" reused.steps.1 > /dev/null && echo two || echo one)" "one"
 ok "  and counts the rerun step's tests with the reused one's" "$(field "$GATE_DIR/$SHA3.json" summary | grep -c '2/3 tests passed (1 skipped)')" "1"
 gate STUB_METALLIB="metallib v2" -- --continue "$PRIOR" HEAD
-ok "a rebuilt sushi.metallib reruns every step" "$(skips)" ""
+ok "a rebuilt sushi.metallib reruns metallib steps while reusing non-metallib steps" "$(skips)" "test-host,"
 gate STUB_FAIL=a-test -- HEAD
 echo 'pub const a = 2;' > "$REPO/src/a.zig"
 g -C "$REPO" commit -qam "another zig-only change"

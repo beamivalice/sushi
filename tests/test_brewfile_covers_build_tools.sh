@@ -21,7 +21,7 @@ for tool in cmake ninja pkg-config jq wget autoconf automake; do
 done
 
 # Every dependency build.zig verifies at build time.
-for dep in $(sed -n '/required_brew_deps/,/^};/p' build.zig | sed -n 's/.*\.name = "\([^"]*\)".*/\1/p'); do
+for dep in $(sed -n '/^const required_brew_deps =/,/^};/p' build.zig | sed -n 's/.*\.name = "\([^"]*\)".*/\1/p'); do
     if ! listed "$dep"; then
         echo "FAIL: build.zig requires brew '$dep' but $BREWFILE has no brew \"$dep\"" >&2
         status=1

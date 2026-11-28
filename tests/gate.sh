@@ -2,17 +2,20 @@
 # sushi-test: tier=tool
 # The local release gate: every check a local run can prove, run once on one commit in a clean worktree of it.
 #   tests/gate.sh [--test-budget-gib N] [--continue <prior-ref>] [<ref>]
-#                             the ref as this repo has it (default origin/main: fetch first); N is the test step's
-#                             memory budget (zig build --maxrss), by default the box's row: 72 GiB on 96 GiB or more
-#                             (the M5 Max), 20 GiB and -j8 on 32 GiB or more (the M1 Max); a smaller box names N itself
+#                             the ref as this repo has it (default origin/main: fetch first); N is the build and test
+#                             step's memory budget (zig build --maxrss), by default the box's row: 144 GiB on 192 GiB
+#                             or more (the 256 GiB M5 Ultra), 72 GiB on 96 GiB or more (the M5 Max), 20 GiB and -j8 on
+#                             32 GiB or more (the M1 Max); a smaller box names N itself
 #   --continue <prior-ref>    reuses a prior gate run's per-test results for every test run step whose key is the
-#                             same (tests/lib/test_keys.py: its binary's code and data, its env, the box, lib/mlx,
-#                             the tracked files that are not Zig or docs, the fixtures) and that ended whole there;
-#                             every other step runs, lint, ubench and the guards always; the record names the reuse
+#                             same (tests/lib/test_keys.py: its binary's code and data, its env, sushi.metallib when
+#                             the step uses it, the box, lib/mlx, the tracked files that are not Zig, Metal or docs,
+#                             the fixtures) and that ended whole there; every other step runs, the front-end build
+#                             (lint, ubench, test-build, test-plan) and the guards always; the record names the reuse
 # It refuses while the GPU lock is held: a full model load owns the box, and the suite's fixture loads would join it.
-# Steps, each under `taskpolicy -a`, stopping at the first failure: zig build lint, zig build ubench, then
-# zig build test -Doptimize=ReleaseFast --summary all with the tiny-fixture envs of tests/lib/fixture_envs.sh,
-# -Dtest-log and, when they name the Qwen cut, -Dfixture-cut=true, with tests/hermetic_guards.sh running beside it. Each test's log line shows as it lands; at the end the
+# Steps, each under `taskpolicy -a`, stopping at the first failure: one unified front-end `zig build lint ubench
+# test-build test-plan -Doptimize=ReleaseFast`, then `zig build test -Doptimize=ReleaseFast --summary all` with the
+# tiny-fixture envs of tests/lib/fixture_envs.sh, -Dtest-log and, when they name the Qwen cut, -Dfixture-cut=true, with
+# tests/hermetic_guards.sh running beside both from the start. Each test's log line shows as it lands; at the end the
 # per-step table, the 10 slowest tests and, last, every failed test with its error block (tests/lib/test_log.py).
 # On success it writes ${SUSHI_GATE_DIR:-$HOME/.sushi/runs/gate}/<sha>.json, the record ./release.sh requires; each
 # step's log, the per-test log (tests.tsv) and each run step's key (step-keys.tsv) stay in <sha>.logs/ beside it.
@@ -79,6 +82,8 @@ BUDGET_FROM="hw.memsize $MEM_GIB GiB"
 JOBS=()
 if [ -n "$BUDGET_GIB" ]; then
   BUDGET_FROM="--test-budget-gib; $BUDGET_FROM"
+elif [ "$MEM_GIB" -ge 192 ]; then
+  BUDGET_GIB=144
 elif [ "$MEM_GIB" -ge 96 ]; then
   BUDGET_GIB=72
 elif [ "$MEM_GIB" -ge 32 ]; then
@@ -105,9 +110,12 @@ mkdir -p "$GATE_DIR"
 GUARDS_PID=""
 FOLLOW_PID=""
 cleanup() {
-  [ -z "$FOLLOW_PID" ] || kill "$FOLLOW_PID" 2> /dev/null || true
+  if [ -n "$FOLLOW_PID" ]; then
+    kill "$FOLLOW_PID" 2> /dev/null || true
+    wait "$FOLLOW_PID" 2> /dev/null || true
+  fi
   if [ -n "$GUARDS_PID" ]; then
-    kill -TERM -- "-$GUARDS_PID" 2> /dev/null || true
+    kill -TERM -- "-$GUARDS_PID" "$GUARDS_PID" 2> /dev/null || true
     wait "$GUARDS_PID" 2> /dev/null || true
   fi
   git -C "$ROOT" worktree remove --force "$WT" 2> /dev/null || rm -rf "$WT"
@@ -168,9 +176,9 @@ run_step() {
   STEP_SECONDS="$STEP_SECONDS $name=$(($(date +%s) - t0))"
 }
 
-# The guards run beside the test step, in a process group of their own (set -m), which a failure stops whole.
+# The guards run beside the build and test steps, in a process group of their own (set -m), which a failure stops whole.
 start_guards() {
-  echo "gate: guards (beside the test step)"
+  echo "gate: guards (beside build and test)"
   set -m
   (
     rc=0
@@ -187,6 +195,10 @@ join_guards() {
   local rc secs
   wait "$GUARDS_PID" || true
   GUARDS_PID=""
+  if [ ! -f "$LOGS/guards.rc" ]; then
+    [ ! -f "$LOGS/guards.log" ] || tail -n 40 "$LOGS/guards.log" >&2
+    die "step 'guards' exited without writing status on $SHA; log: $LOGS/guards.log; no record written"
+  fi
   read -r rc secs < "$LOGS/guards.rc"
   if [ "$rc" -ne 0 ]; then
     tail -n 40 "$LOGS/guards.log" >&2
@@ -195,15 +207,12 @@ join_guards() {
   STEP_SECONDS="$STEP_SECONDS guards=$secs"
 }
 
-# The test step: its binaries and their plan built first and every run step keyed (step-keys.tsv), the steps a
-# --continue reuses left out, the rest with their log lines shown as they land, then the summary; a failure ends the
-# gate naming the step.
+# The test step: every run step of the built plan keyed (step-keys.tsv), the steps a --continue reuses left out, the
+# rest with their log lines shown as they land, then the summary; a failure ends the gate naming the step.
 TEST_LOG="$LOGS/tests.tsv"
 REUSED=()
 run_tests() {
   local t0 rc=0 skips=()
-  run_step test-build zig build test-build test-plan -Doptimize=ReleaseFast --cache-dir "$ZIG_CACHE" \
-    --maxrss $((BUDGET_GIB << 30)) ${JOBS[@]+"${JOBS[@]}"} ${CUT[@]+"${CUT[@]}"}
   SUSHI_FIXTURE_ENVS="$SUSHI_FIXTURE_ENVS" "$PY" -I "$ROOT/tests/lib/test_keys.py" keys zig-out/test-plan.json "$WT" \
     > "$LOGS/step-keys.tsv" \
     || die "step 'test' failed: the run steps could not be keyed on $SHA; no record written"
@@ -232,9 +241,9 @@ run_tests() {
   STEP_SECONDS="$STEP_SECONDS test=$(($(date +%s) - t0))"
 }
 
-run_step lint zig build lint --cache-dir "$ZIG_CACHE"
-run_step ubench zig build ubench --cache-dir "$ZIG_CACHE"
 start_guards
+run_step build zig build lint ubench test-build test-plan -Doptimize=ReleaseFast --cache-dir "$ZIG_CACHE" \
+  --maxrss $((BUDGET_GIB << 30)) ${JOBS[@]+"${JOBS[@]}"} ${CUT[@]+"${CUT[@]}"}
 run_tests
 join_guards
 

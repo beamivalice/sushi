@@ -55,7 +55,7 @@ taskpolicy -a "$ZIG" build test -Doptimize=ReleaseFast "-Dtest-filter=$COOLER" "
   "-Dtest-filter=$SERVER" "-Dtest-filter=$PREFIX" "-Dtest-log=$TMP/domains.tsv" >"$TMP/out" 2>&1 \
   || fail "one test of each domain runs green"
 want="cooler-load PASS cooler_contract_test.test.$COOLER
-test-deepseek PASS dsv41.dsv41_config.test.$DEEPSEEK
+test-deepseek-core PASS dsv41.dsv41_config.test.$DEEPSEEK
 test-glm PASS glm5.glm5_config.test.$GLM
 test-kernels PASS mlx_util.test.$KERNELS
 test-load PASS pack_index.test.$LOAD

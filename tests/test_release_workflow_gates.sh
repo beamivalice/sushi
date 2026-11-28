@@ -227,19 +227,50 @@ names = [s.get("name", "") for s in job["steps"]]
 check(gate_step.get("name") in names and names.index(gate_step.get("name")) < names.index("Set up the build"),
       "the gate sha is checked before the build is set up")
 
-# The Zig build cache: restored before the release build, keyed on the toolchain, the build files, the submodules and
-# the Xcode the setup selected (zig caches configure-time SDK paths).
+# The Zig build cache: restored before the release build, keyed on the toolchain, submodules, Xcode (zig caches
+# configure-time SDK paths) and build/metallib inputs — omitting build.zig.zon while `.dependencies = .{}` so every
+# release's version bump hits the warm cache, with a restore-keys fallback on the toolchain+submodules+Xcode prefix.
 zig_cache = [s for s in job["steps"] if s.get("uses", "").startswith("actions/cache")]
 check(len(zig_cache) == 1, "one Zig cache step")
 zc = zig_cache[0].get("with", {}) if zig_cache else {}
 check(".zig-cache" in str(zc.get("path", "")) and "~/.cache/zig" in str(zc.get("path", "")),
       "the Zig cache holds .zig-cache and ~/.cache/zig")
-check(str(zc.get("key", "")) == "zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-"
-      "${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}", "the Zig cache key")
+zc_prefix = "zig-cache-${{ hashFiles('scripts/fetch-zig.sh') }}-${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}-"
+zc_key = str(zc.get("key", ""))
+check(zc_key.startswith(zc_prefix) and "build.zig'" in zc_key and "build.zig.zon" not in zc_key,
+      "the Zig cache key omits build.zig.zon and starts with the toolchain/submodules/Xcode prefix")
+check(zc_prefix in [l.strip() for l in str(zc.get("restore-keys", "")).splitlines() if l.strip()],
+      "the Zig cache has a restore-keys fallback on the toolchain/submodules/Xcode prefix")
+check(re.search(r'\.dependencies\s*=\s*\.\{\s*\}', open("build.zig.zon").read()) is not None,
+      "build.zig.zon has empty .dependencies (revisit zig-cache key if Zig deps are added)")
 check(next((s for s in job["steps"] if s.get("name") == "Set up the build"), {}).get("id") == "setup",
       "the setup step's outputs feed the cache key")
 check(names.index(zig_cache[0].get("name")) < names.index("Build sushi (Zig)") if zig_cache else False,
       "the Zig cache is restored before the build")
+
+# The composite setup-build action: caches .zig-toolchain keyed by runner + fetch-zig.sh before running fetch-zig.sh,
+# and includes patches/*.patch and scripts/build-mlx.sh in the mlx-stage cache key.
+setup_action = yaml.safe_load(open(".github/actions/setup-build/action.yml"))
+setup_steps = setup_action["runs"]["steps"]
+setup_names = [s.get("name", "") for s in setup_steps]
+zig_tc_cache = [s for s in setup_steps if s.get("uses", "").startswith("actions/cache") and str(s.get("with", {}).get("path", "")).strip() == ".zig-toolchain"]
+check(len(zig_tc_cache) == 1, "setup-build caches .zig-toolchain")
+check(str(zig_tc_cache[0].get("with", {}).get("key", "")) == "zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}" if zig_tc_cache else False,
+      "the .zig-toolchain cache key hashes runner OS/arch and scripts/fetch-zig.sh")
+check(setup_names.index(zig_tc_cache[0].get("name")) < setup_names.index("Install Zig (pinned)") if zig_tc_cache and "Install Zig (pinned)" in setup_names else False,
+      "the .zig-toolchain cache is restored before Install Zig")
+
+mlx_cache = [s for s in setup_steps if s.get("uses", "").startswith("actions/cache") and str(s.get("with", {}).get("path", "")).strip() == "lib/mlx"]
+check(len(mlx_cache) == 1, "setup-build caches lib/mlx")
+mlx_key = str(mlx_cache[0].get("with", {}).get("key", "")) if mlx_cache else ""
+check("'patches/*.patch'" in mlx_key
+      and "'scripts/build-mlx.sh'" in mlx_key
+      and "steps.mlxpin.outputs.mlx" in mlx_key
+      and "steps.mlxpin.outputs.mlxc" in mlx_key
+      and "steps.mlxpin.outputs.xcode" in mlx_key,
+      "the mlx-stage cache key includes mlx, mlxc, patches/*.patch, scripts/build-mlx.sh, and xcode")
+check(setup_names.index(mlx_cache[0].get("name")) < setup_names.index("Build mlx + mlx-c (NAX-enabled)") if mlx_cache and "Build mlx + mlx-c (NAX-enabled)" in setup_names else False,
+      "the mlx-stage cache is restored before building mlx")
 
 sys.exit(FAIL)
 EOF

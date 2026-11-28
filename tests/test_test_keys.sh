@@ -39,5 +39,37 @@ cmp -s "$TMP/base" "$TMP/other_cache" && fail "the two caches' builds should dif
 [ "$(key base)" = "$(key left_out_edit)" ] || fail "an edit to a test the binary leaves out should hash alike"
 [ "$(key base)" != "$(key kept_edit)" ] || fail "an edit to a test the binary holds should change the hash"
 
+# metallib invalidation: only steps whose plan marks metallib=true (or omits it, fail-safe) hash zig-out/lib/sushi.metallib,
+# and tracked .metal files do not spuriously bust pure-host / non-metallib steps.
+REPO="$TMP/repo"
+mkdir -p "$REPO/lib/mlx/lib" "$REPO/src/tensor/metallib" "$REPO/zig-out/tests" "$REPO/zig-out/lib"
+git -C "$REPO" init -q
+printf 'mlx' > "$REPO/lib/mlx/lib/libmlx.dylib"
+printf 'kernel void k() {}\n' > "$REPO/src/tensor/metallib/k.metal"
+git -C "$REPO" -c user.name=t -c user.email=t@t add -A
+git -C "$REPO" -c user.name=t -c user.email=t@t commit -qm init
+cp "$TMP/base" "$REPO/zig-out/tests/t"
+printf 'mlib-v1' > "$REPO/zig-out/lib/sushi.metallib"
+cat > "$REPO/zig-out/test-plan.json" << 'EOF'
+[
+  {"step":"step-no-mlib","binary":"tests/t","metallib":false,"env":[["SUSHI_TEST_STEP","step-no-mlib"]]},
+  {"step":"step-uses-mlib","binary":"tests/t","metallib":true,"env":[["SUSHI_TEST_STEP","step-uses-mlib"]]},
+  {"step":"step-default-mlib","binary":"tests/t","env":[["SUSHI_TEST_STEP","step-default-mlib"]]}
+]
+EOF
+SUSHI_FIXTURE_ENVS="" python3 -I tests/lib/test_keys.py keys "$REPO/zig-out/test-plan.json" "$REPO" > "$TMP/k1.tsv"
+printf 'mlib-v2' > "$REPO/zig-out/lib/sushi.metallib"
+printf 'kernel void k2() {}\n' > "$REPO/src/tensor/metallib/k.metal"
+git -C "$REPO" -c user.name=t -c user.email=t@t commit -qam "edit metal"
+SUSHI_FIXTURE_ENVS="" python3 -I tests/lib/test_keys.py keys "$REPO/zig-out/test-plan.json" "$REPO" > "$TMP/k2.tsv"
+
+kval() { awk -F'\t' -v s="$2" '$1 == s {print $2}' "$1"; }
+[ "$(kval "$TMP/k1.tsv" step-no-mlib)" = "$(kval "$TMP/k2.tsv" step-no-mlib)" ] \
+  || fail "a step with metallib=false should not be invalidated by sushi.metallib or .metal edits"
+[ "$(kval "$TMP/k1.tsv" step-uses-mlib)" != "$(kval "$TMP/k2.tsv" step-uses-mlib)" ] \
+  || fail "a step with metallib=true must be invalidated when sushi.metallib changes"
+[ "$(kval "$TMP/k1.tsv" step-default-mlib)" != "$(kval "$TMP/k2.tsv" step-default-mlib)" ] \
+  || fail "a step omitting metallib must default to hashing sushi.metallib"
+
 [ "$FAIL" -eq 0 ] || { echo "FAIL"; exit 1; }
 echo "PASS"

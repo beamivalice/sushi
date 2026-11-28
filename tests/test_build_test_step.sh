@@ -41,4 +41,51 @@ else
   fi
 fi
 
+# Split domain and fault-sweep group aliases still resolve cleanly via -Dtest-step=<group>, and test-plan.json records
+# the split steps plus exact metallib dependency flags.
+"$ZIG" build test-plan -Doptimize=ReleaseFast -Dfixture-cut=true >"$TMP/out" 2>&1 || { echo "  FAIL: full test-plan"; tail -3 "$TMP/out"; exit 1; }
+python3 -I - <<'PY' || FAIL=$((FAIL + 1))
+import json, sys
+plan = {r["step"]: r for r in json.load(open("zig-out/test-plan.json"))}
+need = [
+    "test-deepseek-stream", "test-deepseek-generate", "test-deepseek-core",
+    "test-hy4-plan", "test-hy4-request", "test-hy4-stq", "test-hy4-core",
+    "cooler-requests-fault-spec", "cooler-requests-fault-rows",
+    "cooler-load-fault-mlx", "cooler-load-fault-pool",
+]
+missing = [s for s in need if s not in plan]
+if missing:
+    print(f"  FAIL: test-plan missing split steps: {missing}")
+    sys.exit(1)
+no_mlib = ["test-host", "test-sushibar", "test-encoder", "test-glm", "test-mimo", "test-exl3-format"]
+bad_no = [s for s in no_mlib if plan[s].get("metallib") is not False]
+if bad_no:
+    print(f"  FAIL: expected metallib=false for {bad_no}")
+    sys.exit(1)
+yes_mlib = ["test-server", "cooler-load", "test-deepseek-core", "test-hy4-plan", "test-exl3-experts", "test-exl3-trunk"]
+bad_yes = [s for s in yes_mlib if plan[s].get("metallib") is not True]
+if bad_yes:
+    print(f"  FAIL: expected metallib=true for {bad_yes}")
+    sys.exit(1)
+no_cut = ["cooler-load", "cooler-manifest", "cooler-requests", "cooler-load-fault-mlx", "cooler-load-fault-pool",
+          "cooler-requests-fault-spec", "cooler-requests-fault-rows", "cooler-restore",
+          "qwen-late-gdn-captured-verify", "qwen-late-gdn-final-state", "qwen-late-vision-tower",
+          "qwen-late-qsa-split", "qwen-late-qsa-row-class"]
+bad_cut = [s for s in no_cut if any(k == "SUSHI_TEST_FIXTURE_CUT" for k, _ in plan[s]["env"])]
+if bad_cut:
+    print(f"  FAIL: non-cut steps still carry SUSHI_TEST_FIXTURE_CUT: {bad_cut}")
+    sys.exit(1)
+PY
+
+for args in \
+  "-Dmodel=dsv41 -Dtest-step=test-deepseek" \
+  "-Dmodel=hy4flash -Dtest-step=test-hy4" \
+  "-Dtest-step=cooler-requests-fault" \
+  "-Dtest-step=cooler-load-fault"; do
+  # shellcheck disable=SC2086
+  if ! "$ZIG" build test-plan -Doptimize=ReleaseFast $args >"$TMP/out" 2>&1; then
+    echo "  FAIL: group alias failed to configure: $args"; tail -5 "$TMP/out" | sed 's/^/    /'; FAIL=$((FAIL + 1))
+  fi
+done
+
 [ "$FAIL" -eq 0 ] && echo "PASS: test_build_test_step" || { echo "FAIL: test_build_test_step ($FAIL)"; exit 1; }

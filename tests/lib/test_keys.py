@@ -6,8 +6,9 @@ can read is the same, and a test run then would have run the same code on the sa
   test_keys.py keys <test-plan.json> <repo>
       one `<step>\t<key>` line per run step of the plan (`zig build test-plan`; its binaries sit beside it after
       `zig build test-build`); the key hashes the step's test binary
-      (its code and data, read as `normalized` reads it), the step's own env, and what every step shares: the box
-      (macOS build, chip), lib/mlx's files, the tracked files of <repo> that are neither Zig source nor docs, the
+      (its code and data, read as `normalized` reads it), the step's own env, `zig-out/lib/sushi.metallib` when the
+      step uses it (`metallib` in the plan, defaulting to true), and what every step shares: the box
+      (macOS build, chip), lib/mlx's files, the tracked files of <repo> that are not Zig, Metal or docs, the
       environment's SUSHI_/MLX_/fixture variables and the contents of every fixture folder SUSHI_FIXTURE_ENVS names
   test_keys.py reuse <prior logs dir> <keys file> <reused log>
       the steps whose key equals the prior gate's and whose prior run ended whole (one DONE, no FAIL, its counts
@@ -104,7 +105,7 @@ def shared(repo):
     h.update(f"mlx {tree_sha(os.path.join(repo, 'lib', 'mlx', 'lib'))}\n".encode())
     for line in out("git", "-C", repo, "ls-files", "-s").splitlines():
         path = line.split("\t", 1)[1]
-        if path.endswith((".zig", ".md")) or path.startswith("docs/"):
+        if path.endswith((".zig", ".md", ".metal")) or path.startswith("docs/"):
             continue
         h.update(line.encode() + b"\n")
     for name in sorted(os.environ):
@@ -121,11 +122,12 @@ def keys(plan_path, repo):
     out_dir = os.path.dirname(os.path.abspath(plan_path))
     base = shared(repo)
     sushi_metallib = os.path.join(out_dir, "lib", "sushi.metallib")
-    if os.path.isfile(sushi_metallib):
-        base = hashlib.sha256(f"{base}\nsushi.metallib {file_sha(sushi_metallib)}\n".encode()).hexdigest()
+    metallib_sha = file_sha(sushi_metallib) if os.path.isfile(sushi_metallib) else None
     for step in plan:
         h = hashlib.sha256()
         h.update(f"{base}\n{step['step']}\n".encode())
+        if metallib_sha is not None and step.get("metallib", True):
+            h.update(f"sushi.metallib {metallib_sha}\n".encode())
         h.update(normalized(os.path.join(out_dir, step["binary"])).encode())
         h.update(json.dumps(step["env"], sort_keys=True).encode())
         print(f"{step['step']}\t{h.hexdigest()}")

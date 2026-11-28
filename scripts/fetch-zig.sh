@@ -11,14 +11,17 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEST="$REPO_ROOT/.zig-toolchain"
 STAMP="$DEST/.version"
 
-# Idempotent: skip when the staged copy already matches the pinned version.
-if [ -f "$STAMP" ] && [ -x "$DEST/zig" ]; then
-  if [ "$(cat "$STAMP")" = "$ZIG_VERSION" ]; then
+# Idempotent: skip when the staged copy already matches the pinned version and passes a basic sanity check.
+if [ -f "$STAMP" ] && [ -x "$DEST/zig" ] && [ -d "$DEST/lib/std" ]; then
+  if [ "$(cat "$STAMP")" = "$ZIG_VERSION" ] && [ "$("$DEST/zig" version 2>/dev/null || true)" = "$ZIG_VERSION" ]; then
     echo "[fetch-zig] .zig-toolchain already at $ZIG_VERSION — nothing to do"
     exit 0
   fi
-  echo "[fetch-zig] staged version '$(cat "$STAMP")' != '$ZIG_VERSION' — refetching"
+  echo "[fetch-zig] staged toolchain '$(cat "$STAMP")' does not match '$ZIG_VERSION' — refetching"
   # The build cache holds configure-time paths from the old toolchain.
+  rm -rf "$REPO_ROOT/.zig-cache"
+elif [ -e "$DEST" ]; then
+  echo "[fetch-zig] incomplete .zig-toolchain — refetching"
   rm -rf "$REPO_ROOT/.zig-cache"
 fi
 

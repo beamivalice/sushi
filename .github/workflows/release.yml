@@ -106,16 +106,20 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
-      # Bounded: the key is written once per toolchain/build/submodule set, so
-      # later runs restore it and never re-save a growing cache. Xcode is in the
-      # key because zig caches configure-time SDK paths.
+      # Bounded: build.zig.zon is omitted while `.dependencies = .{}` so release
+      # version bumps hit the warm cache instead of forcing a cold rebuild. The
+      # toolchain, submodules and Xcode prefix isolates configure-time SDK paths
+      # and serves as the restore-keys fallback so build.zig or metallib edits
+      # reuse warm .zig-cache and unchanged metallib shards incrementally.
       - name: Cache Zig build artifacts
         uses: actions/cache@v4
         with:
           path: |
             .zig-cache
             ~/.cache/zig
-          key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}
+          key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh') }}-${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}-${{ hashFiles('build.zig', 'src/metallib_*.zig', 'src/tensor/metallib_*.zig', 'src/**/*.metal', 'src/*/metallib.zig') }}
+          restore-keys: |
+            zig-cache-${{ hashFiles('scripts/fetch-zig.sh') }}-${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}-
 
       - name: Build sushi (Zig)
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}

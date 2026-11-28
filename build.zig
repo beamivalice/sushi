@@ -207,7 +207,7 @@ pub fn build(b: *std.Build) void {
     if (host_filters.len > 0) {
         const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters, .test_runner = testRunner(b), .max_rss = 5 * gib });
         test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        if (runs.add(host_tests, host_tests.name, &.{}, false, 1)) |run_host_tests| {
+        if (runs.add(host_tests, host_tests.name, &.{}, false, 1, false, .{ null, null })) |run_host_tests| {
             test_host_step.dependOn(&run_host_tests.step);
             test_step.dependOn(&run_host_tests.step);
             if (test_filter == null) {
@@ -229,8 +229,14 @@ pub fn build(b: *std.Build) void {
             env.append(b.allocator, .{ "SUSHI_TEST_SELECT", step.select }) catch @panic("OOM");
             if (step.env) |kv| env.append(b.allocator, kv) catch @panic("OOM");
             if (qwen_preprocess_fixture) |fixture| env.append(b.allocator, .{ "QWEN_PREPROCESS_FIXTURE", fixture }) catch @panic("OOM");
-            const run = runs.add(domain.compile, step.name, env.items, step.holds_cut orelse domain.domain.cut, step.run_gib orelse domain.domain.run_gib) orelse continue;
-            run.addFileArg2(sushi_metallib, .{ .prefix = "--env=SUSHI_METALLIB=", .make_absolute = true });
+            const uses_metallib = domain.domain.metallib;
+            const run = runs.add(domain.compile, step.name, env.items, step.holds_cut orelse domain.domain.cut, step.run_gib orelse domain.domain.run_gib, uses_metallib, .{ step.group, step.domain_group }) orelse continue;
+            if (uses_metallib) {
+                run.addFileArg2(sushi_metallib, .{ .prefix = "--env=SUSHI_METALLIB=", .make_absolute = true });
+            } else {
+                // Fail loudly if a non-metallib domain ever tries to load sushi.metallib (keeps test_keys.py sound).
+                run.addArg("--env=SUSHI_METALLIB=/dev/null");
+            }
             if (qwen_preprocess_fixture) |fixture| {
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
@@ -253,8 +259,12 @@ pub fn build(b: *std.Build) void {
         const area = for (exl3_test_bins) |area| {
             if (std.mem.eql(u8, exl3_test.name, b.fmt("test-exl3-{s}", .{area.area}))) break area;
         } else unreachable;
-        if (runs.add(exl3_test, exl3_test.name, &.{}, area.cut, area.run_gib)) |run_exl3| {
-            run_exl3.addFileArg2(sushi_metallib, .{ .prefix = "--env=SUSHI_METALLIB=", .make_absolute = true });
+        if (runs.add(exl3_test, exl3_test.name, &.{}, area.cut, area.run_gib, area.metallib, .{ null, null })) |run_exl3| {
+            if (area.metallib) {
+                run_exl3.addFileArg2(sushi_metallib, .{ .prefix = "--env=SUSHI_METALLIB=", .make_absolute = true });
+            } else {
+                run_exl3.addArg("--env=SUSHI_METALLIB=/dev/null");
+            }
             test_step.dependOn(&run_exl3.step);
             test_step.dependOn(countGuard(b, count_guard, exl3_test));
         }
@@ -269,8 +279,8 @@ pub fn build(b: *std.Build) void {
     });
     if ((test_model == null or test_model == .enc) and encoderSelected(b, test_filter)) {
         test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        if (runs.add(encoder_tests, encoder_tests.name, &.{}, false, 7)) |run_encoder| {
-            run_encoder.addFileArg2(sushi_metallib, .{ .prefix = "--env=SUSHI_METALLIB=", .make_absolute = true });
+        if (runs.add(encoder_tests, encoder_tests.name, &.{}, false, 7, false, .{ null, null })) |run_encoder| {
+            run_encoder.addArg("--env=SUSHI_METALLIB=/dev/null");
             test_step.dependOn(&run_encoder.step);
             test_step.dependOn(countGuard(b, count_guard, encoder_tests));
         }
@@ -285,7 +295,7 @@ pub fn build(b: *std.Build) void {
             .filters = filters,
         });
         test_build.dependOn(&b.addInstallArtifact(bar_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        if (runs.add(bar_tests, bar_tests.name, &.{}, false, 1)) |run_bar| {
+        if (runs.add(bar_tests, bar_tests.name, &.{}, false, 1, false, .{ null, null })) |run_bar| {
             test_step.dependOn(&run_bar.step);
             test_step.dependOn(countGuard(b, count_guard, bar_tests));
         }
@@ -489,6 +499,19 @@ fn linkApple(module: *std.Build.Module, macos_sdk_frameworks: ?[]const u8) void 
     module.linkFramework("IOSurface", .{});
 }
 
+/// Tests split out of `cooler_load_fault_test.zig` into `cooler-load-fault-mlx` (sibling step `cooler-load-fault-pool`
+/// excludes this exact slice so every test runs once and new tests land automatically in the pool sibling).
+const cooler_load_fault_mlx_tests = [_]TestRef{
+    .{ .file = "cooler_load_fault_test", .name = "cooler contract: a Cooler load failed at the first checked MLX call of any step, or the last of a bring-up step, leaves nothing of it behind" },
+};
+
+/// Tests split out of `cooler_requests_fault_test.zig` into `cooler-requests-fault-spec` (sibling step
+/// `cooler-requests-fault-rows` excludes this exact slice for a ~50/50 wall-time balance).
+const cooler_requests_fault_spec_tests = [_]TestRef{
+    .{ .file = "cooler_requests_fault_test", .name = "cooler contract: speculative rows failed at any checked MLX call site their solo plain requests lack, at its first call or its last, leave the next rows their solo tokens and the pool as it was" },
+    .{ .file = "cooler_requests_fault_test", .name = "cooler contract: a Cooler request failed at any of its checked MLX call sites leaves the engine as a whole request does, and the next says the same tokens" },
+};
+
 /// The MLX tests compile as one binary per domain, `test-<name>`, named by what its tests prove. A domain holds every
 /// test file of its `folders` (`src/<folder>/`) and the files it lists (`src/`-relative, without `.zig`); a listed file
 /// leaves its folder's domain. A test file that no domain holds, or that two list, fails the configure by name.
@@ -506,16 +529,20 @@ const test_domains = [_]TestDomain{
             "cooler_manifest_test",
         },
         .steps = &.{
-            .{ .name = "cooler-load", .files = &.{ "cooler_contract_test", "cooler_load_test" } },
+            // Non-cut cooler steps (measured <= 2 GiB on tiny fixtures) declare `.holds_cut = false` so they do not
+            // reserve 12 GiB cut slots and starve actual cut steps under `--maxrss`.
+            .{ .name = "cooler-load", .files = &.{ "cooler_contract_test", "cooler_load_test" }, .holds_cut = false, .run_gib = 3 },
             // The manifest's cells warm whole loads: beside the load step, not after it.
-            .{ .name = "cooler-manifest", .files = &.{"cooler_manifest_test"} },
+            .{ .name = "cooler-manifest", .files = &.{"cooler_manifest_test"}, .holds_cut = false, .run_gib = 3 },
             .{ .name = "cooler-pool", .files = &.{"cooler_pool_test"} },
             .{ .name = "cooler-prefill-bill", .files = &.{"cooler_prefill_bill_test"} },
-            .{ .name = "cooler-requests", .files = &.{"cooler_requests_test"} },
-            // The fault sweeps, each family's longest cells, run beside their family's step, not after it.
-            .{ .name = "cooler-load-fault", .files = &.{"cooler_load_fault_test"} },
-            .{ .name = "cooler-requests-fault", .files = &.{"cooler_requests_fault_test"} },
-            .{ .name = "cooler-restore", .files = &.{"cooler_restore_test"}, .holds_cut = false },
+            .{ .name = "cooler-requests", .files = &.{"cooler_requests_test"}, .holds_cut = false, .run_gib = 3 },
+            // The fault sweeps, each family's longest cells, split in two and run beside their family's step.
+            .{ .name = "cooler-load-fault-mlx", .group = "cooler-load-fault", .files = &.{"cooler_load_fault_test"}, .tests = &cooler_load_fault_mlx_tests, .holds_cut = false, .run_gib = 4 },
+            .{ .name = "cooler-load-fault-pool", .group = "cooler-load-fault", .files = &.{"cooler_load_fault_test"}, .exclude_tests = &cooler_load_fault_mlx_tests, .holds_cut = false, .run_gib = 3 },
+            .{ .name = "cooler-requests-fault-spec", .group = "cooler-requests-fault", .files = &.{"cooler_requests_fault_test"}, .tests = &cooler_requests_fault_spec_tests, .holds_cut = false, .run_gib = 3 },
+            .{ .name = "cooler-requests-fault-rows", .group = "cooler-requests-fault", .files = &.{"cooler_requests_fault_test"}, .exclude_tests = &cooler_requests_fault_spec_tests, .holds_cut = false, .run_gib = 3 },
+            .{ .name = "cooler-restore", .files = &.{"cooler_restore_test"}, .holds_cut = false, .run_gib = 2 },
             // A served load per fixture held across the step's request-level cells (`heldLoad`), apart from the cells
             // that make their own loads.
             .{ .name = "cooler-held-requests", .files = &.{"cooler_held_requests_test"} },
@@ -525,18 +552,40 @@ const test_domains = [_]TestDomain{
             .{ .name = "cooler-late-hy4", .files = &.{"hy4flash/hy4_late_test"}, .holds_cut = false, .env = hy4_tf32_off },
         },
     },
-    .{ .name = "deepseek", .folders = &.{"dsv41"}, .compile_gib = 8, .run_gib = 9 },
+    .{
+        .name = "deepseek",
+        .folders = &.{"dsv41"},
+        .compile_gib = 8,
+        .run_gib = 9,
+        .steps = &.{
+            .{ .name = "test-deepseek-stream", .files = &.{"dsv41/dsv41_stream"}, .run_gib = 3 },
+            .{ .name = "test-deepseek-generate", .files = &.{ "dsv41/dsv41_generate_test", "dsv41/kld_capture" }, .run_gib = 3 },
+            .{ .name = "test-deepseek-core", .rest = true, .run_gib = 9 },
+        },
+    },
     .{ .name = "qwen", .folders = &.{"qwen4"}, .cut = true, .run_gib = 6 },
-    .{ .name = "glm", .folders = &.{"glm5"}, .compile_gib = 7 },
-    .{ .name = "mimo", .folders = &.{"mimo2"} },
+    .{ .name = "glm", .folders = &.{"glm5"}, .compile_gib = 7, .run_gib = 3, .metallib = false },
+    .{ .name = "mimo", .folders = &.{"mimo2"}, .run_gib = 3, .metallib = false },
     // Cold compile peaks at 8.85 GB: 9 GiB leaves 9% over it.
-    .{ .name = "hy4", .folders = &.{"hy4flash"}, .compile_gib = 9, .env = hy4_tf32_off },
+    .{
+        .name = "hy4",
+        .folders = &.{"hy4flash"},
+        .compile_gib = 9,
+        .run_gib = 3,
+        .env = hy4_tf32_off,
+        .steps = &.{
+            .{ .name = "test-hy4-plan", .files = &.{ "hy4flash/hy4_plan_test", "hy4flash/hy4_plan_audit_test" } },
+            .{ .name = "test-hy4-request", .files = &.{ "hy4flash/hy4_request_test", "hy4flash/hy4_ledger_test" } },
+            .{ .name = "test-hy4-stq", .files = &.{ "hy4flash/hy4_stq_test", "hy4flash/hy4_layer_major", "hy4flash/hy4_oracle_test" } },
+            .{ .name = "test-hy4-core", .rest = true },
+        },
+    },
     .{ .name = "kernels", .folders = &.{"tensor"}, .run_gib = 6, .files = &.{
         "attn_kernels",       "dflash_conv",    "dflash_qmv",      "expert_bf16_kernels", "fp8_block",    "hc_kernels", "linear",     "metal",
         "metal_mlx",          "mlx",            "mlx_kernel_keys", "mlx_pages",           "mlx_util",     "moe_gqmv",   "moe_router",
         "moe_stream_compute", "mtp_dense_rows", "mtp_qmv",         "nax_gate",            "sampler_draw", "verify_moe", "verify_qmm",
     } },
-    .{ .name = "generate", .compile_gib = 8, .files = &.{
+    .{ .name = "generate", .compile_gib = 8, .run_gib = 2, .files = &.{
         "arm_trial",     "degenerate",   "dflash",             "forward_diag", "generate",       "hc_prefill",   "kv_cache",
         "kv_quant",      "mtp",                "mtp_plan",     "mtp_policy",     "mtp_round",    "mtp_tick",
         "prefill_plan",  "restore_dump", "row_store",          "sampler",      "scheduler",      "slot_admission", "slot_outcome",
@@ -549,13 +598,13 @@ const test_domains = [_]TestDomain{
         "model_load",     "model_registry",  "owned_weights",         "pack_index",    "tests",        "transient_peak",
         "vision_common",  "repack_stamp_test",
     } },
-    .{ .name = "server", .compile_gib = 10, .files = &.{
+    .{ .name = "server", .compile_gib = 10, .run_gib = 2, .files = &.{
         "anthropic",     "bench",          "byte_budget", "cli",           "completions", "downloads",      "generation_stream",
         "http_conn",     "http_head",      "launch",      "main",          "metrics",     "model_settings", "models_api",
         "request_media", "request_policy", "responses",   "responses_api", "server",      "server_test",    "settings_api",
         "sleep_inhibit", "status",         "version",     "vision_queue",
     } },
-    .{ .name = "prefix-cache", .files = &.{
+    .{ .name = "prefix-cache", .run_gib = 2, .files = &.{
         "disk_placement",          "dsv41/dsv41_prefix_cache_test", "glm5/glm5_prefix_cache_test", "kv_disk_fs",
         "kv_disk_index_test",      "kv_disk_persist_test",          "kv_disk_restore_test",        "prefix_cache",
         "prefix_cache_admin",      "prefix_cache_commit_test",      "prefix_cache_evict_test",     "prefix_cache_index_test",
@@ -582,11 +631,11 @@ const alone_tests = [_]AloneTest{
     .{ .step = "hy4-late-tower-affine", .file = "hy4flash/hy4_vision_test", .name = "hy4 vision: a Cooler load's tower warms before the seal, so an image of any grid compiles nothing inside a request, at the release's widths, its matrices affine 8" },
     .{ .step = "hy4-late-embed-gather", .file = "hy4flash/hy4_stq_test", .name = "hy4 stq: after warmKernels a GPU embedding gather of any block count, in any order, makes no pipeline (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" },
     .{ .step = "hy4-late-vision-image", .file = "hy4flash/hy4_vision_test", .name = "hy4 vision: after warmKernels an image prompt's prefill makes no pipeline a text prefill of its width did not (HY4_BF16_TINY)" },
-    .{ .step = "qwen-late-gdn-captured-verify", .file = "qwen4/gdn_decode", .name = "gdn recur: on the engine before the seal a captured verify makes the replay kernel at each count up to its own" },
-    .{ .step = "qwen-late-gdn-final-state", .file = "qwen4/gdn_decode", .name = "gdn recur: on the engine before the seal a verify that keeps only its final state makes the replay at each count up to its own" },
-    .{ .step = "qwen-late-vision-tower", .file = "qwen4/qwen_vision", .name = "qwen vision: a Cooler load's tower warms before the seal, so images and videos of any grid compile nothing inside a request" },
-    .{ .step = "qwen-late-qsa-split", .file = "qwen4/qwen4_qsa_select", .name = "qsa select on the engine before the seal makes the split's pipelines, so a long select after it compiles none" },
-    .{ .step = "qwen-late-qsa-row-class", .file = "qwen4/qwen4_qsa_select", .name = "qsa select before the seal, at the one row class a warm's wide chunk takes, makes every row class's, so a chunk's remainder of any width compiles none" },
+    .{ .step = "qwen-late-gdn-captured-verify", .holds_cut = false, .file = "qwen4/gdn_decode", .name = "gdn recur: on the engine before the seal a captured verify makes the replay kernel at each count up to its own" },
+    .{ .step = "qwen-late-gdn-final-state", .holds_cut = false, .file = "qwen4/gdn_decode", .name = "gdn recur: on the engine before the seal a verify that keeps only its final state makes the replay at each count up to its own" },
+    .{ .step = "qwen-late-vision-tower", .holds_cut = false, .file = "qwen4/qwen_vision", .name = "qwen vision: a Cooler load's tower warms before the seal, so images and videos of any grid compile nothing inside a request" },
+    .{ .step = "qwen-late-qsa-split", .holds_cut = false, .file = "qwen4/qwen4_qsa_select", .name = "qsa select on the engine before the seal makes the split's pipelines, so a long select after it compiles none" },
+    .{ .step = "qwen-late-qsa-row-class", .holds_cut = false, .file = "qwen4/qwen4_qsa_select", .name = "qsa select before the seal, at the one row class a warm's wide chunk takes, makes every row class's, so a chunk's remainder of any width compiles none" },
     .{ .step = "kernels-late-f32-simd", .file = "tensor/route", .name = "engine f32 matmul on the SIMD tiles: the first use of a tile before the seal makes every alignment of it, so no length compiles inside a request" },
     .{ .step = "kernels-late-bf16-nax", .file = "tensor/route", .name = "engine bf16 matmul on the NAX tiles: a weight's first product before the seal makes what every row count to the widest chunk picks, so no length compiles inside a request" },
     .{ .step = "kernels-late-by-size", .file = "tensor/route", .name = "engine kernels a request's lengths pick by size: an elementwise op's and a matrix-vector product's first use before the seal makes every size's, so a long prompt compiles nothing" },
@@ -596,6 +645,9 @@ const alone_tests = [_]AloneTest{
 /// pipeline cache that load filled can show (an earlier test's compiles would hide a late one).
 /// `holds_cut`: false for a test of a cut domain that never loads the Qwen cut (its runner then refuses it).
 const AloneTest = struct { step: []const u8, holds_cut: ?bool = null, file: []const u8, name: []const u8, env: ?[2][]const u8 = null };
+
+/// A single named test in `src/<file>.zig`, used by `RunStep.tests` / `exclude_tests` to split a heavy test file.
+const TestRef = struct { file: []const u8, name: []const u8 };
 
 /// Hy4-Flash's tiny GPU cells hold their bytes with f32 products off TF32: the steps that run them set it, so no cell
 /// depends on the caller's environment or on which test read MLX's TF32 setting first.
@@ -608,21 +660,30 @@ const TestDomain = struct {
     compile_gib: u64 = 6,
     run_gib: u64 = 4,
     cut: bool = false,
+    /// True when any test in the domain may load `sushi.metallib` (false disables `SUSHI_METALLIB` and skips hashing it in `test_keys.py`).
+    metallib: bool = true,
     /// What every step of the domain runs under, where the step names none of its own.
     env: ?[2][]const u8 = null,
     /// The run steps that share the binary, each a process of its own; none means one, `test-<name>`, over every file.
     steps: []const RunStep = &.{},
 };
 
-/// One process of a domain's binary: the tests of `files` (none: every file of the domain), under `env`. An `again`
-/// step runs tests another step runs, on another backend: only an unfiltered run takes it.
+/// One process of a domain's binary: the tests of `files` (none: every file of the domain; `rest`: every domain file
+/// unclaimed by sibling steps), optionally split by `tests` / `exclude_tests`, under `env`. An `again` step runs tests
+/// another step runs, on another backend: only an unfiltered run takes it.
 const RunStep = struct {
     name: []const u8,
     files: []const []const u8 = &.{},
+    rest: bool = false,
+    tests: []const TestRef = &.{},
+    exclude_tests: []const TestRef = &.{},
+    group: ?[]const u8 = null,
     env: ?[2][]const u8 = null,
     again: bool = false,
     /// False for a step of a cut domain whose tests never load the Qwen cut (its runner then refuses it).
     holds_cut: ?bool = null,
+    /// Override the domain's `run_gib` when not holding the Qwen cut.
+    run_gib: ?u64 = null,
 };
 
 /// The RSS a step that loads the Qwen cut declares: its measured peak is 10 GB. `--maxrss` (the box's RAM) runs as
@@ -831,6 +892,8 @@ const PlannedStep = struct {
     /// Null: the domain's.
     holds_cut: ?bool = null,
     run_gib: ?u64 = null,
+    group: ?[]const u8 = null,
+    domain_group: ?[]const u8 = null,
 };
 
 fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, user: ?[]const []const u8) []const DomainBuild {
@@ -841,23 +904,62 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
     var planned: std.ArrayList(struct { domain: usize, step: PlannedStep, again: bool }) = .empty;
     for (test_domains, 0..) |d, di| {
         const steps: []const RunStep = if (d.steps.len > 0) d.steps else &.{.{ .name = b.fmt("test-{s}", .{d.name}) }};
+        const domain_group: ?[]const u8 = if (d.steps.len > 0) b.fmt("test-{s}", .{d.name}) else null;
+        var rest_count: usize = 0;
         for (steps) |s| {
+            if (s.rest) rest_count += 1;
             if (s.again and user != null) continue;
             var select: std.ArrayList(u8) = .empty;
-            for (files) |f| {
-                if (f.host or f.domain != di or !f.in_scope or !stepHolds(s, f.path)) continue;
-                select.print(b.allocator, "{s}\n", .{f.prefix}) catch @panic("OOM");
-                for (alone_tests) |t| if (std.mem.eql(u8, t.file, f.path))
-                    select.print(b.allocator, "!{s}test.{s}\n", .{ f.prefix, t.name }) catch @panic("OOM");
+            if (s.tests.len > 0) {
+                for (s.tests) |t| {
+                    const folder = testFolder(t.file);
+                    if (folder.len > 0 and std.meta.isError(buildRootHandle(b).access(b.graph.io, b.fmt("src/{s}", .{folder}), .{}))) continue;
+                    const f = for (files) |f| {
+                        if (!f.host and std.mem.eql(u8, f.path, t.file)) break f;
+                    } else std.debug.panic("step {s} names src/{s}.zig, which holds no MLX test", .{ s.name, t.file });
+                    if (f.domain != di or !f.in_scope) continue;
+                    const full = b.fmt("{s}test.{s}", .{ f.prefix, t.name });
+                    var held: usize = 0;
+                    for (f.names) |n| held += @intFromBool(std.mem.startsWith(u8, n.full, full));
+                    if (held != 1) std.debug.panic("step {s}'s test ref would run {d} tests, not one: {s}", .{ s.name, held, full });
+                    select.print(b.allocator, "{s}\n", .{full}) catch @panic("OOM");
+                }
+            } else {
+                for (files) |f| {
+                    if (f.host or f.domain != di or !f.in_scope or !stepHolds(steps, s, f.path)) continue;
+                    select.print(b.allocator, "{s}\n", .{f.prefix}) catch @panic("OOM");
+                    for (alone_tests) |t| if (std.mem.eql(u8, t.file, f.path))
+                        select.print(b.allocator, "!{s}test.{s}\n", .{ f.prefix, t.name }) catch @panic("OOM");
+                    for (s.exclude_tests) |t| if (std.mem.eql(u8, t.file, f.path)) {
+                        const full = b.fmt("{s}test.{s}", .{ f.prefix, t.name });
+                        var held: usize = 0;
+                        for (f.names) |n| held += @intFromBool(std.mem.startsWith(u8, n.full, full));
+                        if (held != 1) std.debug.panic("step {s}'s exclude_tests ref would drop {d} tests, not one: {s}", .{ s.name, held, full });
+                        select.print(b.allocator, "!{s}\n", .{full}) catch @panic("OOM");
+                    };
+                }
             }
             // A step is made when it runs a test the user's filters select (any named test without filters).
             var runs_one = false;
             for (files) |f| {
-                if (f.host or f.domain != di or !f.in_scope or !stepHolds(s, f.path)) continue;
+                if (f.host or f.domain != di or !f.in_scope or !stepHolds(steps, s, f.path)) continue;
                 for (f.names) |n| runs_one = runs_one or (!n.anonymous and selectedByUser(user, n.full) and selects(select.items, n.full));
             }
-            if (runs_one) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env orelse d.env, .holds_cut = s.holds_cut }, .again = s.again }) catch @panic("OOM");
+            if (runs_one) planned.append(b.allocator, .{
+                .domain = di,
+                .step = .{
+                    .name = s.name,
+                    .select = select.items,
+                    .env = s.env orelse d.env,
+                    .holds_cut = s.holds_cut,
+                    .run_gib = s.run_gib,
+                    .group = s.group,
+                    .domain_group = domain_group,
+                },
+                .again = s.again,
+            }) catch @panic("OOM");
         }
+        if (rest_count > 1) std.debug.panic("test-{s} has {d} .rest steps, at most one is allowed", .{ d.name, rest_count });
         for (alone_tests) |t| {
             const folder = testFolder(t.file);
             if (folder.len > 0 and std.meta.isError(buildRootHandle(b).access(b.graph.io, b.fmt("src/{s}", .{folder}), .{}))) continue;
@@ -870,10 +972,26 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
             for (f.names) |n| held += @intFromBool(std.mem.startsWith(u8, n.full, full));
             if (held != 1) std.debug.panic("alone_tests' step {s} would run {d} tests, not one: {s}", .{ t.step, held, full });
             if (!selectedByUser(user, full)) continue;
-            planned.append(b.allocator, .{ .domain = di, .step = .{ .name = t.step, .select = b.fmt("{s}\n", .{full}), .env = t.env orelse d.env, .holds_cut = t.holds_cut, .run_gib = if (d.cut) null else alone_run_gib }, .again = false }) catch @panic("OOM");
+            planned.append(b.allocator, .{
+                .domain = di,
+                .step = .{
+                    .name = t.step,
+                    .select = b.fmt("{s}\n", .{full}),
+                    .env = t.env orelse d.env,
+                    .holds_cut = t.holds_cut,
+                    .run_gib = if (t.holds_cut orelse d.cut) null else alone_run_gib,
+                },
+                .again = false,
+            }) catch @panic("OOM");
         }
-        for (d.steps) |s| for (s.files) |sf| if (domainOf(sf) != di)
-            std.debug.panic("test-{s}'s step {s} names {s}, a file of another domain", .{ d.name, s.name, sf });
+        for (d.steps) |s| {
+            for (s.files) |sf| if (domainOf(sf) != di)
+                std.debug.panic("test-{s}'s step {s} names {s}, a file of another domain", .{ d.name, s.name, sf });
+            for (s.tests) |t| if (domainOf(t.file) != di)
+                std.debug.panic("test-{s}'s step {s} names test in {s}, a file of another domain", .{ d.name, s.name, t.file });
+            for (s.exclude_tests) |t| if (domainOf(t.file) != di)
+                std.debug.panic("test-{s}'s step {s} excludes test in {s}, a file of another domain", .{ d.name, s.name, t.file });
+        }
     }
     // Every test the steps can see runs in exactly one of them (a second backend's run aside).
     for (files) |f| {
@@ -920,7 +1038,14 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
     return out.items;
 }
 
-fn stepHolds(step: RunStep, path: []const u8) bool {
+fn stepHolds(domain_steps: []const RunStep, step: RunStep, path: []const u8) bool {
+    if (step.rest) {
+        for (domain_steps) |other| {
+            if (other.rest or other.again) continue;
+            for (other.files) |f| if (std.mem.eql(u8, f, path)) return false;
+        }
+        return true;
+    }
     if (step.files.len == 0) return true;
     for (step.files) |f| if (std.mem.eql(u8, f, path)) return true;
     return false;
@@ -1106,10 +1231,10 @@ fn isHostFile(host_paths: []const []const u8, dir_path: []const u8, stem: []cons
 const exl3_test_bins = [_]Exl3Bin{
     .{ .area = "experts", .compile_gib = 4, .run_gib = 8, .files = &.{ "expert_exl3_kernels", "expert_exl3", "rate_groups", "project_rows", "coop_rows2", "prefill_grid", "sorted_windows", "geometry_5120x2304_test" } },
     .{ .area = "trunk", .compile_gib = 2, .run_gib = 8, .cut = true, .files = &.{ "linear", "trunk", "trunk_gemm" } },
-    .{ .area = "format", .compile_gib = 2, .run_gib = 4, .files = &.{ "root", "device", "kernel_source", "codebook_tables", "side_cache", "layout", "pack" } },
+    .{ .area = "format", .compile_gib = 2, .run_gib = 2, .metallib = false, .files = &.{ "root", "device", "kernel_source", "codebook_tables", "side_cache", "layout", "pack" } },
 };
 
-const Exl3Bin = struct { area: []const u8, compile_gib: u64, run_gib: u64, cut: bool = false, files: []const []const u8 };
+const Exl3Bin = struct { area: []const u8, compile_gib: u64, run_gib: u64, cut: bool = false, metallib: bool = true, files: []const []const u8 };
 
 /// The binary `exl3_test_bins` lists the file `stem` under.
 fn exl3Bin(stem: []const u8) usize {
@@ -1316,25 +1441,43 @@ const TestRuns = struct {
     log: ?[]const u8,
     fixture_cut: bool,
     skip: []const []const u8,
-    /// `-Dtest-step`: when set, only these run steps run; every step made stays in the plan.
+    /// `-Dtest-step`: when set, only these run steps (or split groups such as `test-deepseek`, `test-hy4`,
+    /// `cooler-requests-fault`) run; every step made stays in the plan.
     only: []const []const u8,
     plan: std.ArrayList(PlanRow) = .empty,
+    plan_groups: std.ArrayList([2]?[]const u8) = .empty,
 
-    const PlanRow = struct { step: []const u8, binary: []const u8, env: []const [2][]const u8 };
+    const PlanRow = struct { step: []const u8, binary: []const u8, metallib: bool, env: []const [2][]const u8 };
+
+    fn matchesStep(name: []const u8, groups: [2]?[]const u8, query: []const u8) bool {
+        if (std.mem.eql(u8, name, query)) return true;
+        for (groups) |g| if (g) |gn| if (std.mem.eql(u8, gn, query)) return true;
+        return false;
+    }
 
     /// The run step `name` of `compile` with `env` set, or null when `-Dtest-skip-step` names it. Its RSS bound for
     /// `--maxrss` is `run_gib` (Metal is not in RSS, so it is generous); a step that can load the Qwen cut holds
     /// `cut_run_gib` under `-Dfixture-cut=true`, and without it its runner refuses QWEN4_TEST_MODEL.
-    fn add(self: *TestRuns, compile: *std.Build.Step.Compile, name: []const u8, env: []const [2][]const u8, holds_cut: bool, run_gib: u64) ?*std.Build.Step.Run {
+    fn add(
+        self: *TestRuns,
+        compile: *std.Build.Step.Compile,
+        name: []const u8,
+        env: []const [2][]const u8,
+        holds_cut: bool,
+        run_gib: u64,
+        uses_metallib: bool,
+        groups: [2]?[]const u8,
+    ) ?*std.Build.Step.Run {
         const b = self.b;
         var all: std.ArrayList([2][]const u8) = .empty;
         all.append(b.allocator, .{ "SUSHI_TEST_STEP", name }) catch @panic("OOM");
         all.appendSlice(b.allocator, env) catch @panic("OOM");
         if (holds_cut) all.append(b.allocator, .{ "SUSHI_TEST_FIXTURE_CUT", if (self.fixture_cut) "1" else "0" }) catch @panic("OOM");
-        self.plan.append(b.allocator, .{ .step = name, .binary = b.fmt("tests/{s}", .{compile.name}), .env = all.items }) catch @panic("OOM");
+        self.plan.append(b.allocator, .{ .step = name, .binary = b.fmt("tests/{s}", .{compile.name}), .metallib = uses_metallib, .env = all.items }) catch @panic("OOM");
+        self.plan_groups.append(b.allocator, groups) catch @panic("OOM");
         for (self.skip) |s| if (std.mem.eql(u8, s, name)) return null;
         if (self.only.len > 0) for (self.only) |s| {
-            if (std.mem.eql(u8, s, name)) break;
+            if (matchesStep(name, groups, s)) break;
         } else return null;
         const run = b.addRunArtifact(compile);
         runEveryTime(run);
@@ -1353,11 +1496,16 @@ const TestRuns = struct {
         const b = self.b;
         for (self.only) |s| for (self.skip) |k| if (std.mem.eql(u8, s, k))
             std.debug.panic("-Dtest-step={s} is also named by -Dtest-skip-step", .{s});
-        for ([_]struct { []const u8, []const []const u8 }{ .{ "test-skip-step", self.skip }, .{ "test-step", self.only } }) |opt| for (opt[1]) |s| {
+        for (self.skip) |s| {
             for (self.plan.items) |row| {
                 if (std.mem.eql(u8, row.step, s)) break;
-            } else std.debug.panic("-D{s}={s} names no test run step", .{ opt[0], s });
-        };
+            } else std.debug.panic("-Dtest-skip-step={s} names no test run step", .{s});
+        }
+        for (self.only) |s| {
+            for (self.plan.items, self.plan_groups.items) |row, grp| {
+                if (matchesStep(row.step, grp, s)) break;
+            } else std.debug.panic("-Dtest-step={s} names no test run step", .{s});
+        }
         const json = std.json.Stringify.valueAlloc(b.allocator, self.plan.items, .{}) catch @panic("OOM");
         const file = b.addWriteFiles().add("test-plan.json", json);
         const step = b.step("test-plan", "Write zig-out/test-plan.json: each test run step's name, binary and env");
@@ -1493,41 +1641,43 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.L
         "rope",
         "softmax",
     };
+    // Heaviest static stock units first so `quantized` and `quantized_nax` (~13.5s each) start immediately at t=0
+    // in parallel with compiling `gen-metallib`, avoiding tail stragglers on 3–4 core CI runners.
     const sushi_units = [_][]const u8{
-        "unary",
-        "binary",
-        "reduce",
-        "scan",
-        "sort",
-        "steel_conv",
-        "gemv",
-        "steel_gemm_fused",
-        "steel_gemm_fused_nax",
-        "steel_gemm_splitk",
-        "steel_gemm_splitk_nax",
-        "steel_gemm_gather",
-        "sdpa_vector",
-        "steel_attention",
-        "steel_attention_nax",
         "quantized",
         "quantized_nax",
-        "fp_quantized",
+        "steel_gemm_splitk",
+        "steel_gemm_fused_nax",
+        "steel_gemm_fused",
+        "steel_gemm_splitk_nax",
+        "steel_gemm_gather",
         "fp_quantized_nax",
+        "fp_quantized",
+        "sort",
+        "gemv",
+        "steel_attention_nax",
+        "scan",
+        "binary",
+        "sdpa_vector",
+        "reduce",
+        "unary",
+        "steel_attention",
+        "steel_conv",
     };
-    // Balanced unit layout: list heaviest shards FIRST so Zig schedules them on P-cores immediately
-    // after `gen-metallib`. Each `.metal` unit compiles directly to its own `.metallib` in parallel
-    // (parallelizing `air-lld`), then `xcrun metallib --split-module-without-linking` stitches all
-    // per-unit `.metallib`s into `sushi.metallib` with O(1) per-file overhead.
+    // Post-FC rebalanced unit layout: heaviest generated shards FIRST so Zig schedules them on P-cores immediately
+    // after `gen-metallib`, while collapsing shrunk post-FC units (`exl3_fz_simd` 5->3, `exl3_simd` 3->1,
+    // `exl3_rows_simd` 3->1) to drop redundant `metal` + `air-lld` launches. Each `.metal` unit compiles directly
+    // to its own `.metallib` in parallel, then `xcrun metallib --split-module-without-linking` stitches all parts.
     const gen_unit_specs = [_]struct { base: []const u8, shards: usize }{
         .{ .base = "exl3_rg_simd", .shards = 6 },
-        .{ .base = "exl3_fz_simd", .shards = 5 },
-        .{ .base = "exl3_fz_nax", .shards = 4 },
-        .{ .base = "exl3_rows_simd", .shards = 3 },
+        .{ .base = "exl3_fz_nax", .shards = 5 },
         .{ .base = "exl3_rows_nax", .shards = 3 },
-        .{ .base = "exl3_simd", .shards = 3 },
-        .{ .base = "shared_simd", .shards = 1 },
+        .{ .base = "exl3_fz_simd", .shards = 3 },
         .{ .base = "nax_small", .shards = 1 },
+        .{ .base = "shared_simd", .shards = 1 },
         .{ .base = "ops_all", .shards = 1 },
+        .{ .base = "exl3_simd", .shards = 1 },
+        .{ .base = "exl3_rows_simd", .shards = 1 },
     };
     var gen_units: std.ArrayList([]const u8) = .empty;
     for (gen_unit_specs) |u| {
@@ -1583,6 +1733,18 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.L
     const link = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metallib", "--split-module-without-linking" });
     link.setName("metallib stitch sushi.metallib");
 
+    for (sushi_units) |stem| {
+        const compile = b.addSystemCommand(&metal_flags);
+        compile.setName(b.fmt("metal {s}.metal", .{stem}));
+        compile.addArg("-MMD");
+        compile.addArg("-MF");
+        _ = compile.addDepFileOutputArg2(b.fmt("sushi_{s}.d", .{stem}), .{});
+        compile.addFileArg2(b.path(b.fmt("src/tensor/metallib/{s}.metal", .{stem})), .{});
+        compile.addDirectoryArg2(b.path("lib/mlx-src"), .{ .prefix = "-I" });
+        compile.addArg("-o");
+        const part = compile.addOutputFileArg2(b.fmt("sushi_{s}.metallib", .{stem}), .{});
+        link.addFileArg2(part, .{});
+    }
     for (gen_units.items) |unit| {
         gen_run.addArg(unit);
         const metal_src = gen_run.addOutputFileArg2(b.fmt("sushi_{s}.metal", .{unit}), .{});
@@ -1607,18 +1769,6 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.L
         compile.addDirectoryArg2(b.path("lib/mlx-src"), .{ .prefix = "-I" });
         compile.addArg("-o");
         const part = compile.addOutputFileArg2(b.fmt("mlx_{s}.metallib", .{stem}), .{});
-        link.addFileArg2(part, .{});
-    }
-    for (sushi_units) |stem| {
-        const compile = b.addSystemCommand(&metal_flags);
-        compile.setName(b.fmt("metal {s}.metal", .{stem}));
-        compile.addArg("-MMD");
-        compile.addArg("-MF");
-        _ = compile.addDepFileOutputArg2(b.fmt("sushi_{s}.d", .{stem}), .{});
-        compile.addFileArg2(b.path(b.fmt("src/tensor/metallib/{s}.metal", .{stem})), .{});
-        compile.addDirectoryArg2(b.path("lib/mlx-src"), .{ .prefix = "-I" });
-        compile.addArg("-o");
-        const part = compile.addOutputFileArg2(b.fmt("sushi_{s}.metallib", .{stem}), .{});
         link.addFileArg2(part, .{});
     }
 
@@ -1772,6 +1922,22 @@ test "an arch_tests.zig lists its host tests one import a line, and a stray line
         \\    @import("a.zig")
         \\};
     , "host_tests"));
+}
+
+test "split steps claim listed files while .rest claims the rest, and -Dtest-step matches step or group" {
+    const steps = [_]RunStep{
+        .{ .name = "test-ds-stream", .files = &.{"dsv41/dsv41_stream"} },
+        .{ .name = "test-ds-core", .rest = true },
+    };
+    try std.testing.expect(stepHolds(&steps, steps[0], "dsv41/dsv41_stream"));
+    try std.testing.expect(!stepHolds(&steps, steps[0], "dsv41/dsv41_model"));
+    try std.testing.expect(!stepHolds(&steps, steps[1], "dsv41/dsv41_stream"));
+    try std.testing.expect(stepHolds(&steps, steps[1], "dsv41/dsv41_model"));
+    try std.testing.expect(stepHolds(&steps, steps[1], "dsv41/new_future_test"));
+    try std.testing.expect(TestRuns.matchesStep("cooler-requests-fault-spec", .{ "cooler-requests-fault", "test-cooler" }, "cooler-requests-fault-spec"));
+    try std.testing.expect(TestRuns.matchesStep("cooler-requests-fault-spec", .{ "cooler-requests-fault", "test-cooler" }, "cooler-requests-fault"));
+    try std.testing.expect(TestRuns.matchesStep("cooler-requests-fault-spec", .{ "cooler-requests-fault", "test-cooler" }, "test-cooler"));
+    try std.testing.expect(!TestRuns.matchesStep("cooler-requests-fault-spec", .{ "cooler-requests-fault", "test-cooler" }, "cooler-load"));
 }
 
 /// Every test binary runs under sushi's runner: std's, plus the check after each test that the engine is at rest.
