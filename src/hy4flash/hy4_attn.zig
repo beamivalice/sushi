@@ -85,14 +85,14 @@ const tile_open: [:0]const u8 =
     \\int bb = 0;
     \\PRELUDE
     \\for (int t0 = 0; t0 < total; t0 += KT, bb ^= 1) {
-    \\  float s[NK][8];
     \\  bfloat16_t kf[NK][QS][16];
     \\  if (work) {
     \\  #pragma clang loop unroll(full)
     \\  for (int kt = 0; kt < NK; ++kt) {
+    \\    float s[8];
     \\    const int ra = TSRC(kt * 16 + r0), rb = TSRC(kt * 16 + r0 + 8);
     \\    #pragma clang loop unroll(full)
-    \\    for (int i = 0; i < 8; ++i) s[kt][i] = 0.0f;
+    \\    for (int i = 0; i < 8; ++i) s[i] = 0.0f;
     \\    #pragma clang loop unroll(full)
     \\    for (int ks = 0; ks < QS; ++ks) {
     \\      #pragma clang loop unroll(full)
@@ -114,12 +114,12 @@ const tile_open: [:0]const u8 =
     \\        #pragma clang loop unroll(full)
     \\        for (int e = 0; e < 4; ++e) kf[kt][ks][g * 4 + e] = v[e];
     \\      }
-    \\      hy4_nax_mma<16, 32>(s[kt], kf[kt][ks], qo[ks]);
-    \\      hy4_nax_mma<16, 32>(s[kt], kf[kt][ks], qm[ks]);
-    \\      hy4_nax_mma<16, 32>(s[kt], kf[kt][ks], qh[ks]);
+    \\      hy4_nax_mma<16, 32>(s, kf[kt][ks], qo[ks]);
+    \\      hy4_nax_mma<16, 32>(s, kf[kt][ks], qm[ks]);
+    \\      hy4_nax_mma<16, 32>(s, kf[kt][ks], qh[ks]);
     \\    }
     \\    #pragma clang loop unroll(full)
-    \\    for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + hy4_nax_c(lane, i)) * KT + kt * 16 + hy4_nax_r(lane, i)] = s[kt][i];
+    \\    for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + hy4_nax_c(lane, i)) * KT + kt * 16 + hy4_nax_r(lane, i)] = s[i];
     \\  }
     \\  }
 ;
@@ -134,6 +134,7 @@ const tile_close: [:0]const u8 =
     \\      float v = -INFINITY;
     \\      if (TSRC(j) != -1) {
     \\        float a = 0.0f;
+    \\        #pragma clang loop unroll(full)
     \\        for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + j];
     \\        v = a * scale;
     \\      }
@@ -141,6 +142,7 @@ const tile_close: [:0]const u8 =
     \\      tmax = metal::max(tmax, v);
     \\    }
     \\    PREFETCH
+    \\    #pragma clang loop unroll(full)
     \\    for (int off = 8; off > 0; off >>= 1) tmax = metal::max(tmax, metal::simd_shuffle_xor(tmax, ushort(off)));
     \\    const float mn = metal::max(m, tmax), corr = metal::precise::exp(m - mn);
     \\    float psum = 0.0f;
@@ -153,6 +155,7 @@ const tile_close: [:0]const u8 =
     \\      ph[hh * KT + j] = hi;
     \\      pl[hh * KT + j] = bfloat16_t(p - float(hi));
     \\    }
+    \\    #pragma clang loop unroll(full)
     \\    for (int off = 8; off > 0; off >>= 1) psum += metal::simd_shuffle_xor(psum, ushort(off));
     \\    lsum = lsum * corr + psum;
     \\    m = mn;

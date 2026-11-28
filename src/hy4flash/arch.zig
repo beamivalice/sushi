@@ -224,7 +224,10 @@ pub fn warmup(xfm: Model) !void {
     if (xfm.arch_state.hy4flash.model) |m| try m.warmKernels();
     if (xfm.arch_state.hy4flash.model) |m| {
         try m.warmJoined(joined, kv);
-        if (xfm.arch_state.hy4flash.drafter) |*d| try m.warmJoinedGroups(d, joined, kv);
+        if (xfm.arch_state.hy4flash.drafter) |*d| {
+            try m.warmDrafter(d, kv);
+            try m.warmJoinedGroups(d, joined, kv);
+        }
     }
     try xfm.warmupTrunk();
     if (marker) |mk| mlx.engine.pipeline_registry.recordMarker("hy4 arch warm", &mk);

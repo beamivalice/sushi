@@ -14,42 +14,27 @@ const score_tg = 256;
 // No contract pragma: the rope and the dots are written as `hy4_rope.tail` and `sparse.indexScores` write them, under
 // the same default.
 pub const score_source: [:0]const u8 =
-    \\const int l = threadgroup_position_in_grid.y;
+    \\const int L = q_shape[0];
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
     \\constexpr int KPT = TG / IH, P = IHD + 1;
     \\const int W = NOPE + HALF;
     \\const int nb = keys_shape[0];
     \\const int n0 = int(threadgroup_position_in_grid.x) * KPT;
-    \\threadgroup float qs[IH * P], ks[KPT * P];
-    \\for (int e = int(tid); e < IH * W; e += TG) {
-    \\  const int h = e / W;
-    \\  const uint j = uint(e % W);
-    \\  const device float* row = q + (size_t(l) * IH + h) * IHD;
-    \\  threadgroup float* dst = qs + h * P;
-    \\  if (j < uint(NOPE)) {
-    \\    dst[j] = row[j];
-    \\    continue;
+    \\const int kk = int(tid) / IH, h = int(tid) % IH, n = n0 + kk;
+    \\const int max_seen = (meta[0] + L - 1) / meta[1];
+    \\if (n0 >= max_seen) {
+    \\  if (h == 0 && n < nb) {
+    \\    for (int l = 0; l < L; ++l) scores[size_t(l) * nb + n] = -INFINITY;
     \\  }
-    \\  uint i = j - uint(NOPE);
-    \\  float d = static_cast<float>(i) / static_cast<float>(HALF);
-    \\  float inv_freq = metal::exp2(-d * as_type<float>(BASE));
-    \\  float L = as_type<float>(QSCALE) * static_cast<float>(meta[0] + l);
-    \\  float theta = L * inv_freq;
-    \\  float costheta = metal::fast::cos(theta);
-    \\  float sintheta = metal::fast::sin(theta);
-    \\  float x1 = static_cast<float>(row[NOPE + 2 * i]);
-    \\  float x2 = static_cast<float>(row[NOPE + 2 * i + 1]);
-    \\  float rx1 = x1 * costheta - x2 * sintheta;
-    \\  float rx2 = x1 * sintheta + x2 * costheta;
-    \\  dst[NOPE + 2 * i] = rx1;
-    \\  dst[NOPE + 2 * i + 1] = rx2;
+    \\  return;
     \\}
+    \\threadgroup float qs[IH * P], ks[KPT * P];
     \\for (int e = int(tid); e < KPT * W; e += TG) {
-    \\  const int kk = e / W, n = n0 + kk;
+    \\  const int kki = e / W, ni = n0 + kki;
     \\  const uint j = uint(e % W);
-    \\  threadgroup float* dst = ks + kk * P;
-    \\  if (n >= nb) continue;
-    \\  const device float* row = keys + size_t(n) * IHD;
+    \\  threadgroup float* dst = ks + kki * P;
+    \\  if (ni >= nb) continue;
+    \\  const device float* row = keys + size_t(ni) * IHD;
     \\  if (j < uint(NOPE)) {
     \\    dst[j] = static_cast<float>(row[j]);
     \\    continue;
@@ -57,8 +42,8 @@ pub const score_source: [:0]const u8 =
     \\  uint i = j - uint(NOPE);
     \\  float d = static_cast<float>(i) / static_cast<float>(HALF);
     \\  float inv_freq = metal::exp2(-d * as_type<float>(BASE));
-    \\  float L = as_type<float>(KSCALE) * static_cast<float>(0 + n);
-    \\  float theta = L * inv_freq;
+    \\  float Lpos = as_type<float>(KSCALE) * static_cast<float>(0 + ni);
+    \\  float theta = Lpos * inv_freq;
     \\  float costheta = metal::fast::cos(theta);
     \\  float sintheta = metal::fast::sin(theta);
     \\  float x1 = static_cast<float>(row[NOPE + 2 * i]);
@@ -68,23 +53,48 @@ pub const score_source: [:0]const u8 =
     \\  dst[NOPE + 2 * i] = rx1;
     \\  dst[NOPE + 2 * i + 1] = rx2;
     \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\const int kk = int(tid) / IH, h = int(tid) % IH, n = n0 + kk;
     \\const threadgroup float* qh = qs + h * P;
     \\const threadgroup float* kr = ks + kk * P;
-    \\float dot = 0.0f;
-    \\for (int j = 0; j < IHD; ++j) {
-    \\  const float kv = kr[j];
-    \\  dot += qh[j] * kv;
-    \\}
     \\const uint first = lane - uint(h);
-    \\float s = 0.0f;
-    \\for (int hh = 0; hh < IH; ++hh) {
-    \\  const float dh = metal::simd_shuffle(dot, ushort(first + uint(hh)));
-    \\  s += (float(w[l * IH + hh]) * wsc[0]) * metal::max(dh, 0.0f);
+    \\for (int l = 0; l < L; ++l) {
+    \\  if (l > 0) threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int e = int(tid); e < IH * W; e += TG) {
+    \\    const int hh = e / W;
+    \\    const uint j = uint(e % W);
+    \\    const device float* row = q + (size_t(l) * IH + hh) * IHD;
+    \\    threadgroup float* dst = qs + hh * P;
+    \\    if (j < uint(NOPE)) {
+    \\      dst[j] = row[j];
+    \\      continue;
+    \\    }
+    \\    uint i = j - uint(NOPE);
+    \\    float d = static_cast<float>(i) / static_cast<float>(HALF);
+    \\    float inv_freq = metal::exp2(-d * as_type<float>(BASE));
+    \\    float Lpos = as_type<float>(QSCALE) * static_cast<float>(meta[0] + l);
+    \\    float theta = Lpos * inv_freq;
+    \\    float costheta = metal::fast::cos(theta);
+    \\    float sintheta = metal::fast::sin(theta);
+    \\    float x1 = static_cast<float>(row[NOPE + 2 * i]);
+    \\    float x2 = static_cast<float>(row[NOPE + 2 * i + 1]);
+    \\    float rx1 = x1 * costheta - x2 * sintheta;
+    \\    float rx2 = x1 * sintheta + x2 * costheta;
+    \\    dst[NOPE + 2 * i] = rx1;
+    \\    dst[NOPE + 2 * i + 1] = rx2;
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  float dot = 0.0f;
+    \\  for (int j = 0; j < IHD; ++j) {
+    \\    const float kv = kr[j];
+    \\    dot += qh[j] * kv;
+    \\  }
+    \\  float s = 0.0f;
+    \\  for (int hh = 0; hh < IH; ++hh) {
+    \\    const float dh = metal::simd_shuffle(dot, ushort(first + uint(hh)));
+    \\    s += (float(w[l * IH + hh]) * wsc[0]) * metal::max(dh, 0.0f);
+    \\  }
+    \\  const int seen = (meta[0] + l) / meta[1];
+    \\  if (h == 0 && n < nb) scores[size_t(l) * nb + n] = n < seen ? s : -INFINITY;
     \\}
-    \\const int seen = (meta[0] + l) / meta[1];
-    \\if (h == 0 && n < nb) scores[size_t(l) * nb + n] = n < seen ? s : -INFINITY;
 ;
 
 var score_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -103,9 +113,9 @@ fn scoreKernel() !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
-/// The most rows a score launch takes: a decode block. Each row's threadgroups rotate their keys again, which a
-/// prefill span's rows would repeat where the chain rotates once a span.
-pub const rows_max = 8;
+/// The most rows a score launch takes: a decode or copy-draft block. Each row's threadgroups rotate their keys again,
+/// which a prefill span's rows would repeat where the chain rotates once a span.
+pub const rows_max = 16;
 
 /// Whether `scores` takes the query rows `q` [T, IH·IHD] f32 (unrotated) against the pooled keys `keys` [G, IHD] f32
 /// (unrotated: the pool's; BF16 keys rotate through MLX's rope, which rounds them), `heads` lanes a key and the rotated
@@ -127,7 +137,7 @@ fn build(k: Key) !kcfg.Config {
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const kpt = @divExact(score_tg, k.ih);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.t, k.nb }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(k.nb + kpt - 1, kpt) * score_tg, k.t, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(k.nb + kpt - 1, kpt) * score_tg, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, score_tg, 1, 1));
     inline for (.{ "TG", "IH", "IHD", "NOPE", "HALF", "BASE", "QSCALE", "KSCALE" }, .{ score_tg, k.ih, k.ihd, k.nope, k.half, k.base, kcfg.bits(1.0), k.kscale }) |n, v|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, n, v));
@@ -415,6 +425,140 @@ pub fn wideScores(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr, wscale: f32, p0:
     return out;
 }
 
+/// Strict f32 `simdgroup_float8x8` prefill indexer scores: 8 query rows × 32 keys per threadgroup (1 simdgroup/row),
+/// keeping every dot product and head sum in f32 while accelerating `Q @ K^T` on the FP32 matrix unit.
+pub const wide_score_sg_source: [:0]const u8 =
+    \\constexpr int QL = 8, KN = 32, BK = 32, HH = IH / 8;
+    \\const int l0 = int(threadgroup_position_in_grid.y) * QL;
+    \\const int n0 = int(threadgroup_position_in_grid.x) * KN;
+    \\const uint tid = thread_index_in_threadgroup;
+    \\const uint sg = simdgroup_index_in_threadgroup;
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const int L = q_shape[0], nb = keys_shape[0];
+    \\const int l = l0 + int(sg);
+    \\const int n = n0 + int(lane);
+    \\const int max_l = metal::min(l0 + QL - 1, L - 1);
+    \\const int max_seen = (meta[0] + max_l + 1) / meta[1];
+    \\if (n0 >= max_seen) {
+    \\  if (l < L && n < nb) scores[size_t(l) * nb + n] = -INFINITY;
+    \\  return;
+    \\}
+    \\threadgroup float ks[KN * BK];
+    \\threadgroup float ds[QL * IH * KN];
+    \\simdgroup_float8x8 acc[HH][4];
+    \\#pragma clang loop unroll(full)
+    \\for (int hh = 0; hh < HH; ++hh) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int nn = 0; nn < 4; ++nn) {
+    \\    acc[hh][nn] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\  }
+    \\}
+    \\const int kn = int(tid) / 8;
+    \\const int c4 = int(tid) % 8;
+    \\const int key_idx = n0 + kn;
+    \\for (int k0 = 0; k0 < IHD; k0 += BK) {
+    \\  float4 v = float4(0.0f);
+    \\  if (key_idx < nb) {
+    \\    const device float* kp = keys + size_t(key_idx) * IHD + k0 + c4 * 4;
+    \\    v = float4(kp[0], kp[1], kp[2], kp[3]);
+    \\  }
+    \\  threadgroup float* kd = ks + kn * BK + c4 * 4;
+    \\  kd[0] = v.x; kd[1] = v.y; kd[2] = v.z; kd[3] = v.w;
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (l < L) {
+    \\    const device float* qrow = q + size_t(l) * size_t(IH) * size_t(IHD) + k0;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int kk = 0; kk < BK; kk += 8) {
+    \\      simdgroup_float8x8 qa[HH];
+    \\      #pragma clang loop unroll(full)
+    \\      for (int hh = 0; hh < HH; ++hh) {
+    \\        simdgroup_load(qa[hh], qrow + size_t(hh * 8) * IHD + kk, IHD);
+    \\      }
+    \\      #pragma clang loop unroll(full)
+    \\      for (int nn = 0; nn < 4; ++nn) {
+    \\        simdgroup_float8x8 kb;
+    \\        simdgroup_load(kb, ks + (nn * 8) * BK + kk, BK, ulong2(0, 0), true);
+    \\        #pragma clang loop unroll(full)
+    \\        for (int hh = 0; hh < HH; ++hh) {
+    \\          simdgroup_multiply_accumulate(acc[hh][nn], qa[hh], kb, acc[hh][nn]);
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\if (l < L) {
+    \\  threadgroup float* dsg = ds + int(sg) * (IH * KN);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int hh = 0; hh < HH; ++hh) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int nn = 0; nn < 4; ++nn) {
+    \\      simdgroup_store(acc[hh][nn], dsg + (hh * 8) * KN + nn * 8, KN);
+    \\    }
+    \\  }
+    \\  simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (n < nb) {
+    \\    const int seen = (meta[0] + l + 1) / meta[1];
+    \\    if (n < seen) {
+    \\      float s = 0.0f;
+    \\      const float sc = wsc[0];
+    \\      const device float* wl = w + size_t(l) * IH;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int h = 0; h < IH; ++h) {
+    \\        s += (wl[h] * sc) * metal::max(dsg[h * KN + int(lane)], 0.0f);
+    \\      }
+    \\      scores[size_t(l) * nb + n] = s;
+    \\    } else {
+    \\      scores[size_t(l) * nb + n] = -INFINITY;
+    \\    }
+    \\  }
+    \\}
+;
+
+var wide_score_sg_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn wideScoreSgKernel() !mlx.mlx_fast_metal_kernel {
+    if (wide_score_sg_kernel) |k| return k;
+    const ins = [_][*:0]const u8{ "q", "keys", "w", "meta", "wsc" };
+    const outs = [_][*:0]const u8{"scores"};
+    const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_hy4_index_wide_sg", iv, ov, wide_score_sg_source, "", true, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    wide_score_sg_kernel = k;
+    return k;
+}
+
+pub fn wideScoresSgApply(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr) bool {
+    if (!wideScoresApply(s, q, keys, w)) return false;
+    const qs = mlx.getShape(q);
+    return (qs[1] == 8 or qs[1] == 16) and @rem(qs[2], 32) == 0;
+}
+
+pub fn wideScoresSg(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr, wscale: f32, p0: i32, ratio: usize) !Arr {
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(keys);
+    const cfg = try wide_cfgs.get(.{ .l = qs[0], .nb = ks[0], .ih = qs[1], .ihd = qs[2] }, buildWide);
+    const mv = [_]i32{ p0, @intCast(ratio) };
+    const meta = try mlx.newData(&mv, &.{2}, .int32);
+    defer _ = mlx.mlx_array_free(meta);
+    const sv = [_]f32{wscale};
+    const wsc = try mlx.newData(&sv, &.{1}, .float32);
+    defer _ = mlx.mlx_array_free(wsc);
+    const ins = [_]Arr{ q, keys, w, meta, wsc };
+    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try wideScoreSgKernel(), iv, cfg, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+    return out;
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -573,5 +717,52 @@ test "hy4 index: wide prefill scores match sparse.indexScores byte for byte acro
         try mlx.check(mlx.mlx_array_eval(got));
         try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
         try testing.expectEqualSlices(u8, wb, try bytesOf(&o, got));
+    }
+}
+
+test "hy4 index: simdgroup_float8x8 wide prefill scores match wideScores to f32 rounding across release and tail shapes" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const Case = struct { h: c_int, d: c_int, g: c_int, t: c_int };
+    const cases = [_]Case{
+        .{ .h = 16, .d = 128, .g = 1024, .t = 256 },
+        .{ .h = 16, .d = 128, .g = 1001, .t = 37 },
+        .{ .h = 8, .d = 64, .g = 150, .t = 19 },
+    };
+    const ratio: c_int = 4;
+    for (cases, 0..) |c, ci| {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const seed: u64 = 201 * ci + 13;
+        const q = try randomArr(&o, &.{ c.t, c.h, c.d }, seed, 0.6);
+        const keys = try randomArr(&o, &.{ c.g, c.d }, seed + 1, 1);
+        const w = try randomArr(&o, &.{ c.t, c.h }, seed + 2, 0.5);
+        const scale = std.math.pow(f32, @floatFromInt(c.h * c.d), -0.5);
+        const p0: c_int = ratio * c.g - c.t + 1;
+        const want = try o.own(try wideScores(es, q, keys, w, scale, p0 - 1, @intCast(ratio)));
+        try mlx.check(mlx.mlx_array_eval(want));
+        try testing.expect(wideScoresSgApply(es, q, keys, w));
+        const before = mlx.engine.stats().dispatches;
+        const got = try o.own(try wideScoresSg(es, q, keys, w, scale, p0 - 1, @intCast(ratio)));
+        try mlx.check(mlx.mlx_array_eval(got));
+        try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
+        const n = mlx.mlx_array_size(want);
+        const wp = (mlx.mlx_array_data_float32(want) orelse return error.HostRead)[0..n];
+        const gp = (mlx.mlx_array_data_float32(got) orelse return error.HostRead)[0..n];
+        var max_err: f32 = 0;
+        for (wp, gp) |a, b| {
+            if (std.math.isInf(a)) {
+                try testing.expect(std.math.isInf(b) and (a < 0) == (b < 0));
+            } else {
+                const diff = @abs(a - b);
+                if (diff > max_err) max_err = diff;
+            }
+        }
+        try testing.expect(max_err < 1e-4);
     }
 }

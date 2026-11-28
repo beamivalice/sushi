@@ -27,39 +27,65 @@ pub const source: [:0]const u8 =
     \\uint count = groups[g * 3u + 2u];
     \\const device TW* mat = bank + ((size_t)expert * (size_t)NDIM + (size_t)row0) * (size_t)KDIM;
     \\const device T* vec[NV];
+    \\#pragma clang loop unroll(full)
     \\for (int v = 0; v < NV; ++v) {
     \\  uint pick = start + (uint(v) < count ? uint(v) : 0u);
     \\  vec[v] = rows + (size_t)picks[pick * 2u] * (size_t)KDIM;
     \\}
     \\float result[NV][TM];
-    \\for (int v = 0; v < NV; ++v) for (int tm = 0; tm < TM; ++tm) result[v][tm] = 0.0f;
+    \\#pragma clang loop unroll(full)
+    \\for (int v = 0; v < NV; ++v)
+    \\  #pragma clang loop unroll(full)
+    \\  for (int tm = 0; tm < TM; ++tm) result[v][tm] = 0.0f;
     \\const int n_iter = KDIM / BLOCK;
     \\int bn = int(lane) * TN;
     \\for (int i = 0; i < n_iter; ++i) {
     \\  float inter[TM][TN];
-    \\  for (int tm = 0; tm < TM; ++tm) for (int tn = 0; tn < TN; ++tn) inter[tm][tn] = static_cast<float>(mat[tm * KDIM + bn + tn]);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int tm = 0; tm < TM; ++tm)
+    \\    #pragma clang loop unroll(full)
+    \\    for (int tn = 0; tn < TN; ++tn) inter[tm][tn] = static_cast<float>(mat[tm * KDIM + bn + tn]);
+    \\  #pragma clang loop unroll(full)
     \\  for (int v = 0; v < NV; ++v) {
     \\    float coeff[TN];
+    \\    #pragma clang loop unroll(full)
     \\    for (int tn = 0; tn < TN; ++tn) coeff[tn] = static_cast<float>(vec[v][bn + tn]);
-    \\    for (int tm = 0; tm < TM; ++tm) for (int tn = 0; tn < TN; ++tn) result[v][tm] += inter[tm][tn] * coeff[tn];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int tm = 0; tm < TM; ++tm)
+    \\      #pragma clang loop unroll(full)
+    \\      for (int tn = 0; tn < TN; ++tn) result[v][tm] += inter[tm][tn] * coeff[tn];
     \\  }
     \\  bn += BLOCK;
     \\}
     \\if (KDIM - n_iter * BLOCK > 0) {
     \\  float inter[TM][TN];
-    \\  for (int tm = 0; tm < TM; ++tm) for (int tn = 0; tn < TN; ++tn) inter[tm][tn] = bn + tn < KDIM ? static_cast<float>(mat[tm * KDIM + bn + tn]) : 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int tm = 0; tm < TM; ++tm)
+    \\    #pragma clang loop unroll(full)
+    \\    for (int tn = 0; tn < TN; ++tn) inter[tm][tn] = bn + tn < KDIM ? static_cast<float>(mat[tm * KDIM + bn + tn]) : 0.0f;
+    \\  #pragma clang loop unroll(full)
     \\  for (int v = 0; v < NV; ++v) {
     \\    float coeff[TN];
+    \\    #pragma clang loop unroll(full)
     \\    for (int tn = 0; tn < TN; ++tn) coeff[tn] = bn + tn < KDIM ? static_cast<float>(vec[v][bn + tn]) : 0.0f;
-    \\    for (int tm = 0; tm < TM; ++tm) for (int tn = 0; tn < TN; ++tn) result[v][tm] += inter[tm][tn] * coeff[tn];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int tm = 0; tm < TM; ++tm)
+    \\      #pragma clang loop unroll(full)
+    \\      for (int tn = 0; tn < TN; ++tn) result[v][tm] += inter[tm][tn] * coeff[tn];
     \\  }
     \\}
-    \\for (int v = 0; v < NV; ++v) for (int tm = 0; tm < TM; ++tm) {
-    \\  for (ushort sn = 16; sn >= 1; sn >>= 1) result[v][tm] += simd_shuffle_down(result[v][tm], sn);
-    \\}
+    \\#pragma clang loop unroll(full)
+    \\for (int v = 0; v < NV; ++v)
+    \\  #pragma clang loop unroll(full)
+    \\  for (int tm = 0; tm < TM; ++tm) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (ushort sn = 16; sn >= 1; sn >>= 1) result[v][tm] += simd_shuffle_down(result[v][tm], sn);
+    \\  }
     \\if (lane == 0u) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int v = 0; v < NV; ++v) if (uint(v) < count) {
     \\    device T* o = out + (size_t)picks[(start + uint(v)) * 2u + 1u] * (size_t)NDIM + (size_t)row0;
+    \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; ++tm) o[tm] = static_cast<T>(result[v][tm]);
     \\  }
     \\}

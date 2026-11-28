@@ -16,6 +16,8 @@ const nsg = 2;
 pub const max_rows: c_int = 16;
 
 pub const source: [:0]const u8 =
+    \\using B4 = metal::vec<bfloat16_t, 4>;
+    \\using F4 = metal::vec<float, 4>;
     \\constexpr int TN = 4;
     \\constexpr int BLOCK_N = 32 * TN;
     \\uint lane = thread_index_in_simdgroup;
@@ -26,33 +28,44 @@ pub const source: [:0]const u8 =
     \\static_assert(K % BLOCK_N == 0, "a row off the gemv tile");
     \\#endif
     \\float result[R][TM];
+    \\#pragma clang loop unroll(full)
     \\for (int r = 0; r < R; ++r) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int t = 0; t < TM; ++t) result[r][t] = 0.0f;
     \\}
     \\int bn = int(lane) * TN;
     \\const int n_iter = K / BLOCK_N;
     \\for (int i = 0; i < n_iter; ++i) {
     \\  float inter[TM][TN];
+    \\  #pragma clang loop unroll(full)
     \\  for (int t = 0; t < TM; ++t) {
-    \\    for (int tn = 0; tn < TN; ++tn) inter[t][tn] = static_cast<float>(mat[(size_t)t * (size_t)K + bn + tn]);
+    \\    const B4 mv = *(const device B4*)(mat + (size_t)t * (size_t)K + bn);
+    \\    #pragma clang loop unroll(full)
+    \\    for (int tn = 0; tn < TN; ++tn) inter[t][tn] = static_cast<float>(mv[tn]);
     \\  }
+    \\  #pragma clang loop unroll(full)
     \\  for (int r = 0; r < R; ++r) {
-    \\    float coeff[TN];
-    \\    const device float* xr = x + (size_t)r * (size_t)K;
-    \\    for (int tn = 0; tn < TN; ++tn) coeff[tn] = xr[bn + tn];
+    \\    const F4 cv = *(const device F4*)(x + (size_t)r * (size_t)K + bn);
+    \\    #pragma clang loop unroll(full)
     \\    for (int t = 0; t < TM; ++t) {
-    \\      for (int tn = 0; tn < TN; ++tn) result[r][t] += inter[t][tn] * coeff[tn];
+    \\      #pragma clang loop unroll(full)
+    \\      for (int tn = 0; tn < TN; ++tn) result[r][t] += inter[t][tn] * cv[tn];
     \\    }
     \\  }
     \\  bn += BLOCK_N;
     \\}
+    \\#pragma clang loop unroll(full)
     \\for (int r = 0; r < R; ++r) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int t = 0; t < TM; ++t) {
+    \\    #pragma clang loop unroll(full)
     \\    for (ushort sn = 16; sn >= 1; sn >>= 1) result[r][t] += simd_shuffle_down(result[r][t], sn);
     \\  }
     \\}
     \\if (lane == 0u) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int r = 0; r < R; ++r) {
+    \\    #pragma clang loop unroll(full)
     \\    for (int t = 0; t < TM; ++t) out[(size_t)r * (size_t)N + out_row + t] = result[r][t];
     \\  }
     \\}
@@ -69,7 +82,9 @@ pub const wide_source: [:0]const u8 =
     \\uint sg = simdgroup_index_in_threadgroup;
     \\threadgroup float tgp[BN * R * TM];
     \\float result[R][TM];
+    \\#pragma clang loop unroll(full)
     \\for (int r = 0; r < R; r++) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; tm++) result[r][tm] = 0.0f;
     \\}
     \\float inter[TM][TN];
@@ -81,50 +96,72 @@ pub const wide_source: [:0]const u8 =
     \\const int leftover = K - BLOCK_N * n_iter;
     \\for (int i = 0; i < n_iter; ++i) {
     \\  int mat_offset = 0;
+    \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; tm++) {
+    \\    #pragma clang loop unroll(full)
     \\    for (int tn = 0; tn < TN; tn++) inter[tm][tn] = static_cast<float>(mat[mat_offset + bn + tn]);
     \\    mat_offset += K;
     \\  }
+    \\  #pragma clang loop unroll(full)
     \\  for (int r = 0; r < R; r++) {
     \\    const device float* xr = x + (size_t)r * (size_t)K;
+    \\    #pragma clang loop unroll(full)
     \\    for (int tn = 0; tn < TN; tn++) v_coeff[tn] = xr[bn + tn];
+    \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; tm++) {
+    \\      #pragma clang loop unroll(full)
     \\      for (int tn = 0; tn < TN; tn++) result[r][tm] += inter[tm][tn] * v_coeff[tn];
     \\    }
     \\  }
     \\  bn += BLOCK_N;
     \\}
     \\if (leftover > 0) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; tm++) {
+    \\    #pragma clang loop unroll(full)
     \\    for (int tn = 0; tn < TN; tn++) inter[tm][tn] = bn + tn < K ? static_cast<float>(mat[tm * K + bn + tn]) : 0.0f;
     \\  }
+    \\  #pragma clang loop unroll(full)
     \\  for (int r = 0; r < R; r++) {
     \\    const device float* xr = x + (size_t)r * (size_t)K;
+    \\    #pragma clang loop unroll(full)
     \\    for (int tn = 0; tn < TN; tn++) v_coeff[tn] = bn + tn < K ? xr[bn + tn] : 0.0f;
+    \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; tm++) {
+    \\      #pragma clang loop unroll(full)
     \\      for (int tn = 0; tn < TN; tn++) result[r][tm] += inter[tm][tn] * v_coeff[tn];
     \\    }
     \\  }
     \\}
+    \\#pragma clang loop unroll(full)
     \\for (int r = 0; r < R; r++) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int tm = 0; tm < TM; tm++) {
+    \\    #pragma clang loop unroll(full)
     \\    for (ushort sn = SN / 2; sn >= 1; sn >>= 1) result[r][tm] += simd_shuffle_down(result[r][tm], sn);
     \\  }
     \\}
     \\threadgroup float* mine = tgp + sg * (R * TM);
     \\if (lane == 0) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int r = 0; r < R; r++) {
+    \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; tm++) mine[r * TM + tm] = result[r][tm];
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\if (sg == 0 && lane == 0) {
+    \\  #pragma clang loop unroll(full)
     \\  for (int sgn = 1; sgn < BN; sgn++) {
+    \\    #pragma clang loop unroll(full)
     \\    for (int r = 0; r < R; r++) {
+    \\      #pragma clang loop unroll(full)
     \\      for (int tm = 0; tm < TM; tm++) result[r][tm] += tgp[sgn * (R * TM) + r * TM + tm];
     \\    }
     \\  }
+    \\  #pragma clang loop unroll(full)
     \\  for (int r = 0; r < R; r++) {
+    \\    #pragma clang loop unroll(full)
     \\    for (int tm = 0; tm < TM; tm++) out[(size_t)r * (size_t)N + out_row + tm] = result[r][tm];
     \\  }
     \\}

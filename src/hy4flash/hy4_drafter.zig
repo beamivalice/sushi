@@ -80,17 +80,22 @@ const Hooks = struct {
     pub const row_grammar = @import("../row_grammar.zig");
     pub const max_verify_rows: u8 = max_rows;
     pub const diag_env = "SUSHI_HY4_DFLY2_ROWS";
-    /// No copy rounds (`copyArm` is null).
-    pub const copy_narrow: usize = 0;
+    /// Drafts of the widest exact verify block (`verify_rows_max - 1`): copy rounds verify up to 8 rows exact.
+    pub const copy_narrow: usize = @intCast(@import("hy4_forward.zig").verify_rows_max - 1);
 
     pub fn draft(xfm: *Trunk, ctx: *ForwardCtx, t1: u32) !Draft {
+        return draftMeasured(xfm, ctx, t1, null, null);
+    }
+
+    pub fn draftMeasured(xfm: *Trunk, ctx: *ForwardCtx, t1: u32, limit: ?u32, meter: ?*@import("../round_meter.zig").RoundMeter) !Draft {
+        _ = meter;
         const st = &xfm.arch_state.hy4flash;
         const m = st.model orelse return error.Hy4ModelMissing;
         const d = &(st.drafter orelse return error.Hy4DflyMissing);
         const scope = m.enterForward(@import("hy4_state.zig").requestOf(ctx));
         defer scope.endForward();
         if (m.reqConst().pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
-        return @import("hy4_plan.zig").runDraft(m, d, t1);
+        return @import("hy4_plan.zig").runDraftLimit(m, d, t1, if (limit) |l| @as(usize, l) else null);
     }
 
     /// Advances the request by `ids` (`[t1, drafts...]`) with a mark before them, which `finish` returns to; the
@@ -233,8 +238,10 @@ const Hooks = struct {
         return if (xfm.arch_state.hy4flash.model) |m| m.config.dfly.draft else @import("../arch/drafter_rounds.zig").default_block;
     }
 
-    pub fn copyArm(_: *Trunk) ?drafter_round.CopyArm {
-        return null;
+    pub fn copyArm(xfm: *Trunk) ?drafter_round.CopyArm {
+        const m = xfm.arch_state.hy4flash.model orelse return null;
+        if (!Hooks.widthExact(xfm)) return null;
+        return .{ .exact_rows = @intCast(@import("hy4_forward.zig").verify_rows_max), .block = m.config.dfly.draft };
     }
 };
 

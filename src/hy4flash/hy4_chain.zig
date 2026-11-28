@@ -5,11 +5,19 @@ const mlx = @import("../mlx.zig");
 const Arr = mlx.mlx_array;
 const kcfg = @import("hy4_kcfg.zig");
 
-/// MLX's `Sigmoid` functor (`unary_ops.h`, the engine's `sushi_sigmoid`) on a float.
+/// MLX's `Sigmoid` functor (`unary_ops.h`, the engine's `sushi_sigmoid`) on a float, plus the KV8 affine unpacker
+/// compiled outside `#pragma clang fp contract(off)` so its bf16 multiply-add matches `hy4_latent.zig` byte for byte.
 pub const header: [:0]const u8 =
     \\inline float hy4_sigmoid(float x) {
     \\  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
     \\  return (x < 0) ? y : 1 - y;
+    \\}
+    \\inline metal::vec<float, 4> hy4_kv8_unpack4(uint32_t word, bfloat16_t scale, bfloat16_t bias) {
+    \\  bfloat16_t v0 = scale * uint8_t(word & 0xffu) + bias;
+    \\  bfloat16_t v1 = scale * uint8_t((word >> 8) & 0xffu) + bias;
+    \\  bfloat16_t v2 = scale * uint8_t((word >> 16) & 0xffu) + bias;
+    \\  bfloat16_t v3 = scale * uint8_t((word >> 24) & 0xffu) + bias;
+    \\  return metal::vec<float, 4>(float(v0), float(v1), float(v2), float(v3));
     \\}
 ;
 
@@ -100,22 +108,26 @@ fn build(k: Key) !kcfg.Config {
         },
         .sink_sm_causal, .sink_sm_mask => {
             const heads_first = (k.d & 1) != 0;
+            const single = (k.d & 4) != 0;
             const out_shape = if (heads_first) [_]c_int{ k.a, k.b, k.c } else [_]c_int{ k.b, k.a, k.c };
             const group = sinkSoftmaxGroup(k.c);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 3, .float32));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, k.a * k.b * group, 1, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, group, 1, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "HEADS_FIRST", heads_first));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "SINGLE", single));
             if (k.kind == .sink_sm_mask) {
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "MASK_BOOL", (k.d & 2) != 0));
             }
         },
         .ring_keys => {
             const width = k.c + k.d;
+            const pe_dt: mlx.mlx_dtype = @enumFromInt(k.e);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.b, k.c }, 3, .float32));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.b, k.d }, 3, .float32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.b, k.d }, 3, pe_dt));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, width, k.b, k.a));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(width, 256), 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "PE_OUT", pe_dt));
         },
     }
     return cfg;
@@ -619,7 +631,7 @@ pub const sink_softmax_causal_source: [:0]const u8 =
     \\  int col = lid * 4 + i;
     \\  if (col < N) {
     \\    size_t idx = (size_t)gid * (size_t)N + (size_t)col;
-    \\    float s = a[idx] + b[idx];
+    \\    float s = SINGLE ? a[idx] : (a[idx] + b[idx]);
     \\    float sc = s * scale;
     \\    float cf = static_cast<float>(col);
     \\    bool keep = (cf <= rf) && (window <= 0 || (cf > (rf - wf)));
@@ -650,7 +662,7 @@ pub const sink_softmax_mask_source: [:0]const u8 =
     \\  int col = lid * 4 + i;
     \\  if (col < N) {
     \\    size_t idx = (size_t)gid * (size_t)N + (size_t)col;
-    \\    float s = a[idx] + b[idx];
+    \\    float s = SINGLE ? a[idx] : (a[idx] + b[idx]);
     \\    float sc = s * scale;
     \\    size_t midx = (size_t)t * (size_t)N + (size_t)col;
     \\    float m = MASK_BOOL ? (mask[midx] ? 0.0f : -metal::numeric_limits<float>::infinity()) : static_cast<float>(mask[midx]);
@@ -692,6 +704,14 @@ pub fn sinkSoftmaxMaskApplies(s: mlx.mlx_stream, a: Arr, b: Arr, mask: Arr, sink
 }
 
 pub fn sinkSoftmaxCausal(s: mlx.mlx_stream, a: Arr, b: Arr, sinks: Arr, scale: f32, p0: c_int, window: c_int, heads_first: bool) !Arr {
+    return sinkSoftmaxCausalImpl(s, a, b, sinks, scale, p0, window, heads_first, false);
+}
+
+pub fn sinkSoftmaxCausalSingle(s: mlx.mlx_stream, a: Arr, sinks: Arr, scale: f32, p0: c_int, window: c_int, heads_first: bool) !Arr {
+    return sinkSoftmaxCausalImpl(s, a, a, sinks, scale, p0, window, heads_first, true);
+}
+
+fn sinkSoftmaxCausalImpl(s: mlx.mlx_stream, a: Arr, b: Arr, sinks: Arr, scale: f32, p0: c_int, window: c_int, heads_first: bool, single: bool) !Arr {
     const k = try getKernel(&sink_sm_causal_kernel, "sushi_hy4_sink_softmax_causal", &.{ "a", "b", "sinks", "meta" }, sink_softmax_causal_source);
     const sa = mlx.getShape(a);
     const h = if (heads_first) sa[0] else sa[1];
@@ -700,13 +720,22 @@ pub fn sinkSoftmaxCausal(s: mlx.mlx_stream, a: Arr, b: Arr, sinks: Arr, scale: f
     const mv = [_]i32{ h, t, n, p0, window, kcfg.bits(scale) };
     const meta = try intsArr(&mv);
     defer _ = mlx.mlx_array_free(meta);
-    const cfg = try cfgs.get(.{ .kind = .sink_sm_causal, .a = h, .b = t, .c = n, .d = @intFromBool(heads_first) }, build);
+    const flags: c_int = @as(c_int, @intFromBool(heads_first)) | (@as(c_int, @intFromBool(single)) << 2);
+    const cfg = try cfgs.get(.{ .kind = .sink_sm_causal, .a = h, .b = t, .c = n, .d = flags }, build);
     var out: [1]Arr = undefined;
     try applyOuts(s, k, &.{ a, b, sinks, meta }, cfg, &out);
     return out[0];
 }
 
 pub fn sinkSoftmaxMask(s: mlx.mlx_stream, a: Arr, b: Arr, mask: Arr, sinks: Arr, scale: f32, heads_first: bool) !Arr {
+    return sinkSoftmaxMaskImpl(s, a, b, mask, sinks, scale, heads_first, false);
+}
+
+pub fn sinkSoftmaxMaskSingle(s: mlx.mlx_stream, a: Arr, mask: Arr, sinks: Arr, scale: f32, heads_first: bool) !Arr {
+    return sinkSoftmaxMaskImpl(s, a, a, mask, sinks, scale, heads_first, true);
+}
+
+fn sinkSoftmaxMaskImpl(s: mlx.mlx_stream, a: Arr, b: Arr, mask: Arr, sinks: Arr, scale: f32, heads_first: bool, single: bool) !Arr {
     const k = try getKernel(&sink_sm_mask_kernel, "sushi_hy4_sink_softmax_mask", &.{ "a", "b", "mask", "sinks", "meta" }, sink_softmax_mask_source);
     const sa = mlx.getShape(a);
     const h = if (heads_first) sa[0] else sa[1];
@@ -716,7 +745,7 @@ pub fn sinkSoftmaxMask(s: mlx.mlx_stream, a: Arr, b: Arr, mask: Arr, sinks: Arr,
     const mv = [_]i32{ h, t, n, kcfg.bits(scale) };
     const meta = try intsArr(&mv);
     defer _ = mlx.mlx_array_free(meta);
-    const flags: c_int = @as(c_int, @intFromBool(heads_first)) | (@as(c_int, @intFromBool(mask_bool)) << 1);
+    const flags: c_int = @as(c_int, @intFromBool(heads_first)) | (@as(c_int, @intFromBool(mask_bool)) << 1) | (@as(c_int, @intFromBool(single)) << 2);
     const cfg = try cfgs.get(.{ .kind = .sink_sm_mask, .a = h, .b = t, .c = n, .d = flags }, build);
     var out: [1]Arr = undefined;
     try applyOuts(s, k, &.{ a, b, mask, sinks, meta }, cfg, &out);
@@ -740,7 +769,7 @@ pub const ring_keys_source: [:0]const u8 =
     \\  c_out[((size_t)r * (size_t)w + (size_t)i) * (size_t)lat + col] = static_cast<float>(c[(size_t)src * (size_t)lat + col]);
     \\} else {
     \\  uint pc = col - uint(lat);
-    \\  pe_out[((size_t)r * (size_t)w + (size_t)i) * (size_t)rope + pc] = static_cast<float>(k_pe[(size_t)src * (size_t)rope + pc]);
+    \\  pe_out[((size_t)r * (size_t)w + (size_t)i) * (size_t)rope + pc] = static_cast<PE_OUT>(k_pe[(size_t)src * (size_t)rope + pc]);
     \\}
 ;
 
@@ -758,9 +787,16 @@ pub fn ringKeysApplies(s: mlx.mlx_stream, c: Arr, k_pe: Arr, t: c_int, p0: c_int
         t > 0 and window > 0 and ring_p0 + 1 > window and p0 + 1 >= window and p0 + t <= cs[0];
 }
 
+pub const RingKeys = struct { c: Arr, pe: Arr };
+
 /// Each of a verify block's `t` rows' sliding window, widened to f32 in the order its one-row step reads the ring
 /// (rotated at its own slot): [t, W, latent] and [t, W, rope], one launch for the block. The caller frees both.
-pub fn ringKeys(s: mlx.mlx_stream, c: Arr, k_pe: Arr, t: c_int, p0: c_int, window: c_int, ring_p0: c_int) !struct { c: Arr, pe: Arr } {
+pub fn ringKeys(s: mlx.mlx_stream, c: Arr, k_pe: Arr, t: c_int, p0: c_int, window: c_int, ring_p0: c_int) !RingKeys {
+    return ringKeysAs(s, c, k_pe, t, p0, window, ring_p0, .float32);
+}
+
+/// `ringKeys` writing `pe_out` at `pe_dt` (`.float32` or `.bfloat16`, for `steelScoresGroups`).
+pub fn ringKeysAs(s: mlx.mlx_stream, c: Arr, k_pe: Arr, t: c_int, p0: c_int, window: c_int, ring_p0: c_int, pe_dt: mlx.mlx_dtype) !RingKeys {
     if (ring_keys_kernel == null) {
         const ins = [_][*:0]const u8{ "c", "k_pe", "meta" };
         const outs = [_][*:0]const u8{ "c_out", "pe_out" };
@@ -777,7 +813,7 @@ pub fn ringKeys(s: mlx.mlx_stream, c: Arr, k_pe: Arr, t: c_int, p0: c_int, windo
     const mv = [_]i32{ t, window, p0, ring_p0, lat, rope };
     const meta = try intsArr(&mv);
     defer _ = mlx.mlx_array_free(meta);
-    const cfg = try cfgs.get(.{ .kind = .ring_keys, .a = t, .b = window, .c = lat, .d = rope }, build);
+    const cfg = try cfgs.get(.{ .kind = .ring_keys, .a = t, .b = window, .c = lat, .d = rope, .e = @intFromEnum(pe_dt) }, build);
     var out: [2]Arr = undefined;
     try applyOuts(s, ring_keys_kernel.?, &.{ c, k_pe, meta }, cfg, &out);
     return .{ .c = out[0], .pe = out[1] };
@@ -1252,6 +1288,1020 @@ pub fn steelValuesGroups(s: mlx.mlx_stream, groups: c_int, p: Arr, c: Arr) !Arr 
     const cfg = try steel_groups_cfgs.get(.{ .h = h, .n = n, .w = lat, .parts = plan.parts, .pk = plan.pk, .groups = groups, .scores = false }, steelGroupsBuild);
     var out: [1]Arr = undefined;
     try applyOuts(s, steel_values_groups_kernel.?, &.{ p, c }, cfg, &out);
+    return out[0];
+}
+
+// ── Direct BF16 / inline-KV8 steel decode & verify attention (0 ct_int, bit-exact to steelPlan) ──
+
+fn steelScoresDirectSource(comptime kv8: bool) [:0]const u8 {
+    return
+        \\#pragma clang fp contract(off)
+        \\using B4 = metal::vec<bfloat16_t, 4>;
+        \\using F4 = metal::vec<float, 4>;
+        \\
+    ++ (if (kv8)
+        \\using U2 = metal::vec<uint32_t, 2>;
+        \\
+    else "") ++
+        \\const uint tid = thread_index_in_threadgroup;
+        \\const uint sg = simdgroup_index_in_threadgroup;
+        \\const int key0 = int(threadgroup_position_in_grid.x) * 8;
+        \\const int grp = int(threadgroup_position_in_grid.y);
+        \\const int h0 = int(sg) * 8;
+        \\const int p0_mod = meta[1], window = meta[2], ha = meta[3], ga = meta[4];
+        \\const ulong qs = ulong(ql_strides[ha]);
+        \\const ulong ps = ulong(qp_strides[ha]);
+        \\const device float* qrow = ql + size_t(grp) * size_t(ql_strides[ga]) + size_t(h0) * size_t(qs);
+        \\const device float* prow = qp + size_t(grp) * size_t(qp_strides[ga]) + size_t(h0) * size_t(ps);
+        \\const size_t c_s0 = size_t(c_strides[0]), cf_s0 = size_t(cf_strides[0]);
+        \\const size_t pe_s0 = size_t(pe_strides[0]), pef_s0 = size_t(pef_strides[0]);
+        \\const size_t rs0 = size_t(rows_strides[0]), rs1 = size_t(rows_strides[1]);
+        \\
+    ++ (if (kv8)
+        \\const size_t cs_s0 = size_t(cs_strides[0]), cb_s0 = size_t(cb_strides[0]);
+        \\const size_t cfs_s0 = size_t(cfs_strides[0]), cfb_s0 = size_t(cfb_strides[0]);
+        \\
+    else "") ++
+        \\threadgroup int t_src[8];
+        \\threadgroup uchar t_fr[8];
+        \\if (tid < 8u) {
+        \\  const int ki = key0 + int(tid);
+        \\  if (MODE == 0) {
+        \\    t_src[tid] = ki;
+        \\    t_fr[tid] = 0;
+        \\  } else if (MODE == 1) {
+        \\    int d = ki - p0_mod;
+        \\    if (d < 0) d += window;
+        \\    if (d <= grp) { t_src[tid] = d; t_fr[tid] = 1; }
+        \\    else { t_src[tid] = ki; t_fr[tid] = 0; }
+        \\  } else {
+        \\    t_src[tid] = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\    t_fr[tid] = 0;
+        \\  }
+        \\}
+        \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\constexpr int R_STR = 68;
+        \\constexpr int C_STR = 132;
+        \\constexpr int CS_SZ = 8 * C_STR;
+        \\threadgroup float sm[2 * CS_SZ];
+        \\{
+        \\  const int r4 = R >> 2;
+        \\  if (int(tid) < 8 * r4) {
+        \\    const int r = int(tid) / r4;
+        \\    const int c4 = (int(tid) % r4) * 4;
+        \\    const bool fr = (MODE == 1) ? (t_fr[r] != 0) : false;
+        \\    const device bfloat16_t* pbase = fr ? (pef + size_t(t_src[r]) * pef_s0) : (pe + size_t(t_src[r]) * pe_s0);
+        \\    const B4 bv = *(const device B4*)(pbase + size_t(c4));
+        \\    *(threadgroup F4*)(sm + r * R_STR + c4) = F4(float(bv[0]), float(bv[1]), float(bv[2]), float(bv[3]));
+        \\  }
+        \\}
+        \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\simdgroup_float8x8 rope = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\for (int kk = 0; kk < R; kk += 8) {
+        \\  simdgroup_float8x8 a, b;
+        \\  simdgroup_load(b, sm + kk, R_STR, ulong2(0, 0), true);
+        \\  simdgroup_load(a, prow + kk, ps);
+        \\  simdgroup_multiply_accumulate(rope, a, b, rope);
+        \\}
+        \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\float v0 = 0.0f, v1 = 0.0f;
+        \\if (NPART == 2 && PK >= 64 && (PK % 64) == 0) {
+        \\  const bool two_v4 = (H == 32);
+        \\  const int half_tg = two_v4 ? 64 : 128;
+        \\  const int lp = int(tid) / half_tg;
+        \\  const int lt = int(tid) % half_tg;
+        \\  const int slots_per_row = two_v4 ? 8 : 16;
+        \\  const int lr = lt / slots_per_row;
+        \\  const int lc_p = (lt % slots_per_row) * (two_v4 ? 8 : 4);
+        \\  const int lc_sm = lp * 64 + lc_p;
+        \\  const int my_src = t_src[lr];
+        \\  const bool my_fr = (MODE == 1) ? (t_fr[lr] != 0) : false;
+        \\  {
+        \\    const int g_k0 = lp * PK + lc_p;
+        \\
+    ++ (if (kv8)
+        \\    const size_t g = size_t(g_k0 >> 6);
+        \\    const bfloat16_t sc = my_fr ? cfs[size_t(my_src) * cfs_s0 + g] : cs[size_t(my_src) * cs_s0 + g];
+        \\    const bfloat16_t bi = my_fr ? cfb[size_t(my_src) * cfb_s0 + g] : cb[size_t(my_src) * cb_s0 + g];
+        \\    const device uint32_t* wptr = (my_fr ? (cf + size_t(my_src) * cf_s0) : (c + size_t(my_src) * c_s0)) + size_t(g_k0 >> 2);
+        \\    if (two_v4) {
+        \\      const U2 w2 = *(const device U2*)wptr;
+        \\      *(threadgroup F4*)(sm + lr * C_STR + lc_sm + 0) = hy4_kv8_unpack4(w2[0], sc, bi);
+        \\      *(threadgroup F4*)(sm + lr * C_STR + lc_sm + 4) = hy4_kv8_unpack4(w2[1], sc, bi);
+        \\    } else {
+        \\      *(threadgroup F4*)(sm + lr * C_STR + lc_sm) = hy4_kv8_unpack4(wptr[0], sc, bi);
+        \\    }
+        \\
+    else
+        \\    const device bfloat16_t* cbase = (my_fr ? (cf + size_t(my_src) * cf_s0) : (c + size_t(my_src) * c_s0)) + size_t(g_k0);
+        \\    if (two_v4) {
+        \\      const B4 b0 = *(const device B4*)(cbase + 0);
+        \\      const B4 b1 = *(const device B4*)(cbase + 4);
+        \\      *(threadgroup F4*)(sm + lr * C_STR + lc_sm + 0) = F4(float(b0[0]), float(b0[1]), float(b0[2]), float(b0[3]));
+        \\      *(threadgroup F4*)(sm + lr * C_STR + lc_sm + 4) = F4(float(b1[0]), float(b1[1]), float(b1[2]), float(b1[3]));
+        \\    } else {
+        \\      const B4 bv = *(const device B4*)cbase;
+        \\      *(threadgroup F4*)(sm + lr * C_STR + lc_sm) = F4(float(bv[0]), float(bv[1]), float(bv[2]), float(bv[3]));
+        \\    }
+        \\
+    ) ++
+        \\  }
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  int buf = 0;
+        \\  simdgroup_float8x8 ap0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\  simdgroup_float8x8 ap1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\  for (int k0 = 0; k0 < PK; k0 += 64, buf ^= 1) {
+        \\    threadgroup float* cs_cur = sm + buf * CS_SZ;
+        \\    const int next_k0 = k0 + 64;
+        \\    const bool has_next = (next_k0 < PK);
+        \\
+    ++ (if (kv8)
+        \\    uint32_t nw0 = 0, nw1 = 0;
+        \\    bfloat16_t nsc = bfloat16_t(0), nbi = bfloat16_t(0);
+        \\    if (has_next) {
+        \\      const int g_k0 = lp * PK + next_k0 + lc_p;
+        \\      const device uint32_t* wptr = (my_fr ? (cf + size_t(my_src) * cf_s0) : (c + size_t(my_src) * c_s0)) + size_t(g_k0 >> 2);
+        \\      if (two_v4) {
+        \\        const U2 w2 = *(const device U2*)wptr;
+        \\        nw0 = w2[0]; nw1 = w2[1];
+        \\      } else {
+        \\        nw0 = wptr[0];
+        \\      }
+        \\      const size_t g = size_t(g_k0 >> 6);
+        \\      nsc = my_fr ? cfs[size_t(my_src) * cfs_s0 + g] : cs[size_t(my_src) * cs_s0 + g];
+        \\      nbi = my_fr ? cfb[size_t(my_src) * cfb_s0 + g] : cb[size_t(my_src) * cb_s0 + g];
+        \\    }
+        \\
+    else
+        \\    B4 nb0 = B4(0), nb1 = B4(0);
+        \\    if (has_next) {
+        \\      const int g_k0 = lp * PK + next_k0 + lc_p;
+        \\      const device bfloat16_t* cbase = (my_fr ? (cf + size_t(my_src) * cf_s0) : (c + size_t(my_src) * c_s0)) + size_t(g_k0);
+        \\      nb0 = *(const device B4*)(cbase + 0);
+        \\      if (two_v4) nb1 = *(const device B4*)(cbase + 4);
+        \\    }
+        \\
+    ) ++
+        \\    for (int kk = 0; kk < 64; kk += 16) {
+        \\      simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+        \\      simdgroup_load(b0, cs_cur + kk + 0, C_STR, ulong2(0, 0), true);
+        \\      simdgroup_load(a0, qrow + k0 + kk + 0, qs);
+        \\      simdgroup_load(b1, cs_cur + 64 + kk + 0, C_STR, ulong2(0, 0), true);
+        \\      simdgroup_load(a1, qrow + PK + k0 + kk + 0, qs);
+        \\      simdgroup_load(b2, cs_cur + kk + 8, C_STR, ulong2(0, 0), true);
+        \\      simdgroup_load(a2, qrow + k0 + kk + 8, qs);
+        \\      simdgroup_load(b3, cs_cur + 64 + kk + 8, C_STR, ulong2(0, 0), true);
+        \\      simdgroup_load(a3, qrow + PK + k0 + kk + 8, qs);
+        \\      simdgroup_multiply_accumulate(ap0, a0, b0, ap0);
+        \\      simdgroup_multiply_accumulate(ap1, a1, b1, ap1);
+        \\      simdgroup_multiply_accumulate(ap0, a2, b2, ap0);
+        \\      simdgroup_multiply_accumulate(ap1, a3, b3, ap1);
+        \\    }
+        \\    if (has_next) {
+        \\      threadgroup float* dst = sm + (buf ^ 1) * CS_SZ + lr * C_STR + lc_sm;
+        \\
+    ++ (if (kv8)
+        \\      *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(nw0, nsc, nbi);
+        \\      if (two_v4) *(threadgroup F4*)(dst + 4) = hy4_kv8_unpack4(nw1, nsc, nbi);
+        \\
+    else
+        \\      *(threadgroup F4*)(dst + 0) = F4(float(nb0[0]), float(nb0[1]), float(nb0[2]), float(nb0[3]));
+        \\      if (two_v4) *(threadgroup F4*)(dst + 4) = F4(float(nb1[0]), float(nb1[1]), float(nb1[2]), float(nb1[3]));
+        \\
+    ) ++
+        \\      threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\    }
+        \\  }
+        \\  v0 += ap0.thread_elements()[0];
+        \\  v1 += ap0.thread_elements()[1];
+        \\  v0 += ap1.thread_elements()[0];
+        \\  v1 += ap1.thread_elements()[1];
+        \\} else {
+        \\const int bk = (PK >= 128 && (PK % 128) == 0) ? 128 : ((PK >= 64 && (PK % 64) == 0) ? 64 : ((PK >= 32 && (PK % 32) == 0) ? 32 : 16));
+        \\const bool two_v4 = (bk == 128) && (H == 32);
+        \\const int bk_slots = two_v4 ? 16 : (bk >> 2);
+        \\const int total_slots = 8 * bk_slots;
+        \\const int lr = int(tid) / bk_slots;
+        \\const int lc = (int(tid) % bk_slots) * (two_v4 ? 8 : 4);
+        \\const bool loader = int(tid) < total_slots;
+        \\const int my_src = loader ? t_src[lr] : 0;
+        \\const bool my_fr = (loader && MODE == 1) ? (t_fr[lr] != 0) : false;
+        \\if (loader) {
+        \\
+    ++ (if (kv8)
+        \\  const size_t g = size_t(lc >> 6);
+        \\  const bfloat16_t sc = my_fr ? cfs[size_t(my_src) * cfs_s0 + g] : cs[size_t(my_src) * cs_s0 + g];
+        \\  const bfloat16_t bi = my_fr ? cfb[size_t(my_src) * cfb_s0 + g] : cb[size_t(my_src) * cb_s0 + g];
+        \\  const device uint32_t* wptr = (my_fr ? (cf + size_t(my_src) * cf_s0) : (c + size_t(my_src) * c_s0)) + size_t(lc >> 2);
+        \\  if (two_v4) {
+        \\    const U2 w2 = *(const device U2*)wptr;
+        \\    *(threadgroup F4*)(sm + lr * C_STR + lc + 0) = hy4_kv8_unpack4(w2[0], sc, bi);
+        \\    *(threadgroup F4*)(sm + lr * C_STR + lc + 4) = hy4_kv8_unpack4(w2[1], sc, bi);
+        \\  } else {
+        \\    *(threadgroup F4*)(sm + lr * C_STR + lc) = hy4_kv8_unpack4(wptr[0], sc, bi);
+        \\  }
+        \\
+    else
+        \\  const device bfloat16_t* cbase = (my_fr ? (cf + size_t(my_src) * cf_s0) : (c + size_t(my_src) * c_s0)) + size_t(lc);
+        \\  if (two_v4) {
+        \\    const B4 b0 = *(const device B4*)(cbase + 0);
+        \\    const B4 b1 = *(const device B4*)(cbase + 4);
+        \\    *(threadgroup F4*)(sm + lr * C_STR + lc + 0) = F4(float(b0[0]), float(b0[1]), float(b0[2]), float(b0[3]));
+        \\    *(threadgroup F4*)(sm + lr * C_STR + lc + 4) = F4(float(b1[0]), float(b1[1]), float(b1[2]), float(b1[3]));
+        \\  } else {
+        \\    const B4 bv = *(const device B4*)cbase;
+        \\    *(threadgroup F4*)(sm + lr * C_STR + lc) = F4(float(bv[0]), float(bv[1]), float(bv[2]), float(bv[3]));
+        \\  }
+        \\
+    ) ++
+        \\}
+        \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\int buf = 0;
+        \\for (int p = 0; p < NPART; ++p) {
+        \\  simdgroup_float8x8 ap = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\  for (int k0 = 0; k0 < PK; k0 += bk, buf ^= 1) {
+        \\    threadgroup float* cs_cur = sm + buf * CS_SZ;
+        \\    int next_k0 = k0 + bk;
+        \\    int next_p = p;
+        \\    if (next_k0 >= PK) { next_k0 = 0; next_p = p + 1; }
+        \\    const bool has_next = (next_p < NPART) && loader;
+        \\
+    ++ (if (kv8)
+        \\    uint32_t nw0 = 0, nw1 = 0;
+        \\    bfloat16_t nsc = bfloat16_t(0), nbi = bfloat16_t(0);
+        \\    if (has_next) {
+        \\      const int g_k0 = next_p * PK + next_k0 + lc;
+        \\      const device uint32_t* wptr = (my_fr ? (cf + size_t(my_src) * cf_s0) : (c + size_t(my_src) * c_s0)) + size_t(g_k0 >> 2);
+        \\      if (two_v4) {
+        \\        const U2 w2 = *(const device U2*)wptr;
+        \\        nw0 = w2[0]; nw1 = w2[1];
+        \\      } else {
+        \\        nw0 = wptr[0];
+        \\      }
+        \\      const size_t g = size_t(g_k0 >> 6);
+        \\      nsc = my_fr ? cfs[size_t(my_src) * cfs_s0 + g] : cs[size_t(my_src) * cs_s0 + g];
+        \\      nbi = my_fr ? cfb[size_t(my_src) * cfb_s0 + g] : cb[size_t(my_src) * cb_s0 + g];
+        \\    }
+        \\
+    else
+        \\    B4 nb0 = B4(0), nb1 = B4(0);
+        \\    if (has_next) {
+        \\      const int g_k0 = next_p * PK + next_k0 + lc;
+        \\      const device bfloat16_t* cbase = (my_fr ? (cf + size_t(my_src) * cf_s0) : (c + size_t(my_src) * c_s0)) + size_t(g_k0);
+        \\      nb0 = *(const device B4*)(cbase + 0);
+        \\      if (two_v4) nb1 = *(const device B4*)(cbase + 4);
+        \\    }
+        \\
+    ) ++
+        \\    const int cur_g_k0 = p * PK + k0;
+        \\    if ((bk & 31) == 0) {
+        \\      for (int kk = 0; kk < bk; kk += 32) {
+        \\        simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+        \\        simdgroup_load(b0, cs_cur + kk + 0, C_STR, ulong2(0, 0), true);
+        \\        simdgroup_load(a0, qrow + cur_g_k0 + kk + 0, qs);
+        \\        simdgroup_load(b1, cs_cur + kk + 8, C_STR, ulong2(0, 0), true);
+        \\        simdgroup_load(a1, qrow + cur_g_k0 + kk + 8, qs);
+        \\        simdgroup_load(b2, cs_cur + kk + 16, C_STR, ulong2(0, 0), true);
+        \\        simdgroup_load(a2, qrow + cur_g_k0 + kk + 16, qs);
+        \\        simdgroup_load(b3, cs_cur + kk + 24, C_STR, ulong2(0, 0), true);
+        \\        simdgroup_load(a3, qrow + cur_g_k0 + kk + 24, qs);
+        \\        simdgroup_multiply_accumulate(ap, a0, b0, ap);
+        \\        simdgroup_multiply_accumulate(ap, a1, b1, ap);
+        \\        simdgroup_multiply_accumulate(ap, a2, b2, ap);
+        \\        simdgroup_multiply_accumulate(ap, a3, b3, ap);
+        \\      }
+        \\    } else {
+        \\      for (int kk = 0; kk < bk; kk += 16) {
+        \\        simdgroup_float8x8 a0, b0, a1, b1;
+        \\        simdgroup_load(b0, cs_cur + kk, C_STR, ulong2(0, 0), true);
+        \\        simdgroup_load(a0, qrow + cur_g_k0 + kk, qs);
+        \\        simdgroup_load(b1, cs_cur + kk + 8, C_STR, ulong2(0, 0), true);
+        \\        simdgroup_load(a1, qrow + cur_g_k0 + kk + 8, qs);
+        \\        simdgroup_multiply_accumulate(ap, a0, b0, ap);
+        \\        simdgroup_multiply_accumulate(ap, a1, b1, ap);
+        \\      }
+        \\    }
+        \\    if (has_next) {
+        \\      threadgroup float* dst = sm + (buf ^ 1) * CS_SZ + lr * C_STR + lc;
+        \\
+    ++ (if (kv8)
+        \\      *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(nw0, nsc, nbi);
+        \\      if (two_v4) *(threadgroup F4*)(dst + 4) = hy4_kv8_unpack4(nw1, nsc, nbi);
+        \\
+    else
+        \\      *(threadgroup F4*)(dst + 0) = F4(float(nb0[0]), float(nb0[1]), float(nb0[2]), float(nb0[3]));
+        \\      if (two_v4) *(threadgroup F4*)(dst + 4) = F4(float(nb1[0]), float(nb1[1]), float(nb1[2]), float(nb1[3]));
+        \\
+    ) ++
+        \\    }
+        \\    if (next_p < NPART) threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  }
+        \\  v0 += ap.thread_elements()[0];
+        \\  v1 += ap.thread_elements()[1];
+        \\}
+        \\}
+        \\simdgroup_float8x8 res;
+        \\res.thread_elements()[0] = v0 + rope.thread_elements()[0];
+        \\res.thread_elements()[1] = v1 + rope.thread_elements()[1];
+        \\simdgroup_store(res, s + (size_t(grp) * size_t(H) + size_t(h0)) * size_t(N) + size_t(key0), N);
+        \\
+    ;
+}
+
+fn steelValuesDirectSource(comptime kv8: bool) [:0]const u8 {
+    return
+        \\#pragma clang fp contract(off)
+        \\
+    ++ (if (kv8)
+        \\using U2 = metal::vec<uint32_t, 2>;
+        \\
+    else
+        \\using B4 = metal::vec<bfloat16_t, 4>;
+        \\
+    ) ++
+        \\using F4 = metal::vec<float, 4>;
+        \\const uint tid = thread_index_in_threadgroup;
+        \\const uint sg = simdgroup_index_in_threadgroup;
+        \\const int G = pp_shape[0];
+        \\const int grp = int(threadgroup_position_in_grid.y);
+        \\const int h0 = int(sg) * 8;
+        \\const int p0_mod = meta[1], window = meta[2], out_hf = meta[3];
+        \\const ulong ps = ulong(pp_strides[1]);
+        \\const size_t pp_s0 = size_t(pp_strides[0]);
+        \\const device float* prow = pp + size_t(grp) * pp_s0 + size_t(h0) * size_t(ps);
+        \\const size_t c_s0 = size_t(c_strides[0]), cf_s0 = size_t(cf_strides[0]);
+        \\const size_t rs0 = size_t(rows_strides[0]), rs1 = size_t(rows_strides[1]);
+        \\
+    ++ (if (kv8)
+        \\const size_t cs_s0 = size_t(cs_strides[0]), cb_s0 = size_t(cb_strides[0]);
+        \\const size_t cfs_s0 = size_t(cfs_strides[0]), cfb_s0 = size_t(cfb_strides[0]);
+        \\
+    else "") ++
+        \\threadgroup float sm[3072];
+        \\if (KSG == 0) {
+        \\  const int d0 = int(threadgroup_position_in_grid.x) * 8;
+        \\  constexpr int C_STR = 12;
+        \\  constexpr int CS_SZ = 128 * C_STR;
+        \\  const bool two_v4 = (H == 32);
+        \\  const int kr = two_v4 ? int(tid) : (int(tid) >> 1);
+        \\  const int dc = two_v4 ? 0 : ((int(tid) & 1) * 4);
+        \\
+    ++ (if (kv8)
+        \\  const size_t g = size_t(d0 >> 6);
+        \\  const size_t col_w = size_t((d0 + dc) >> 2);
+        \\
+    else "") ++
+        \\  float v0 = 0.0f, v1 = 0.0f;
+        \\  if (NPART == 2 && PK >= 64 && (PK % 64) == 0) {
+        \\    const int lp = kr >> 6;
+        \\    const int kr_p = kr & 63;
+        \\    {
+        \\      const int ki = lp * PK + kr_p;
+        \\      int src;
+        \\      bool fr = false;
+        \\      if (MODE == 0) { src = ki; }
+        \\      else if (MODE == 1) {
+        \\        int d = ki - p0_mod;
+        \\        if (d < 0) d += window;
+        \\        if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\      } else {
+        \\        src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\      }
+        \\      threadgroup float* dst = sm + kr * C_STR + dc;
+        \\
+    ++ (if (kv8)
+        \\      const device uint32_t* wptr = (fr ? (cf + size_t(src) * cf_s0) : (c + size_t(src) * c_s0)) + col_w;
+        \\      const bfloat16_t sc = fr ? cfs[size_t(src) * cfs_s0 + g] : cs[size_t(src) * cs_s0 + g];
+        \\      const bfloat16_t bi = fr ? cfb[size_t(src) * cfb_s0 + g] : cb[size_t(src) * cb_s0 + g];
+        \\      if (two_v4) {
+        \\        const U2 w2 = *(const device U2*)wptr;
+        \\        *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(w2[0], sc, bi);
+        \\        *(threadgroup F4*)(dst + 4) = hy4_kv8_unpack4(w2[1], sc, bi);
+        \\      } else {
+        \\        *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(wptr[0], sc, bi);
+        \\      }
+        \\
+    else
+        \\      const device bfloat16_t* cbase = fr ? (cf + size_t(src) * cf_s0 + size_t(d0 + dc)) : (c + size_t(src) * c_s0 + size_t(d0 + dc));
+        \\      if (two_v4) {
+        \\        const B4 b0 = *(const device B4*)(cbase + 0);
+        \\        const B4 b1 = *(const device B4*)(cbase + 4);
+        \\        *(threadgroup F4*)(dst + 0) = F4(float(b0[0]), float(b0[1]), float(b0[2]), float(b0[3]));
+        \\        *(threadgroup F4*)(dst + 4) = F4(float(b1[0]), float(b1[1]), float(b1[2]), float(b1[3]));
+        \\      } else {
+        \\        const B4 bv0 = *(const device B4*)cbase;
+        \\        *(threadgroup F4*)(dst + 0) = F4(float(bv0[0]), float(bv0[1]), float(bv0[2]), float(bv0[3]));
+        \\      }
+        \\
+    ) ++
+        \\    }
+        \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\    int buf = 0;
+        \\    simdgroup_float8x8 ap0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\    simdgroup_float8x8 ap1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\    for (int k0 = 0; k0 < PK; k0 += 64, buf ^= 1) {
+        \\      threadgroup float* cs_cur = sm + buf * CS_SZ;
+        \\      const int next_k0 = k0 + 64;
+        \\      const bool has_next = (next_k0 < PK);
+        \\
+    ++ (if (kv8)
+        \\      uint32_t nw0 = 0, nw1 = 0;
+        \\      bfloat16_t nsc = bfloat16_t(0), nbi = bfloat16_t(0);
+        \\      if (has_next) {
+        \\        const int ki = lp * PK + next_k0 + kr_p;
+        \\        int src;
+        \\        bool fr = false;
+        \\        if (MODE == 0) { src = ki; }
+        \\        else if (MODE == 1) {
+        \\          int d = ki - p0_mod;
+        \\          if (d < 0) d += window;
+        \\          if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\        } else {
+        \\          src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\        }
+        \\        const device uint32_t* wptr = (fr ? (cf + size_t(src) * cf_s0) : (c + size_t(src) * c_s0)) + col_w;
+        \\        if (two_v4) {
+        \\          const U2 w2 = *(const device U2*)wptr;
+        \\          nw0 = w2[0]; nw1 = w2[1];
+        \\        } else {
+        \\          nw0 = wptr[0];
+        \\        }
+        \\        nsc = fr ? cfs[size_t(src) * cfs_s0 + g] : cs[size_t(src) * cs_s0 + g];
+        \\        nbi = fr ? cfb[size_t(src) * cfb_s0 + g] : cb[size_t(src) * cb_s0 + g];
+        \\      }
+        \\
+    else
+        \\      B4 nb0 = B4(0), nb1 = B4(0);
+        \\      if (has_next) {
+        \\        const int ki = lp * PK + next_k0 + kr_p;
+        \\        int src;
+        \\        bool fr = false;
+        \\        if (MODE == 0) { src = ki; }
+        \\        else if (MODE == 1) {
+        \\          int d = ki - p0_mod;
+        \\          if (d < 0) d += window;
+        \\          if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\        } else {
+        \\          src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\        }
+        \\        const device bfloat16_t* cbase = fr ? (cf + size_t(src) * cf_s0 + size_t(d0 + dc)) : (c + size_t(src) * c_s0 + size_t(d0 + dc));
+        \\        nb0 = *(const device B4*)(cbase + 0);
+        \\        if (two_v4) nb1 = *(const device B4*)(cbase + 4);
+        \\      }
+        \\
+    ) ++
+        \\      for (int kk = 0; kk < 64; kk += 16) {
+        \\        simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+        \\        simdgroup_load(a0, prow + k0 + kk + 0, ps);
+        \\        simdgroup_load(b0, cs_cur + (kk + 0) * C_STR, C_STR);
+        \\        simdgroup_load(a1, prow + PK + k0 + kk + 0, ps);
+        \\        simdgroup_load(b1, cs_cur + (64 + kk + 0) * C_STR, C_STR);
+        \\        simdgroup_load(a2, prow + k0 + kk + 8, ps);
+        \\        simdgroup_load(b2, cs_cur + (kk + 8) * C_STR, C_STR);
+        \\        simdgroup_load(a3, prow + PK + k0 + kk + 8, ps);
+        \\        simdgroup_load(b3, cs_cur + (64 + kk + 8) * C_STR, C_STR);
+        \\        simdgroup_multiply_accumulate(ap0, a0, b0, ap0);
+        \\        simdgroup_multiply_accumulate(ap1, a1, b1, ap1);
+        \\        simdgroup_multiply_accumulate(ap0, a2, b2, ap0);
+        \\        simdgroup_multiply_accumulate(ap1, a3, b3, ap1);
+        \\      }
+        \\      if (has_next) {
+        \\        threadgroup float* dst = sm + (buf ^ 1) * CS_SZ + kr * C_STR + dc;
+        \\
+    ++ (if (kv8)
+        \\        *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(nw0, nsc, nbi);
+        \\        if (two_v4) *(threadgroup F4*)(dst + 4) = hy4_kv8_unpack4(nw1, nsc, nbi);
+        \\
+    else
+        \\        *(threadgroup F4*)(dst + 0) = F4(float(nb0[0]), float(nb0[1]), float(nb0[2]), float(nb0[3]));
+        \\        if (two_v4) *(threadgroup F4*)(dst + 4) = F4(float(nb1[0]), float(nb1[1]), float(nb1[2]), float(nb1[3]));
+        \\
+    ) ++
+        \\        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\      }
+        \\    }
+        \\    v0 += ap0.thread_elements()[0];
+        \\    v1 += ap0.thread_elements()[1];
+        \\    v0 += ap1.thread_elements()[0];
+        \\    v1 += ap1.thread_elements()[1];
+        \\  } else {
+        \\  const int bk = (PK >= 128 && (PK % 128) == 0) ? 128 : ((PK >= 64 && (PK % 64) == 0) ? 64 : ((PK >= 32 && (PK % 32) == 0) ? 32 : 16));
+        \\  const bool active = (kr < bk);
+        \\  if (active) {
+        \\    const int ki = kr;
+        \\    int src;
+        \\    bool fr = false;
+        \\    if (MODE == 0) { src = ki; }
+        \\    else if (MODE == 1) {
+        \\      int d = ki - p0_mod;
+        \\      if (d < 0) d += window;
+        \\      if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\    } else {
+        \\      src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\    }
+        \\    threadgroup float* dst = sm + kr * C_STR + dc;
+        \\
+    ++ (if (kv8)
+        \\    const device uint32_t* wptr = (fr ? (cf + size_t(src) * cf_s0) : (c + size_t(src) * c_s0)) + col_w;
+        \\    const bfloat16_t sc = fr ? cfs[size_t(src) * cfs_s0 + g] : cs[size_t(src) * cs_s0 + g];
+        \\    const bfloat16_t bi = fr ? cfb[size_t(src) * cfb_s0 + g] : cb[size_t(src) * cb_s0 + g];
+        \\    if (two_v4) {
+        \\      const U2 w2 = *(const device U2*)wptr;
+        \\      *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(w2[0], sc, bi);
+        \\      *(threadgroup F4*)(dst + 4) = hy4_kv8_unpack4(w2[1], sc, bi);
+        \\    } else {
+        \\      *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(wptr[0], sc, bi);
+        \\    }
+        \\
+    else
+        \\    const device bfloat16_t* cbase = fr ? (cf + size_t(src) * cf_s0 + size_t(d0 + dc)) : (c + size_t(src) * c_s0 + size_t(d0 + dc));
+        \\    if (two_v4) {
+        \\      const B4 b0 = *(const device B4*)(cbase + 0);
+        \\      const B4 b1 = *(const device B4*)(cbase + 4);
+        \\      *(threadgroup F4*)(dst + 0) = F4(float(b0[0]), float(b0[1]), float(b0[2]), float(b0[3]));
+        \\      *(threadgroup F4*)(dst + 4) = F4(float(b1[0]), float(b1[1]), float(b1[2]), float(b1[3]));
+        \\    } else {
+        \\      const B4 bv0 = *(const device B4*)cbase;
+        \\      *(threadgroup F4*)(dst + 0) = F4(float(bv0[0]), float(bv0[1]), float(bv0[2]), float(bv0[3]));
+        \\    }
+        \\
+    ) ++
+        \\  }
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  int buf = 0;
+        \\  for (int p = 0; p < NPART; ++p) {
+        \\    simdgroup_float8x8 ap0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\    for (int k0 = 0; k0 < PK; k0 += bk, buf ^= 1) {
+        \\      threadgroup float* cs_cur = sm + buf * CS_SZ;
+        \\      const int cur_g_k0 = p * PK + k0;
+        \\      int next_k0 = k0 + bk;
+        \\      int next_p = p;
+        \\      if (next_k0 >= PK) { next_k0 = 0; next_p = p + 1; }
+        \\      const bool has_next = (next_p < NPART) && active;
+        \\
+    ++ (if (kv8)
+        \\      uint32_t nw0 = 0, nw1 = 0;
+        \\      bfloat16_t nsc = bfloat16_t(0), nbi = bfloat16_t(0);
+        \\      if (has_next) {
+        \\        const int ki = next_p * PK + next_k0 + kr;
+        \\        int src;
+        \\        bool fr = false;
+        \\        if (MODE == 0) { src = ki; }
+        \\        else if (MODE == 1) {
+        \\          int d = ki - p0_mod;
+        \\          if (d < 0) d += window;
+        \\          if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\        } else {
+        \\          src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\        }
+        \\        const device uint32_t* wptr = (fr ? (cf + size_t(src) * cf_s0) : (c + size_t(src) * c_s0)) + col_w;
+        \\        if (two_v4) {
+        \\          const U2 w2 = *(const device U2*)wptr;
+        \\          nw0 = w2[0]; nw1 = w2[1];
+        \\        } else {
+        \\          nw0 = wptr[0];
+        \\        }
+        \\        nsc = fr ? cfs[size_t(src) * cfs_s0 + g] : cs[size_t(src) * cs_s0 + g];
+        \\        nbi = fr ? cfb[size_t(src) * cfb_s0 + g] : cb[size_t(src) * cb_s0 + g];
+        \\      }
+        \\
+    else
+        \\      B4 nb0 = B4(0), nb1 = B4(0);
+        \\      if (has_next) {
+        \\        const int ki = next_p * PK + next_k0 + kr;
+        \\        int src;
+        \\        bool fr = false;
+        \\        if (MODE == 0) { src = ki; }
+        \\        else if (MODE == 1) {
+        \\          int d = ki - p0_mod;
+        \\          if (d < 0) d += window;
+        \\          if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\        } else {
+        \\          src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\        }
+        \\        const device bfloat16_t* cbase = fr ? (cf + size_t(src) * cf_s0 + size_t(d0 + dc)) : (c + size_t(src) * c_s0 + size_t(d0 + dc));
+        \\        nb0 = *(const device B4*)(cbase + 0);
+        \\        if (two_v4) nb1 = *(const device B4*)(cbase + 4);
+        \\      }
+        \\
+    ) ++
+        \\      if ((bk & 31) == 0) {
+        \\        for (int kk = 0; kk < bk; kk += 32) {
+        \\          simdgroup_float8x8 a0, b0, a1, b1, a2, b2, a3, b3;
+        \\          simdgroup_load(a0, prow + cur_g_k0 + kk + 0, ps);
+        \\          simdgroup_load(b0, cs_cur + (kk + 0) * C_STR, C_STR);
+        \\          simdgroup_load(a1, prow + cur_g_k0 + kk + 8, ps);
+        \\          simdgroup_load(b1, cs_cur + (kk + 8) * C_STR, C_STR);
+        \\          simdgroup_load(a2, prow + cur_g_k0 + kk + 16, ps);
+        \\          simdgroup_load(b2, cs_cur + (kk + 16) * C_STR, C_STR);
+        \\          simdgroup_load(a3, prow + cur_g_k0 + kk + 24, ps);
+        \\          simdgroup_load(b3, cs_cur + (kk + 24) * C_STR, C_STR);
+        \\          simdgroup_multiply_accumulate(ap0, a0, b0, ap0);
+        \\          simdgroup_multiply_accumulate(ap0, a1, b1, ap0);
+        \\          simdgroup_multiply_accumulate(ap0, a2, b2, ap0);
+        \\          simdgroup_multiply_accumulate(ap0, a3, b3, ap0);
+        \\        }
+        \\      } else {
+        \\        for (int kk = 0; kk < bk; kk += 8) {
+        \\          simdgroup_float8x8 a, b0;
+        \\          simdgroup_load(a, prow + cur_g_k0 + kk, ps);
+        \\          simdgroup_load(b0, cs_cur + kk * C_STR, C_STR);
+        \\          simdgroup_multiply_accumulate(ap0, a, b0, ap0);
+        \\        }
+        \\      }
+        \\      if (has_next) {
+        \\        threadgroup float* dst = sm + (buf ^ 1) * CS_SZ + kr * C_STR + dc;
+        \\
+    ++ (if (kv8)
+        \\        *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(nw0, nsc, nbi);
+        \\        if (two_v4) *(threadgroup F4*)(dst + 4) = hy4_kv8_unpack4(nw1, nsc, nbi);
+        \\
+    else
+        \\        *(threadgroup F4*)(dst + 0) = F4(float(nb0[0]), float(nb0[1]), float(nb0[2]), float(nb0[3]));
+        \\        if (two_v4) *(threadgroup F4*)(dst + 4) = F4(float(nb1[0]), float(nb1[1]), float(nb1[2]), float(nb1[3]));
+        \\
+    ) ++
+        \\      }
+        \\      if (next_p < NPART) threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\    }
+        \\    v0 += ap0.thread_elements()[0];
+        \\    v1 += ap0.thread_elements()[1];
+        \\  }
+        \\  }
+        \\  simdgroup_float8x8 res0;
+        \\  res0.thread_elements()[0] = v0;
+        \\  res0.thread_elements()[1] = v1;
+        \\  if (out_hf != 0) {
+        \\    const size_t base = (size_t(h0) * size_t(G) + size_t(grp)) * size_t(W) + size_t(d0);
+        \\    simdgroup_store(res0, u + base, ulong(G) * ulong(W));
+        \\  } else {
+        \\    const size_t base = (size_t(grp) * size_t(H) + size_t(h0)) * size_t(W) + size_t(d0);
+        \\    simdgroup_store(res0, u + base, W);
+        \\  }
+        \\} else {
+        \\  const int d0 = int(threadgroup_position_in_grid.x) * 16;
+        \\  const int bk = (PK >= 64 && (PK % 64) == 0) ? 64 : ((PK >= 32 && (PK % 32) == 0) ? 32 : 16);
+        \\  constexpr int C_STR = 20;
+        \\  constexpr int CS_SZ = 64 * C_STR;
+        \\  const bool two_v4 = (H == 32);
+        \\  const int kr = two_v4 ? (int(tid) >> 1) : (int(tid) >> 2);
+        \\  const int dc = two_v4 ? ((int(tid) & 1) * 8) : ((int(tid) & 3) * 4);
+        \\  const bool active = (kr < bk);
+        \\
+    ++ (if (kv8)
+        \\  const size_t g = size_t(d0 >> 6);
+        \\  const size_t col_w = size_t((d0 + dc) >> 2);
+        \\
+    else "") ++
+        \\  if (active) {
+        \\    const int ki = kr;
+        \\    int src;
+        \\    bool fr = false;
+        \\    if (MODE == 0) { src = ki; }
+        \\    else if (MODE == 1) {
+        \\      int d = ki - p0_mod;
+        \\      if (d < 0) d += window;
+        \\      if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\    } else {
+        \\      src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\    }
+        \\    threadgroup float* dst = sm + kr * C_STR + dc;
+        \\
+    ++ (if (kv8)
+        \\    const device uint32_t* wptr = (fr ? (cf + size_t(src) * cf_s0) : (c + size_t(src) * c_s0)) + col_w;
+        \\    const bfloat16_t sc = fr ? cfs[size_t(src) * cfs_s0 + g] : cs[size_t(src) * cs_s0 + g];
+        \\    const bfloat16_t bi = fr ? cfb[size_t(src) * cfb_s0 + g] : cb[size_t(src) * cb_s0 + g];
+        \\    if (two_v4) {
+        \\      const U2 w2 = *(const device U2*)wptr;
+        \\      *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(w2[0], sc, bi);
+        \\      *(threadgroup F4*)(dst + 4) = hy4_kv8_unpack4(w2[1], sc, bi);
+        \\    } else {
+        \\      *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(wptr[0], sc, bi);
+        \\    }
+        \\
+    else
+        \\    const device bfloat16_t* cbase = fr ? (cf + size_t(src) * cf_s0 + size_t(d0 + dc)) : (c + size_t(src) * c_s0 + size_t(d0 + dc));
+        \\    if (two_v4) {
+        \\      const B4 b0 = *(const device B4*)(cbase + 0);
+        \\      const B4 b1 = *(const device B4*)(cbase + 4);
+        \\      *(threadgroup F4*)(dst + 0) = F4(float(b0[0]), float(b0[1]), float(b0[2]), float(b0[3]));
+        \\      *(threadgroup F4*)(dst + 4) = F4(float(b1[0]), float(b1[1]), float(b1[2]), float(b1[3]));
+        \\    } else {
+        \\      const B4 bv0 = *(const device B4*)cbase;
+        \\      *(threadgroup F4*)(dst + 0) = F4(float(bv0[0]), float(bv0[1]), float(bv0[2]), float(bv0[3]));
+        \\    }
+        \\
+    ) ++
+        \\  }
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  int buf = 0;
+        \\  float v0_0 = 0.0f, v1_0 = 0.0f, v0_1 = 0.0f, v1_1 = 0.0f;
+        \\  for (int p = 0; p < NPART; ++p) {
+        \\    simdgroup_float8x8 ap0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\    simdgroup_float8x8 ap1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\    for (int k0 = 0; k0 < PK; k0 += bk, buf ^= 1) {
+        \\      threadgroup float* cs_cur = sm + buf * CS_SZ;
+        \\      const int cur_g_k0 = p * PK + k0;
+        \\      int next_k0 = k0 + bk;
+        \\      int next_p = p;
+        \\      if (next_k0 >= PK) { next_k0 = 0; next_p = p + 1; }
+        \\      const bool has_next = (next_p < NPART) && active;
+        \\
+    ++ (if (kv8)
+        \\      uint32_t nw0 = 0, nw1 = 0;
+        \\      bfloat16_t nsc = bfloat16_t(0), nbi = bfloat16_t(0);
+        \\      if (has_next) {
+        \\        const int ki = next_p * PK + next_k0 + kr;
+        \\        int src;
+        \\        bool fr = false;
+        \\        if (MODE == 0) { src = ki; }
+        \\        else if (MODE == 1) {
+        \\          int d = ki - p0_mod;
+        \\          if (d < 0) d += window;
+        \\          if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\        } else {
+        \\          src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\        }
+        \\        const device uint32_t* wptr = (fr ? (cf + size_t(src) * cf_s0) : (c + size_t(src) * c_s0)) + col_w;
+        \\        if (two_v4) {
+        \\          const U2 w2 = *(const device U2*)wptr;
+        \\          nw0 = w2[0]; nw1 = w2[1];
+        \\        } else {
+        \\          nw0 = wptr[0];
+        \\        }
+        \\        nsc = fr ? cfs[size_t(src) * cfs_s0 + g] : cs[size_t(src) * cs_s0 + g];
+        \\        nbi = fr ? cfb[size_t(src) * cfb_s0 + g] : cb[size_t(src) * cb_s0 + g];
+        \\      }
+        \\
+    else
+        \\      B4 nb0 = B4(0), nb1 = B4(0);
+        \\      if (has_next) {
+        \\        const int ki = next_p * PK + next_k0 + kr;
+        \\        int src;
+        \\        bool fr = false;
+        \\        if (MODE == 0) { src = ki; }
+        \\        else if (MODE == 1) {
+        \\          int d = ki - p0_mod;
+        \\          if (d < 0) d += window;
+        \\          if (d <= grp) { src = d; fr = true; } else { src = ki; }
+        \\        } else {
+        \\          src = int(rows[size_t(grp) * rs0 + size_t(ki) * rs1]);
+        \\        }
+        \\        const device bfloat16_t* cbase = fr ? (cf + size_t(src) * cf_s0 + size_t(d0 + dc)) : (c + size_t(src) * c_s0 + size_t(d0 + dc));
+        \\        nb0 = *(const device B4*)(cbase + 0);
+        \\        if (two_v4) nb1 = *(const device B4*)(cbase + 4);
+        \\      }
+        \\
+    ) ++
+        \\      for (int kk = 0; kk < bk; kk += 16) {
+        \\        simdgroup_float8x8 a0, b00, b01, a1, b10, b11;
+        \\        simdgroup_load(a0, prow + cur_g_k0 + kk + 0, ps);
+        \\        simdgroup_load(b00, cs_cur + (kk + 0) * C_STR + 0, C_STR);
+        \\        simdgroup_load(b01, cs_cur + (kk + 0) * C_STR + 8, C_STR);
+        \\        simdgroup_load(a1, prow + cur_g_k0 + kk + 8, ps);
+        \\        simdgroup_load(b10, cs_cur + (kk + 8) * C_STR + 0, C_STR);
+        \\        simdgroup_load(b11, cs_cur + (kk + 8) * C_STR + 8, C_STR);
+        \\        simdgroup_multiply_accumulate(ap0, a0, b00, ap0);
+        \\        simdgroup_multiply_accumulate(ap1, a0, b01, ap1);
+        \\        simdgroup_multiply_accumulate(ap0, a1, b10, ap0);
+        \\        simdgroup_multiply_accumulate(ap1, a1, b11, ap1);
+        \\      }
+        \\      if (has_next) {
+        \\        threadgroup float* dst = sm + (buf ^ 1) * CS_SZ + kr * C_STR + dc;
+        \\
+    ++ (if (kv8)
+        \\        *(threadgroup F4*)(dst + 0) = hy4_kv8_unpack4(nw0, nsc, nbi);
+        \\        if (two_v4) *(threadgroup F4*)(dst + 4) = hy4_kv8_unpack4(nw1, nsc, nbi);
+        \\
+    else
+        \\        *(threadgroup F4*)(dst + 0) = F4(float(nb0[0]), float(nb0[1]), float(nb0[2]), float(nb0[3]));
+        \\        if (two_v4) *(threadgroup F4*)(dst + 4) = F4(float(nb1[0]), float(nb1[1]), float(nb1[2]), float(nb1[3]));
+        \\
+    ) ++
+        \\      }
+        \\      if (next_p < NPART) threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\    }
+        \\    v0_0 += ap0.thread_elements()[0];
+        \\    v1_0 += ap0.thread_elements()[1];
+        \\    v0_1 += ap1.thread_elements()[0];
+        \\    v1_1 += ap1.thread_elements()[1];
+        \\  }
+        \\  simdgroup_float8x8 res0, res1;
+        \\  res0.thread_elements()[0] = v0_0;
+        \\  res0.thread_elements()[1] = v1_0;
+        \\  res1.thread_elements()[0] = v0_1;
+        \\  res1.thread_elements()[1] = v1_1;
+        \\  if (out_hf != 0) {
+        \\    const size_t base = (size_t(h0) * size_t(G) + size_t(grp)) * size_t(W) + size_t(d0);
+        \\    simdgroup_store(res0, u + base + 0, ulong(G) * ulong(W));
+        \\    simdgroup_store(res1, u + base + 8, ulong(G) * ulong(W));
+        \\  } else {
+        \\    const size_t base = (size_t(grp) * size_t(H) + size_t(h0)) * size_t(W) + size_t(d0);
+        \\    simdgroup_store(res0, u + base + 0, W);
+        \\    simdgroup_store(res1, u + base + 8, W);
+        \\  }
+        \\}
+        \\
+    ;
+}
+
+pub const steel_scores_direct_source: [:0]const u8 = steelScoresDirectSource(false);
+pub const steel_scores_direct_kv8_source: [:0]const u8 = steelScoresDirectSource(true);
+pub const steel_values_direct_source: [:0]const u8 = steelValuesDirectSource(false);
+pub const steel_values_direct_kv8_source: [:0]const u8 = steelValuesDirectSource(true);
+
+var steel_scores_direct_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var steel_scores_direct_kv8_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var steel_values_direct_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var steel_values_direct_kv8_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+pub const DirectMode = enum(i32) { range = 0, ring = 1, picks = 2 };
+
+/// Key store passed directly to `steelDirectScores` / `steelDirectValues` without gathering, ring duplication, or f32
+/// widening. Supports both BF16 (`scales == null`) and affine-8 (`scales`/`biases` non-null, group_size 64).
+pub const DirectKeys = struct {
+    c: Arr,
+    pe: Arr,
+    scales: ?Arr = null,
+    biases: ?Arr = null,
+    c_fresh: ?Arr = null,
+    pe_fresh: ?Arr = null,
+    scales_fresh: ?Arr = null,
+    biases_fresh: ?Arr = null,
+    rows: ?Arr = null,
+    mode: DirectMode,
+    n: c_int,
+    p0_mod: c_int = 0,
+    window: c_int = 0,
+    group_size: u32 = 64,
+
+    pub fn isKv8(self: DirectKeys) bool {
+        return self.scales != null and self.biases != null;
+    }
+};
+
+const DirectKey = struct { h: c_int, n: c_int, w: c_int, r: c_int = 0, parts: c_int, pk: c_int, groups: c_int, mode: c_int, ksg: c_int = 1, scores: bool, out_hf: bool = false };
+var steel_direct_cfgs: kcfg.Cache(DirectKey) = .{};
+
+fn steelDirectBuild(k: DirectKey) !kcfg.Config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const tg: c_int = k.h * 4;
+    if (k.scores) {
+        const shape = [_]c_int{ k.groups, k.h, k.n };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(k.n, 8) * tg, k.groups, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg, 1, 1));
+        for ([_]struct { [:0]const u8, c_int }{ .{ "N", k.n }, .{ "R", k.r }, .{ "MODE", k.mode } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0].ptr, kv[1]));
+    } else {
+        const shape = if (k.out_hf) [_]c_int{ k.h, k.groups, k.w } else [_]c_int{ k.groups, k.h, k.w };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, 3, .float32));
+        const bn: c_int = if (k.ksg == 0) 8 else 16;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(k.w, bn) * tg, k.groups, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg, 1, 1));
+        for ([_]struct { [:0]const u8, c_int }{ .{ "W", k.w }, .{ "MODE", k.mode }, .{ "KSG", k.ksg } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0].ptr, kv[1]));
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", k.h));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NPART", k.parts));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PK", k.pk));
+    return cfg;
+}
+
+pub fn steelDirectFits(h: c_int, n: c_int, lat: c_int, rope: c_int) bool {
+    if (h != 32 and h != 64) return false;
+    if (rope <= 0 or rope > 64 or @rem(rope, 8) != 0) return false;
+    if (lat <= 0 or @rem(lat, 64) != 0) return false;
+    if (n < 32 or @rem(n, 16) != 0) return false;
+    const rp = steelPlan(h, n, rope) orelse return false;
+    if (rp.parts != 1) return false;
+    return steelPlan(h, n, lat) != null and steelPlan(h, lat, n) != null;
+}
+
+pub fn steelDirectKeysValid(s: mlx.mlx_stream, keys: DirectKeys, lat: c_int, rope: c_int, groups: c_int) bool {
+    if (!mlx.streamIsGpu(s) or !mlx.engine.isStream(s) or groups < 1) return false;
+    if (mlx.mlx_array_dtype(keys.pe) != .bfloat16) return false;
+    const ps = mlx.getShape(keys.pe);
+    if (ps.len != 2 or ps[1] != rope) return false;
+    const cs = mlx.getShape(keys.c);
+    if (cs.len != 2 or cs[0] != ps[0]) return false;
+    if (keys.isKv8()) {
+        if (keys.group_size != 64 or mlx.mlx_array_dtype(keys.c) != .uint32 or cs[1] != @divExact(lat, 4)) return false;
+        const sc = keys.scales.?;
+        const bi = keys.biases.?;
+        if (mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return false;
+        if (mlx.getShape(sc).len != 2 or mlx.getShape(sc)[0] != cs[0] or mlx.getShape(sc)[1] != @divExact(lat, 64)) return false;
+        if (mlx.getShape(bi).len != 2 or mlx.getShape(bi)[0] != cs[0] or mlx.getShape(bi)[1] != @divExact(lat, 64)) return false;
+    } else {
+        if (mlx.mlx_array_dtype(keys.c) != .bfloat16 or cs[1] != lat) return false;
+    }
+    switch (keys.mode) {
+        .range => return keys.n <= cs[0],
+        .ring => {
+            if (keys.window <= 0 or keys.n != keys.window or keys.window > cs[0]) return false;
+            const cf = keys.c_fresh orelse return false;
+            const pef = keys.pe_fresh orelse return false;
+            if (mlx.mlx_array_dtype(cf) != mlx.mlx_array_dtype(keys.c) or mlx.mlx_array_dtype(pef) != .bfloat16) return false;
+            if (mlx.getShape(cf).len != 2 or mlx.getShape(cf)[0] < groups or mlx.getShape(cf)[1] != cs[1]) return false;
+            if (mlx.getShape(pef).len != 2 or mlx.getShape(pef)[0] < groups or mlx.getShape(pef)[1] != rope) return false;
+            if (keys.isKv8()) {
+                const cfs = keys.scales_fresh orelse return false;
+                const cfb = keys.biases_fresh orelse return false;
+                if (mlx.mlx_array_dtype(cfs) != .bfloat16 or mlx.mlx_array_dtype(cfb) != .bfloat16) return false;
+                if (mlx.getShape(cfs).len != 2 or mlx.getShape(cfs)[0] < groups or mlx.getShape(cfs)[1] != @divExact(lat, 64)) return false;
+                if (mlx.getShape(cfb).len != 2 or mlx.getShape(cfb)[0] < groups or mlx.getShape(cfb)[1] != @divExact(lat, 64)) return false;
+            }
+            return true;
+        },
+        .picks => {
+            const rs = keys.rows orelse return false;
+            if (mlx.mlx_array_dtype(rs) != .uint32) return false;
+            const rsh = mlx.getShape(rs);
+            return rsh.len == 2 and rsh[0] == groups and rsh[1] == keys.n;
+        },
+    }
+}
+
+fn getDirectKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, out_name: [*:0]const u8, src: [:0]const u8) !mlx.mlx_fast_metal_kernel {
+    if (slot.*) |k| return k;
+    const outs = [_][*:0]const u8{out_name};
+    const iv = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, header, false, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    slot.* = k;
+    return k;
+}
+
+/// Computes `s = (ql · cᵀ) + (qp · k_peᵀ)` as `[G, H, N]` f32 directly from BF16 or KV8 keys (no gather, ring copy,
+/// or f32 widening), matching `steelScores` + `s1 + s2` byte for byte.
+pub fn steelDirectScores(s: mlx.mlx_stream, ql: Arr, qp: Arr, keys: DirectKeys, heads_first_q: bool) !Arr {
+    const qs = mlx.getShape(ql);
+    const h = if (heads_first_q) qs[0] else qs[1];
+    const g = if (heads_first_q) qs[1] else qs[0];
+    const lat = qs[2];
+    const rope = mlx.getShape(qp)[2];
+    const plan = steelPlan(h, keys.n, lat).?;
+    const mode_i: c_int = @intFromEnum(keys.mode);
+    const cfg = try steel_direct_cfgs.get(.{ .h = h, .n = keys.n, .w = lat, .r = rope, .parts = plan.parts, .pk = plan.pk, .groups = g, .mode = mode_i, .scores = true }, steelDirectBuild);
+    const mv = [_]i32{ @intFromEnum(keys.mode), keys.p0_mod, keys.window, if (heads_first_q) 0 else 1, if (heads_first_q) 1 else 0 };
+    const meta = try intsArr(&mv);
+    defer _ = mlx.mlx_array_free(meta);
+    const rv_dummy = [_]u32{0};
+    const dummy_rows = if (keys.rows == null) try mlx.newData(&rv_dummy, &.{ 1, 1 }, .uint32) else null;
+    defer if (dummy_rows) |dr| {
+        _ = mlx.mlx_array_free(dr);
+    };
+    const rows_arr = keys.rows orelse dummy_rows.?;
+    const cf = keys.c_fresh orelse keys.c;
+    const pef = keys.pe_fresh orelse keys.pe;
+    var out: [1]Arr = undefined;
+    if (keys.isKv8()) {
+        const k = try getDirectKernel(&steel_scores_direct_kv8_kernel, "sushi_hy4_steel_scores_direct_kv8", &.{ "ql", "qp", "c", "cs", "cb", "pe", "cf", "cfs", "cfb", "pef", "rows", "meta" }, "s", steel_scores_direct_kv8_source);
+        const cfs = keys.scales_fresh orelse keys.scales.?;
+        const cfb = keys.biases_fresh orelse keys.biases.?;
+        try applyOuts(s, k, &.{ ql, qp, keys.c, keys.scales.?, keys.biases.?, keys.pe, cf, cfs, cfb, pef, rows_arr, meta }, cfg, &out);
+    } else {
+        const k = try getDirectKernel(&steel_scores_direct_kernel, "sushi_hy4_steel_scores_direct", &.{ "ql", "qp", "c", "pe", "cf", "pef", "rows", "meta" }, "s", steel_scores_direct_source);
+        try applyOuts(s, k, &.{ ql, qp, keys.c, keys.pe, cf, pef, rows_arr, meta }, cfg, &out);
+    }
+    return out[0];
+}
+
+/// Computes `u = pp · c` as `[H, G, lat]` f32 (`out_heads_first`) or `[G, H, lat]` f32 directly from BF16 or KV8 keys,
+/// matching `steelValues` byte for byte. `pp` is `[G, H, N]` f32.
+pub fn steelDirectValues(s: mlx.mlx_stream, pp: Arr, keys: DirectKeys, lat: c_int, out_heads_first: bool) !Arr {
+    const ps = mlx.getShape(pp);
+    const g = ps[0];
+    const h = ps[1];
+    const n = ps[2];
+    const plan = steelPlan(h, lat, n).?;
+    const mode_i: c_int = @intFromEnum(keys.mode);
+    const ksg: c_int = if (g == 1 or @rem(lat, 16) != 0) 0 else 1;
+    const cfg = try steel_direct_cfgs.get(.{ .h = h, .n = n, .w = lat, .parts = plan.parts, .pk = plan.pk, .groups = g, .mode = mode_i, .ksg = ksg, .scores = false, .out_hf = out_heads_first }, steelDirectBuild);
+    const mv = [_]i32{ @intFromEnum(keys.mode), keys.p0_mod, keys.window, @intFromBool(out_heads_first) };
+    const meta = try intsArr(&mv);
+    defer _ = mlx.mlx_array_free(meta);
+    const rv_dummy = [_]u32{0};
+    const dummy_rows = if (keys.rows == null) try mlx.newData(&rv_dummy, &.{ 1, 1 }, .uint32) else null;
+    defer if (dummy_rows) |dr| {
+        _ = mlx.mlx_array_free(dr);
+    };
+    const rows_arr = keys.rows orelse dummy_rows.?;
+    const cf = keys.c_fresh orelse keys.c;
+    var out: [1]Arr = undefined;
+    if (keys.isKv8()) {
+        const k = try getDirectKernel(&steel_values_direct_kv8_kernel, "sushi_hy4_steel_values_direct_kv8", &.{ "pp", "c", "cs", "cb", "cf", "cfs", "cfb", "rows", "meta" }, "u", steel_values_direct_kv8_source);
+        const cfs = keys.scales_fresh orelse keys.scales.?;
+        const cfb = keys.biases_fresh orelse keys.biases.?;
+        try applyOuts(s, k, &.{ pp, keys.c, keys.scales.?, keys.biases.?, cf, cfs, cfb, rows_arr, meta }, cfg, &out);
+    } else {
+        const k = try getDirectKernel(&steel_values_direct_kernel, "sushi_hy4_steel_values_direct", &.{ "pp", "c", "cf", "rows", "meta" }, "u", steel_values_direct_source);
+        try applyOuts(s, k, &.{ pp, keys.c, cf, rows_arr, meta }, cfg, &out);
+    }
     return out[0];
 }
 
@@ -1774,4 +2824,178 @@ test "hy4 chain: gatedPreparedInto fuses gatedInto and prepare_h128 in one launc
     const wb: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(cw) orelse return error.HostRead);
     const gb: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(cg) orelse return error.HostRead);
     try testing.expectEqualSlices(u16, wb[0..n], gb[0..n]);
+}
+
+test "hy4 chain: direct BF16 and inline-KV8 steel scores + single sink softmax + values match f32 chain byte for byte across range, ring (with wrap), and sparse picks (G=1, 6, 12)" {
+    const kv_quant = @import("../kv_quant.zig");
+    const hy4_latent = @import("hy4_latent.zig");
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+
+    const lat: c_int = 512;
+    const rope: c_int = 64;
+    const scale: f32 = 1.0 / 16.0;
+
+    // 1. Sliding MODE 0 (G=1 unordered ring) & MODE 1 (G=6, 12 ring + fresh, including wrap at p0=1022), BF16 and KV8.
+    for ([_]bool{ false, true }) |kv8| {
+        const h: c_int = 64;
+        const w: c_int = 512;
+        for ([_]struct { g: c_int, p0: c_int, mode: DirectMode }{
+            .{ .g = 1, .p0 = 512, .mode = .range },
+            .{ .g = 2, .p0 = 1023, .mode = .ring },
+            .{ .g = 5, .p0 = 1022, .mode = .ring },
+            .{ .g = 6, .p0 = 1022, .mode = .ring },
+            .{ .g = 12, .p0 = 1020, .mode = .ring },
+        }, 0..) |cs, ci| {
+            var o: Ops = .{ .s = es };
+            defer o.deinit();
+            const seed: u64 = 9000 + @as(u64, @intFromBool(kv8)) * 100 + ci * 10;
+            const ql_h = try randomF32(&o, &.{ h, cs.g, lat }, seed + 1, 1.0);
+            const qp_h = try randomF32(&o, &.{ h, cs.g, rope }, seed + 2, 1.0);
+            const ring_c_bf = try o.cast(try randomF32(&o, &.{ w, lat }, seed + 3, 1.5), .bfloat16);
+            const ring_pe_bf = try o.cast(try randomF32(&o, &.{ w, rope }, seed + 4, 1.0), .bfloat16);
+            const fresh_c_bf = try o.cast(try randomF32(&o, &.{ cs.g, lat }, seed + 5, 1.5), .bfloat16);
+            const fresh_pe_bf = try o.cast(try randomF32(&o, &.{ cs.g, rope }, seed + 6, 1.0), .bfloat16);
+            const sinks = try randomF32(&o, &.{h}, seed + 7, 1.0);
+
+            var q_ring = if (kv8) try kv_quant.quantizeAffine(es, ring_c_bf, 64, 8) else null;
+            defer if (q_ring) |*q| q.deinit();
+            var q_fresh = if (kv8) try kv_quant.quantizeAffine(es, fresh_c_bf, 64, 8) else null;
+            defer if (q_fresh) |*q| q.deinit();
+
+            const ring_c_f32 = if (q_ring) |q| try o.own(try hy4_latent.range(es, q.q, q.scales, q.biases, 64)) else try o.cast(ring_c_bf, .float32);
+            const fresh_c_f32 = if (q_fresh) |q| try o.own(try hy4_latent.range(es, q.q, q.scales, q.biases, 64)) else try o.cast(fresh_c_bf, .float32);
+
+            const dk: DirectKeys = .{
+                .c = if (q_ring) |q| q.q else ring_c_bf,
+                .pe = ring_pe_bf,
+                .scales = if (q_ring) |q| q.scales else null,
+                .biases = if (q_ring) |q| q.biases else null,
+                .c_fresh = if (cs.mode == .ring) (if (q_fresh) |q| q.q else fresh_c_bf) else null,
+                .pe_fresh = if (cs.mode == .ring) fresh_pe_bf else null,
+                .scales_fresh = if (cs.mode == .ring and kv8) q_fresh.?.scales else null,
+                .biases_fresh = if (cs.mode == .ring and kv8) q_fresh.?.biases else null,
+                .mode = cs.mode,
+                .n = w,
+                .p0_mod = @mod(cs.p0, w),
+                .window = w,
+            };
+            try testing.expect(steelDirectFits(h, w, lat, rope));
+            try testing.expect(steelDirectKeysValid(es, dk, lat, rope, cs.g));
+
+            const got_s = try o.own(try steelDirectScores(es, ql_h, qp_h, dk, true));
+            const got_p = try o.own(try sinkSoftmaxCausalSingle(es, got_s, sinks, scale, w - 1, 0, false));
+            const got_u = try o.own(try steelDirectValues(es, got_p, dk, lat, true));
+            try mlx.check(mlx.mlx_array_eval(got_u));
+
+            // Reference: build each row's exact ring-ordered [w, lat] f32 and [w, rope] bf16 and run existing steelScores + sinkSoftmaxCausal + steelValues.
+            const combined_c = if (cs.mode == .ring) try o.concat(&.{ ring_c_f32, fresh_c_f32 }, 0) else ring_c_f32;
+            const combined_pe = if (cs.mode == .ring) try o.concat(&.{ ring_pe_bf, fresh_pe_bf }, 0) else ring_pe_bf;
+            const idx_host = try testing.allocator.alloc(u32, @intCast(w));
+            defer testing.allocator.free(idx_host);
+            for (0..@intCast(cs.g)) |ri| {
+                var o2: Ops = .{ .s = es };
+                defer o2.deinit();
+                const r_i: c_int = @intCast(ri);
+                var c_ref: Arr = ring_c_f32;
+                var pe_ref: Arr = ring_pe_bf;
+                if (cs.mode == .ring) {
+                    const p0m = @mod(cs.p0, w);
+                    for (0..@intCast(w)) |slot| {
+                        const s_i: c_int = @intCast(slot);
+                        const d = @mod(s_i - p0m, w);
+                        idx_host[slot] = if (d <= r_i) @intCast(w + d) else @intCast(slot);
+                    }
+                    const idx_arr = try o2.own(try mlx.newData(idx_host.ptr, &.{w}, .uint32));
+                    c_ref = try o2.take(combined_c, idx_arr, 0);
+                    pe_ref = try o2.take(combined_pe, idx_arr, 0);
+                }
+                const ql1 = try o2.contiguous(try o2.slice(ql_h, 1, r_i, r_i + 1));
+                const qp1 = try o2.contiguous(try o2.slice(qp_h, 1, r_i, r_i + 1));
+                const sc_ref = try steelScores(es, ql1, qp1, c_ref, pe_ref);
+                const s1 = try o2.own(sc_ref.s1);
+                const s2 = try o2.own(sc_ref.s2);
+                const p_ref = try o2.own(try sinkSoftmaxCausal(es, s1, s2, sinks, scale, w - 1, 0, true));
+                const u_ref = try o2.own(try steelValues(es, p_ref, c_ref));
+                const got_u_row = try o2.contiguous(try o2.slice(got_u, 1, r_i, r_i + 1));
+                try testing.expectEqualSlices(u8, try hostF32(&o2, u_ref), try hostF32(&o2, got_u_row));
+            }
+        }
+    }
+
+    // 2. Sparse MODE 2 (indirect picks N=2048, H=32, G=1, 6, 12), BF16 and KV8.
+    for ([_]bool{ false, true }) |kv8| {
+        const h: c_int = 32;
+        const n_sel: c_int = 2048;
+        const store_n: c_int = 3000;
+        for ([_]c_int{ 1, 2, 5, 6, 12 }, 0..) |g, ci| {
+            var o: Ops = .{ .s = es };
+            defer o.deinit();
+            const seed: u64 = 9500 + @as(u64, @intFromBool(kv8)) * 100 + ci * 10;
+            const ql_h = try randomF32(&o, &.{ h, g, lat }, seed + 1, 1.0);
+            const qp_h = try randomF32(&o, &.{ h, g, rope }, seed + 2, 1.0);
+            const st_c_bf = try o.cast(try randomF32(&o, &.{ store_n, lat }, seed + 3, 1.5), .bfloat16);
+            const st_pe_bf = try o.cast(try randomF32(&o, &.{ store_n, rope }, seed + 4, 1.0), .bfloat16);
+            const sinks = try randomF32(&o, &.{h}, seed + 5, 1.0);
+
+            var prng = std.Random.DefaultPrng.init(seed + 6);
+            const rnd = prng.random();
+            const rows_host = try testing.allocator.alloc(u32, @intCast(g * n_sel));
+            defer testing.allocator.free(rows_host);
+            const keep_host = try testing.allocator.alloc(bool, @intCast(g * n_sel));
+            defer testing.allocator.free(keep_host);
+            for (rows_host, keep_host) |*r, *k| {
+                r.* = rnd.uintLessThan(u32, @intCast(store_n));
+                k.* = rnd.uintLessThan(u32, 10) != 0;
+            }
+            const rows_arr = try o.own(try mlx.newData(rows_host.ptr, &.{ g, n_sel }, .uint32));
+            const keep_arr = try o.own(try mlx.newData(keep_host.ptr, &.{ g, n_sel }, .bool_));
+
+            var q_st = if (kv8) try kv_quant.quantizeAffine(es, st_c_bf, 64, 8) else null;
+            defer if (q_st) |*q| q.deinit();
+
+            const dk: DirectKeys = .{
+                .c = if (q_st) |q| q.q else st_c_bf,
+                .pe = st_pe_bf,
+                .scales = if (q_st) |q| q.scales else null,
+                .biases = if (q_st) |q| q.biases else null,
+                .rows = rows_arr,
+                .mode = .picks,
+                .n = n_sel,
+            };
+            try testing.expect(steelDirectFits(h, n_sel, lat, rope));
+            try testing.expect(steelDirectKeysValid(es, dk, lat, rope, g));
+
+            const got_s = try o.own(try steelDirectScores(es, ql_h, qp_h, dk, true));
+            const got_p = try o.own(try sinkSoftmaxMaskSingle(es, got_s, keep_arr, sinks, scale, false));
+            const got_u = try o.own(try steelDirectValues(es, got_p, dk, lat, true));
+            try mlx.check(mlx.mlx_array_eval(got_u));
+
+            for (0..@intCast(g)) |ri| {
+                var o2: Ops = .{ .s = es };
+                defer o2.deinit();
+                const r_i: c_int = @intCast(ri);
+                const idx1 = try o2.reshape(try o2.slice(rows_arr, 0, r_i, r_i + 1), &.{n_sel});
+                const keep1 = try o2.slice(keep_arr, 0, r_i, r_i + 1);
+                const c_ref = if (q_st) |q| try o2.own(try hy4_latent.gather(es, q.q, q.scales, q.biases, idx1, 64)) else try o2.cast(try o2.take(st_c_bf, idx1, 0), .float32);
+                const pe_ref = try o2.take(st_pe_bf, idx1, 0);
+                const ql1 = try o2.contiguous(try o2.slice(ql_h, 1, r_i, r_i + 1));
+                const qp1 = try o2.contiguous(try o2.slice(qp_h, 1, r_i, r_i + 1));
+                const sc_ref = try steelScores(es, ql1, qp1, c_ref, pe_ref);
+                const s1 = try o2.own(sc_ref.s1);
+                const s2 = try o2.own(sc_ref.s2);
+                const p_ref = try o2.own(try sinkSoftmaxMask(es, s1, s2, keep1, sinks, scale, true));
+                const u_ref = try o2.own(try steelValues(es, p_ref, c_ref));
+                const got_u_row = try o2.contiguous(try o2.slice(got_u, 1, r_i, r_i + 1));
+                try testing.expectEqualSlices(u8, try hostF32(&o2, u_ref), try hostF32(&o2, got_u_row));
+            }
+        }
+    }
 }

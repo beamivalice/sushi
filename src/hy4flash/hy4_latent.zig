@@ -132,8 +132,8 @@ pub fn gather(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, idx: Arr, gro
     return launch(s, q, scales, biases, idx, true, mlx.getShape(idx)[0], group_size, false);
 }
 
-/// The most rows one `append` writes (a verify block).
-pub const append_rows_max: c_int = 8;
+/// The most rows one `append` writes (a verify or copy-draft block).
+pub const append_rows_max: c_int = 16;
 
 pub const append_source: [:0]const u8 =
     \\constexpr float eps = 1e-7f;

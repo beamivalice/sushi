@@ -317,6 +317,9 @@ fn linearStoredAs(o: *Ops, x: Arr, lin: Lin, rows_as: ?c_int) !Arr {
     if (lin.stq) |b| return hy4_stq.applyStored(o, x, b);
     const w = lin.w;
     if (products == .f32 or mlx.mlx_array_dtype(w) != .bfloat16) return linearF32As(o, x, w, rows_as);
+    const rows = mlx.getShape(x)[0];
+    if (rows_as == null and chain_kernels_on and rows >= 1 and rows <= verify_rows_max and hy4_gemv.appliesStored(o.s, x, w))
+        return o.own(try hy4_gemv.rowsStored(o.s, x, w));
     return mmByRow(o, try o.cast(x, .bfloat16), try o.transpose(w, &.{ 1, 0 }), rows_as);
 }
 
@@ -557,6 +560,9 @@ pub const Router = struct { weight: Arr, bias: Arr };
 /// The experts a row routes to and the weight each takes: `picks` [T, k] int32, `weights` [T, k] f32.
 pub const Routed = struct { picks: Arr, weights: Arr };
 
+/// `routeMapped` output: routed picks+weights and optional resident-stream slot indices.
+pub const MappedRoute = struct { routed: Routed, slots: ?Arr };
+
 /// `HYV4TopkRouter` (one group): `s = σ(x·Wᵀ)` in f32, the top `k` of `s + bias` picked, their unbiased `s`
 /// normalized to sum 1 and scaled by `scale` (3.998 in the release).
 pub fn route(o: *Ops, x: Arr, w: Router, k: c_int, scale: f32) !Routed {
@@ -565,7 +571,7 @@ pub fn route(o: *Ops, x: Arr, w: Router, k: c_int, scale: f32) !Routed {
 
 /// `route`, and with `map` [E] int32 (a resident stream's slots) each pick's slot [T, k] uint32: on a GPU stream a
 /// decode row's picks, weights and slots are one launch past the logits (`hy4_route.pick`).
-pub fn routeMapped(o: *Ops, x: Arr, w: Router, k: c_int, scale: f32, map: ?Arr) !struct { routed: Routed, slots: ?Arr } {
+pub fn routeMapped(o: *Ops, x: Arr, w: Router, k: c_int, scale: f32, map: ?Arr) !MappedRoute {
     const logits = try linearF32(o, x, w.weight);
     if (chain_kernels_on and hy4_route.applies(o.s, logits, w.bias, k)) {
         const p = try hy4_route.pick(o.s, logits, w.bias, k, scale, map);
@@ -1056,23 +1062,29 @@ pub fn attention(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, mask: A
 /// The new rows' projections: the rotated queries `q` [H, T, qk], the normalized latent `c` [T, latent] and the
 /// rotated `k_pe` [T, rope] at the cache's BF16 (a row the cache keeps for every later query), and `q_resid` for the
 /// indexer; a decode row also keeps `q_raw`, its queries before the rotation, for the absorb to read beside the rope.
-pub const Projected = struct { q: Arr, c: Arr, k_pe: Arr, q_resid: Arr, q_raw: ?Arr = null };
+pub const Projected = struct { q: Arr, c: Arr, k_pe: Arr, q_resid: Arr, q_raw: ?Arr = null, stored_into: bool = false };
 
 pub fn project(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int) !Projected {
-    return projectWith(o, x, w, g, pos0, .float32, .float32, .float32);
+    return projectWith(o, x, w, g, pos0, .float32, .float32, .float32, null);
 }
 
 /// `project` with the latent `c` at `c_dt` (the cache's BF16 for a caller that only stores it).
 pub fn projectAs(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype) !Projected {
-    return projectWith(o, x, w, g, pos0, c_dt, .bfloat16, .float32);
+    return projectWith(o, x, w, g, pos0, c_dt, .bfloat16, .float32, null);
 }
 
 /// `projectAs` with the q residual written in `q_dt`: BF16 where `W_qb` reads its input at BF16 anyway.
 pub fn projectAsQ(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype) !Projected {
-    return projectWith(o, x, w, g, pos0, c_dt, .bfloat16, q_dt);
+    return projectWith(o, x, w, g, pos0, c_dt, .bfloat16, q_dt, null);
 }
 
-fn projectWith(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype, k_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype) !Projected {
+/// `projectAsQ` writing BF16 `c` and rotated `k_pe` directly into `into` (ring or sparse store) in one launch when
+/// `hy4_front.intoApplies` serves (`stored_into == true`), skipping separate `copy_into_bf16` writes.
+pub fn projectAsQInto(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype, into: ?hy4_front.Into) !Projected {
+    return projectWith(o, x, w, g, pos0, c_dt, .bfloat16, q_dt, into);
+}
+
+fn projectWith(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype, k_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype, into: ?hy4_front.Into) !Projected {
     const t = mlx.getShape(x)[0];
     const qk = g.nope + g.rope;
     const q_resid = try linearNormedAs(o, x, w.q_a, w.q_a_norm, g.eps, q_dt);
@@ -1080,7 +1092,11 @@ fn projectWith(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx
     const q = try o.transpose(try o.reshape(qb_raw, &.{ t, g.heads, qk }), &.{ 1, 0, 2 }); // [H, T, qk]
     const use_front = k_dt == .bfloat16 and front_kernel_on and norm_kernel_on and rope_kernel_on;
     const ckv = if (t > 1 and use_front and mlx.streamIsGpu(o.s) and storedCheap(x, w.kv_a)) try linearStored(o, x, w.kv_a) else try linear(o, x, w.kv_a); // [T, latent + rope]
-    // The latent's norm and its key's rotation in one launch.
+    // The latent's norm and its key's rotation in one launch, writing directly into the ring/store when provided.
+    if (into) |dst| if (use_front and c_dt == .bfloat16 and hy4_front.intoApplies(o.s, ckv, w.kv_a_norm, g.latent, g.rope, dst)) {
+        try hy4_front.runInto(o.s, try o.contiguous(ckv), w.kv_a_norm, g.latent, g.rope, g.theta, g.eps, pos0, dst);
+        return .{ .q = try rope(o, q, g.rope, g.theta, pos0), .c = undefined, .k_pe = undefined, .q_resid = q_resid, .q_raw = if (t == 1 and rope_kernel_on and hy4_rope.applies(o.s, q, g.rope)) q else null, .stored_into = true };
+    };
     if (use_front and hy4_front.applies(o.s, ckv, w.kv_a_norm, g.latent, g.rope)) {
         const f = try hy4_front.run(o.s, try o.contiguous(ckv), w.kv_a_norm, g.latent, g.rope, g.theta, g.eps, pos0, c_dt);
         const c = o.own(f.c) catch |e| {
@@ -1222,6 +1238,24 @@ pub fn attend(o: *Ops, x: Arr, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeomet
     return attendGated(o, .{ .gate = try linearStored(o, x, w.gate), .whole = true }, q, c, k_pe, w, g, mask, at);
 }
 
+/// Drafter-block attention (`hy4_dfly`): runs scores and value sum as single batched GEMMs over the block `[H, T, N]`
+/// instead of `T` serial 1-row `mmInto` calls, cutting DFly2 attention from 18+1 to 3+1 launches per layer.
+pub fn attendDrafter(o: *Ops, in: SpanIn, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeometry, mask: Arr) !Arr {
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as, in.q_raw);
+    const t = mlx.getShape(ab.q_lat)[1];
+    const n = mlx.getShape(c)[0];
+    const c32 = try o.cast(c, .float32);
+    const pe32 = try o.cast(k_pe, .float32);
+    const s1 = try o.binary(.mm, ab.q_lat, try o.transpose(c32, &.{ 1, 0 }));
+    const s2 = try o.binary(.mm, ab.q_pe, try o.transpose(pe32, &.{ 1, 0 }));
+    const p = if (chain_kernels_on and hy4_chain.sinkSoftmaxMaskApplies(o.s, s1, s2, mask, w.sinks, true))
+        try o.own(try hy4_chain.sinkSoftmaxMask(o.s, s1, s2, mask, w.sinks, scaleOf(g), true))
+    else
+        try sinkSoftmax(o, try o.binary(.add, try o.binary(.mul, try o.binary(.add, s1, s2), try o.scalar(scaleOf(g), .float32)), mask), w.sinks, g.heads, t, n, true);
+    const u_lat = try o.binary(.mm, p, c32);
+    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, null, in.whole, in.o_left, in.dst, in.rows_as, in.hold);
+}
+
 /// What an attention span reads beside its queries and keys: its rows' gate product as stored (`linearStored` of
 /// `W_g`, [T, H·v]), and `kv_b` widened to f32 once for every span of a forward (null: the span widens it, or a
 /// one-row span reads it as stored).
@@ -1296,6 +1330,37 @@ pub fn causalLatent(o: *Ops, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr, w: Attn, 
         switch (mask_spec) {
             .causal => |cm| {
                 const use_ring = chain_kernels_on and cm.ring_p0 != null and hy4_chain.ringKeysApplies(o.s, c, k_pe, t, cm.p0, cm.window, cm.ring_p0.?);
+                const use_ring_steel = use_ring and own_stream and mlx.mlx_array_dtype(k_pe) == .bfloat16 and
+                    mlx.mlx_array_dtype(q_lat) == .float32 and mlx.mlx_array_dtype(q_pe) == .float32 and
+                    hy4_chain.steelScoresGroupsFits(g.heads, cm.window, g.latent, g.rope);
+                if (use_ring_steel) {
+                    var work: Ops = .{ .s = o.s };
+                    defer work.deinit();
+                    const built = try hy4_chain.ringKeysAs(o.s, c, k_pe, t, cm.p0, cm.window, cm.ring_p0.?, .bfloat16);
+                    const rc = work.own(built.c) catch |e| {
+                        _ = mlx.mlx_array_free(built.pe);
+                        return e;
+                    };
+                    const rpe = try work.own(built.pe);
+                    const ql4 = try work.reshape(try work.contiguous(try work.transpose(q_lat, &.{ 1, 0, 2 })), &.{ t, g.heads, 1, g.latent });
+                    const qp4 = try work.reshape(try work.contiguous(try work.transpose(q_pe, &.{ 1, 0, 2 })), &.{ t, g.heads, 1, g.rope });
+                    const sc = try hy4_chain.steelScoresGroups(o.s, t, ql4, qp4, rc, rpe);
+                    const s1 = work.own(sc.s1) catch |e| {
+                        _ = mlx.mlx_array_free(sc.s2);
+                        return e;
+                    };
+                    const s2 = try work.own(sc.s2);
+                    const p = if (hy4_chain.sinkSoftmaxCausalApplies(o.s, s1, s2, w.sinks, false))
+                        try work.own(try hy4_chain.sinkSoftmaxCausal(o.s, s1, s2, w.sinks, scaleOf(g), cm.window - 1, 0, false))
+                    else
+                        try sinkSoftmax(&work, try work.binary(.add, try work.binary(.mul, try work.binary(.add, s1, s2), try work.scalar(scaleOf(g), .float32)), try causalMask(&work, 1, cm.window, cm.window - 1, 0)), w.sinks, g.heads, t, cm.window, false);
+                    const u = if (hy4_chain.steelValuesGroupsFits(g.heads, cm.window, g.latent))
+                        try work.own(try hy4_chain.steelValuesGroups(o.s, t, try work.reshape(p, &.{ t, g.heads, 1, cm.window }), rc))
+                    else
+                        try mmGrouped(&work, p, rc, false);
+                    const u_out = try o.own(try work.result(u));
+                    break :blk try o.transpose(u_out, &.{ 1, 0, 2 });
+                }
                 const ring = if (use_ring) rk: {
                     const built = try hy4_chain.ringKeys(o.s, c, k_pe, t, cm.p0, cm.window, cm.ring_p0.?);
                     const rc = o.own(built.c) catch |e| {
@@ -1444,6 +1509,35 @@ pub fn attendStraddleGated(o: *Ops, in: SpanIn, q: Arr, cut: c_int, c: Arr, k_pe
 pub fn rowsLatent(o: *Ops, q_lat_h: Arr, q_pe_h: Arr, c_g_flat: Arr, pe_g_flat: Arr, keep: Arr, w: Attn, g: AttnGeometry) !Arr {
     const t = mlx.getShape(q_lat_h)[1];
     const sel = selectedWidth(keep);
+    if (isVerifyBlock(t) and chain_kernels_on and mlx.engine.isStream(o.s) and
+        mlx.mlx_array_dtype(pe_g_flat) == .bfloat16 and
+        mlx.mlx_array_dtype(q_lat_h) == .float32 and mlx.mlx_array_dtype(q_pe_h) == .float32 and
+        hy4_chain.steelScoresGroupsFits(g.heads, sel, g.latent, g.rope) and
+        hy4_chain.steelValuesGroupsFits(g.heads, sel, g.latent))
+    {
+        var work: Ops = .{ .s = o.s };
+        defer work.deinit();
+        const c_g = try work.reshape(try work.cast(c_g_flat, .float32), &.{ t, sel, g.latent });
+        const pe_g_bf = try work.reshape(pe_g_flat, &.{ t, sel, g.rope });
+        const ql4 = try work.reshape(try work.contiguous(try work.transpose(q_lat_h, &.{ 1, 0, 2 })), &.{ t, g.heads, 1, g.latent });
+        const qp4 = try work.reshape(try work.contiguous(try work.transpose(q_pe_h, &.{ 1, 0, 2 })), &.{ t, g.heads, 1, g.rope });
+        const sc = try hy4_chain.steelScoresGroups(o.s, t, ql4, qp4, c_g, pe_g_bf);
+        const s1 = work.own(sc.s1) catch |e| {
+            _ = mlx.mlx_array_free(sc.s2);
+            return e;
+        };
+        const s2 = try work.own(sc.s2);
+        const p = if (hy4_chain.sinkSoftmaxMaskApplies(o.s, s1, s2, keep, w.sinks, false))
+            try work.own(try hy4_chain.sinkSoftmaxMask(o.s, s1, s2, keep, w.sinks, scaleOf(g), false))
+        else inner: {
+            const scores = try work.binary(.add, s1, s2);
+            const mask = try work.reshape(try additive(&work, keep), &.{ t, 1, sel });
+            break :inner try sinkSoftmax(&work, try work.binary(.add, try work.binary(.mul, scores, try work.scalar(scaleOf(g), .float32)), mask), w.sinks, g.heads, t, sel, false);
+        };
+        const u = try work.own(try hy4_chain.steelValuesGroups(o.s, t, try work.reshape(p, &.{ t, g.heads, 1, sel }), c_g));
+        const u_out = try o.own(try work.result(u));
+        return o.transpose(u_out, &.{ 1, 0, 2 });
+    }
     const c_g = try o.reshape(try o.cast(c_g_flat, .float32), &.{ t, sel, g.latent }); // [T, S, latent]
     const pe_g_bf = try o.reshape(pe_g_flat, &.{ t, sel, g.rope });
     const q_lat = try o.transpose(q_lat_h, &.{ 1, 0, 2 }); // [T, H, latent]
@@ -1693,6 +1787,35 @@ pub fn attendJoinedGated(gpa: std.mem.Allocator, o: *Ops, out: []Arr, qs: []cons
 /// units (`hy4_attn`) rather than as the op chain. A test seam: the two agree to f32 rounding, not byte for byte.
 pub var core_kernel_on = true;
 
+/// Maximum row count served by the direct BF16 / inline-KV8 steel decode & verify attention path.
+pub const direct_rows_max: c_int = hy4_absorb.joined_max_rows;
+
+/// Whether the direct BF16 / inline-KV8 steel attention kernels serve `rows` rows of layer `g` over `n` keys per row
+/// at KV config `kv_off` / `(kv_bits, kv_group_size)`.
+pub fn directAttnFits(s: mlx.mlx_stream, w: Attn, g: AttnGeometry, n: c_int, rows: c_int, kv_off: bool, kv_bits: u8, kv_group_size: u32) bool {
+    if (!chain_kernels_on or !mlx.streamIsGpu(s) or !mlx.engine.isStream(s)) return false;
+    if (rows < 1 or rows > direct_rows_max or n >= 4096) return false;
+    if (!kv_off and (kv_bits != 8 or kv_group_size != 64)) return false;
+    const sdt = mlx.mlx_array_dtype(w.sinks);
+    if ((sdt != .float32 and sdt != .bfloat16) or mlx.getShape(w.sinks).len != 1 or mlx.getShape(w.sinks)[0] != g.heads) return false;
+    return hy4_chain.steelDirectFits(g.heads, n, g.latent, g.rope);
+}
+
+/// Bit-exact direct BF16 / inline-KV8 attention for 1..16 decode/verify rows: reads the stored ring/fresh/picked keys
+/// directly with zero `take`, `cast`, `ring_keys`, `concat2`, or `transpose`, running `steelDirectScores` +
+/// `sinkSoftmax*Single` + `steelDirectValues` and finishing via `gatedOut` (using `hy4_absorb` for 1..8 rows and
+/// Wave H1 `wideSg` for 9..16 rows).
+pub fn attendDirectGated(o: *Ops, in: SpanIn, q: Arr, keys: hy4_chain.DirectKeys, keep_mask: ?Arr, w: Attn, g: AttnGeometry, at: ?At) !Arr {
+    const ab = try absorbWith(o, q, w, g, in.kv_b32, in.rows_as, in.q_raw, true);
+    const s = try o.own(try hy4_chain.steelDirectScores(o.s, ab.q_lat, ab.q_pe, keys, true));
+    const p = if (keep_mask) |km|
+        try o.own(try hy4_chain.sinkSoftmaxMaskSingle(o.s, s, km, w.sinks, scaleOf(g), false))
+    else
+        try o.own(try hy4_chain.sinkSoftmaxCausalSingle(o.s, s, w.sinks, scaleOf(g), keys.n - 1, 0, false));
+    const u_lat = try o.own(try hy4_chain.steelDirectValues(o.s, p, keys, g.latent, true));
+    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as, in.hold);
+}
+
 /// Whether `hy4_attn` serves a span of `rows` rows of a layer with `w` and `g`: a wide span only, so a decode row and a
 /// verify block (2..8 rows) never reach it and keep the chain's bytes.
 pub fn coreServes(s: mlx.mlx_stream, w: Attn, g: AttnGeometry, rows: c_int) bool {
@@ -1715,9 +1838,15 @@ pub const CoreRange = struct { keys: hy4_attn.Keys, p0: c_int, window: c_int };
 /// Row `i` reads `keys` at `rows[i, :]` where `keep[i, :]` (`recalledRows`' rows and keep mask).
 pub const CorePicks = struct { keys: hy4_attn.Keys, rows: Arr, keep: Arr };
 
+/// Whether the FP32 `simdgroup_float8x8` wide-span absorb kernels serve a core span of `rows` rows
+/// (reading BF16 `kv_b` directly without f32 widening and fusing output gating/Hadamard prep).
+pub fn coreAbsorbServes(s: mlx.mlx_stream, kv_b: Arr, g: AttnGeometry, rows: c_int) bool {
+    return core_kernel_on and rows > verify_rows_max and hy4_absorb.wideSgApplies(s, kv_b, absorbGeometry(g), rows);
+}
+
 /// `attendGated` with the core as `hy4_attn`'s launch over `core`'s keys.
 pub fn attendCoreGated(o: *Ops, in: SpanIn, q: Arr, core: CoreKeys, w: Attn, g: AttnGeometry, at: ?At) !Arr {
-    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as, in.q_raw);
+    const ab = try absorbWith(o, q, w, g, in.kv_b32, in.rows_as, in.q_raw, true);
     const u_lat = try coreLatent(o, ab, core, w, g);
     return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as, in.hold);
 }
@@ -1757,10 +1886,19 @@ const Absorbed = struct { q_lat: Arr, q_pe: Arr, w_v: ?Arr };
 /// `q` [H, T, qk] split: its nope part taken into the latent through `W_k` [H, nope, latent], its rope part kept; and
 /// `W_v` [H, v, latent], both from `kv_b` [H·(nope+v), latent] widened to f32 (`kv_b32` when the caller widened it).
 fn absorb(o: *Ops, q: Arr, w: Attn, g: AttnGeometry, kv_b32: ?Arr, rows_as: ?c_int, q_raw: ?Arr) !Absorbed {
-    if (absorbServes(o.s, w.kv_b, g, mlx.getShape(q)[1])) {
+    return absorbWith(o, q, w, g, kv_b32, rows_as, q_raw, false);
+}
+
+fn absorbWith(o: *Ops, q: Arr, w: Attn, g: AttnGeometry, kv_b32: ?Arr, rows_as: ?c_int, q_raw: ?Arr, allow_wide_sg: bool) !Absorbed {
+    const rows = mlx.getShape(q)[1];
+    if (absorbServes(o.s, w.kv_b, g, rows)) {
         // The absorb kernel reads the query's nope part in place.
         const q32 = try o.contiguous(try o.cast(q, .float32));
         return .{ .q_lat = try o.own(try hy4_absorb.queryLatent(o.s, q_raw orelse q32, w.kv_b, absorbGeometry(g))), .q_pe = try o.slice(q32, 2, g.nope, g.nope + g.rope), .w_v = null };
+    }
+    if (allow_wide_sg and coreAbsorbServes(o.s, w.kv_b, g, rows)) {
+        const q32 = try o.cast(q, .float32);
+        return .{ .q_lat = try o.own(try hy4_absorb.queryLatentWideSg(o.s, q32, w.kv_b, absorbGeometry(g))), .q_pe = try o.slice(q32, 2, g.nope, g.nope + g.rope), .w_v = null };
     }
     const kvb = try o.reshape(kv_b32 orelse try o.cast(w.kv_b, .float32), &.{ g.heads, g.nope + g.v, g.latent });
     const w_k = try o.slice(kvb, 1, 0, g.nope);
@@ -1806,10 +1944,23 @@ pub fn absorbValueGatedRows(o: *Ops, u_rows: Arr, gate_rows: Arr, w: Attn, g: At
 /// The attended latent [H, T, latent] out through `W_v`, gated by `σ` of its rows' `gate` (as stored), as `W_o` reads it.
 fn gatedOut(o: *Ops, gate_rows: Arr, u_lat: Arr, w_v: ?Arr, w: Attn, g: AttnGeometry, at: ?At, whole: bool, o_left: ?*OLeft, dst: ?GatedDst, rows_as: ?c_int, hold: ?*Arr) !Arr {
     const t = mlx.getShape(u_lat)[1];
+    const ag = absorbGeometry(g);
+    const wide_sg = w_v == null and !hy4_absorb.applies(o.s, w.kv_b, ag, t);
+    if (wide_sg and at == null and !whole) if (dst) |d| {
+        if (d.suh) |suh| if (chain_kernels_on and hy4_absorb.wideSgPreparedIntoApplies(o.s, u_lat, w.kv_b, ag, gate_rows, suh, d.block)) {
+            try hy4_absorb.valueOutWideSgPreparedInto(o.s, u_lat, w.kv_b, ag, gate_rows, suh, d.block, d.row);
+            return mlx.mlx_array_new();
+        };
+        if (chain_kernels_on and hy4_absorb.wideSgGatedApplies(o.s, u_lat, w.kv_b, ag, gate_rows, d.block)) {
+            try hy4_absorb.valueOutWideSgGatedInto(o.s, u_lat, w.kv_b, ag, gate_rows, d.block, d.row);
+            return mlx.mlx_array_new();
+        }
+    };
+    const wide_joined = wide_sg and dst == null and at == null and chain_kernels_on and hy4_absorb.wideSgGatedApplies(o.s, u_lat, w.kv_b, ag, gate_rows, null);
     // A span that writes into its chunk's block keeps that write; the joined launch returns rows only.
-    const joined = dst == null and w_v == null and chain_kernels_on and hy4_absorb.valueOutGatedApplies(o.s, u_lat, w.kv_b, absorbGeometry(g), gate_rows);
-    const u = if (joined) u_lat else if (w_v) |wv| try mmHeadsAs(o, u_lat, try o.transpose(wv, &.{ 0, 2, 1 }), rows_as) else try o.own(try hy4_absorb.valueOut(o.s, u_lat, w.kv_b, absorbGeometry(g))); // [H, T, v]
-    if (!joined and at == null and !whole) if (dst) |d| {
+    const joined = dst == null and w_v == null and chain_kernels_on and hy4_absorb.valueOutGatedApplies(o.s, u_lat, w.kv_b, ag, gate_rows);
+    const u = if (joined or wide_joined) u_lat else if (w_v) |wv| try mmHeadsAs(o, u_lat, try o.transpose(wv, &.{ 0, 2, 1 }), rows_as) else if (wide_sg) try o.own(try hy4_absorb.valueOutWideSg(o.s, u_lat, w.kv_b, ag)) else try o.own(try hy4_absorb.valueOut(o.s, u_lat, w.kv_b, ag)); // [H, T, v]
+    if (!joined and !wide_joined and at == null and !whole) if (dst) |d| {
         if (d.suh) |suh| if (chain_kernels_on and hy4_chain.gatedPreparedIntoApplies(o.s, u, gate_rows, suh, d.block)) {
             try hy4_chain.gatedPreparedInto(o.s, u, gate_rows, suh, d.block, d.row);
             return mlx.mlx_array_new();
@@ -1819,7 +1970,7 @@ fn gatedOut(o: *Ops, gate_rows: Arr, u_lat: Arr, w_v: ?Arr, w: Attn, g: AttnGeom
             return mlx.mlx_array_new();
         }
     };
-    const gated = if (joined) try o.own(try hy4_absorb.valueOutGated(o.s, u_lat, w.kv_b, absorbGeometry(g), gate_rows)) else if (chain_kernels_on and hy4_chain.gatedApplies(o.s, u, gate_rows)) try o.own(try hy4_chain.gated(o.s, u, gate_rows)) else blk: {
+    const gated = if (wide_joined) try o.own(try hy4_absorb.valueOutWideSgGated(o.s, u_lat, w.kv_b, ag, gate_rows)) else if (joined) try o.own(try hy4_absorb.valueOutGated(o.s, u_lat, w.kv_b, ag, gate_rows)) else if (chain_kernels_on and hy4_chain.gatedApplies(o.s, u, gate_rows)) try o.own(try hy4_chain.gated(o.s, u, gate_rows)) else blk: {
         const gate = try o.unary(.sigmoid, try o.transpose(try o.reshape(try o.cast(gate_rows, .float32), &.{ t, g.heads, g.v }), &.{ 1, 0, 2 }));
         break :blk try o.reshape(try o.transpose(try o.binary(.mul, u, gate), &.{ 1, 0, 2 }), &.{ t, g.heads * g.v });
     };
@@ -2112,7 +2263,9 @@ pub fn recalledPrepared(o: *Ops, idx: IndexIn, r0: c_int, r1: c_int, pooled_grou
     const scale = std.math.pow(f32, @floatFromInt(g.heads * g.dim), -0.5);
     const qt = try o.slice(idx.qt, 0, s0, s1);
     const hw = try o.slice(idx.hw, 0, s0, s1);
-    const logits = if (hy4_index.wideScoresApply(o.s, qt, idx.k_rot, hw))
+    const logits = if (hy4_index.wideScoresSgApply(o.s, qt, idx.k_rot, hw))
+        try o.own(try hy4_index.wideScoresSg(o.s, qt, idx.k_rot, hw, scale, p0 - 1, @intCast(g.ratio)))
+    else if (hy4_index.wideScoresApply(o.s, qt, idx.k_rot, hw))
         try o.own(try hy4_index.wideScores(o.s, qt, idx.k_rot, hw, scale, p0 - 1, @intCast(g.ratio)))
     else
         try o.own(try sparse.indexScores(o.s, qt, idx.k_rot, hw, scale, p0 - 1, @intCast(g.ratio)));

@@ -119,14 +119,23 @@ pub const Drafter = struct {
     /// (its last hidden state and its shared layers' rows). Reads the target, never writes it. Each mask row's argmax
     /// is its draft (a point mass, which the verify's exact rule accepts at any temperature).
     pub fn draft(self: *const Drafter, m: *Model, t1: u32) !Draft {
-        const n_draft: usize = m.config.dfly.draft;
+        return self.draftLimit(m, t1, null);
+    }
+
+    /// `draft` capped to `max_drafts` slots (when non-null, clamped to `c.dfly.draft`), skipping the unused
+    /// `[draft, vocab]` logits concat and syncing `best` + `conf` in a single GPU wait.
+    pub fn draftLimit(self: *const Drafter, m: *Model, t1: u32, max_drafts: ?usize) !Draft {
+        const cap: usize = m.config.dfly.draft;
+        const n_draft: usize = @min(max_drafts orelse cap, cap);
+        if (n_draft == 0) return error.Hy4RowsWidth;
         var o: Ops = .{ .s = m.s };
         defer o.deinit();
-        const out = try self.forwardBlock(&o, m, t1);
+        const out = try self.forwardBlockFor(&o, m, t1, n_draft, false);
         const best = try o.contiguous(try o.cast(out.best, .uint32));
         const conf = try o.contiguous(try o.cast(out.conf, .float32));
-        try mlx.check(mlx.mlx_array_eval(best));
-        try mlx.check(mlx.mlx_array_eval(conf));
+        const vec = mlx.mlx_vector_array_new_data(&[_]Arr{ best, conf }, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
         const ids = try self.gpa.alloc(u32, n_draft + 1);
         errdefer self.gpa.free(ids);
         ids[0] = t1;
@@ -140,8 +149,11 @@ pub const Drafter = struct {
 
     /// `draft`'s forward, its outputs left in `o` (the oracle test's seam).
     pub fn forwardBlock(self: *const Drafter, o: *Ops, m: *Model, t1: u32) !Block {
+        return self.forwardBlockFor(o, m, t1, m.config.dfly.draft, true);
+    }
+
+    fn forwardBlockFor(self: *const Drafter, o: *Ops, m: *Model, t1: u32, n_draft: usize, need_logits: bool) !Block {
         const c = m.config;
-        const n_draft: usize = c.dfly.draft;
         const t: c_int = @intCast(n_draft + 1);
         const req_ = m.reqConst();
         const h = req_.last_hidden orelse return error.Hy4DflyNoHandover;
@@ -174,7 +186,11 @@ pub const Drafter = struct {
             const keys_c = try ol.concat(&.{ shared.c, pr.c }, 0);
             const keys_pe = try ol.concat(&.{ shared.k_pe, pr.k_pe }, 0);
             const mask = try blockMask(&ol, t, mlx.getShape(shared.c)[0], shared.keep);
-            const x1 = try ol.binary(.add, x, try fwd.attend(&ol, a, pr.q, keys_c, keys_pe, ly.attn, ly.geometry, mask, null));
+            const attn_y = if (need_logits)
+                try fwd.attend(&ol, a, pr.q, keys_c, keys_pe, ly.attn, ly.geometry, mask, null)
+            else
+                try fwd.attendDrafter(&ol, .{ .gate = try fwd.linearStored(&ol, a, ly.attn.gate), .whole = true }, pr.q, keys_c, keys_pe, ly.attn, ly.geometry, mask);
+            const x1 = try ol.binary(.add, x, attn_y);
             const x2 = try ol.binary(.add, x1, try fwd.swiglu(&ol, try fwd.norm(&ol, x1, ly.post_norm, c.eps), ly.mlp, null));
             x = try o.own(try ol.result(x2));
         }
@@ -197,13 +213,13 @@ pub const Drafter = struct {
             try mlx.check(mlx.mlx_argmax_axis(am, logits, 1, false, os.s));
             const best = try os.contiguous(try os.cast(am.*, .uint32));
             const conf = try os.unary(.sigmoid, try os.binary(.add, try fwd.linearF32(&os, hc, self.conf_w), try os.cast(self.conf_b, .float32)));
-            parts[j] = try o.own(try os.result(logits));
+            if (need_logits) parts[j] = try o.own(try os.result(logits));
             parts[n_draft + j] = try o.own(try os.result(conf));
             parts[2 * n_draft + j] = try o.own(try os.result(best));
             if (j + 1 < n_draft) prev_e = try o.own(try os.result(try embedRowId(&os, m, best)));
         }
         return .{
-            .logits = try o.concat(parts[0..n_draft], 0),
+            .logits = if (need_logits) try o.concat(parts[0..n_draft], 0) else mlx.mlx_array_new(),
             .conf = try o.reshape(try o.concat(parts[n_draft .. 2 * n_draft], 0), &.{t - 1}),
             .best = try o.concat(parts[2 * n_draft ..], 0),
         };
@@ -302,7 +318,7 @@ pub const Drafter = struct {
                     const q_i = try sl.slice(pr.q_full.?, 1, r0, r1);
                     const q_raw_i = if (pr.q_raw) |qr| try sl.slice(qr, 1, r0, r1) else null;
                     const gate_i = try sl.slice(gate_all, 0, r0, r1);
-                    const g_i = try fwd.attendGated(&sl, .{ .gate = gate_i, .whole = false, .q_raw = q_raw_i }, q_i, keys_c, keys_pe, ly.attn, ly.geometry, mask, null);
+                    const g_i = try fwd.attendDrafter(&sl, .{ .gate = gate_i, .whole = false, .q_raw = q_raw_i }, q_i, keys_c, keys_pe, ly.attn, ly.geometry, mask);
                     gated_parts[i] = try ol.own(try sl.result(g_i));
                 }
             }

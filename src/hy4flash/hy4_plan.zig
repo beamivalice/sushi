@@ -29,7 +29,7 @@ pub fn root(p: Probe) plan.FrameId {
     // A batched draft (`groups.len > 0`) keys by `(slots, max_drafts, kv)`.
     if (p.phase == .draft) {
         if (p.groups.len > 0) return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.groups.len, p.rows, p.kv.scheme, p.kv.bits, p.kv.group_size }) };
-        return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.kv.scheme, p.kv.bits, p.kv.group_size }) };
+        return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.rows, p.kv.scheme, p.kv.bits, p.kv.group_size }) };
     }
     if (p.phase == .joined) return joinedId(p);
     return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.rows, p.readout, p.keep_hidden, p.kv.scheme, p.kv.bits, p.kv.group_size }) };
@@ -81,9 +81,14 @@ pub const Phase = enum {
     joined,
 };
 
+/// A draft at a state `n` rows deep, by `d`, drafting `n_draft` slots.
+pub fn draftProbeN(d: *const Drafter, kv: KVQuantConfig, n: usize, n_draft: usize) Probe {
+    return .{ .rows = n_draft + 1, .readout = .all, .keep_hidden = true, .kv = kv, .n = n, .phase = .draft, .drafter = d };
+}
+
 /// A draft at a state `n` rows deep, by `d`.
 pub fn draftProbe(d: *const Drafter, c: *const hy4_config.Config, kv: KVQuantConfig, n: usize) Probe {
-    return .{ .rows = c.dfly.draft + 1, .readout = .all, .keep_hidden = true, .kv = kv, .n = n, .phase = .draft, .drafter = d };
+    return draftProbeN(d, kv, n, c.dfly.draft);
 }
 
 /// The positions a draft is recorded at, for a load whose requests reach `reach` rows: the state's depth either side of
@@ -528,7 +533,7 @@ fn recordDraft(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fi
     {
         try core.beginRecording(.{ .dry = .{ .driver = driver, .fill = fill } }, &rec);
         defer core.endRecording() catch {};
-        var drafted = try d.draft(m, 0);
+        var drafted = try d.draftLimit(m, 0, probe.rows - 1);
         drafted.deinit();
     }
     return rec.end();
@@ -649,8 +654,9 @@ fn probeOf(s: plan_book.Shape, reach: usize, drafter: ?*const Drafter, c: *const
     if (s.phase == draft_phase) {
         const d = drafter orelse return null;
         const fwd_probe = probeOf(.{ .phase = shape_phase, .args = .{ 1, @backingInt(Readout.last), s.args[2] & ~@as(u64, 0xff), s.args[3] } }, reach, null, c) orelse return null;
-        if (s.args[3] == 0 or s.args[3] + c.dfly.draft + 1 > reach) return null;
-        return draftProbe(d, c, fwd_probe.kv, s.args[3]);
+        const rows = s.args[0];
+        if (rows < 2 or rows > c.dfly.draft + 1 or s.args[3] == 0 or s.args[3] + rows > reach) return null;
+        return draftProbeN(d, fwd_probe.kv, s.args[3], rows - 1);
     }
     if (s.phase != shape_phase and s.phase != joined_phase) return null;
     if (s.args[2] & 0xfe != 0) return null;
@@ -898,6 +904,11 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
             try addProbe(m, gpa, p, draftProbe(d, &m.config, kv, n), reach);
             probes += 1;
         }
+        const short: usize = @import("../drafter_rows.zig").Policy.short_drafts;
+        if (short > 0 and short < m.config.dfly.draft) for (at) |n| {
+            try addProbe(m, gpa, p, draftProbeN(d, kv, n, short), reach);
+            probes += 1;
+        };
         if (p.joined > 1) for (2..@min(p.joined, Drafter.max_batch_slots) + 1) |slots| {
             const n_use = groupDraftWidth(@as(usize, m.config.dfly.draft), p.joined, slots);
             if (n_use == 0 or slots * (n_use + 1) > 64) continue;
@@ -1657,12 +1668,19 @@ fn wide(m: *Model, p: *const Plans, ids: []const u32, vision: ?Model.VisionRows,
 /// DFly2's draft of `t1` (`Drafter.draft`): an execution of the load's draft root where it planned one for the
 /// request's KV width, else on the pool.
 pub fn runDraft(m: *Model, d: *const Drafter, t1: u32) !Drafter.Draft {
-    const p = m.plans orelse return d.draft(m, t1);
+    return runDraftLimit(m, d, t1, null);
+}
+
+/// `runDraft` capped to `max_drafts` slots (clamped to `m.config.dfly.draft`).
+pub fn runDraftLimit(m: *Model, d: *const Drafter, t1: u32, max_drafts: ?usize) !Drafter.Draft {
+    const cap: usize = m.config.dfly.draft;
+    const n_draft: usize = @min(max_drafts orelse cap, cap);
+    const p = m.plans orelse return d.draftLimit(m, t1, n_draft);
     const req_ = m.reqConst();
-    const probe = draftProbe(d, &m.config, req_.kv, req_.pos);
-    const tables = p.tables(probe) orelse return d.draft(m, t1);
+    const probe = draftProbeN(d, req_.kv, req_.pos, n_draft);
+    const tables = p.tables(probe) orelse return d.draftLimit(m, t1, n_draft);
     try core.beginExecution(tables, root(probe));
-    var drafted = d.draft(m, t1) catch |e| {
+    var drafted = d.draftLimit(m, t1, n_draft) catch |e| {
         core.abortExecution();
         return if (core.executionMiss()) |miss| missed(m, p, probe, miss) else e;
     };

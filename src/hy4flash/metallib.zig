@@ -34,6 +34,10 @@ const map_dts: []const Dtype = &.{ .int32, .uint32, .float32, .bfloat16 };
 const rows_1_16: []const i32 = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
 const rows_1_8: []const i32 = &.{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
+fn idxSlot(n: []const u8) InputSlot {
+    return .{ .name = n, .ty = .{ .fixed = .uint32 }, .allow_i32_as_u32 = true };
+}
+
 const hc_narrow_td = [_][2]i32{
     .{ 1024, 128 }, .{ 512, 128 }, .{ 256, 128 }, .{ 128, 128 }, .{ 64, 128 },
     .{ 1024, 256 }, .{ 512, 256 }, .{ 256, 256 },
@@ -454,14 +458,16 @@ pub const specs: []const KernelSpec = &.{
     // ── hy4_gemv ────────────────────────────────────────────────────────────────
     .{
         .name = "sushi_hy4_gemv_thru",
-        .source = hy4_gemv.source,
+        .source = if (custom.is_codegen) hy4_gemv.source else "",
         .inputs = &.{
             .{ .name = "w", .ty = .{ .fixed = .bfloat16 } },
-            .{ .name = "x", .ty = .{ .fixed = .float32 } },
+            .{ .name = "x", .ty = .{ .param = "XT" } },
         },
-        .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
+        .outputs = &.{.{ .name = "out", .ty = .{ .param = "OT" } }},
         .params = &.{
             .{ .name = "R", .kind = .ct_int, .ints = rows_1_16 },
+            .{ .name = "XT", .kind = .io_dtype, .dtypes = f32_bf16 },
+            .{ .name = "OT", .kind = .ct_dtype, .dtypes = f32_bf16 },
             .{ .name = "K", .kind = .fc_int },
             .{ .name = "N", .kind = .fc_int },
         },
@@ -606,6 +612,77 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "QS", .kind = .ignored },
             .{ .name = "R", .kind = .fc_int },
             .{ .name = "ROW_MAJOR", .kind = .ignored },
+        },
+    },
+    .{
+        .name = "sushi_hy4_absorb_q_sg",
+        .source = if (custom.is_codegen) hy4_absorb.q_sg_source else "",
+        .inputs = &.{
+            .{ .name = "kvb", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "q", .ty = .{ .fixed = .float32 } },
+        },
+        .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "ROWS", .kind = .fc_int },
+            .{ .name = "NOPE", .kind = .fc_int },
+            .{ .name = "LAT", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "sushi_hy4_absorb_v_sg",
+        .source = if (custom.is_codegen) hy4_absorb.v_sg_source else "",
+        .inputs = &.{
+            .{ .name = "kvb", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "u", .ty = .{ .fixed = .float32 } },
+        },
+        .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "ROWS", .kind = .fc_int },
+            .{ .name = "NOPE", .kind = .fc_int },
+            .{ .name = "VDIM", .kind = .fc_int },
+            .{ .name = "LAT", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "sushi_hy4_absorb_v_sg_gated",
+        .header = if (custom.is_codegen) hy4_absorb.sigmoid_header else "",
+        .source = if (custom.is_codegen) hy4_absorb.v_sg_gated_source else "",
+        .inputs = &.{
+            .{ .name = "kvb", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "u", .ty = .{ .fixed = .float32 } },
+            .{ .name = "gate", .ty = .{ .param = "TG" } },
+            .{ .name = "row0", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{.{ .name = "out", .ty = .{ .param = "OT" } }},
+        .params = &.{
+            .{ .name = "OT", .kind = .ct_dtype, .dtypes = f32_bf16 },
+            .{ .name = "TG", .kind = .io_dtype, .dtypes = f32_bf16 },
+            .{ .name = "HEADS", .kind = .fc_int },
+            .{ .name = "ROWS", .kind = .fc_int },
+            .{ .name = "NOPE", .kind = .fc_int },
+            .{ .name = "VDIM", .kind = .fc_int },
+            .{ .name = "LAT", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "sushi_hy4_absorb_v_sg_prepared_into",
+        .header = if (custom.is_codegen) hy4_absorb.sigmoid_header else "",
+        .source = if (custom.is_codegen) hy4_absorb.v_sg_prepared_into_source else "",
+        .inputs = &.{
+            .{ .name = "kvb", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "u", .ty = .{ .fixed = .float32 } },
+            .{ .name = "gate", .ty = .{ .param = "TG" } },
+            .{ .name = "suh", .ty = .{ .fixed = .float16 } },
+            .{ .name = "row0", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float16 } }},
+        .params = &.{
+            .{ .name = "TG", .kind = .io_dtype, .dtypes = f32_bf16 },
+            .{ .name = "HEADS", .kind = .fc_int },
+            .{ .name = "ROWS", .kind = .fc_int },
+            .{ .name = "NOPE", .kind = .fc_int },
+            .{ .name = "VDIM", .kind = .fc_int },
+            .{ .name = "LAT", .kind = .fc_int },
         },
     },
 
@@ -780,8 +857,8 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "sushi_hy4_sink_softmax_causal",
-        .header = hy4_chain.header,
-        .source = hy4_chain.sink_softmax_causal_source,
+        .header = if (custom.is_codegen) hy4_chain.header else "",
+        .source = if (custom.is_codegen) hy4_chain.sink_softmax_causal_source else "",
         .inputs = &.{
             .{ .name = "a", .ty = .{ .fixed = .float32 } },
             .{ .name = "b", .ty = .{ .fixed = .float32 } },
@@ -792,12 +869,13 @@ pub const specs: []const KernelSpec = &.{
         .params = &.{
             .{ .name = "TS", .kind = .io_dtype, .dtypes = f32_bf16 },
             .{ .name = "HEADS_FIRST", .kind = .fc_bool },
+            .{ .name = "SINGLE", .kind = .fc_bool },
         },
     },
     .{
         .name = "sushi_hy4_sink_softmax_mask",
-        .header = hy4_chain.header,
-        .source = hy4_chain.sink_softmax_mask_source,
+        .header = if (custom.is_codegen) hy4_chain.header else "",
+        .source = if (custom.is_codegen) hy4_chain.sink_softmax_mask_source else "",
         .inputs = &.{
             .{ .name = "a", .ty = .{ .fixed = .float32 } },
             .{ .name = "b", .ty = .{ .fixed = .float32 } },
@@ -810,13 +888,112 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "TM", .kind = .io_dtype, .dtypes = bool_f32 },
             .{ .name = "TS", .kind = .io_dtype, .dtypes = f32_bf16 },
             .{ .name = "HEADS_FIRST", .kind = .fc_bool },
+            .{ .name = "SINGLE", .kind = .fc_bool },
             .{ .name = "MASK_BOOL", .kind = .fc_bool },
         },
     },
     .{
+        .name = "sushi_hy4_steel_scores_direct",
+        .header = if (custom.is_codegen) hy4_chain.header else "",
+        .source = if (custom.is_codegen) hy4_chain.steel_scores_direct_source else "",
+        .inputs = &.{
+            .{ .name = "ql", .ty = .{ .fixed = .float32 } },
+            .{ .name = "qp", .ty = .{ .fixed = .float32 } },
+            .{ .name = "c", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "pe", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "cf", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "pef", .ty = .{ .fixed = .bfloat16 } },
+            idxSlot("rows"),
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{.{ .name = "s", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "N", .kind = .fc_int },
+            .{ .name = "R", .kind = .fc_int },
+            .{ .name = "MODE", .kind = .fc_int },
+            .{ .name = "H", .kind = .fc_int },
+            .{ .name = "NPART", .kind = .fc_int },
+            .{ .name = "PK", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "sushi_hy4_steel_scores_direct_kv8",
+        .header = if (custom.is_codegen) hy4_chain.header else "",
+        .source = if (custom.is_codegen) hy4_chain.steel_scores_direct_kv8_source else "",
+        .inputs = &.{
+            .{ .name = "ql", .ty = .{ .fixed = .float32 } },
+            .{ .name = "qp", .ty = .{ .fixed = .float32 } },
+            .{ .name = "c", .ty = .{ .fixed = .uint32 } },
+            .{ .name = "cs", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "cb", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "pe", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "cf", .ty = .{ .fixed = .uint32 } },
+            .{ .name = "cfs", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "cfb", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "pef", .ty = .{ .fixed = .bfloat16 } },
+            idxSlot("rows"),
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{.{ .name = "s", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "N", .kind = .fc_int },
+            .{ .name = "R", .kind = .fc_int },
+            .{ .name = "MODE", .kind = .fc_int },
+            .{ .name = "H", .kind = .fc_int },
+            .{ .name = "NPART", .kind = .fc_int },
+            .{ .name = "PK", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "sushi_hy4_steel_values_direct",
+        .header = if (custom.is_codegen) hy4_chain.header else "",
+        .source = if (custom.is_codegen) hy4_chain.steel_values_direct_source else "",
+        .inputs = &.{
+            .{ .name = "pp", .ty = .{ .fixed = .float32 } },
+            .{ .name = "c", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "cf", .ty = .{ .fixed = .bfloat16 } },
+            idxSlot("rows"),
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{.{ .name = "u", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "W", .kind = .fc_int },
+            .{ .name = "MODE", .kind = .fc_int },
+            .{ .name = "KSG", .kind = .fc_int },
+            .{ .name = "H", .kind = .fc_int },
+            .{ .name = "NPART", .kind = .fc_int },
+            .{ .name = "PK", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "sushi_hy4_steel_values_direct_kv8",
+        .header = if (custom.is_codegen) hy4_chain.header else "",
+        .source = if (custom.is_codegen) hy4_chain.steel_values_direct_kv8_source else "",
+        .inputs = &.{
+            .{ .name = "pp", .ty = .{ .fixed = .float32 } },
+            .{ .name = "c", .ty = .{ .fixed = .uint32 } },
+            .{ .name = "cs", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "cb", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "cf", .ty = .{ .fixed = .uint32 } },
+            .{ .name = "cfs", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "cfb", .ty = .{ .fixed = .bfloat16 } },
+            idxSlot("rows"),
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{.{ .name = "u", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "W", .kind = .fc_int },
+            .{ .name = "MODE", .kind = .fc_int },
+            .{ .name = "KSG", .kind = .fc_int },
+            .{ .name = "H", .kind = .fc_int },
+            .{ .name = "NPART", .kind = .fc_int },
+            .{ .name = "PK", .kind = .fc_int },
+        },
+    },
+    .{
         .name = "sushi_hy4_ring_keys",
-        .header = hy4_chain.header,
-        .source = hy4_chain.ring_keys_source,
+        .header = if (custom.is_codegen) hy4_chain.header else "",
+        .source = if (custom.is_codegen) hy4_chain.ring_keys_source else "",
         .inputs = &.{
             .{ .name = "c", .ty = .{ .param = "TC" } },
             .{ .name = "k_pe", .ty = .{ .param = "TP" } },
@@ -824,11 +1001,12 @@ pub const specs: []const KernelSpec = &.{
         },
         .outputs = &.{
             .{ .name = "c_out", .ty = .{ .fixed = .float32 } },
-            .{ .name = "pe_out", .ty = .{ .fixed = .float32 } },
+            .{ .name = "pe_out", .ty = .{ .param = "PE_OUT" } },
         },
         .params = &.{
             .{ .name = "TC", .kind = .io_dtype, .dtypes = f32_bf16 },
             .{ .name = "TP", .kind = .io_dtype, .dtypes = f32_bf16 },
+            .{ .name = "PE_OUT", .kind = .ct_dtype, .dtypes = f32_bf16 },
         },
     },
     .{
@@ -990,6 +1168,54 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "PER_ROW", .kind = .fc_bool },
         },
     },
+    .{
+        .name = "sushi_hy4_front_into",
+        .source = if (custom.is_codegen) hy4_front.into_source else "",
+        .inputs = &.{
+            .{ .name = "ckv", .ty = .{ .param = "T" } },
+            .{ .name = "w", .ty = .{ .param = "TW" } },
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{
+            .{ .name = "c_dst", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "k_dst", .ty = .{ .fixed = .bfloat16 } },
+        },
+        .params = &.{
+            .{ .name = "T", .kind = .ct_dtype, .dtypes = f32_bf16 },
+            .{ .name = "TW", .kind = .io_dtype, .dtypes = f32_bf16 },
+            .{ .name = "LAT", .kind = .fc_int },
+            .{ .name = "CKW", .kind = .fc_int },
+            .{ .name = "HALF", .kind = .fc_int },
+            .{ .name = "BASE", .kind = .fc_int },
+            .{ .name = "EPS", .kind = .fc_int },
+            .{ .name = "SCALE", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "sushi_hy4_front_into_kv8",
+        .source = if (custom.is_codegen) hy4_front.into_kv8_source else "",
+        .inputs = &.{
+            .{ .name = "ckv", .ty = .{ .param = "T" } },
+            .{ .name = "w", .ty = .{ .param = "TW" } },
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+        },
+        .outputs = &.{
+            .{ .name = "q_dst", .ty = .{ .fixed = .uint32 } },
+            .{ .name = "s_dst", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "b_dst", .ty = .{ .fixed = .bfloat16 } },
+            .{ .name = "k_dst", .ty = .{ .fixed = .bfloat16 } },
+        },
+        .params = &.{
+            .{ .name = "T", .kind = .ct_dtype, .dtypes = f32_bf16 },
+            .{ .name = "TW", .kind = .io_dtype, .dtypes = f32_bf16 },
+            .{ .name = "LAT", .kind = .fc_int },
+            .{ .name = "CKW", .kind = .fc_int },
+            .{ .name = "HALF", .kind = .fc_int },
+            .{ .name = "BASE", .kind = .fc_int },
+            .{ .name = "EPS", .kind = .fc_int },
+            .{ .name = "SCALE", .kind = .fc_int },
+        },
+    },
 
     // ── hy4_index ───────────────────────────────────────────────────────────────
     .{
@@ -1045,6 +1271,22 @@ pub const specs: []const KernelSpec = &.{
         .outputs = &.{.{ .name = "scores", .ty = .{ .fixed = .float32 } }},
         .params = &.{
             .{ .name = "IH", .kind = .ct_int, .ints = &.{ 4, 8, 12, 16, 20, 24, 28, 32 } },
+            .{ .name = "IHD", .kind = .fc_int },
+        },
+    },
+    .{
+        .name = "sushi_hy4_index_wide_sg",
+        .source = if (custom.is_codegen) hy4_index.wide_score_sg_source else "",
+        .inputs = &.{
+            .{ .name = "q", .ty = .{ .fixed = .float32 } },
+            .{ .name = "keys", .ty = .{ .fixed = .float32 } },
+            .{ .name = "w", .ty = .{ .fixed = .float32 } },
+            .{ .name = "meta", .ty = .{ .fixed = .int32 } },
+            .{ .name = "wsc", .ty = .{ .fixed = .float32 } },
+        },
+        .outputs = &.{.{ .name = "scores", .ty = .{ .fixed = .float32 } }},
+        .params = &.{
+            .{ .name = "IH", .kind = .ct_int, .ints = &.{ 8, 16 } },
             .{ .name = "IHD", .kind = .fc_int },
         },
     },

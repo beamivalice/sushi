@@ -36,7 +36,9 @@ pub const header =
     \\  return (ulong(metal::simd_shuffle_xor(uint(v >> 32), j)) << 32) | ulong(metal::simd_shuffle_xor(uint(v), j));
     \\}
     \\inline ulong sg_sort32(ulong key, uint lane) {
+    \\  #pragma clang loop unroll(full)
     \\  for (uint k = 2; k <= 32; k <<= 1) {
+    \\    #pragma clang loop unroll(full)
     \\    for (uint j = k >> 1; j > 0; j >>= 1) {
     \\      ulong other = sg_xor(key, ushort(j));
     \\      key = (((lane & j) == 0) == ((lane & k) == 0)) ? metal::min(key, other) : metal::max(key, other);
@@ -45,6 +47,7 @@ pub const header =
     \\  return key;
     \\}
     \\inline ulong sg_merge32(ulong key, uint lane) {
+    \\  #pragma clang loop unroll(full)
     \\  for (uint j = 16; j > 0; j >>= 1) {
     \\    ulong other = sg_xor(key, ushort(j));
     \\    key = ((lane & j) == 0) ? metal::min(key, other) : metal::max(key, other);
