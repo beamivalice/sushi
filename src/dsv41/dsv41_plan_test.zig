@@ -397,3 +397,108 @@ test "dsv41 plan: held logits view with rotated logits_turn stays in-place witho
     try testing.expectEqualSlices(f32, ref0, try evalSlice(lg0));
     try testing.expectEqualSlices(f32, ref1, try evalSlice(lg1));
 }
+
+test "dsv41 plan: aliasEngineForServing gates tail aliasing to streamed loads unless force_alias_for_test is set" {
+    const expert_stream = @import("../expert_stream.zig");
+    const was_force = dsv41_plan.force_alias_for_test;
+    defer dsv41_plan.force_alias_for_test = was_force;
+    dsv41_plan.force_alias_for_test = false;
+
+    try testing.expect(dsv41_plan.aliasEngineForServing(null) == null);
+
+    var eng: expert_stream.Engine = undefined;
+    eng.plan = std.mem.zeroes(expert_stream.CachePlan);
+    eng.plan.resident = false;
+    try testing.expectEqual(@as(?*expert_stream.Engine, &eng), dsv41_plan.aliasEngineForServing(&eng));
+
+    eng.plan.resident = true;
+    try testing.expect(dsv41_plan.aliasEngineForServing(&eng) == null);
+
+    dsv41_plan.force_alias_for_test = true;
+    try testing.expectEqual(@as(?*expert_stream.Engine, &eng), dsv41_plan.aliasEngineForServing(&eng));
+}
+
+test "dsv41 plan: resident planBuild skips tail aliasing and performs zero SSD fills across prefill and decode (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!exl3.kernels.gemmNaxOn()) return error.SkipZigTest;
+    {
+        var pack = try Packed.open("DSV41_STQ_TINY", false);
+        defer pack.deinit();
+        const m = pack.mdl;
+        try testing.expect(m.cfg.layers > 4);
+        const stq = dsv41_state.stqExpertsOf(pack.loaded.xfm) orelse return error.MissingExpertStream;
+        const engine = stq.engine;
+        try testing.expect(engine.plan.resident);
+        engine.borrow_from = 4;
+
+        const own = dsv41_model.ownBegin(m);
+        defer dsv41_model.ownEnd(m, own);
+        const lent = dsv41_model.lendOwn(m);
+        defer lent.end();
+
+        const reach: usize = @min(@as(usize, m.cfg.max_pos), 96);
+        var prompt: [24]u32 = undefined;
+        for (&prompt, 0..) |*tok, i| tok.* = @intCast(1 + i * 4);
+
+        // Reference outputs on pool before planBuild installs the static arena.
+        const prefill_ref = blk: {
+            try dsv41_model.reserveNew(m, reach);
+            const a_pre = m.arm(.prefill);
+            defer a_pre.end();
+            const lg = try dsv41_model.extendVision(m, &prompt, .last, dsv41_model.SPAN, null);
+            defer _ = mlx.mlx_array_free(lg);
+            break :blk try testing.allocator.dupe(f32, try evalSlice(lg));
+        };
+        defer testing.allocator.free(prefill_ref);
+        const step_ref = blk: {
+            const a_step = m.arm(.step);
+            defer a_step.end();
+            const lg = try dsv41_model.extendVision(m, &.{7}, .last, dsv41_model.SPAN, null);
+            defer _ = mlx.mlx_array_free(lg);
+            break :blk try testing.allocator.dupe(f32, try evalSlice(lg));
+        };
+        defer testing.allocator.free(step_ref);
+        dsv41_model.resetState(m);
+
+        pack.loaded.xfm.config.static_prefill_chunk = 2048;
+        const dsv41_arch = @import("arch.zig");
+        try dsv41_arch.planBuild(pack.loaded.xfm);
+        const plans = m.plans orelse return error.TestUnexpectedResult;
+        try testing.expect(reach <= plans.reach);
+        try testing.expect(plans.alias_engine == null);
+        try testing.expect(core.arenaTail() == null);
+        try testing.expect(!core.arenaLeaseHeld());
+        try testing.expectEqual(@as(usize, 0), engine.grouped_union.len);
+        for (engine.layers) |*layer| {
+            try testing.expect(!layer.aliased);
+            try testing.expect(!layer.borrowed);
+        }
+        // Non-vacuous check: `.within_wide` had enough tail budget to alias at least one layer if not gated.
+        const base_l = plans.layout();
+        const narrow_g = @import("../tensor/plan/plan_api.zig").region.withNarrowHeadroom(plans.narrow, plans.alignment).scratch;
+        const page: u64 = @max(std.heap.pageSize(), std.heap.page_size_max);
+        const h_bytes = base_l.h * base_l.replicas;
+        const keep = std.mem.alignForward(u64, h_bytes + narrow_g, page) - h_bytes;
+        try testing.expect(engine.aliasPlan(engine.borrow_from, base_l.g -| keep).layer_count > 0);
+
+        const pool_was = core.poolGate();
+        try core.closePool(.refuse);
+        defer core.closePool(pool_was) catch {};
+
+        const fills_before = engine.fill_experts_total;
+        try dsv41_model.reserveNew(m, reach);
+        defer dsv41_model.resetState(m);
+        const wide_lg = try dsv41_plan.wide(m, &prompt, .last, null);
+        defer _ = mlx.mlx_array_free(wide_lg);
+        try testing.expectEqualSlices(f32, prefill_ref, try evalSlice(wide_lg));
+        try testing.expect(!core.arenaLeaseHeld());
+        try testing.expect(!engine.layers[4].borrowed);
+
+        const step_lg = try dsv41_plan.run(m, &.{7}, .last, null);
+        defer _ = mlx.mlx_array_free(step_lg);
+        try testing.expectEqualSlices(f32, step_ref, try evalSlice(step_lg));
+        try testing.expectEqual(fills_before, engine.fill_experts_total);
+    }
+    try testing.expect(core.arenaLayout() == null);
+    try testing.expectEqual(@as(u64, 0), core.arenaTotal());
+}

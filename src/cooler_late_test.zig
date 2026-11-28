@@ -357,6 +357,10 @@ test "cooler contract: after a Cooler load's warm, and after one whose served wa
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
             const cooler_warm = @import("cooler_warm.zig");
+            const dsv41_plan = @import("dsv41/dsv41_plan.zig");
+            const was_force_alias = dsv41_plan.force_alias_for_test;
+            dsv41_plan.force_alias_for_test = true;
+            defer dsv41_plan.force_alias_for_test = was_force_alias;
             var tmp = testing.tmpDir(.{ .iterate = true });
             defer tmp.cleanup();
             shared.root_hook = tmp.dir;

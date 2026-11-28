@@ -268,7 +268,7 @@ pub fn planBuild(xfm: Model) !void {
     const p = m.recorded.?;
     const chunk = @min(@import("../prefill_plan.zig").widestPrefillWidth(&xfm.config), p.reach);
     _ = try dsv41_plan.regionAt(m, p, chunk);
-    try dsv41_plan.makeArenaWithBorrowBudget(m, p, xfm.expert_stream, .within_wide);
+    try dsv41_plan.makeArenaWithBorrowBudget(m, p, dsv41_plan.aliasEngineForServing(xfm.expert_stream), .within_wide);
     m.recorded = null;
     m.plans = p;
 }

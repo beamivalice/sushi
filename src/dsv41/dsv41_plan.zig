@@ -765,6 +765,21 @@ pub fn makeArena(m: *Model, p: *Plans) !void {
 
 pub const BorrowMode = enum { all_from_borrow, within_wide };
 
+/// Test hook: allow `planBuild` to alias decoder slabs even on a resident load so tiny-fixture tests can
+/// exercise lent-route late-compile contracts without artificially forcing SSD streaming.
+pub var force_alias_for_test: bool = false;
+
+/// Returns `engine` for tail-aliasing only when experts stream from SSD (`!resident`), or under a test hook.
+/// A resident load holds every routed expert in RAM ("routes read no SSD") and already fits the full wide arena
+/// inside its static-bill budget (`openLedger`); aliasing a resident layer's slabs into the wide arena tail forces
+/// SSD reads on wide prefill and a ~300 ms synchronous SSD refill on every request's first decode tick.
+pub fn aliasEngineForServing(engine: ?*expert_stream.Engine) ?*expert_stream.Engine {
+    const eng = engine orelse return null;
+    if (!eng.plan.resident) return eng;
+    if (comptime @import("builtin").is_test) if (force_alias_for_test) return eng;
+    return null;
+}
+
 pub fn makeArenaWithBorrow(m: *Model, p: *Plans, engine: ?*expert_stream.Engine) !void {
     return makeArenaWithBorrowBudget(m, p, engine, .all_from_borrow);
 }
