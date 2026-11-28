@@ -19,8 +19,10 @@ pub const Arm = enum { rows, gemm, gemv };
 /// Per-call launch options; the default is a plain serial call.
 pub const Opts = struct {
     rows: project_rows.Mode = .{},
-    /// The caller's transient bill holds `trunk_gemm.DECODED_SCRATCH_BYTES`; others keep the sorted GEMM.
+    /// The caller's transient bill holds `trunk_gemm.DECODED_SCRATCH_BYTES` (or `decoded_max_weights` f16); others keep the sorted GEMM.
     decoded_billed: bool = false,
+    decoded_max_weights: usize = trunk_gemm.DECODED_MAX_WEIGHTS,
+    decoded_min_rows: c_int = trunk_gemm.DECODED_MIN_ROWS,
 };
 
 /// `x` [rows, in] through the one-bank projection `p` (trellis [1, in/16, out/16, n]): [rows, out] in x's dtype.
@@ -445,8 +447,12 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, grou
     defer _ = mlx.mlx_array_free(prepared);
     const inner = if ((force_arm orelse .gemm) == .gemm) blk: {
         const out_dim: c_int = mlx.getShape(p.trellis)[2] * 16;
-        if (groups == 1 and trunk_gemm.decodedServes(opts.decoded_billed, @intCast(rows), mlx.getShape(x)[1], out_dim))
-            break :blk try trunk_gemm.innerDense(s, prepared, p.trellis);
+        if (trunk_gemm.decodedServesWith(opts.decoded_billed, @intCast(rows), mlx.getShape(x)[1], out_dim, groups, opts.decoded_min_rows, opts.decoded_max_weights)) {
+            break :blk if (groups == 1)
+                try trunk_gemm.innerDense(s, prepared, p.trellis)
+            else
+                try trunk_gemm.innerDenseGrouped(s, prepared, p.trellis, @intCast(groups));
+        }
         break :blk try kernels.innerGemmSortedTable(s, prepared, p.trellis, slots, kernels.gemmWindowRows(), true, inputs.tab);
     } else try kernels.indexedGemvCoopF16(s, prepared, p.trellis, slots);
     defer _ = mlx.mlx_array_free(inner);
@@ -1668,7 +1674,7 @@ test "exl3 Ultra pins the K5 query projection geometry at every decode width" {
         const geo = try Geo.init(weight, null, .{ .exact = true });
         for (geo.rows) |slot| {
             const g = slot.?.g;
-            try std.testing.expectEqual(@as(c_int, if (n == 80) 1 else 4), g.kph);
+            try std.testing.expectEqual(@as(c_int, if (n == 80) 2 else 4), g.kph);
             try std.testing.expectEqual(@as(c_int, 1), g.nsplit);
         }
     }

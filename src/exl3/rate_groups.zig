@@ -16,7 +16,9 @@ const root = @import("root.zig");
 const fuse = @import("fuse.zig");
 const riders = @import("riders_gated.zig");
 const shared_trellis = @import("shared_trellis.zig");
+const project_rows = @import("project_rows.zig");
 const linear = @import("linear.zig");
+const trunk_gemm = @import("trunk_gemm.zig");
 
 const max_groups = group_layout.max_groups;
 
@@ -866,12 +868,14 @@ const FuseKey = struct {
     sn: u32,
     coop: bool,
     b_first: bool,
+    shared_nax: bool = false,
+    shared_nsplit: c_int = 1,
 };
 
 const FusedStage = struct { kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config };
 var fused_stages: std.AutoHashMapUnmanaged(FuseKey, FusedStage) = .empty;
 var fused_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const ReduceKey = struct { hidden: c_int, rows: c_int, topk: c_int, expand_dt: ?mlx.mlx_dtype = null };
+const ReduceKey = struct { hidden: c_int, rows: c_int, topk: c_int, shared_nsplit: c_int = 1, expand_dt: ?mlx.mlx_dtype = null };
 var fused_reduce_cfgs: kernel_src.CfgCache(ReduceKey, 16) = .{};
 var fused_reduce_expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -879,8 +883,10 @@ var fused_reduce_expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
 /// stream's `post` `[rows, 4]` and `comb` `[rows, 4, 4]` (f32).
 pub const StreamExpand = struct { x: mlx.mlx_array, post: mlx.mlx_array, comb: mlx.mlx_array };
 var fused_reduce_redo_kernel: ?mlx.mlx_fast_metal_kernel = null;
-/// Test and bench arm: which part's threadgroups the fused grid lists first.
-pub var fused_shared_first: bool = false;
+/// Test and bench arm: overrides which part's threadgroups the fused grid lists first (null = default per chain).
+pub var fused_shared_first: ?bool = null;
+/// Test and bench arm: disables NAX matmul2d for the multi-row shared expert.
+pub var shared_nax_off: bool = false;
 
 /// One set for each side of the host: an array belongs to the side that made it.
 var zero_slot_rows: @import("side_cache.zig").SideCache(usize, kernels.DECODE_ROWS_MAX + 1) = .{};
@@ -901,6 +907,61 @@ fn intArgs(alloc: std.mem.Allocator, pairs: anytype) ![]const fuse.IntArg {
 
 fn halfOut(alloc: std.mem.Allocator, rows: c_int, dim: c_int) !fuse.Out {
     return .{ .shape = try alloc.dupe(c_int, &.{ rows, dim }), .dtype = .float16 };
+}
+
+fn typedOut(alloc: std.mem.Allocator, rows: c_int, dim: c_int, dtype: mlx.mlx_dtype) !fuse.Out {
+    return .{ .shape = try alloc.dupe(c_int, &.{ rows, dim }), .dtype = dtype };
+}
+
+fn sharedPairNsplit(in_dim: c_int) c_int {
+    if (@rem(in_dim, 4 * 128) == 0) return 4;
+    if (@rem(in_dim, 2 * 128) == 0) return 2;
+    return 1;
+}
+
+fn sharedDownNsplit(in_dim: c_int) c_int {
+    if (@rem(in_dim, 4 * 16) == 0) return 4;
+    if (@rem(in_dim, 2 * 16) == 0) return 2;
+    return 1;
+}
+
+fn sharedNaxInts(alloc: std.mem.Allocator, in_dim: c_int, out_dim: c_int, rows: c_int, nsplit: c_int, n: c_int) ![]const fuse.IntArg {
+    const slice = @divExact(in_dim, nsplit);
+    const chunk = @min(slice, @max(128, @divFloor(@divFloor(4096, rows), 128) * 128));
+    const kt = @divExact(slice, 16);
+    const unr: c_int = if (@rem(kt, 2) == 0 and @rem(chunk, 32) == 0) 2 else 1;
+    return intArgs(alloc, .{
+        .{ "IDIM", in_dim }, .{ "ODIM", out_dim }, .{ "ROWS", rows }, .{ "GROUPS", 1 },
+        .{ "TGRP", 4 }, .{ "KPH", 1 }, .{ "NSPLIT", nsplit }, .{ "CHUNK", chunk },
+        .{ "FOLD", 0 }, .{ "NHW", n }, .{ "SB1", out_dim }, .{ "SB2", out_dim }, .{ "SB3", out_dim },
+        .{ "UNR", unr }, .{ "R32", 1 }, .{ "SW", 1 },
+    });
+}
+
+fn sharedNaxPairBody(alloc: std.mem.Allocator) ![]const u8 {
+    const rep =
+        \\const bool upper = (threadgroup_position_in_grid.z & 1u) != 0u;
+        \\const uint split = uint(threadgroup_position_in_grid.z) >> 1u;
+        \\const device half *suh = upper ? suhu : suhg;
+        \\const device half *svh = suh;
+        \\const device ushort *trellis = upper ? tu : tg;
+        \\device float *y = upper ? yu : yg;
+    ;
+    const s0 = kernels.metalReplaceFound(project_rows.ROWS_NAX_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", rep);
+    return std.mem.concat(alloc, u8, &.{ "typedef bfloat16_t OutT;\n", s0 });
+}
+
+fn sharedNaxDownBody(alloc: std.mem.Allocator) ![]const u8 {
+    const s0 = kernels.metalReplaceFound(project_rows.ROWS_NAX_PREPPED_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", "const uint split = uint(threadgroup_position_in_grid.z);");
+    return std.mem.concat(alloc, u8, &.{ "typedef bfloat16_t OutT;\n", s0 });
+}
+
+/// Multi-row NAX shared expert: matmul2d(16, 32, 16) computes 3..16 rows in one weight pass, avoiding
+/// redundant shared-expert weight walks on DSpark verify and prompt-lookup copy-draft rounds.
+fn sharedNaxActive(rows: c_int, rb: *const Ragged, se: SharedExpert) bool {
+    return kernels.gemmNaxOn() and !shared_nax_off and rows >= 3 and rows <= project_rows.NAX_ROWS_MAX and
+        rb.inter >= 512 and @rem(rb.inter, 128) == 0 and @rem(rb.hidden, 128) == 0 and
+        se.bank.gate.suh.ctx != null and se.bank.up.suh.ctx != null and se.bank.down.suh.ctx != null;
 }
 
 fn outs1(alloc: std.mem.Allocator, a: fuse.Out) ![]const fuse.Out {
@@ -962,27 +1023,53 @@ fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
     const groups = if (grouped_rows) @divTrunc(rows + span - 1, span) else rows;
     const pair_tiles = @divExact(k.inter, 16);
     const down_tiles = @divExact(k.hidden, 16);
+    const nsplit = k.shared_nsplit;
     switch (k.stage) {
-        .prep => return .{
+        .prep => if (k.shared_nax) return .{
+            .launch = .{ .tgs = .{ 1, 1, 1 }, .threads = 32, .ints = &.{}, .outs = try outs2(alloc, try halfOut(alloc, 1, 1), try halfOut(alloc, 1, 1)) },
+            .body = "if (thread_index_in_threadgroup == 0u && threadgroup_position_in_grid.x == 0u && threadgroup_position_in_grid.y == 0u) { yg[0] = half(0); yu[0] = half(0); }",
+            .ins = &.{ "x", "suhg", "suhu", "slots" },
+            .outs = &.{ "yg", "yu" },
+        } else return .{
             .launch = .{ .tgs = .{ @divExact(k.hidden, 128), rows, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "IDIM", k.hidden }, .{ "TOPK", 1 } }), .outs = try outs2(alloc, try halfOut(alloc, rows, k.hidden), try halfOut(alloc, rows, k.hidden)) },
             .body = kernels.LANE_PREP_UNSORTED_SOURCE,
             .ins = &.{ "x", "suhg", "suhu", "slots" },
             .outs = &.{ "yg", "yu" },
         },
-        .pair => return .{
+        .pair => if (k.shared_nax) return .{
+            .launch = .{ .tgs = .{ @divExact(k.inter, 128), 1, 2 * nsplit }, .threads = 128, .ints = try sharedNaxInts(alloc, k.hidden, k.inter, rows, nsplit, n), .outs = try outs2(alloc, try typedOut(alloc, rows * nsplit, k.inter, .float32), try typedOut(alloc, rows * nsplit, k.inter, .float32)) },
+            .body = try sharedNaxPairBody(alloc),
+            .ins = &.{ "x", "tg", "tu", "suhg", "suhu" },
+            .outs = &.{ "yg", "yu" },
+            .header = try std.mem.concat(alloc, u8, &.{ header_text, project_rows.ROWS_NAX_FRAGS }),
+        } else return .{
             .launch = .{ .tgs = .{ if (tile_pairs) @divExact(pair_tiles, 2) else pair_tiles, groups, 2 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "IDIM", k.hidden }, .{ "ODIM", k.inter }, .{ "NHW", n }, .{ "ROWS", rows }, .{ "SHARED_ROWS", span } }), .outs = try outs2(alloc, try halfOut(alloc, rows, k.inter), try halfOut(alloc, rows, k.inter)) },
             .body = if (grouped_rows) kernels.SHARED_ROWS_PAIR_SOURCE else if (tile_pairs) kernels.ONE_ROW_PAIR_SOURCE else kernels.LANE_PAIR_SOURCE,
             .ins = &.{ "xg", "xu", "tg", "tu", "slots" },
             .outs = &.{ "yg", "yu" },
             .header = header_text,
         },
-        .mid => return .{
+        .mid => if (k.shared_nax) {
+            const body = if (k.limit > 0) try clampSwiglu(alloc, kernels.DECODE_MID_SOURCE, k.limit) else try alloc.dupe(u8, kernels.DECODE_MID_SOURCE);
+            return .{
+                .launch = .{ .tgs = .{ @divExact(k.inter, 128), rows, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "IDIM", k.inter }, .{ "NSPLIT", nsplit } }), .outs = try outs1(alloc, try halfOut(alloc, rows, k.inter)) },
+                .body = body,
+                .ins = &.{ "ig", "iu", "svhg", "svhu", "suhd", "slots" },
+                .outs = &.{"prepared"},
+            };
+        } else return .{
             .launch = .{ .tgs = .{ @divExact(k.inter, 128), rows, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "ODIM", k.inter }, .{ "CLAMP_LIMIT", k.limit } }), .outs = try outs1(alloc, try halfOut(alloc, rows, k.inter)) },
             .body = kernels.DOWN_LANE_MID_SOURCE,
             .ins = &.{ "ig", "iu", "svhg", "svhu", "suhd", "slots" },
             .outs = &.{"yd"},
         },
-        .down => return .{
+        .down => if (k.shared_nax) return .{
+            .launch = .{ .tgs = .{ @divExact(k.hidden, 128), 1, nsplit }, .threads = 128, .ints = try sharedNaxInts(alloc, k.inter, k.hidden, rows, nsplit, n), .outs = try outs1(alloc, try typedOut(alloc, rows * nsplit, k.hidden, .float32)) },
+            .body = try sharedNaxDownBody(alloc),
+            .ins = &.{ "x", "trellis", "svh" },
+            .outs = &.{"y"},
+            .header = try std.mem.concat(alloc, u8, &.{ header_text, project_rows.ROWS_NAX_FRAGS }),
+        } else return .{
             .launch = .{ .tgs = .{ if (tile_pairs) @divExact(down_tiles, 2) else down_tiles, groups, 1 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "IDIM", k.inter }, .{ "ODIM", k.hidden }, .{ "NHW", n }, .{ "ROWS", rows }, .{ "SHARED_ROWS", span } }), .outs = try outs1(alloc, try halfOut(alloc, rows, k.hidden)) },
             .body = if (grouped_rows) kernels.SHARED_ROWS_COOP_SOURCE else if (tile_pairs) kernels.ONE_ROW_COOP_SOURCE else kernels.DOWN_LANE_COOP_SOURCE,
             .ins = &.{ "x", "trellis", "slots" },
@@ -1020,6 +1107,7 @@ fn buildStage(gpa: std.mem.Allocator, k: FuseKey) !FusedStage {
     }
     if (k.stage == .mid) try name.print(alloc, "_clamp{d}", .{k.limit});
     if (k.coop) try name.appendSlice(alloc, if (k.rows == 1) "_one" else "_shared_rows");
+    if (k.shared_nax) try name.appendSlice(alloc, "_snax");
     if (k.tile_major) try name.appendSlice(alloc, "_tm");
     try name.append(alloc, 0);
     var slot: ?mlx.mlx_fast_metal_kernel = null;
@@ -1042,14 +1130,22 @@ fn applyStage(s: mlx.mlx_stream, f: *const FusedStage, a: []const mlx.mlx_array,
     return kernels.applyOuts(s, f.kernel, all[0 .. a.len + b.len], f.cfg, n_out);
 }
 
+/// `REDUCE_FUSED_SOURCE` without `S_DOWN_NSPLIT`, used by `PREFILL_REDUCE_SOURCE` where both down planes are f16.
+const REDUCE_FUSED_PREFILL_BASE: [:0]const u8 = REDUCE_FUSED_HEAD ++
+    \\const device half *rows_in = own ? s_inner : inner;
+    \\const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
+    \\float4 v = float4(float(rows_in[xb + lane]), float(rows_in[xb + lane + 32u]), float(rows_in[xb + lane + 64u]), float(rows_in[xb + lane + 96u]));
+    \\
+++ REDUCE_FUSED_TAIL;
+
 /// The finish reduce with the shared expert's down finish in one more simdgroup per threadgroup: its H128 and `svh`
 /// scale, rounded to the shared chain's dtype `ST`, then the routed sum's own `T` add, in the statements of the two
-/// reduces it replaces.
-pub const REDUCE_FUSED_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_ROWS_PLAIN ++ REDUCE_FUSED_SCALE ++ REDUCE_XB_PLAIN ++ REDUCE_FUSED_TAIL;
+/// reduces it replaces. Sums `S_DOWN_NSPLIT` k-split partials when the shared down ran on NAX.
+pub const REDUCE_FUSED_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_LOAD_PLAIN ++ REDUCE_FUSED_TAIL;
 
 /// The same reduce reading the planes of the picks `part` holds (`redo[slot]` is a row of `part`, -1 where the kept plane
 /// of `inner` stands): a settle that recomputed some picks sums over the kept planes and theirs, in the same order.
-pub const REDUCE_FUSED_REDO_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_ROWS_REDO ++ REDUCE_FUSED_SCALE ++ REDUCE_XB_REDO ++ REDUCE_FUSED_TAIL;
+pub const REDUCE_FUSED_REDO_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_LOAD_REDO ++ REDUCE_FUSED_TAIL;
 
 const REDUCE_FUSED_HEAD =
     \\threadgroup float vals[(uint(TOPK) + 1u) * 128u];
@@ -1060,33 +1156,40 @@ const REDUCE_FUSED_HEAD =
     \\const uint base = block * 128u;
     \\const bool own = sg >= uint(TOPK);
     \\const uint slot = own ? row : row * uint(TOPK) + sg;
-    \\
-;
-const REDUCE_ROWS_PLAIN =
-    \\const device half *rows_in = own ? s_inner : inner;
-    \\
-;
-const REDUCE_ROWS_REDO =
-    \\const int at = own ? -1 : redo[slot];
-    \\const device half *rows_in = own ? s_inner : (at >= 0 ? part : inner);
-    \\
-;
-const REDUCE_FUSED_SCALE =
     \\const device half *scale = own ? s_svh : svh;
+    \\const size_t sb = own ? (size_t)base : (size_t)uint(slots[slot]) * (size_t)(ODIM) + base;
     \\
 ;
-const REDUCE_XB_PLAIN =
-    \\const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
+const REDUCE_LOAD_PLAIN =
+    \\float4 v = 0.0f;
+    \\if (own) {
+    \\  for (uint sp = 0u; sp < uint(S_DOWN_NSPLIT); sp++) {
+    \\    const size_t xbs = ((size_t)slot * uint(S_DOWN_NSPLIT) + sp) * (size_t)(ODIM) + base;
+    \\    v += float4(float(s_inner[xbs + lane]), float(s_inner[xbs + lane + 32u]), float(s_inner[xbs + lane + 64u]), float(s_inner[xbs + lane + 96u]));
+    \\  }
+    \\} else {
+    \\  const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
+    \\  v = float4(float(inner[xb + lane]), float(inner[xb + lane + 32u]), float(inner[xb + lane + 64u]), float(inner[xb + lane + 96u]));
+    \\}
     \\
 ;
-const REDUCE_XB_REDO =
-    \\const size_t xb = (size_t)(at >= 0 ? uint(at) : slot) * (size_t)(ODIM) + base;
+const REDUCE_LOAD_REDO =
+    \\float4 v = 0.0f;
+    \\if (own) {
+    \\  for (uint sp = 0u; sp < uint(S_DOWN_NSPLIT); sp++) {
+    \\    const size_t xbs = ((size_t)slot * uint(S_DOWN_NSPLIT) + sp) * (size_t)(ODIM) + base;
+    \\    v += float4(float(s_inner[xbs + lane]), float(s_inner[xbs + lane + 32u]), float(s_inner[xbs + lane + 64u]), float(s_inner[xbs + lane + 96u]));
+    \\  }
+    \\} else {
+    \\  const int at = redo[slot];
+    \\  const device half *rows_in = at >= 0 ? part : inner;
+    \\  const size_t xb = (size_t)(at >= 0 ? uint(at) : slot) * (size_t)(ODIM) + base;
+    \\  v = float4(float(rows_in[xb + lane]), float(rows_in[xb + lane + 32u]), float(rows_in[xb + lane + 64u]), float(rows_in[xb + lane + 96u]));
+    \\}
     \\
 ;
 const REDUCE_FUSED_TAIL =
-    \\const size_t sb = own ? (size_t)base : (size_t)uint(slots[slot]) * (size_t)(ODIM) + base;
     \\const float scv = 0.08838834764831845f;
-    \\float4 v = float4(float(rows_in[xb + lane]), float(rows_in[xb + lane + 32u]), float(rows_in[xb + lane + 64u]), float(rows_in[xb + lane + 96u]));
     \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
     \\  const float p0 = simd_shuffle_xor(v.x, bit);
     \\  const float p1 = simd_shuffle_xor(v.y, bit);
@@ -1187,9 +1290,9 @@ fn unitScore(s: mlx.mlx_stream) !mlx.mlx_array {
 /// A settle's recomputed picks: their planes, and for each slot its row of `part` or -1.
 const Redo = struct { part: mlx.mlx_array, at: mlx.mlx_array };
 
-fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, sdown: mlx.mlx_array, se: SharedExpert, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, expand: ?StreamExpand, redo: ?Redo) !mlx.mlx_array {
+fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, sdown: mlx.mlx_array, se: SharedExpert, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, expand: ?StreamExpand, redo: ?Redo, shared_nsplit: c_int) !mlx.mlx_array {
     const xdt = if (expand) |e| mlx.mlx_array_dtype(e.x) else out_dtype;
-    const key: ReduceKey = .{ .hidden = rb.hidden, .rows = rows, .topk = topk, .expand_dt = if (expand != null) xdt else null };
+    const key: ReduceKey = .{ .hidden = rb.hidden, .rows = rows, .topk = topk, .shared_nsplit = shared_nsplit, .expand_dt = if (expand != null) xdt else null };
     const cfg = fused_reduce_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -1202,6 +1305,7 @@ fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots:
         if (expand != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "XT", xdt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", rb.hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "S_DOWN_NSPLIT", shared_nsplit));
         fused_reduce_cfgs.put(key, c);
         break :blk c;
     };
@@ -1241,6 +1345,7 @@ pub fn moeDecodeClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *con
 pub const Kept = struct {
     down: mlx.mlx_array = .{ .ctx = null },
     shared: mlx.mlx_array = .{ .ctx = null },
+    shared_nsplit: c_int = 1,
 
     pub fn deinit(self: *Kept) void {
         for ([_]mlx.mlx_array{ self.down, self.shared }) |a| if (a.ctx != null) {
@@ -1249,10 +1354,11 @@ pub const Kept = struct {
         self.* = .{};
     }
 
-    fn hold(self: *Kept, down: mlx.mlx_array, shared: mlx.mlx_array) void {
+    fn hold(self: *Kept, down: mlx.mlx_array, shared: mlx.mlx_array, shared_nsplit: c_int) void {
         self.deinit();
         self.down = mlx.mlx_array_new();
         self.shared = mlx.mlx_array_new();
+        self.shared_nsplit = shared_nsplit;
         _ = mlx.mlx_array_set(&self.down, down);
         _ = mlx.mlx_array_set(&self.shared, shared);
     }
@@ -1280,6 +1386,9 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
     if (group > 0) kernels.logGroupedEngaged(group);
     const layout = kernels.gemvLayout(@divExact(rb.inter, 16));
     const down_layout = kernels.gemvLayout(@divExact(rb.hidden, 16));
+    const shared_nax = sharedNaxActive(rows, rb, se);
+    const shared_pair_nsplit: c_int = if (shared_nax) sharedPairNsplit(rb.hidden) else 1;
+    const shared_down_nsplit: c_int = if (shared_nax) sharedDownNsplit(rb.inter) else 1;
     var key: FuseKey = .{
         .stage = .prep,
         .nslots = nslots,
@@ -1298,7 +1407,9 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
         .sdec = se.dec,
         .sn = sr.n,
         .coop = false,
-        .b_first = fused_shared_first,
+        .b_first = fused_shared_first orelse true,
+        .shared_nax = shared_nax,
+        .shared_nsplit = shared_pair_nsplit,
     };
     const zeros = try zeroSlots(@intCast(rows));
     const prep_ov = try applyStage(s, try stageFor(key), &.{ x, rb.suh[0], rb.suh[1], slots }, &.{ x, se.bank.gate.suh, se.bank.up.suh, zeros }, 3);
@@ -1317,8 +1428,12 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
     key.funnel = pair_layout.funnel;
     @memcpy(key.classes[0..pair.len], pair);
     key.class_count = pair.len;
-    key.coop = sr.coop_pair;
-    const pair_ov = try applyStage(s, try stageFor(key), &.{ prep, rb.trellis[0], rb.trellis[1], slots, rb.meta }, &.{ sxg, sxu, se.bank.gate.trellis, se.bank.up.trellis, zeros }, 4);
+    key.coop = sr.coop_pair and !shared_nax;
+    const pair_se_ins = if (shared_nax)
+        [_]mlx.mlx_array{ x, se.bank.gate.trellis, se.bank.up.trellis, se.bank.gate.suh, se.bank.up.suh }
+    else
+        [_]mlx.mlx_array{ sxg, sxu, se.bank.gate.trellis, se.bank.up.trellis, zeros };
+    const pair_ov = try applyStage(s, try stageFor(key), &.{ prep, rb.trellis[0], rb.trellis[1], slots, rb.meta }, &pair_se_ins, 4);
     defer _ = mlx.mlx_vector_array_free(pair_ov);
     const ig = try getOut(pair_ov, 0);
     defer _ = mlx.mlx_array_free(ig);
@@ -1352,15 +1467,20 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
     key.limit = 0;
     @memcpy(key.classes[0..downs.len], downs);
     key.class_count = downs.len;
-    key.coop = sr.coop_down;
-    const down_ov = try applyStage(s, try stageFor(key), &.{ middle, rb.trellis[2], slots, rb.meta }, &.{ smid, se.bank.down.trellis, zeros }, 2);
+    key.coop = sr.coop_down and !shared_nax;
+    key.shared_nsplit = shared_down_nsplit;
+    const down_se_ins = if (shared_nax)
+        [_]mlx.mlx_array{ smid, se.bank.down.trellis, se.bank.down.svh }
+    else
+        [_]mlx.mlx_array{ smid, se.bank.down.trellis, zeros };
+    const down_ov = try applyStage(s, try stageFor(key), &.{ middle, rb.trellis[2], slots, rb.meta }, &down_se_ins, 2);
     defer _ = mlx.mlx_vector_array_free(down_ov);
     const down = try getOut(down_ov, 0);
     defer _ = mlx.mlx_array_free(down);
     const sdown = try getOut(down_ov, 1);
     defer _ = mlx.mlx_array_free(sdown);
-    if (keep) |k| k.hold(down, sdown);
-    return try reduceFused(s, down, rb, slots, scores, sdown, se, rows, topk, out_dtype, expand, null);
+    if (keep) |k| k.hold(down, sdown, shared_down_nsplit);
+    return try reduceFused(s, down, rb, slots, scores, sdown, se, rows, topk, out_dtype, expand, null, shared_down_nsplit);
 }
 
 /// The chain `kept` came from, over resolved `slots` (`host_slots`, flat `[rows * topk]`) that differ from its own at the
@@ -1406,7 +1526,7 @@ pub fn moeDecodeClampedSharedRedo(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *cons
     defer _ = mlx.mlx_array_free(middle);
     const part = try downPreparedMixed(s, middle, rb, slots_b, downs, 0);
     defer _ = mlx.mlx_array_free(part);
-    return try reduceFused(s, kept.down, rb, slots, scores, kept.shared, se, rows, topk, out_dtype, null, .{ .part = part, .at = redo_at });
+    return try reduceFused(s, kept.down, rb, slots, scores, kept.shared, se, rows, topk, out_dtype, null, .{ .part = part, .at = redo_at }, kept.shared_nsplit);
 }
 
 // ---- Qwen's shared expert inside the unprepared decode chain ----
@@ -1559,7 +1679,7 @@ fn gatedFold(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: mlx.m
         .classes = std.mem.zeroes([max_groups]RateClass),
         .class_count = pair_classes.len,
         .dec = kernels.activeDecode(),
-        .b_first = fused_shared_first,
+        .b_first = fused_shared_first orelse false,
     };
     @memcpy(key.classes[0..pair_classes.len], pair_classes);
     var buf: [11]mlx.mlx_array = undefined;
@@ -2150,7 +2270,7 @@ pub const SHARED_PREPARE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernel
 
 /// `REDUCE_FUSED_SOURCE` over a sorted down plane: the routed slot's row is `inverse[slot]`, and the sum is the f32 add
 /// of the routed bf16 sum and the shared bf16 result, stored f32 (the add the forward makes after both).
-const PREFILL_REDUCE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_SOURCE, "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;", "const size_t xb = (own ? (size_t)slot : (size_t)inverse[slot]) * (size_t)(ODIM) + base;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", "y[yb + lane] = float(T(a0)) + float(ST(b0));"), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", "y[yb + lane + 32u] = float(T(a1)) + float(ST(b1));"), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", "y[yb + lane + 64u] = float(T(a2)) + float(ST(b2));"), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "y[yb + lane + 96u] = float(T(a3)) + float(ST(b3));");
+const PREFILL_REDUCE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_PREFILL_BASE, "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;", "const size_t xb = (own ? (size_t)slot : (size_t)inverse[slot]) * (size_t)(ODIM) + base;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", "y[yb + lane] = float(T(a0)) + float(ST(b0));"), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", "y[yb + lane + 32u] = float(T(a1)) + float(ST(b1));"), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", "y[yb + lane + 64u] = float(T(a2)) + float(ST(b2));"), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "y[yb + lane + 96u] = float(T(a3)) + float(ST(b3));");
 
 /// `PREFILL_REDUCE_SOURCE` reading a routed row from the plane of its rate group (`inner0..`).
 pub const PREFILL_REDUCE_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
@@ -2246,12 +2366,16 @@ fn zerosU32(s: mlx.mlx_stream, rows: c_int) !mlx.mlx_array {
     return out;
 }
 
-/// One shared-expert projection over every row: the sorted GEMM on a window table of `rows`, the trunk's own GEMM arm.
+/// One shared-expert projection over every row: decoded NAX GEMM where admitted (same bytes, decoded once for the
+/// chunk), else the sorted GEMM on a window table of `rows`.
 fn sharedGemm(s: mlx.mlx_stream, prepared: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, back: exl3.Decode, zeros: mlx.mlx_array, rows: c_int) !mlx.mlx_array {
-    const win = kernels.gemmWindowRows();
-    const tab = (try linear.gemmInputs(1, @intCast(rows), win)).tab;
     kernels.setDecodeParams(dec);
     defer kernels.setDecodeParams(back);
+    const tsh = mlx.getShape(p.trellis);
+    if (linear.force_arm == null and trunk_gemm.decodedServes(true, rows, tsh[1] * 16, tsh[2] * 16))
+        return trunk_gemm.innerDense(s, prepared, p.trellis);
+    const win = kernels.gemmWindowRows();
+    const tab = (try linear.gemmInputs(1, @intCast(rows), win)).tab;
     return kernels.innerGemmSortedTable(s, prepared, p.trellis, zeros, win, true, tab);
 }
 
@@ -3078,6 +3202,9 @@ fn sharedFusedCase(t: std.mem.Allocator, s: mlx.mlx_stream, f: *const Fixture, s
     var bound = se;
     bound.lane = &lane;
     for (1..kernels.DECODE_ROWS_MAX + 1) |r| try std.testing.expectEqual(sharedRate(se, &f.rb, r), sharedRate(bound, &f.rb, r));
+    const nax_active = sharedNaxActive(@intCast(rows), &f.rb, se);
+    var ref_fused: []u8 = &.{};
+    defer if (ref_fused.len > 0) t.free(ref_fused);
     const Variant = struct { first: bool, expert: SharedExpert };
     const all_vars = [_]Variant{
         .{ .first = false, .expert = se },
@@ -3098,9 +3225,27 @@ fn sharedFusedCase(t: std.mem.Allocator, s: mlx.mlx_stream, f: *const Fixture, s
         const got_bytes = try bytesOf(s, got, &cg);
         // The shared expert adds no dispatch: prepare, pair, mid, down and reduce are the routed chain's five.
         try std.testing.expectEqual(before + 5, kernels.fusedDispatchCount());
-        try std.testing.expectEqualSlices(u8, want_bytes, got_bytes);
+        if (!nax_active) {
+            try std.testing.expectEqualSlices(u8, want_bytes, got_bytes);
+        } else {
+            if (ref_fused.len == 0) {
+                ref_fused = try t.dupe(u8, got_bytes);
+                const wf = std.mem.bytesAsSlice(f32, want_bytes);
+                const gf = std.mem.bytesAsSlice(f32, got_bytes);
+                var max_diff: f32 = 0;
+                var max_ref: f32 = 0;
+                for (wf, gf) |a, b| {
+                    try std.testing.expect(std.math.isFinite(b));
+                    max_diff = @max(max_diff, @abs(a - b));
+                    max_ref = @max(max_ref, @abs(a));
+                }
+                try std.testing.expect(max_diff <= @max(@as(f32, 2e-2), max_ref * 1e-2));
+            } else {
+                try std.testing.expectEqualSlices(u8, ref_fused, got_bytes);
+            }
+        }
     }
-    if (opts.with_expand) try expandedReduceCase(t, s, f, se, limit, dec, want_bytes, hidden, rows, seed);
+    if (opts.with_expand) try expandedReduceCase(t, s, f, se, limit, dec, if (nax_active) ref_fused else want_bytes, hidden, rows, seed);
 }
 
 fn truncMantissa(v: f32) f32 {
@@ -3162,7 +3307,7 @@ test "exl3 rate groups: the shared expert riding the decode launches writes the 
     defer kernels.setDecodeParams(.mul1);
     defer {
         prepared_force = null;
-        fused_shared_first = false;
+        fused_shared_first = null;
     }
     prepared_force = true;
     const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 40, 40, 40 }, .{ 32, 26, 24 } };
@@ -3192,7 +3337,7 @@ test "exl3 rate groups: the shared expert riding a DSpark stage's one-group bank
     defer kernels.setDecodeParams(.mul1);
     defer {
         prepared_force = null;
-        fused_shared_first = false;
+        fused_shared_first = null;
     }
     prepared_force = true;
     const rates = [_][3]u32{.{ 32, 32, 32 }};
@@ -3221,7 +3366,8 @@ test "exl3 rate groups: the shared expert riding the decode launches at DeepSeek
     defer kernels.setDecodeParams(.mul1);
     defer {
         prepared_force = null;
-        fused_shared_first = false;
+        fused_shared_first = null;
+        shared_nax_off = false;
     }
     const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 40, 40, 40 }, .{ 32, 32, 26 } };
     const experts = [_]u32{ 3, 2, 2 };
@@ -3233,12 +3379,56 @@ test "exl3 rate groups: the shared expert riding the decode launches at DeepSeek
     defer freeBank(&se.bank);
     for ([_]usize{ 1, 4 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0xd5 + rows);
-        try sharedFusedCase(t.allocator, s, &f, se, 0xd5 + rows, .{
+        const opts: SharedFusedOpts = .{
             .all_variants = false,
             .with_expand = rows == 4,
             .first = rows == 4,
             .use_bound = rows == 4,
-        });
+        };
+        if (rows == 4) {
+            shared_nax_off = true;
+            try sharedFusedCase(t.allocator, s, &f, se, 0xd5 + rows, .{ .all_variants = false, .with_expand = false, .first = true, .use_bound = true });
+            shared_nax_off = false;
+        }
+        try sharedFusedCase(t.allocator, s, &f, se, 0xd5 + rows, opts);
+    }
+}
+
+test "exl3 rate groups: NAX shared expert matches lane reference and redo across TP4/TP2/TP1 widths and 3..16 rows" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
+    defer kernels.setDecodeParams(.mul1);
+    defer {
+        prepared_force = null;
+        fused_shared_first = null;
+        shared_nax_off = false;
+    }
+    prepared_force = true;
+    const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 40, 40, 40 } };
+    const experts = [_]u32{ 4, 4 };
+    const Case = struct { inter: usize, rows: []const usize };
+    for ([_]Case{
+        .{ .inter = 512, .rows = &.{ 3, 6 } },
+        .{ .inter = 1152, .rows = &.{ 8, 9 } },
+        .{ .inter = 2304, .rows = &.{ 12, 16 } },
+    }) |c| {
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        var f = try sharedLayer(arena.allocator(), s, 1024, c.inter, &rates, &experts, 6, 0xe1 + c.inter);
+        defer f.deinit();
+        var se = try sharedOf(&f);
+        defer freeBank(&se.bank);
+        for (c.rows) |rows| {
+            try f.redraw(arena.allocator(), rows, 400, null, 0xe1 + c.inter + rows);
+            try sharedFusedCase(t.allocator, s, &f, se, 0xe1 + c.inter + rows, .{
+                .all_variants = rows == 6,
+                .with_expand = rows == 6 or rows == 16,
+                .first = rows >= 8,
+                .use_bound = rows >= 8,
+            });
+            if (rows == 6 or rows == 16) try redoCase(t.allocator, s, &f, se);
+        }
     }
 }
 
@@ -3565,7 +3755,7 @@ test "exl3 rate groups: adjacent shared rows use one weight walk and match indep
     defer kernels.setDecodeParams(.mul1);
     defer {
         prepared_force = null;
-        fused_shared_first = false;
+        fused_shared_first = null;
     }
     prepared_force = true;
     var arena = std.heap.ArenaAllocator.init(t.allocator);

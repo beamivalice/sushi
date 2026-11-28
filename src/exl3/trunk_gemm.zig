@@ -12,8 +12,8 @@ pub var enabled: bool = true;
 /// Inner planes taken through the decoded path, for a test.
 pub var decoded_calls: u64 = 0;
 
-/// A one-bank trellis `[1, in/16, out/16, n]` decoded to its f16 weight `[out, in]`: the values the GEMMs' fragment
-/// reader hands their MMAs, each at its (output, input) place.
+/// A trellis bank `[G, in/16, out/16, n]` decoded to its f16 weight `[G, out, in]` (`[out, in]` when G == 1):
+/// the values the GEMMs' fragment reader hands their MMAs, each at its (bank, output, input) place.
 pub const DENSE_SOURCE: [:0]const u8 =
     \\constexpr uint N = uint(NHW);
     \\constexpr uint PACKED_W = N / 2u;
@@ -22,36 +22,44 @@ pub const DENSE_SOURCE: [:0]const u8 =
     \\const uint pair = uint(threadgroup_position_in_grid.x) * 4u + uint(simdgroup_index_in_threadgroup);
     \\if (pair >= OT / 2u) return;
     \\const uint tk = uint(threadgroup_position_in_grid.y);
-    \\const device uint *words = (const device uint *)trellis + ((size_t)tk * (size_t)OT + pair * 2u) * PACKED_W;
+    \\const size_t grp = size_t(threadgroup_position_in_grid.z);
+    \\const size_t bank_t = grp * (size_t(IDIM) / 16u) * (size_t)OT * PACKED_W;
+    \\const size_t bank_y = grp * (size_t)ODIM * (size_t)IDIM;
+    \\const device uint *words = (const device uint *)trellis + bank_t + ((size_t)tk * (size_t)OT + pair * 2u) * PACKED_W;
     \\const nfrag w0 = nax_wfrag_k<N>(words, lane);
     \\const nfrag w1 = nax_wfrag_k<N>(words + PACKED_W, lane);
     \\const short2 o = nax_origin(lane);
     \\const size_t k = (size_t)tk * 16u + uint(o.x);
     \\const size_t n0 = (size_t)pair * 32u + uint(o.y);
-    \\*(device half4 *)(y + n0 * IDIM + k) = half4(w0[0], w0[1], w0[2], w0[3]);
-    \\*(device half4 *)(y + (n0 + 8u) * IDIM + k) = half4(w0[4], w0[5], w0[6], w0[7]);
-    \\*(device half4 *)(y + (n0 + 16u) * IDIM + k) = half4(w1[0], w1[1], w1[2], w1[3]);
-    \\*(device half4 *)(y + (n0 + 24u) * IDIM + k) = half4(w1[4], w1[5], w1[6], w1[7]);
+    \\*(device half4 *)(y + bank_y + n0 * IDIM + k) = half4(w0[0], w0[1], w0[2], w0[3]);
+    \\*(device half4 *)(y + bank_y + (n0 + 8u) * IDIM + k) = half4(w0[4], w0[5], w0[6], w0[7]);
+    \\*(device half4 *)(y + bank_y + (n0 + 16u) * IDIM + k) = half4(w1[0], w1[1], w1[2], w1[3]);
+    \\*(device half4 *)(y + bank_y + (n0 + 24u) * IDIM + k) = half4(w1[4], w1[5], w1[6], w1[7]);
 ;
 
 var dense_slots: kernel_src.KernelSlots = kernel_src.no_kernels;
-const DenseKey = struct { in_dim: c_int, out_dim: c_int, n: c_int };
-var dense_cfgs: kernel_src.CfgCache(DenseKey, 16) = .{};
+const DenseKey = struct { groups: c_int, in_dim: c_int, out_dim: c_int, n: c_int };
+var dense_cfgs: kernel_src.CfgCache(DenseKey, 32) = .{};
 
-/// The bank's weight as f16 `[out, in]` under the active decode parameters.
+/// The bank's weight as f16 `[out, in]` (or `[G, out, in]` for G > 1) under the active decode parameters.
 pub fn decodeDense(s: mlx.mlx_stream, trellis: mlx.mlx_array) !mlx.mlx_array {
     const tsh = mlx.getShape(trellis);
-    if (tsh.len != 4 or tsh[0] != 1 or @rem(tsh[2], 2) != 0) return error.BadExl3Shape;
+    if (tsh.len != 4 or tsh[0] < 1 or @rem(tsh[2], 2) != 0) return error.BadExl3Shape;
+    const groups = tsh[0];
     const in_dim = tsh[1] * 16;
     const out_dim = tsh[2] * 16;
     const rate = try kernels.packedRate(tsh[3]);
-    const key = DenseKey{ .in_dim = in_dim, .out_dim = out_dim, .n = @intCast(rate.n) };
+    const key = DenseKey{ .groups = groups, .in_dim = in_dim, .out_dim = out_dim, .n = @intCast(rate.n) };
     const cfg = dense_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ out_dim, in_dim }, 2, .float16));
+        if (groups == 1) {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ out_dim, in_dim }, 2, .float16));
+        } else {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ groups, out_dim, in_dim }, 3, .float16));
+        }
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divFloor(@divExact(tsh[2], 2) + 3, 4) * 128, tsh[1], 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divFloor(@divExact(tsh[2], 2) + 3, 4) * 128, tsh[1], groups));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
@@ -85,7 +93,13 @@ pub fn decodedCanServe() bool {
 pub var can_serve_for_test: ?bool = null;
 
 pub fn decodedServes(billed: bool, rows: c_int, in: c_int, out: c_int) bool {
-    return decodedCanServe() and billed and rows >= DECODED_MIN_ROWS and @as(usize, @intCast(in)) * @as(usize, @intCast(out)) <= DECODED_MAX_WEIGHTS and
+    return decodedServesWith(billed, rows, in, out, 1, DECODED_MIN_ROWS, DECODED_MAX_WEIGHTS);
+}
+
+/// Generalized `decodedServes` for callers that bill a custom decoded scratch cap or grouped banks.
+pub fn decodedServesWith(billed: bool, rows: c_int, in: c_int, out: c_int, groups: usize, min_rows: c_int, max_weights: usize) bool {
+    return decodedCanServe() and billed and rows >= min_rows and
+        groups * @as(usize, @intCast(in)) * @as(usize, @intCast(out)) <= max_weights and
         denseOrderMatches(rows, in, out);
 }
 
@@ -108,6 +122,30 @@ pub fn innerDense(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array) !
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
+    return out;
+}
+
+/// `innerDense` for a G-bank grouped linear (`x` `[G * rows, in]`, `trellis` `[G, in/16, out/16, n]`): decodes all G
+/// banks in one launch and multiplies them in one batched NAX GEMM.
+pub fn innerDenseGrouped(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, groups: c_int) !mlx.mlx_array {
+    decoded_calls += 1;
+    const xsh = mlx.getShape(x);
+    const rows = @divExact(xsh[0], groups);
+    const in_dim = xsh[1];
+    const w = try decodeDense(s, trellis);
+    defer _ = mlx.mlx_array_free(w);
+    var wt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_transpose_axes(&wt, w, &[_]c_int{ 0, 2, 1 }, 3, s));
+    var x3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x3);
+    try mlx.check(mlx.mlx_reshape(&x3, x, &[_]c_int{ groups, rows, in_dim }, 3, s));
+    var y3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y3);
+    try mlx.check(mlx.mlx_matmul(&y3, x3, wt, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, y3, &[_]c_int{ xsh[0], mlx.getShape(y3)[2] }, 2, s));
     return out;
 }
 
@@ -355,6 +393,47 @@ test "trunk gemm: only a billed call takes the decoded path, and only from the m
     try std.testing.expect(decodedServes(true, DECODED_MIN_ROWS, 1024, 512));
     try std.testing.expect(!decodedServes(true, DECODED_MIN_ROWS - 1, 1024, 512));
     try std.testing.expect(!decodedServes(true, DECODED_MIN_ROWS, 1 << 13, 1 << 13));
+    try std.testing.expect(decodedServesWith(true, DECODED_MIN_ROWS, 8192, 5120, 1, DECODED_MIN_ROWS, 1 << 26));
+    try std.testing.expect(decodedServesWith(true, 2048, 4096, 1024, 8, DECODED_MIN_ROWS, 1 << 26));
     enabled = false;
     try std.testing.expect(!decodedServes(true, DECODED_MIN_ROWS, 1024, 512));
+}
+
+test "trunk gemm: grouped dense decode and batched matmul write the sorted GEMM's bytes bit for bit" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    if (!kernels.gemmNaxOn()) return error.SkipZigTest;
+    const linear = @import("linear.zig");
+    const fmt = @import("expert_exl3.zig");
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    kernels.setDecodeParams(kernels.SPEC1_W15);
+    var prng = std.Random.DefaultPrng.init(0x7ea);
+    const rnd = prng.random();
+    const groups: usize = 4;
+    const in: usize = 512;
+    const out: usize = 256;
+    const n: u32 = 80;
+    const rows: c_int = 1024;
+    const words = try t.allocator.alloc(u16, groups * (in / 16) * (out / 16) * n);
+    defer t.allocator.free(words);
+    rnd.bytes(std.mem.sliceAsBytes(words));
+    const tr = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ @intCast(groups), @intCast(in / 16), @intCast(out / 16), @intCast(n) }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr);
+    const xs = try t.allocator.alloc(u16, groups * @as(usize, @intCast(rows)) * in);
+    defer t.allocator.free(xs);
+    for (xs) |*v| v.* = fmt.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 0.5);
+    const x = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(groups * @as(usize, @intCast(rows))), @intCast(in) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x);
+    const inputs = try linear.gemmInputs(groups, @intCast(rows), kernels.gemmWindowRows());
+    const want = try kernels.innerGemmSortedTable(s, x, tr, inputs.slots, kernels.gemmWindowRows(), true, inputs.tab);
+    defer _ = mlx.mlx_array_free(want);
+    const got = try innerDenseGrouped(s, x, tr, @intCast(groups));
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    const len: usize = mlx.mlx_array_size(want);
+    const wp: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(want) orelse return error.Unreadable);
+    const gp: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(got) orelse return error.Unreadable);
+    try t.expectEqualSlices(u16, wp[0..len], gp[0..len]);
 }

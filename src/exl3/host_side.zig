@@ -52,3 +52,10 @@ pub fn counters(s: mlx.mlx_stream) usize {
 pub fn applyCounted(outputs: *mlx.mlx_vector_array, kernel: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, cfg: mlx.mlx_fast_metal_kernel_config, s: mlx.mlx_stream) ?c_int {
     return if (counted) mlx.kernelApplyCounted(outputs, kernel, inputs, cfg, s) else null;
 }
+
+const in_place = @hasDecl(mlx, "kernelApplyInPlace");
+
+/// A launch whose outputs are written directly into caller-provided engine tensors (`mlx.kernelApplyInPlace`); null where unavailable.
+pub fn applyInPlace(kernel: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, cfg: mlx.mlx_fast_metal_kernel_config, s: mlx.mlx_stream, dsts: []const mlx.mlx_array) ?c_int {
+    return if (in_place) mlx.kernelApplyInPlace(kernel, inputs, cfg, s, dsts) else null;
+}

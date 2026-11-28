@@ -7,7 +7,7 @@
 //!   - `exl3_fz_simd`:   fused SIMD kernels (`sushi_exl3_fz_*`, `sushi_rg_fold_*`, `sushi_gated_fold_*` affine)
 //!   - `exl3_gemm_nax`:  NAX prefill GEMMs (`gemm_nax[_tm|_ref]`, `trunk_dense_nax`, `prefill_grid_transpose`)
 //!   - `exl3_rows_nax`:  `project_rows` NAX kernels (`rows_nax`, `_dyn`, `_pend`, `_thru`, `_thru_counted*`)
-//!   - `exl3_fz_nax`:    NAX fused kernels (`sushi_rg_fold_*_tr_*`, `sushi_gated_fold_*_tr_*`)
+//!   - `exl3_fz_nax`:    NAX fused kernels (`sushi_exl3_fz_{pair,down}*_snax*`, `sushi_rg_fold_*_tr_*`, `sushi_gated_fold_*_tr_*`)
 //!
 //! Codebook parameterization uses a 2-way compile-time structural split (`_scalar` vs `_pair1`,
 //! preserving `EXL3_LANE_FIRST = 0` vs `1` register widths and shuffles) combined with Metal
@@ -57,6 +57,8 @@ const fc_b_cb_kind: u32 = 42; // Part B cb_kind
 const fc_b_win_mask: u32 = 43; // Part B win_mask
 const fc_b_hash_mult: u32 = 44; // Part B hash_mult
 const fc_b_hash_mask: u32 = 45; // Part B hash_mask
+const fc_rate_mask_g: u32 = 46; // Active rate-index bitmask for gate/down mixed-rate switch
+const fc_rate_mask_u: u32 = 47; // Active rate-index bitmask for up mixed-rate switch
 
 const fc_fold_out: u32 = spec.fc_bool_base + 12; // FC_B12 (index 60)
 const fc_tile_major: u32 = spec.fc_bool_base + 13; // FC_B13 (index 61)
@@ -204,7 +206,7 @@ const CodecHeaderOpts = struct {
 fn emitPair1RowsTable(out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
     try out.appendSlice(a,
         \\struct exl3_pair_row { uint mult; uint rot; uint mask0; uint mask1; };
-        \\static inline constexpr exl3_pair_row exl3_pair_row_at(uint n) {
+        \\__attribute__((always_inline)) static inline constexpr exl3_pair_row exl3_pair_row_at(uint n) {
         \\  switch (n) {
         \\
     );
@@ -225,7 +227,7 @@ fn emitMixedHashTables(out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
     const alpha = format.Codebook.alpha.hashMask().?;
     try out.appendSlice(a,
         \\struct exl3_hash_row { uint mult; uint mask; };
-        \\static inline exl3_hash_row exl3_hash_row_at(int tid, uint n) {
+        \\__attribute__((always_inline)) static inline exl3_hash_row exl3_hash_row_at(int tid, uint n) {
         \\  if (tid == 0) {
         \\
     );
@@ -271,23 +273,23 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
         try raw.appendSlice(a, "#define EXL3_LANE_FIRST 1u\n");
         try emitPair1RowsTable(&raw, a);
         try raw.print(a,
-            \\template<uint N> static inline half2 exl3_unscaled_n(uint2 cw) {{
+            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_unscaled_n(uint2 cw) {{
             \\  constexpr exl3_pair_row r = exl3_pair_row_at(N);
             \\  cw &= uint2(as_type<uint>(FC_I{d}));
             \\  const uint p = cw.y * r.mult;
             \\  const half4 h = as_type<half4>(uint2(p & r.mask0, rotate(p, r.rot) & r.mask1));
             \\  return half2(h.x + h.y, h.z + h.w);
             \\}}
-            \\template<uint N> static inline half2 exl3_pairh_n(uint2 cw) {{
+            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_pairh_n(uint2 cw) {{
             \\  return exl3_unscaled_n<N>(cw) * half2(4096.0h);
             \\}}
-            \\template<uint N> static inline float2 exl3_decode2_n(uint2 cw) {{
+            \\template<uint N> __attribute__((always_inline)) static inline float2 exl3_decode2_n(uint2 cw) {{
             \\  return FC_B{d} ? float2(exl3_unscaled_n<N>(cw)) : float2(exl3_pairh_n<N>(cw));
             \\}}
-            \\static inline float exl3_out(float v) {{
+            \\__attribute__((always_inline)) static inline float exl3_out(float v) {{
             \\  return FC_B{d} ? (v * 4096.0f) : v;
             \\}}
-            \\template<uint N> static inline float exl3_slot_n(thread const ushort *cw, uint slot) {{
+            \\template<uint N> __attribute__((always_inline)) static inline float exl3_slot_n(thread const ushort *cw, uint slot) {{
             \\  const float2 w = exl3_decode2_n<N>(uint2(0u, uint(cw[slot | 1u])));
             \\  return (slot & 1u) != 0u ? w.y : w.x;
             \\}}
@@ -302,7 +304,7 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
             try emitMixedHashTables(&raw, a);
         }
         try raw.print(a,
-            \\template<uint N> static inline half2 exl3_unscaled_n(uint2 cw) {{
+            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_unscaled_n(uint2 cw) {{
             \\  cw &= uint2(as_type<uint>(FC_I{d}));
             \\  if (FC_I{d} == 2) {{
             \\
@@ -334,16 +336,16 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
             \\    return fma(h, as_type<half2>(ushort2(0x1EEEu)), as_type<half2>(ushort2(0xC931u)));
             \\  }}
             \\}}
-            \\template<uint N> static inline half2 exl3_pairh_n(uint2 cw) {{
+            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_pairh_n(uint2 cw) {{
             \\  return (FC_I{d} == 2) ? (exl3_unscaled_n<N>(cw) * half2(4096.0h)) : exl3_unscaled_n<N>(cw);
             \\}}
-            \\template<uint N> static inline float2 exl3_decode2_n(uint2 cw) {{
+            \\template<uint N> __attribute__((always_inline)) static inline float2 exl3_decode2_n(uint2 cw) {{
             \\  return (FC_I{d} == 2 && FC_B{d}) ? float2(exl3_unscaled_n<N>(cw)) : float2(exl3_pairh_n<N>(cw));
             \\}}
-            \\static inline float exl3_out(float v) {{
+            \\__attribute__((always_inline)) static inline float exl3_out(float v) {{
             \\  return (FC_I{d} == 2 && FC_B{d}) ? (v * 4096.0f) : v;
             \\}}
-            \\template<uint N> static inline float exl3_slot_n(thread const ushort *cw, uint slot) {{
+            \\template<uint N> __attribute__((always_inline)) static inline float exl3_slot_n(thread const ushort *cw, uint slot) {{
             \\  return exl3_decode2_n<N>(uint2(uint(cw[slot]), 0u)).x;
             \\}}
             \\#define exl3_pairh(cw) exl3_pairh_n<N>((cw))
@@ -417,7 +419,7 @@ fn buildRowsNaxFragsFc(a: std.mem.Allocator) ![]u8 {
     ;
     const new_sig =
         \\template<uint N>
-        \\static inline nfrag rows_wfrag(const device uint *words, uint lane, uint R32, uint SW) {
+        \\__attribute__((always_inline)) static inline nfrag rows_wfrag(const device uint *words, uint lane, uint R32, uint SW) {
         \\  if constexpr (N == 80u) { if (SW != 0u) return nax_k5_frag<N>(words, lane); }
         \\  if constexpr (N != 64u && nax_w32_fits(N)) {
         \\    if (R32 != 0u) {
@@ -526,7 +528,6 @@ fn fcCleanSource(a: std.mem.Allocator, base: []const u8) ![]u8 {
     s = try replaceOptAlloc(a, s, "constexpr uint SGS = uint(IDIM) / 128u;", "const uint SGS = uint(IDIM) / 128u;");
     s = try replaceOptAlloc(a, s, "constexpr uint KSPAN = uint(IDIM) / uint(NSPLIT);", "const uint KSPAN = uint(IDIM) / uint(NSPLIT);");
     s = try replaceOptAlloc(a, s, "constexpr uint NW = (uint(NSLOTS) + 31u) / 32u;", "const uint NW = (uint(NSLOTS) + 31u) / 32u;");
-    s = try replaceOptAlloc(a, s, "uint hits[NW];", "uint hits[16];");
     s = try replaceOptAlloc(a, s, "constexpr uint CHUNK_FIT = (4096u / uint(GROUP)) / 128u * 128u;\nconstexpr uint CHUNK = CHUNK_FIT < KSPAN ? CHUNK_FIT : KSPAN;", "const uint CHUNK_FIT = (4096u / uint(GROUP)) / 128u * 128u;\nconst uint CHUNK = CHUNK_FIT < KSPAN ? CHUNK_FIT : KSPAN;");
     s = try replaceOptAlloc(a, s, "threadgroup half prepared[uint(GROUP) * CHUNK];", "threadgroup half prepared[4096];");
     s = try replaceOptAlloc(a, s, "threadgroup half prepared[2u * KSPAN];", "threadgroup half prepared[7680];");
@@ -769,18 +770,20 @@ fn buildMixedRateBody(a: std.mem.Allocator, kind: RgKind, group: u32, is_pair1: 
 
     if (down) {
         try out.appendSlice(a, "switch (meta[eid * 8u + 2u]) {\n");
-        for (rates) |r| {
-            try out.print(a, "case {d}u: {{\nconstexpr uint N = {d}u;\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n", .{ r, r });
+        for (rates, 0..) |r, ri| {
+            try out.print(a, "case {d}u: if ((as_type<uint>(FC_I{d}) & (1u << {d}u)) != 0u) {{\nconstexpr uint N = {d}u;\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n", .{ r, fc_rate_mask_g, ri, r });
             try out.appendSlice(a, body);
             try out.appendSlice(a, "\n} break;\n");
         }
         try out.appendSlice(a, "default: break;\n}\n");
     } else {
         // Explicitly unrolled proj=0 (gate) then proj=1 (up): O(R) cases instead of O(R^2), zero rolled-loop overhead!
+        // Each case is guarded by FC_I46/FC_I47 so PSO specialization dead-code-eliminates every inactive rate.
         for ([_]u32{ 0, 1 }) |proj| {
+            const mask_fc = if (proj == 0) fc_rate_mask_g else fc_rate_mask_u;
             try out.print(a, "{{\nconstexpr uint proj = {d}u;\nswitch (meta[eid * 8u + {d}u]) {{\n", .{ proj, proj });
-            for (rates) |r| {
-                try out.print(a, "case {d}u: {{\nconstexpr uint N = {d}u;\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n", .{ r, r });
+            for (rates, 0..) |r, ri| {
+                try out.print(a, "case {d}u: if ((as_type<uint>(FC_I{d}) & (1u << {d}u)) != 0u) {{\nconstexpr uint N = {d}u;\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n", .{ r, mask_fc, ri, r });
                 try out.appendSlice(a, body);
                 try out.appendSlice(a, "\n} break;\n");
             }
@@ -792,17 +795,19 @@ fn buildMixedRateBody(a: std.mem.Allocator, kind: RgKind, group: u32, is_pair1: 
 }
 
 /// Wraps a single-rate kernel body (whose `N` is driven by FC `NHW` / `S_NHW`) in an FC rate switch.
-/// Metal specializes `switch (uint(NHW))` at PSO creation and dead-eliminates every non-matching case!
+/// Hoists the prologue before `N` (`threadgroup` arrays and grid setup) outside the switch so `metal -c`
+/// emits one threadgroup allocation instead of one per rate, while Metal specializes the switch at PSO creation.
 fn wrapFcRateSwitch(a: std.mem.Allocator, body_in: []const u8, nhw_expr: []const u8, is_pair1: bool, extra_n_decl: []const u8) ![]u8 {
     const rates: []const i32 = if (is_pair1) &pair1_rates else &served_scalar_rates;
     const d = std.mem.indexOf(u8, body_in, extra_n_decl) orelse std.debug.panic("metallib_exl3: rate switch missing N decl '{s}'", .{extra_n_decl});
-    const stripped = try std.mem.concat(a, u8, &.{ body_in[0..d], body_in[d + extra_n_decl.len ..] });
+    const tail = body_in[d + extra_n_decl.len ..];
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
+    try out.appendSlice(a, body_in[0..d]);
     try out.print(a, "switch (uint({s})) {{\n", .{nhw_expr});
     for (rates) |r| {
         try out.print(a, "case {d}u: {{\nconstexpr uint N = {d}u;\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n", .{ r, r });
-        try out.appendSlice(a, stripped);
+        try out.appendSlice(a, tail);
         try out.appendSlice(a, "\n} break;\n");
     }
     try out.appendSlice(a, "default: break;\n}\n");
@@ -984,6 +989,16 @@ fn srcFzPrep(a: std.mem.Allocator, _: usize) ![]const u8 {
     );
 }
 
+fn srcFzPrepSnax(a: std.mem.Allocator, _: usize) ![]const u8 {
+    return buildFusedSource(
+        a,
+        kernels.PAIR_PREP_SOURCE,
+        "if (thread_index_in_threadgroup == 0u && threadgroup_position_in_grid.x == 0u && threadgroup_position_in_grid.y == 0u) { yg[0] = half(0); yu[0] = half(0); }",
+        &.{ "x", "suhg", "suhu", "slots", "yg", "yu" },
+        &.{},
+    );
+}
+
 fn srcFzMid(a: std.mem.Allocator, _: usize) ![]const u8 {
     const a_clean = try fcCleanSource(a, kernels.DECODE_MID_SOURCE);
     const a_clamped = try addFcClamp(a, a_clean);
@@ -995,6 +1010,82 @@ fn srcFzMid(a: std.mem.Allocator, _: usize) ![]const u8 {
         &.{ "ig", "iu", "svhg", "svhu", "suhd", "slots", "yd" },
         &.{ "ODIM", "CLAMP_LIMIT" },
     );
+}
+
+fn srcFzMidSnax(a: std.mem.Allocator, _: usize) ![]const u8 {
+    const a_clean = try fcCleanSource(a, kernels.DECODE_MID_SOURCE);
+    const a_clamped = try addFcClamp(a, a_clean);
+    return buildFusedSource(
+        a,
+        a_clamped,
+        a_clamped,
+        &.{ "ig", "iu", "svhg", "svhu", "suhd", "slots", "prepared" },
+        &.{ "IDIM", "NSPLIT" },
+    );
+}
+
+fn hdrFzSnaxStage(comptime a_pair1: bool, comptime b_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
+    return struct {
+        fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
+            const ah = try buildCodecHeader(a, .{ .is_pair1 = a_pair1, .mixed_rate = true, .secondary = false });
+            const bh = try buildCodecHeader(a, .{ .is_pair1 = b_pair1, .mixed_rate = false, .secondary = true });
+            const frags_fc = try buildRowsNaxFragsFc(a);
+            const frags_sx = try renamePartB(a, frags_fc, &.{}, &.{}, false);
+            return std.mem.concat(a, u8, &.{ kernels.GEMM_NAX_INCLUDES, ah, "\n", bh, "\n", frags_sx });
+        }
+    }.f;
+}
+
+fn srcFzSnaxStage(comptime is_down: bool, comptime group: u32, comptime a_pair1: bool, comptime b_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
+    return struct {
+        fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
+            const a_body = try buildMixedRateBody(a, if (is_down) .down_prepared else .pair_prepared, group, a_pair1);
+            var tr_body: []u8 = undefined;
+            if (!is_down) {
+                const rep =
+                    \\const bool upper = (threadgroup_position_in_grid.z & 1u) != 0u;
+                    \\const uint split = uint(threadgroup_position_in_grid.z) >> 1u;
+                    \\const device half *suh = upper ? suhu : suhg;
+                    \\const device half *svh = suh;
+                    \\const device ushort *trellis = upper ? tu : tg;
+                    \\device float *y = upper ? yu : yg;
+                ;
+                const s0 = try replaceOnceAlloc(a, project_rows.ROWS_NAX_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", rep);
+                tr_body = try transformRowsSource(a, s0, true, false);
+                tr_body = try replaceAllAlloc(a, tr_body, "uint(KPH)", "1u");
+                tr_body = try replaceAllAlloc(a, tr_body, "KPH", "1");
+                tr_body = try replaceOnceAlloc(a, tr_body, "static_assert(UNR == 1 || 1 == 1, \"an unrolled walk steps whole chunks of one slice\");", "");
+                tr_body = try replaceOnceAlloc(a, tr_body, "nfrag wf[UNR][2];", "nfrag wf[2][2];");
+                tr_body = try replaceOnceAlloc(a, tr_body, "uint(ROW_CAP)", "16u");
+            } else {
+                var s = try replaceOnceAlloc(a, project_rows.ROWS_NAX_PREPPED_SOURCE, "const uint split = uint(threadgroup_position_in_grid.y);", "const uint split = uint(threadgroup_position_in_grid.z);");
+                s = try replaceOnceAlloc(a, s, "static_assert(UNR == 1 || KPH == 1, \"an unrolled walk steps whole chunks of one slice\");", "");
+                s = try replaceOnceAlloc(a, s, "constexpr uint OT = uint(ODIM) / TILE;", "const uint OT = uint(ODIM) / TILE;");
+                s = try replaceOnceAlloc(a, s, "constexpr uint KT = uint(IDIM) / uint(NSPLIT) / TILE;", "const uint KT = uint(IDIM) / uint(NSPLIT) / TILE;");
+                s = try replaceOnceAlloc(a, s, "constexpr uint PART_F = uint(ROWS) * KPARTS * 128u;", "constexpr uint PART_F = 16u * KPARTS * 128u;");
+                s = try replaceOnceAlloc(a, s, "threadgroup float tgm[(FOLD || KPARTS > 1u) ? PART_F : 1u];", "threadgroup float tgm[1u];");
+                s = try replaceOnceAlloc(a, s, "rows_wfrag<N, R32, SW>(wp, lane)", "rows_wfrag<N>(wp, lane, uint(R32), uint(SW))");
+                s = try replaceOnceAlloc(a, s, "rows_wfrag<N, R32, SW>(wp + PACKED_W, lane)", "rows_wfrag<N>(wp + PACKED_W, lane, uint(R32), uint(SW))");
+                s = try replaceOnceAlloc(a, s, "nfrag wf[UNR][2];", "nfrag wf[2][2];");
+                s = try replaceOnceAlloc(a, s, "if constexpr (FOLD || KPARTS > 1u) tgm[", "if constexpr (false) tgm[");
+                s = try replaceOnceAlloc(a, s, "if constexpr (FOLD) {", "if constexpr (false) {");
+                s = try replaceOnceAlloc(a, s, "} else if constexpr (KPARTS > 1u) {", "} else if constexpr (false) {");
+                s = try replaceAllAlloc(a, s, "uint(KPH)", "1u");
+                s = try replaceOptAlloc(a, s, "KPH", "1");
+                tr_body = s;
+            }
+            const tr_switched = try wrapFcRateSwitch(a, tr_body, "NHW", b_pair1, "constexpr uint N = uint(NHW);\nconstexpr uint PACKED_W = N / 2u;\n");
+            const b_full = try std.mem.concat(a, u8, &.{ "{\ntypedef bfloat16_t OutT;\n", tr_switched, "\n}\n" });
+            const b_io: []const []const u8 = if (is_down)
+                &.{ "x", "trellis", "svh", "y" }
+            else
+                &.{ "x", "tg", "tu", "suhg", "suhu", "yg", "yu" };
+            const b_ints: []const []const u8 = &.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD", "NHW", "SB1", "SB2", "SB3", "UNR", "R32", "SW" };
+            return buildFusedSource(a, a_body, b_full, b_io, b_ints);
+        }
+    }.f;
 }
 
 const FzBMode = enum { lane, one, shared_rows };
@@ -1314,23 +1405,23 @@ const static_simd_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_down_reduce_fused_shared",
         .source_fn = srcClean(rate_groups.REDUCE_FUSED_SOURCE),
-        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", fix(.uint32)), inSlot("sc", fix(.float32)), inSlot("s_inner", fix(.float16)), inSlot("s_svh", fix(.float16)), inSlot("unit", fix(.float32)) },
+        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", fix(.uint32)), inSlot("sc", fix(.float32)), inSlot("s_inner", par("SI")), inSlot("s_svh", fix(.float16)), inSlot("unit", fix(.float32)) },
         .outputs = &.{outSlot("y", par("T"))},
-        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "ST", .kind = .ct_dtype, .dtypes = &.{.bfloat16} }, fcInt("ODIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "ST", .kind = .ct_dtype, .dtypes = &.{.bfloat16} }, .{ .name = "SI", .kind = .io_dtype, .dtypes = &.{ .float16, .float32 } }, fcInt("ODIM"), fcInt("TOPK"), fcInt("S_DOWN_NSPLIT") },
     },
     .{
         .name = "sushi_exl3_down_reduce_fused_shared_redo",
         .source_fn = srcClean(rate_groups.REDUCE_FUSED_REDO_SOURCE),
-        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("part", fix(.float16)), inSlot("redo", fix(.int32)), inSlot("svh", fix(.float16)), inSlot("slots", fix(.uint32)), inSlot("sc", fix(.float32)), inSlot("s_inner", fix(.float16)), inSlot("s_svh", fix(.float16)), inSlot("unit", fix(.float32)) },
+        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("part", fix(.float16)), inSlot("redo", fix(.int32)), inSlot("svh", fix(.float16)), inSlot("slots", fix(.uint32)), inSlot("sc", fix(.float32)), inSlot("s_inner", par("SI")), inSlot("s_svh", fix(.float16)), inSlot("unit", fix(.float32)) },
         .outputs = &.{outSlot("y", par("T"))},
-        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "ST", .kind = .ct_dtype, .dtypes = &.{.bfloat16} }, fcInt("ODIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "ST", .kind = .ct_dtype, .dtypes = &.{.bfloat16} }, .{ .name = "SI", .kind = .io_dtype, .dtypes = &.{ .float16, .float32 } }, fcInt("ODIM"), fcInt("TOPK"), fcInt("S_DOWN_NSPLIT") },
     },
     .{
         .name = "sushi_exl3_down_reduce_fused_expand",
         .source_fn = srcClean(rate_groups.REDUCE_EXPAND_SOURCE),
-        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", fix(.uint32)), inSlot("sc", fix(.float32)), inSlot("s_inner", fix(.float16)), inSlot("s_svh", fix(.float16)), inSlot("unit", fix(.float32)), inSlot("x1", par("XT")), inSlot("post", fix(.float32)), inSlot("comb", fix(.float32)) },
+        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", fix(.uint32)), inSlot("sc", fix(.float32)), inSlot("s_inner", par("SI")), inSlot("s_svh", fix(.float16)), inSlot("unit", fix(.float32)), inSlot("x1", par("XT")), inSlot("post", fix(.float32)), inSlot("comb", fix(.float32)) },
         .outputs = &.{outSlot("y", par("XT"))},
-        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &bf_f32 }, .{ .name = "ST", .kind = .ct_dtype, .dtypes = &.{.bfloat16} }, .{ .name = "XT", .kind = .ct_dtype, .dtypes = &bf_f32 }, fcInt("ODIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &bf_f32 }, .{ .name = "ST", .kind = .ct_dtype, .dtypes = &.{.bfloat16} }, .{ .name = "XT", .kind = .ct_dtype, .dtypes = &bf_f32 }, .{ .name = "SI", .kind = .io_dtype, .dtypes = &.{ .float16, .float32 } }, fcInt("ODIM"), fcInt("TOPK"), fcInt("S_DOWN_NSPLIT") },
     },
     .{
         .name = "sushi_exl3_prefill_reduce_fused_shared_planes",
@@ -1633,6 +1724,22 @@ const rows_finish_specs = [_]KernelSpec{
         },
         .outputs = &.{ outSlot("qout", par("OutT")), outSlot("rout", par("OutT")) },
         .params = &.{ .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &floats }, fcInt("ODIM"), fcInt("ROWS"), fcInt("NSPLIT"), fcInt("NORM"), fcInt("KV_D"), fcInt("RD"), fcInt("QAT") },
+    },
+    .{
+        .name = "sushi_exl3_rows_finish_rms_ring_ip",
+        .header = if (custom.is_codegen) project_rows.ROWS_RING_HELPERS else "",
+        .source_fn = srcClean(project_rows.ROWS_FINISH_RMS_RING_IP_SOURCE),
+        .inputs = &.{
+            inSlot("part", fix(.float32)),
+            inSlot("svh", fix(.float16)),
+            inSlot("w", par("OutT")),
+            inSlot("eps", fix(.float32)),
+            inSlot("kw", par("OutT")),
+            inSlot("freqs", fix(.float32)),
+            inSlot("pos", fix(.int32)),
+        },
+        .outputs = &.{ outSlot("qout", par("OutT")), outSlot("rout", par("OutT")) },
+        .params = &.{ .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &floats }, fcInt("ODIM"), fcInt("ROWS"), fcInt("NSPLIT"), fcInt("NORM"), fcInt("KV_D"), fcInt("RD"), fcInt("QAT"), fcInt("CAP") },
     },
     .{
         .name = "sushi_exl3_rows_finish_rope",
@@ -2092,6 +2199,16 @@ const fz_simd_specs = blk: {
         .params = &[_]ParamSpec{ fcInt("IDIM"), fcInt("TOPK"), fcInt("S_IDIM"), fcInt("S_TOPK") } ++ &fz_grid_params,
     },
     .{
+        .name = "sushi_exl3_fz_prep_snax",
+        .source_fn = custom.codegenFn(srcFzPrepSnax),
+        .inputs = &.{
+            inSlot("x", fix(.bfloat16)), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("slots", fix(.uint32)),
+            inSlot("s_x", fix(.bfloat16)), inSlot("s_suhg", fix(.float16)), inSlot("s_suhu", fix(.float16)), inSlot("s_slots", fix(.uint32)),
+        },
+        .outputs = &.{ outSlot("prep", fix(.float16)), outSlot("s_yg", fix(.float16)), outSlot("s_yu", fix(.float16)) },
+        .params = &[_]ParamSpec{ fcInt("IDIM"), fcInt("TOPK") } ++ &fz_grid_params,
+    },
+    .{
         .name = "sushi_exl3_fz_mid",
         .source_fn = custom.codegenFn(srcFzMid),
         .inputs = &.{
@@ -2100,6 +2217,16 @@ const fz_simd_specs = blk: {
         },
         .outputs = &.{ outSlot("prepared", fix(.float16)), outSlot("s_yd", fix(.float16)) },
         .params = &[_]ParamSpec{ fcInt("IDIM"), fcInt("NSPLIT"), fcInt("S_ODIM"), fcInt("S_CLAMP_LIMIT") } ++ &fz_grid_params,
+    },
+    .{
+        .name = "sushi_exl3_fz_mid_snax",
+        .source_fn = custom.codegenFn(srcFzMidSnax),
+        .inputs = &.{
+            inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)),
+            inSlot("s_ig", fix(.float32)), inSlot("s_iu", fix(.float32)), inSlot("s_svhg", fix(.float16)), inSlot("s_svhu", fix(.float16)), inSlot("s_suhd", fix(.float16)), inSlot("s_slots", fix(.uint32)),
+        },
+        .outputs = &.{ outSlot("prepared", fix(.float16)), outSlot("s_prepared", fix(.float16)) },
+        .params = &[_]ParamSpec{ fcInt("IDIM"), fcInt("NSPLIT"), fcInt("S_IDIM"), fcInt("S_NSPLIT") } ++ &fz_grid_params,
     },
     // 2. DSv41 fused pair & down (group 0 & 2, lane/one/shared_rows, A={scalar,pair1}, B={scalar,pair1})
     fzPairSpec(0, .lane, false, false),        fzPairSpec(0, .lane, true, false),
@@ -2451,9 +2578,62 @@ fn foldTrellisSpec(comptime mixed: bool, comptime is_down: bool, comptime with_l
     };
 }
 
+fn fzPairSnaxSpec(comptime group: u32, comptime a_pair1: bool, comptime b_pair1: bool) KernelSpec {
+    const g_s = if (group == 0) "" else std.fmt.comptimePrint("_g{d}", .{group});
+    const ab_s = (if (a_pair1) "_ap1" else "_asc") ++ (if (b_pair1) "_bp1" else "_bsc");
+    const a_p = if (group == 0)
+        &[_]ParamSpec{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("NSPLIT"), fcInt("TOPK"), fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL") }
+    else
+        &[_]ParamSpec{ .{ .name = "GROUP", .kind = .ct_int, .ints = &.{@as(i32, @intCast(group))} }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("NSPLIT"), fcInt("TOPK"), fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL"), fcInt("NSLOTS") };
+    const b_p = [_]ParamSpec{
+        fcInt("S_IDIM"), fcInt("S_ODIM"), fcInt("S_ROWS"), fcInt("S_GROUPS"), ign("S_TGRP"), ign("S_KPH"), fcInt("S_NSPLIT"), fcInt("S_CHUNK"), fcInt("S_FOLD"), fcInt("S_NHW"), fcInt("S_SB1"), fcInt("S_SB2"), fcInt("S_SB3"), fcInt("S_UNR"), fcInt("S_R32"), fcInt("S_SW"),
+    };
+    return .{
+        .name = "sushi_exl3_fz_pair" ++ g_s ++ "_snax" ++ ab_s,
+        .nax = true,
+        .header_fn = hdrFzSnaxStage(a_pair1, b_pair1),
+        .source_fn = srcFzSnaxStage(false, group, a_pair1, b_pair1),
+        .inputs = &.{
+            inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)), inSlot("meta", fix(.uint32)),
+            inSlot("s_x", fix(.bfloat16)), inSlot("s_tg", fix(.uint16)), inSlot("s_tu", fix(.uint16)), inSlot("s_suhg", fix(.float16)), inSlot("s_suhu", fix(.float16)),
+        },
+        .outputs = &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)), outSlot("s_yg", fix(.float32)), outSlot("s_yu", fix(.float32)) },
+        .params = a_p ++ &b_p ++ &fz_grid_params,
+    };
+}
+
+fn fzDownSnaxSpec(comptime group: u32, comptime a_pair1: bool, comptime b_pair1: bool) KernelSpec {
+    const g_s = if (group == 0) "" else std.fmt.comptimePrint("_g{d}", .{group});
+    const ab_s = (if (a_pair1) "_ap1" else "_asc") ++ (if (b_pair1) "_bp1" else "_bsc");
+    const a_p = if (group == 0)
+        &[_]ParamSpec{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("NSPLIT"), fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL") }
+    else
+        &[_]ParamSpec{ .{ .name = "GROUP", .kind = .ct_int, .ints = &.{@as(i32, @intCast(group))} }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("NSPLIT"), fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL"), fcInt("NSLOTS") };
+    const b_p = [_]ParamSpec{
+        fcInt("S_IDIM"), fcInt("S_ODIM"), fcInt("S_ROWS"), ign("S_GROUPS"), ign("S_TGRP"), ign("S_KPH"), fcInt("S_NSPLIT"), ign("S_CHUNK"), ign("S_FOLD"), fcInt("S_NHW"), fcInt("S_SB1"), fcInt("S_SB2"), fcInt("S_SB3"), fcInt("S_UNR"), fcInt("S_R32"), fcInt("S_SW"),
+    };
+    return .{
+        .name = "sushi_exl3_fz_down" ++ g_s ++ "_snax" ++ ab_s,
+        .nax = true,
+        .header_fn = hdrFzSnaxStage(a_pair1, b_pair1),
+        .source_fn = srcFzSnaxStage(true, group, a_pair1, b_pair1),
+        .inputs = &.{
+            inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)), inSlot("meta", fix(.uint32)),
+            inSlot("s_x", fix(.float16)), inSlot("s_trellis", fix(.uint16)), inSlot("s_svh", fix(.float16)),
+        },
+        .outputs = &.{ outSlot("y", fix(.float16)), outSlot("s_y", fix(.float32)) },
+        .params = a_p ++ &b_p ++ &fz_grid_params,
+    };
+}
+
 const fz_nax_specs = blk: {
     @setEvalBranchQuota(100000);
     break :blk [_]KernelSpec{
+    // DSv41 fused pair & down with multi-row NAX shared expert (group 0 & 2, A={scalar,pair1}, B={scalar,pair1})
+    fzPairSnaxSpec(0, false, false), fzPairSnaxSpec(0, true, false), fzPairSnaxSpec(0, false, true), fzPairSnaxSpec(0, true, true),
+    fzPairSnaxSpec(2, false, false), fzPairSnaxSpec(2, true, false), fzPairSnaxSpec(2, false, true), fzPairSnaxSpec(2, true, true),
+    fzDownSnaxSpec(0, false, false), fzDownSnaxSpec(0, true, false), fzDownSnaxSpec(0, false, true), fzDownSnaxSpec(0, true, true),
+    fzDownSnaxSpec(2, false, false), fzDownSnaxSpec(2, true, false), fzDownSnaxSpec(2, false, true), fzDownSnaxSpec(2, true, true),
     // rg_fold with trellis shared expert (B scalar = spec1/mcg/alpha, B pair1 = pair1)
     foldTrellisSpec(true, false, false, false, false),  foldTrellisSpec(true, false, false, true, false),
     foldTrellisSpec(true, false, true, false, false),   foldTrellisSpec(true, false, true, true, false),
@@ -2661,21 +2841,36 @@ fn parseCbWinPrefix(s: []const u8, out_meta: *CodecMeta) ?usize {
     return end;
 }
 
-/// Verifies every `_<g>x<u>` class token in `s` uses rates covered by the mixed-rate switch.
-fn verifyClassesInSwitch(s: []const u8, is_pair1: bool) bool {
+const ClassRateMasks = struct { g: u32, u: u32 };
+
+comptime {
+    // FC_I46/FC_I47 encode active rate indices in a 32-bit function constant bitmask.
+    std.debug.assert(served_scalar_rates.len <= 32);
+    std.debug.assert(pair1_rates.len <= 32);
+}
+
+fn rateBit(slice: []const i32, n: u32) ?u32 {
+    for (slice, 0..) |r, i| if (r == @as(i32, @intCast(n))) return @as(u32, 1) << @intCast(i);
+    return null;
+}
+
+/// Verifies every `_<g>x<u>` class token in `s` uses rates covered by the mixed-rate switch and returns
+/// bitmasks of active gate/down (`g`) and up (`u`) rate indices for PSO dead-code elimination.
+fn parseClassRateMasks(s: []const u8, is_pair1: bool) ?ClassRateMasks {
     const rates: []const i32 = if (is_pair1) &pair1_rates else &served_scalar_rates;
     var it = std.mem.splitScalar(u8, s, '_');
     var saw_any = false;
+    var masks: ClassRateMasks = .{ .g = 0, .u = 0 };
     while (it.next()) |tok| {
         if (tok.len == 0) continue;
-        const x_pos = std.mem.indexOfScalar(u8, tok, 'x') orelse return false;
-        const g = std.fmt.parseInt(u32, tok[0..x_pos], 10) catch return false;
-        const u = std.fmt.parseInt(u32, tok[x_pos + 1 ..], 10) catch return false;
-        if (!inRateSlice(rates, g)) return false;
-        if (u != 0 and !inRateSlice(rates, u)) return false;
+        const x_pos = std.mem.indexOfScalar(u8, tok, 'x') orelse return null;
+        const g = std.fmt.parseInt(u32, tok[0..x_pos], 10) catch return null;
+        const u = std.fmt.parseInt(u32, tok[x_pos + 1 ..], 10) catch return null;
+        masks.g |= rateBit(rates, g) orelse return null;
+        if (u != 0) masks.u |= rateBit(rates, u) orelse return null;
         saw_any = true;
     }
-    return saw_any;
+    return if (saw_any) masks else null;
 }
 
 fn resolveMixedRg(
@@ -2733,7 +2928,7 @@ fn resolveMixedRg(
         clamp_limit = std.fmt.parseInt(i32, rest[cidx + 6 ..], 10) catch return false;
         rest = rest[0..cidx];
     }
-    if (!verifyClassesInSwitch(rest, cb == .pair1)) return false;
+    const rate_masks = parseClassRateMasks(rest, cb == .pair1) orelse return false;
 
     const table_id = lookupMixedTableId(meta) orelse return false;
     var spec_name_buf: [128]u8 = undefined;
@@ -2750,6 +2945,11 @@ fn resolveMixedRg(
     if (!appendFcU32(out, fc_win_mask, win.mask())) return false;
     if (!appendFcBool(out, fc_fold_out, true)) return false;
     if (!appendFcBool(out, fc_tile_major, tile_major)) return false;
+    if (!appendFcU32(out, fc_rate_mask_g, rate_masks.g)) return false;
+    const is_down_kind = std.mem.eql(u8, kind, "down") or std.mem.eql(u8, kind, "down_prepared");
+    if (!is_down_kind) {
+        if (!appendFcU32(out, fc_rate_mask_u, rate_masks.u)) return false;
+    }
     if (std.mem.eql(u8, kind, "down")) {
         if (!appendFcInt(out, fc_clamp_limit, clamp_limit)) return false;
     }
@@ -2766,14 +2966,16 @@ fn resolveFusedFz(
     // Format: sushi_exl3_fz_<stage>_<cb>_w<win>[_t<d>]_s<scb>_w<sw>_n<sn>[_t<sd>][_<classes>_g<g>][_clamp<L>][_one|_shared_rows][_tm]
     var rest = name["sushi_exl3_fz_".len..];
     if (std.mem.startsWith(u8, rest, "prep_")) {
-        return custom.resolveSpecs(&fz_simd_specs, "sushi_exl3_fz_prep", inputs, out_dtypes, targs, out);
+        const spec_name = if (std.mem.indexOf(u8, rest, "_snax") != null) "sushi_exl3_fz_prep_snax" else "sushi_exl3_fz_prep";
+        return custom.resolveSpecs(&fz_simd_specs, spec_name, inputs, out_dtypes, targs, out);
     }
     if (std.mem.startsWith(u8, rest, "mid_")) {
         const cidx = std.mem.lastIndexOf(u8, rest, "_clamp") orelse return false;
         var lim_end = cidx + 6;
         while (lim_end < rest.len and std.ascii.isDigit(rest[lim_end])) lim_end += 1;
         const limit = std.fmt.parseInt(i32, rest[cidx + 6 .. lim_end], 10) catch return false;
-        if (!custom.resolveSpecs(&fz_simd_specs, "sushi_exl3_fz_mid", inputs, out_dtypes, targs, out)) return false;
+        const spec_name = if (std.mem.indexOf(u8, rest, "_snax") != null) "sushi_exl3_fz_mid_snax" else "sushi_exl3_fz_mid";
+        if (!custom.resolveSpecs(&fz_simd_specs, spec_name, inputs, out_dtypes, targs, out)) return false;
         if (!appendFcInt(out, fc_clamp_limit, limit)) return false;
         return sortAndFinalize(out);
     }
@@ -2822,11 +3024,14 @@ fn resolveFusedFz(
     } else if (std.mem.endsWith(u8, rest, "_one")) {
         b_mode = "one";
         rest = rest[0 .. rest.len - "_one".len];
+    } else if (std.mem.endsWith(u8, rest, "_snax")) {
+        b_mode = "snax";
+        rest = rest[0 .. rest.len - "_snax".len];
     }
     const gidx = std.mem.lastIndexOf(u8, rest, "_g") orelse return false;
     const group = std.fmt.parseInt(u32, rest[gidx + 2 ..], 10) catch return false;
     const classes_s = rest[0..gidx];
-    if (!verifyClassesInSwitch(classes_s, a_meta.cb == .pair1)) return false;
+    const rate_masks = parseClassRateMasks(classes_s, a_meta.cb == .pair1) orelse return false;
     if (!inRateSlice(if (b_meta.cb == .pair1) &pair1_rates else &served_scalar_rates, sn)) return false;
 
     const a_tid = lookupMixedTableId(a_meta) orelse return false;
@@ -2849,7 +3054,8 @@ fn resolveFusedFz(
             if (b_meta.cb == .pair1) "bp1" else "bsc",
         }) catch return false;
 
-    if (!custom.resolveSpecs(&fz_simd_specs, spec_name, inputs, out_dtypes, targs, out)) return false;
+    const is_snax = std.mem.eql(u8, b_mode, "snax");
+    if (!custom.resolveSpecs(if (is_snax) &fz_nax_specs else &fz_simd_specs, spec_name, inputs, out_dtypes, targs, out)) return false;
     if (a_meta.cb != .pair1) {
         if (!appendFcInt(out, fc_cb_kind, cbKindInt(a_meta.cb))) return false;
         if (!appendFcInt(out, fc_table_id, a_tid)) return false;
@@ -2857,6 +3063,10 @@ fn resolveFusedFz(
     if (!appendFcU32(out, fc_win_mask, a_meta.win.mask())) return false;
     if (!appendFcBool(out, fc_fold_out, true)) return false;
     if (!appendFcBool(out, fc_tile_major, tile_major)) return false;
+    if (!appendFcU32(out, fc_rate_mask_g, rate_masks.g)) return false;
+    if (!is_down) {
+        if (!appendFcU32(out, fc_rate_mask_u, rate_masks.u)) return false;
+    }
 
     if (b_meta.cb != .pair1) {
         if (!appendFcInt(out, fc_b_cb_kind, cbKindInt(b_meta.cb))) return false;
@@ -2932,8 +3142,9 @@ fn resolveFoldGatedOrRg(
         with_logit = true;
         rest = rest[0 .. rest.len - "_logit".len];
     }
+    var rate_masks: ClassRateMasks = .{ .g = 0, .u = 0 };
     if (mixed) {
-        if (!verifyClassesInSwitch(rest, a_meta.cb == .pair1)) return false;
+        rate_masks = parseClassRateMasks(rest, a_meta.cb == .pair1) orelse return false;
     } else if (rest.len != 0) {
         return false;
     }
@@ -2995,6 +3206,10 @@ fn resolveFoldGatedOrRg(
     if (!appendFcBool(out, fc_fold_out, true)) return false;
     if (mixed) {
         if (!appendFcBool(out, fc_tile_major, tile_major)) return false;
+        if (!appendFcU32(out, fc_rate_mask_g, rate_masks.g)) return false;
+        if (!is_down) {
+            if (!appendFcU32(out, fc_rate_mask_u, rate_masks.u)) return false;
+        }
         if (is_down) {
             if (!appendFcInt(out, fc_clamp_limit, 0)) return false;
         }

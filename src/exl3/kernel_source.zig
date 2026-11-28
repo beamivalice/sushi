@@ -74,7 +74,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\static inline constexpr uint exl3_end(uint N, uint j) { return ((j + 1u) * N) >> 4u; }
     \\// The 64 stream bits ending at bit `end` of a tile of `nwords` words (the tile
     \\// wraps). Two words carry only the last 32 + end % 32 of them; `full` reads a third.
-    \\static inline ulong exl3_window(const device uint *words, uint end, uint nwords, bool full) {
+    \\__attribute__((always_inline)) static inline ulong exl3_window(const device uint *words, uint end, uint nwords, bool full) {
     \\  const uint last = (end - 1u) >> 5u;
     \\  const uint prev = last == 0u ? nwords - 1u : last - 1u;
     \\  const uint s = (0u - end) & 31u;
@@ -92,7 +92,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\#endif
     \\template<bool Wide, bool Funnel = false, uint PairKind = 0u> struct exl3_lane_type {
     \\  using type = ulong;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
+    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool full) {
     \\    return exl3_window(words, end, W, full);
     \\  }
     \\};
@@ -100,7 +100,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\// (s < 32): OR-ing the third word into a 64-bit shift costs the ALU-bound decode GEMV far more.
     \\template<> struct exl3_lane_type<false, true, 0u> {
     \\  using type = ulong;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool) {
     \\    const uint last = (end - 1u) >> 5u;
     \\    const uint prev = last == 0u ? W - 1u : last - 1u;
     \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
@@ -114,7 +114,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\// PAIR1 narrow (N <= 42, EXL3_LANE_FIRST == 1u): all 4 odd codewords lie in bits 0..31 -> single 32-bit uint.
     \\template<> struct exl3_lane_type<false, false, 1u> {
     \\  using type = uint;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool) {
     \\    const uint last = (end - 1u) >> 5u;
     \\    const uint prev = last == 0u ? W - 1u : last - 1u;
     \\    const uint s = (0u - end) & 31u;
@@ -124,7 +124,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\// PAIR1 medium (42 < N <= 108, EXL3_LANE_FIRST == 1u): uint2 keeps sh <= 16u as 32-bit shifts and sh > 16u as 32-bit funnels.
     \\template<> struct exl3_lane_type<false, false, 2u> {
     \\  using type = uint2;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool) {
     \\    const uint last = (end - 1u) >> 5u;
     \\    const uint prev = last == 0u ? W - 1u : last - 1u;
     \\    const uint s = (0u - end) & 31u;
@@ -135,7 +135,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\};
     \\template<> struct exl3_lane_type<false, true, 2u> {
     \\  using type = uint2;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool) {
     \\    const uint last = (end - 1u) >> 5u;
     \\    const uint prev = last == 0u ? W - 1u : last - 1u;
     \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
@@ -148,7 +148,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\};
     \\template<> struct exl3_lane_type<true, false, 0u> {
     \\  using type = ulong2;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
+    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool full) {
     \\    return ulong2(exl3_window(words, end, W, full), exl3_window(words, end - 32u, W, true));
     \\  }
     \\};
@@ -158,16 +158,16 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\    : 0u;
     \\}
     \\template<uint N> using exl3_lane_bits = typename exl3_lane_type<(exl3_lane_sh(N, 0u) + 16u > 64u), false, exl3_pair_kind(N)>::type;
-    \\static inline uint exl3_lane_word(uint bits, uint sh) { return bits >> sh; }
-    \\static inline uint exl3_lane_word(uint2 bits, uint sh) {
+    \\__attribute__((always_inline)) static inline uint exl3_lane_word(uint bits, uint sh) { return bits >> sh; }
+    \\__attribute__((always_inline)) static inline uint exl3_lane_word(uint2 bits, uint sh) {
     \\  return sh <= 16u ? (bits.x >> sh) : (sh < 32u ? ((bits.x >> sh) | (bits.y << (32u - sh))) : (bits.y >> (sh - 32u)));
     \\}
-    \\static inline uint exl3_lane_word(ulong bits, uint sh) { return uint(bits >> sh); }
-    \\static inline uint exl3_lane_word(ulong2 bits, uint sh) {
+    \\__attribute__((always_inline)) static inline uint exl3_lane_word(ulong bits, uint sh) { return uint(bits >> sh); }
+    \\__attribute__((always_inline)) static inline uint exl3_lane_word(ulong2 bits, uint sh) {
     \\  return sh <= 48u ? uint(bits.x >> sh) : uint(bits.y >> (sh - 32u));
     \\}
     \\template<uint N>
-    \\static inline exl3_lane_bits<N> exl3_lane(const device uint *words, uint lane) {
+    \\__attribute__((always_inline)) static inline exl3_lane_bits<N> exl3_lane(const device uint *words, uint lane) {
     \\  constexpr uint W = N / 2u;
     \\  constexpr uint low = W & (0u - W);
     \\  constexpr bool wide = exl3_lane_sh(N, 0u) + 16u > 64u;
@@ -186,7 +186,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\// Weight t's 16-bit codeword is the window ending at floor((t+1)*K), with
     \\// K = N/16; the pair (t0, t0+1) shares one 32-bit funnel read.
     \\struct exl3_win { uint i0; uint i1; uint sh; uint fresh; };
-    \\static inline exl3_win exl3_pair_window(uint t0, uint N) {
+    \\__attribute__((always_inline)) static inline exl3_win exl3_pair_window(uint t0, uint N) {
     \\  const uint e0 = ((t0 + 1u) * N) >> 4u;
     \\  const uint e1 = ((t0 + 2u) * N) >> 4u;
     \\  const uint b0 = e0 + 16u * N - 16u;

@@ -328,11 +328,13 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\  const threadgroup half *pl8 = prep + xrow8 * uint(CHUNK) + uint(origin.x);
     \\  for (uint tk = c0 + (kslice + uint(KPH) - (c0 - tk0) % uint(KPH)) % uint(KPH); tk < c1; tk += uint(UNR) * uint(KPH)) {
     \\    nfrag wf[UNR][2];
+    \\    #pragma clang loop unroll(full)
     \\    for (uint u = 0u; u < uint(UNR); u++) {
     \\      const device uint *wp = wcol + (size_t)(tk + u * uint(KPH) - tk0) * OT * PACKED_W;
     \\      wf[u][0] = rows_wfrag<N, R32, SW>(wp, lane);
     \\      wf[u][1] = rows_wfrag<N, R32, SW>(wp + PACKED_W, lane);
     \\    }
+    \\    #pragma clang loop unroll(full)
     \\    for (uint u = 0u; u < uint(UNR); u++) {
     \\      for (short s = 0; s < 8; s++) {
     \\        right[s] = wf[u][0][s];
@@ -361,6 +363,95 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\  }
     \\}
     \\if constexpr (FOLD) {
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+++ ROWS_FOLD ++
+    \\} else if constexpr (KPARTS > 1u) {
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (uint i = lid; i < uint(ROWS) * 128u; i += SGS * 32u) {
+    \\    const uint r = i / 128u;
+    \\    const uint c = i - r * 128u;
+    \\    float sum = 0.0f;
+    \\    for (uint k = 0u; k < KPARTS; k++) sum += tgm[(r * KPARTS + k) * 128u + c];
+    \\    exl3_store(y + (size_t)(r * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + c, sum);
+    \\  }
+    \\}
+;
+
+const ROWS_PREPPED_HEAD: []const u8 =
+    \\constexpr uint TILE = 16u;
+    \\constexpr uint N = uint(NHW);
+    \\constexpr uint PACKED_W = N / 2u;
+    \\constexpr uint OT = uint(ODIM) / TILE;
+    \\constexpr uint KT = uint(IDIM) / uint(NSPLIT) / TILE;
+    \\threadgroup float tgm[(FOLD || KPARTS > 1u) ? PART_F : 1u];
+    \\const uint ot0 = uint(threadgroup_position_in_grid.x) * TGT;
+    \\const uint split = uint(threadgroup_position_in_grid.y);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint tk0 = split * KT;
+    \\
+;
+
+/// `ROWS_NAX_SOURCE` reading already Hadamard-prepared `[ROWS, IDIM]` f16 rows directly in linear `lane` order
+/// (no `suh`, no input H128, no threadgroup prep buffer).
+pub const ROWS_NAX_PREPPED_SOURCE: [:0]const u8 =
+    \\static_assert(UNR == 1 || KPH == 1, "an unrolled walk steps whole chunks of one slice");
+    \\constexpr uint SGS = 4u * uint(KPH);
+    \\constexpr uint KPARTS = uint(KPH);
+    \\constexpr uint TGT = 8u;
+    \\constexpr uint PART_F = uint(ROWS) * KPARTS * 128u;
+    \\
+++ ROWS_PREPPED_HEAD ++
+    \\constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+    \\matmul2d<desc, execution_simdgroup> op;
+    \\auto left = op.get_left_input_cooperative_tensor<half, half, float>();
+    \\auto right = op.get_right_input_cooperative_tensor<half, half, float>();
+    \\auto destination = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(left)>, metal::remove_addrspace_t<decltype(right)>, float>();
+    \\nax_zero(destination);
+    \\const short2 origin = nax_origin(lane);
+    \\const uint xrow = min(uint(origin.y), uint(ROWS) - 1u);
+    \\const uint xrow8 = min(uint(origin.y) + 8u, uint(ROWS) - 1u);
+    \\const uint lid = uint(thread_index_in_threadgroup);
+    \\const uint col0 = sg & 3u;
+    \\const uint kslice = sg >> 2u;
+    \\const device uint *wcol = (const device uint *)trellis + ((size_t)tk0 * OT + ot0 + 2u * col0) * PACKED_W;
+    \\const device half *pl = (const device half *)x + (size_t)xrow * uint(IDIM) + uint(origin.x);
+    \\const device half *pl8 = (const device half *)x + (size_t)xrow8 * uint(IDIM) + uint(origin.x);
+    \\for (uint tk = tk0 + kslice; tk < tk0 + KT; tk += uint(UNR) * uint(KPH)) {
+    \\  nfrag wf[UNR][2];
+    \\  for (uint u = 0u; u < uint(UNR); u++) {
+    \\    const device uint *wp = wcol + (size_t)(tk + u * uint(KPH) - tk0) * OT * PACKED_W;
+    \\    wf[u][0] = rows_wfrag<N, R32, SW>(wp, lane);
+    \\    wf[u][1] = rows_wfrag<N, R32, SW>(wp + PACKED_W, lane);
+    \\  }
+    \\  for (uint u = 0u; u < uint(UNR); u++) {
+    \\    for (short s = 0; s < 8; s++) {
+    \\      right[s] = wf[u][0][s];
+    \\      right[8 + s] = wf[u][1][s];
+    \\    }
+    \\    const half4 v = *((const device half4 *)(pl + (tk + u * uint(KPH)) * TILE));
+    \\    const half4 v8 = ROWS > 8 ? *((const device half4 *)(pl8 + (tk + u * uint(KPH)) * TILE)) : half4(0.0h);
+    \\    for (uint c = 0u; c < 4u; c++) {
+    \\      left[c] = v[c];
+    \\      left[4 + c] = v8[c];
+    \\    }
+    \\    op.run(left, right, destination);
+    \\  }
+    \\}
+    \\for (uint h = 0u; h < (ROWS > 8 ? 2u : 1u); h++) {
+    \\  const uint row = uint(origin.y) + 8u * h;
+    \\  if (row >= uint(ROWS)) continue;
+    \\  for (uint ct = 0u; ct < 2u; ct++) {
+    \\    for (uint c = 0u; c < 4u; c++) {
+    \\      const uint col = col0 * 32u + ct * 16u + uint(origin.x) + c;
+    \\      if constexpr (FOLD || KPARTS > 1u) tgm[(row * KPARTS + kslice) * 128u + col] = destination[ct * 8u + 4u * h + c];
+    \\      else exl3_store(y + (size_t)(row * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, float(destination[ct * 8u + 4u * h + c]));
+    \\    }
+    \\  }
+    \\}
+    \\if constexpr (FOLD) {
+    \\  const float psc = 0.08838834764831845f;
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
 ++ ROWS_FOLD ++
@@ -548,21 +639,7 @@ pub const ROWS_RING_HELPERS: [:0]const u8 = ROWS_HELPERS ++
 /// `ROWS_FINISH_RMS_SOURCE` for a 2-segment `[NORM, KV_D]` attention input (`wq_a` + `wkv`) that also applies
 /// `kv_norm` + tail RoPE + optional fp8 QAT on the `KV_D` segment in the idle simdgroups and copies unchanged rows
 /// of `ring` into `rout` in parallel threadgroups, eliminating the `ropeKvRing` barrier and DRAM roundtrip.
-pub const ROWS_FINISH_RMS_RING_SOURCE: [:0]const u8 =
-    \\#pragma clang fp contract(off)
-    \\const uint tgid = uint(threadgroup_position_in_grid.x);
-    \\const int cap = ring_shape[0];
-    \\if (tgid >= uint(ROWS)) {
-    \\  constexpr uint U = uint(KV_D) * sizeof(OutT) / 16u;
-    \\  const uint u = (tgid - uint(ROWS)) * uint(threads_per_threadgroup.x) + uint(thread_position_in_threadgroup.x);
-    \\  if (u >= uint(cap) * U) return;
-    \\  if ((int(u / U) + cap - int(pos[0]) % cap) % cap < int(ROWS)) return;
-    \\  ((device metal::uint4 *)rout)[u] = ((const device metal::uint4 *)ring)[u];
-    \\  return;
-    \\}
-    \\const uint lane = uint(thread_index_in_simdgroup);
-    \\const uint sg = uint(simdgroup_index_in_threadgroup);
-    \\const uint r = tgid;
+const ROWS_FINISH_RMS_RING_BODY: [:0]const u8 =
     \\threadgroup float fin[NORM];
     \\threadgroup float kfin[KV_D];
     \\threadgroup float sums[32];
@@ -658,6 +735,35 @@ pub const ROWS_FINISH_RMS_RING_SOURCE: [:0]const u8 =
     \\  for (int i = 0; i < 4; i++) dst[i] = OutT(kv[i]);
     \\}
 ;
+
+pub const ROWS_FINISH_RMS_RING_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint tgid = uint(threadgroup_position_in_grid.x);
+    \\const int cap = ring_shape[0];
+    \\if (tgid >= uint(ROWS)) {
+    \\  constexpr uint U = uint(KV_D) * sizeof(OutT) / 16u;
+    \\  const uint u = (tgid - uint(ROWS)) * uint(threads_per_threadgroup.x) + uint(thread_position_in_threadgroup.x);
+    \\  if (u >= uint(cap) * U) return;
+    \\  if ((int(u / U) + cap - int(pos[0]) % cap) % cap < int(ROWS)) return;
+    \\  ((device metal::uint4 *)rout)[u] = ((const device metal::uint4 *)ring)[u];
+    \\  return;
+    \\}
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const uint r = tgid;
+    \\
+++ ROWS_FINISH_RMS_RING_BODY;
+
+/// In-place variant of `ROWS_FINISH_RMS_RING_SOURCE`: writes `ROWS` rows directly into `rout` (the owned KV ring)
+/// with no `ring` read and no copy threadgroups.
+pub const ROWS_FINISH_RMS_RING_IP_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint r = uint(threadgroup_position_in_grid.x);
+    \\const int cap = int(CAP);
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\
+++ ROWS_FINISH_RMS_RING_BODY;
 
 pub const ROWS_NAX_ROPE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_FOLD, ROWS_FOLD_ROPE);
 
@@ -836,6 +942,10 @@ const RowsFinishRmsRingKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int
 var rows_finish_rms_ring_cfgs: kernel_src.CfgCache(RowsFinishRmsRingKey, 32) = .{};
 
 var rows_finish_rms_ring_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+var rows_finish_rms_ring_ip_cfgs: kernel_src.CfgCache(RowsFinishRmsRingKey, 32) = .{};
+
+var rows_finish_rms_ring_ip_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 const RowsNaxRopeKey = struct { base: RowsKey, hd: c_int, rd: c_int };
 
@@ -1326,17 +1436,25 @@ fn isLmHead(in_dim: c_int, out_dim: c_int, groups: c_int) bool {
 /// memory, so a launch needs fewer k-split partials (none, and no finish dispatch, at `nsplit` 1). The geometry never
 /// depends on the row count, which keeps a row's bytes equal at every width.
 const NaxSplit = struct { kph: c_int, nsplit: c_int };
-/// `ultra_k5`: the split a K5 bank takes on the widest desktop class (an M5 Ultra); every other box and rate keeps
-/// `kph`/`nsplit`. A different split sums in another order, so the bytes differ by GPU class.
-const NaxTuned = struct { in_dim: c_int, out_dim: c_int, groups: c_int, kph: c_int, nsplit: c_int, ultra_k5: ?NaxSplit = null };
+/// `ultra_k5` / `ultra_k6`: the split a K5 (`n == 80`) or K6 (`n == 96`) bank takes on the widest desktop class (an M5
+/// Ultra); every other box and rate keeps `kph`/`nsplit`. A different split sums in another order, so the bytes differ by GPU class.
+const NaxTuned = struct { in_dim: c_int, out_dim: c_int, groups: c_int, kph: c_int, nsplit: c_int, ultra_k5: ?NaxSplit = null, ultra_k6: ?NaxSplit = null };
 
 const NAX_TUNED = [_]NaxTuned{
     .{ .in_dim = 5120, .out_dim = 1792, .groups = 1, .kph = 4, .nsplit = 5, .ultra_k5 = .{ .kph = 1, .nsplit = 20 } },
-    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1, .ultra_k5 = .{ .kph = 1, .nsplit = 1 } },
-    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8, .ultra_k5 = .{ .kph = 2, .nsplit = 2 } },
+    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1, .ultra_k5 = .{ .kph = 2, .nsplit = 1 } },
+    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8, .ultra_k5 = .{ .kph = 4, .nsplit = 2 } },
     .{ .in_dim = 8192, .out_dim = 5120, .groups = 1, .kph = 2, .nsplit = 4, .ultra_k5 = .{ .kph = 1, .nsplit = 8 } },
     .{ .in_dim = 6144, .out_dim = 25600, .groups = 1, .kph = 2, .nsplit = 4, .ultra_k5 = .{ .kph = 2, .nsplit = 1 } },
-    .{ .in_dim = 5120, .out_dim = 129280, .groups = 1, .kph = 1, .nsplit = 2 },
+    .{ .in_dim = 5120, .out_dim = 129280, .groups = 1, .kph = 1, .nsplit = 2, .ultra_k6 = .{ .kph = 1, .nsplit = 1 } },
+};
+
+/// Hy4-Flash K6 (`n == 96`) attention output projections on M5 Ultra (`class == .d`): cuts k-split partials on
+/// `o` (32 -> 8) and `o_sparse` (16 -> 8), speeding up both `rows_nax` and `hy4_hc_expand_parts` while keeping
+/// `nsplit > 1` for `applyParts`/`applyFinished`.
+const NAX_ULTRA_K6 = [_]NaxTuned{
+    .{ .in_dim = 16384, .out_dim = 3072, .groups = 1, .kph = 4, .nsplit = 8 },
+    .{ .in_dim = 8192, .out_dim = 3072, .groups = 1, .kph = 4, .nsplit = 8 },
 };
 
 /// The NAX arm walks two k-tiles' fragments ahead of their MMAs at one simdgroup per pair, on 32-bit funnels: a one-row
@@ -1359,8 +1477,16 @@ fn rowsLaunch(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: c_in
     if (nax) for (NAX_TUNED) |t| {
         if (t.in_dim == in_dim and t.out_dim == out_dim and t.groups == groups) {
             const base: NaxSplit = .{ .kph = t.kph, .nsplit = t.nsplit };
-            const g = if (n == 80 and device.current().class == .d) t.ultra_k5 orelse base else base;
+            const g = if (device.current().class == .d)
+                (if (n == 80) t.ultra_k5 else if (n == 96) t.ultra_k6 else null) orelse base
+            else
+                base;
             return .{ .tgrp = 4, .kph = g.kph, .nsplit = g.nsplit, .chunk = rowsChunk(in_dim, rows, g.nsplit), .nax = true };
+        }
+    };
+    if (nax and n == 96 and device.current().class == .d) for (NAX_ULTRA_K6) |t| {
+        if (t.in_dim == in_dim and t.out_dim == out_dim and t.groups == groups) {
+            return .{ .tgrp = 4, .kph = t.kph, .nsplit = t.nsplit, .chunk = rowsChunk(in_dim, rows, t.nsplit), .nax = true };
         }
     };
     if (@divExact(out_dim, 128) * groups >= 1024) return .{ .tgrp = 4, .kph = if (nax) 1 else 2, .nsplit = 1, .chunk = rowsChunk(in_dim, rows, 1), .nax = nax };
@@ -1597,9 +1723,10 @@ pub const Rope = struct { freqs: mlx.mlx_array, pos: mlx.mlx_array, hd: c_int, r
 
 /// Ring-update parameters for `launchRowsNormedRing`: norms + tail-rotates (+ optional fp8 QAT) the `kv` segment
 /// right after `norm.cols` and writes it into `ring` `[cap, kv_dim]` in the same finish dispatch.
-pub const KvRing = struct { kw: mlx.mlx_array, freqs: mlx.mlx_array, pos: mlx.mlx_array, ring: mlx.mlx_array, cap: c_int, kv_dim: c_int, rd: c_int, qat: bool };
+/// When `qout_in_place` is set on the Cooler engine stream, writes `qout` and updates `ring` in place with zero copy.
+pub const KvRing = struct { kw: mlx.mlx_array, freqs: mlx.mlx_array, pos: mlx.mlx_array, ring: mlx.mlx_array, cap: c_int, kv_dim: c_int, rd: c_int, qat: bool, qout_in_place: mlx.mlx_array = .{} };
 
-pub const NormedRingOut = struct { q: mlx.mlx_array, ring: mlx.mlx_array };
+pub const NormedRingOut = struct { q: mlx.mlx_array, ring: mlx.mlx_array, in_place: bool = false };
 
 pub fn normedRingFits(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, norm: Norm, kr: KvRing) bool {
     if (l.thru or !normedFits(l, g, bounds, norm)) return false;
@@ -1627,6 +1754,30 @@ pub fn launchRowsNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.ml
     defer _ = mlx.mlx_array_free(part);
     try mlx.check(mlx.mlx_vector_array_get(&part, pv, 0));
     const fkey = RowsFinishRmsRingKey{ .out_dim = l.out_dim, .rows = l.rows, .nsplit = g.nsplit, .out_dt = l.out_dt, .norm = norm.cols, .kv_dim = kr.kv_dim, .rd = kr.rd, .qat = kr.qat, .cap = kr.cap };
+    if (kr.qout_in_place.ctx != null) {
+        const fcfg_ip = rows_finish_rms_ring_ip_cfgs.get(fkey) orelse blk: {
+            const c = mlx.mlx_fast_metal_kernel_config_new();
+            errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+            const threads = @divExact(l.out_dim, 4);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.rows, norm.cols }, 2, l.out_dt));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ kr.cap, kr.kv_dim }, 2, l.out_dt));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, l.rows * threads, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, threads, 1, 1));
+            inline for (.{ "ODIM", "ROWS", "NSPLIT", "NORM", "KV_D", "RD", "QAT", "CAP" }, .{ l.out_dim, l.rows, g.nsplit, norm.cols, kr.kv_dim, kr.rd, @as(c_int, @intFromBool(kr.qat)), kr.cap }) |name, v|
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
+            rows_finish_rms_ring_ip_cfgs.put(fkey, c);
+            break :blk c;
+        };
+        const fk_ip = try kernels.getNamedKernel(&rows_finish_rms_ring_ip_kernel, "sushi_exl3_rows_finish_rms_ring_ip", &.{ "part", "svh", "w", "eps", "kw", "freqs", "pos" }, &.{ "qout", "rout" }, ROWS_FINISH_RMS_RING_IP_SOURCE, ROWS_RING_HELPERS);
+        const ins = [_]mlx.mlx_array{ part, svh, norm.w, norm.eps, kr.kw, kr.freqs, kr.pos };
+        const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_array_free(iv);
+        if (host_side.applyInPlace(fk_ip, iv, fcfg_ip, s, &.{ kr.qout_in_place, kr.ring })) |rc| {
+            try mlx.check(rc);
+            return .{ .q = kr.qout_in_place, .ring = kr.ring, .in_place = true };
+        }
+    }
     const fcfg = rows_finish_rms_ring_cfgs.get(fkey) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -1653,7 +1804,7 @@ pub fn launchRowsNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.ml
     errdefer _ = mlx.mlx_array_free(rout);
     try mlx.check(mlx.mlx_vector_array_get(&qout, ov, 0));
     try mlx.check(mlx.mlx_vector_array_get(&rout, ov, 1));
-    return .{ .q = qout, .ring = rout };
+    return .{ .q = qout, .ring = rout, .in_place = false };
 }
 
 pub fn ropeFits(l: RowsLaunch, g: RowsGeom, rp: Rope) bool {

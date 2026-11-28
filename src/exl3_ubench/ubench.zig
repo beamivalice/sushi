@@ -2259,6 +2259,7 @@ pub const trunk_hy4: report.Bench = .{
     },
     .arms = &(trunk_launch_arms ++ [_][]const u8{ "hy4", "thru", "hy4_norm", "thru_norm" }),
     .ref = "exact",
+    .opts = &.{.{ .name = "geom", .help = "kph:nsplit forced on the NAX arm at every shape (the tuned table by default)" }},
     .run = runTrunkHy4,
 };
 
@@ -2491,6 +2492,13 @@ fn runTrunkHy4(run: *report.Run) anyerror!void {
 fn runLaunchTable(run: *report.Run, table: []const TrunkLaunch) anyerror!void {
     const s = mlx.gpuStream();
     defer kernels.setDecodeParams(.mul1);
+    if (run.opt("geom")) |v| {
+        var it = std.mem.splitScalar(u8, v, ':');
+        const kph = std.fmt.parseInt(c_int, it.next() orelse return error.BadOpt, 10) catch return error.BadOpt;
+        const nsplit = std.fmt.parseInt(c_int, it.next() orelse return error.BadOpt, 10) catch return error.BadOpt;
+        project_rows.nax_geom_force = .{ .kph = kph, .nsplit = nsplit };
+    }
+    defer project_rows.nax_geom_force = null;
     var prng = std.Random.DefaultPrng.init(0x51);
     const rnd = prng.random();
     try kernels.SPEC1_W15.requireTable();

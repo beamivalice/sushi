@@ -494,7 +494,7 @@ pub const GEMM_NAX_INCLUDES: [:0]const u8 =
 ;
 pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\using nfrag = vec<half, 8>;
-    \\static inline nfrag nax_wfrag(const device uint *words, uint lane) {
+    \\__attribute__((always_inline)) static inline nfrag nax_wfrag(const device uint *words, uint lane) {
     \\  constexpr uint N = 64u;
     \\  const uint source0 = (lane & 16u) + ((lane & 7u) << 1u);
     \\  const uint2 current = *(const device uint2 *)(words + source0);
@@ -517,12 +517,12 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\static inline constexpr bool nax_quads_fit(uint N) {
     \\  return nax_end(N, 0u, 5u) - nax_end(N, 0u, 0u) <= 16u && nax_end(N, 1u, 5u) - nax_end(N, 1u, 0u) <= 16u;
     \\}
-    \\static inline uint nax_sh(uint N, uint b, uint j) {
+    \\__attribute__((always_inline)) static inline uint nax_sh(uint N, uint b, uint j) {
     \\  const uint s0 = nax_end(N, 0u, 5u) - nax_end(N, 0u, j);
     \\  return s0 + b * (nax_end(N, 1u, 5u) - nax_end(N, 1u, j) - s0);
     \\}
     \\template<uint N, typename F>
-    \\static inline nfrag nax_quads(F lo, F hi, uint s0, uint s1, uint s4) {
+    \\__attribute__((always_inline)) static inline nfrag nax_quads(F lo, F hi, uint s0, uint s1, uint s4) {
     \\  const half2 p0 = exl3_pairh(uint2(uint(lo >> s0) & 0xffffu, uint(lo >> s1) & 0xffffu));
     \\  const half2 p1 = exl3_pairh(uint2(uint(lo >> s4) & 0xffffu, uint(lo) & 0xffffu));
     \\  const half2 p2 = exl3_pairh(uint2(uint(hi >> s0) & 0xffffu, uint(hi >> s1) & 0xffffu));
@@ -530,7 +530,7 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
     \\}
     \\// The 64 stream bits ending at `end` as two 32-bit funnels: .x the last 32, .y the 32 ending 16 bits earlier.
-    \\static inline uint2 nax_win2(const device uint *words, uint end, uint nwords) {
+    \\__attribute__((always_inline)) static inline uint2 nax_win2(const device uint *words, uint end, uint nwords) {
     \\  const uint last = (end - 1u) >> 5u;
     \\  const uint prev = last == 0u ? nwords - 1u : last - 1u;
     \\  const uint third = prev == 0u ? nwords - 1u : prev - 1u;
@@ -542,22 +542,22 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\// nax_quads over nax_win2's halves below n64, where the second weight starts within 16 bits of the last and the
     \\// first lies 16 to 32 bits past .x's reach, so it reads .y.
     \\template<uint N>
-    \\static inline nfrag nax_quads_win2(uint2 lo, uint2 hi, uint s0, uint s1, uint s4) {
+    \\__attribute__((always_inline)) static inline nfrag nax_quads_win2(uint2 lo, uint2 hi, uint s0, uint s1, uint s4) {
     \\  const half2 p0 = exl3_pairh(uint2((lo.y >> (s0 - 16u)) & 0xffffu, (lo.x >> s1) & 0xffffu));
     \\  const half2 p1 = exl3_pairh(uint2((lo.x >> s4) & 0xffffu, lo.x & 0xffffu));
     \\  const half2 p2 = exl3_pairh(uint2((hi.y >> (s0 - 16u)) & 0xffffu, (hi.x >> s1) & 0xffffu));
     \\  const half2 p3 = exl3_pairh(uint2((hi.x >> s4) & 0xffffu, hi.x & 0xffffu));
     \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
     \\}
-    \\static inline uint nax_funnel(uint late, uint early, uint s) { return uint(((ulong(early) << 32u) | ulong(late)) >> s); }
+    \\__attribute__((always_inline)) static inline uint nax_funnel(uint late, uint early, uint s) { return uint(((ulong(early) << 32u) | ulong(late)) >> s); }
     \\template<uint N>
-    \\static inline half2 nax_k5_pair(uint bits) {
+    \\__attribute__((always_inline)) static inline half2 nax_k5_pair(uint bits) {
     \\  return exl3_pairh(uint2(bits >> 5u, bits) & uint2(0xffffu));
     \\}
     \\// A K5 lane's four codeword pairs lie in four adjacent words, funneled once at the lane's offset;
     \\// word 0's predecessor is the tile's last word, as the trellis wraps.
     \\template<uint N>
-    \\static inline nfrag nax_k5_frag(const device uint *words, uint lane) {
+    \\__attribute__((always_inline)) static inline nfrag nax_k5_frag(const device uint *words, uint lane) {
     \\  const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
     \\  const uint word = (5u * group) >> 1u;
     \\  const uint shift = 26u - 16u * (group & 1u) - 10u * ((lane >> 3u) & 1u);
@@ -573,7 +573,7 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
     \\}
     \\template<uint N>
-    \\static inline nfrag nax_wfrag_k(const device uint *words, uint lane) {
+    \\__attribute__((always_inline)) static inline nfrag nax_wfrag_k(const device uint *words, uint lane) {
     \\  // A PAIR1 lane's four odd codewords at K2.5 to K3.5 lie in three adjacent words, each read once.
     \\  if constexpr (EXL3_LANE_FIRST == 1u && (N == 40u || N == 48u || N == 56u)) {
     \\    constexpr uint P = N / 8u;
@@ -598,12 +598,12 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\  if (N < 64u) return nax_quads_win2<N>(nax_win2(words, end, W), nax_win2(words, end + W, W), s0, s1, s4);
     \\  return nax_quads<N>(exl3_window(words, end, W, true), exl3_window(words, end + W, W, true), s0, s1, s4);
     \\}
-    \\static inline short2 nax_origin(uint lane) {
+    \\__attribute__((always_inline)) static inline short2 nax_origin(uint lane) {
     \\  const short qid = short(lane >> 2u);
     \\  return short2(short(((qid & 2) | short(lane & 1u)) * 4), short((qid & 4) | short((lane >> 1u) & 3u)));
     \\}
     \\template <typename D>
-    \\static inline void nax_zero(thread D &dst) {
+    \\__attribute__((always_inline)) static inline void nax_zero(thread D &dst) {
     \\  for (uint s = 0u; s < dst.get_capacity(); s++) dst[s] = 0.0f;
     \\}
     \\// `rem` is the block's live row count: the 16-row tile is padded with zeros
@@ -2012,22 +2012,27 @@ pub const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\  // blocks (8 tiles), so the second k-tile of an iteration is always in range.
     \\  const device uint *wp = trellis_e + ((size_t)(tk0 + sg) * (size_t)OT + ot) * PACKED_W;
     \\  const threadgroup half *pp = prepared + (tk0 + sg) * TILE;
-    \\  const uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
+    \\  constexpr uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
     \\  for (uint tk = tk0 + sg; tk < tk1; tk += 2u * SGS) {
     \\    exl3_lane_bits<N> merged[2][OTPT];
+    \\    #pragma clang loop unroll(full)
     \\    for (uint u = 0u; u < 2u; u++) {
+    \\      #pragma clang loop unroll(full)
     \\      for (uint o = 0u; o < uint(OTPT); o++) {
     \\        const device uint *words = wp + u * SGS * OT * PACKED_W + o * PACKED_W;
     \\        merged[u][o] = exl3_lane<N>(words, lane);
     \\      }
     \\    }
+    \\    #pragma clang loop unroll(full)
     \\    for (uint u = 0u; u < 2u; u++) {
     \\      const float in0 = float(pp[u * SGS * TILE + row0]);
     \\      const float in1 = float(pp[u * SGS * TILE + row1]);
     \\      const float in2 = float(pp[u * SGS * TILE + row2]);
     \\      const float in3 = float(pp[u * SGS * TILE + row3]);
     \\      const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+    \\      #pragma clang loop unroll(full)
     \\      for (uint o = 0u; o < uint(OTPT); o++) {
+    \\        #pragma clang loop unroll(full)
     \\        for (uint p = 0u; p < 4u; p++) {
     \\          const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
     \\          const float2 w = exl3_decode2(cw);
@@ -2229,22 +2234,27 @@ pub const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\    // blocks (8 tiles), so the second k-tile of an iteration is always in range.
     \\    const device uint *wp = trellis_e + ((size_t)(tk0 + sg) * (size_t)OT + ot) * PACKED_W;
     \\    const threadgroup half *pp = prepared + xb + sg * TILE;
-    \\    const uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
+    \\    constexpr uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
     \\    for (uint tk = tk0 + sg; tk < tk1; tk += 2u * SGS) {
     \\      exl3_lane_bits<N> merged[2][OTPT];
+    \\      #pragma clang loop unroll(full)
     \\      for (uint u = 0u; u < 2u; u++) {
+    \\        #pragma clang loop unroll(full)
     \\        for (uint o = 0u; o < uint(OTPT); o++) {
     \\          const device uint *words = wp + u * SGS * OT * PACKED_W + o * PACKED_W;
     \\          merged[u][o] = exl3_lane<N>(words, lane);
     \\        }
     \\      }
+    \\      #pragma clang loop unroll(full)
     \\      for (uint u = 0u; u < 2u; u++) {
     \\        const float in0 = float(pp[u * SGS * TILE + row0]);
     \\        const float in1 = float(pp[u * SGS * TILE + row1]);
     \\        const float in2 = float(pp[u * SGS * TILE + row2]);
     \\        const float in3 = float(pp[u * SGS * TILE + row3]);
     \\        const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+    \\        #pragma clang loop unroll(full)
     \\        for (uint o = 0u; o < uint(OTPT); o++) {
+    \\          #pragma clang loop unroll(full)
     \\          for (uint p = 0u; p < 4u; p++) {
     \\            const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
     \\            const float2 w = exl3_decode2(cw);
@@ -6095,36 +6105,36 @@ pub const DOWN_PREPARED_SOURCE: [:0]const u8 = blk: {
 const GROUP_SELECT_SOURCE =
     \\constexpr uint NW = (uint(NSLOTS) + 31u) / 32u;
     \\const uint eid = uint(slots[first]);
-    \\uint hits[NW];
+    \\uint members[GROUP];
+    \\#pragma clang loop unroll(full)
+    \\for (uint j = 0u; j < uint(GROUP); j++) members[j] = first;
     \\uint rank = 0u;
+    \\uint m = 0u;
     \\for (uint i = 0u; i < NW; i++) {
     \\  const bool hit = i * 32u + lane < uint(NSLOTS) && uint(slots[i * 32u + lane]) == eid;
     \\  const uint word = uint(static_cast<simd_vote::vote_t>(simd_ballot(hit)));
     \\  const uint below = first >= (i + 1u) * 32u ? 0xffffffffu : (first <= i * 32u ? 0u : (1u << (first - i * 32u)) - 1u);
     \\  rank += popcount(word & below);
-    \\  hits[i] = word & ~below;
+    \\  uint rem = word & ~below;
+    \\  while (rem != 0u && m < uint(GROUP)) {
+    \\    const uint at = i * 32u + ctz(rem);
+    \\    if constexpr (uint(GROUP) == 2u) {
+    \\      if (m == 0u) members[0] = at; else members[1] = at;
+    \\    } else {
+    \\      members[m] = at;
+    \\    }
+    \\    m++;
+    \\    rem &= rem - 1u;
+    \\  }
     \\}
     \\if (rank % uint(GROUP) != 0u) return;
-    \\uint members[GROUP];
-    \\uint m = 0u;
-    \\for (uint j = 0u; j < uint(GROUP); j++) {
-    \\  uint at = 0xffffffffu;
-    \\  for (uint i = 0u; i < NW; i++) {
-    \\    if (at == 0xffffffffu && hits[i] != 0u) {
-    \\      at = i * 32u + ctz(hits[i]);
-    \\      hits[i] &= hits[i] - 1u;
-    \\    }
-    \\  }
-    \\  members[j] = at != 0xffffffffu ? at : first;
-    \\  m += at != 0xffffffffu ? 1u : 0u;
-    \\}
     \\
 ;
 
 const GROUP_MEMBERS_SOURCE = GROUP_SELECT_SOURCE ++
     \\const uint prow = (lane & 3u) * 2u;
     \\const uint pcol = lane >> 2u;
-    \\const uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
+    \\constexpr uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
     \\
 ;
 
@@ -6149,7 +6159,9 @@ fn groupLadder(comptime g: u32, comptime body: fn (comptime u32, comptime []cons
 /// points at member j's inputs for this iteration's first k-tile.
 fn groupFunnelStep(comptime size: u32, comptime mc: []const u8, comptime member_ptr: []const u8) []const u8 {
     const loads = "exl3_lane_bits<N> merged[2][OTPT];\n" ++
+        \\#pragma clang loop unroll(full)
         \\for (uint u = 0u; u < 2u; u++) {
+        \\  #pragma clang loop unroll(full)
         \\  for (uint o = 0u; o < uint(OTPT); o++) {
         \\    const device uint *words = wp + u * SGS * OT * PACKED_W + o * PACKED_W;
         \\    merged[u][o] = exl3_lane<N>(words, lane);
@@ -6159,21 +6171,26 @@ fn groupFunnelStep(comptime size: u32, comptime mc: []const u8, comptime member_
     ;
     if (size > GROUP_STASH_ABOVE) return loads ++
         \\float2 wq[2][OTPT][4];
+        \\#pragma clang loop unroll(full)
         \\for (uint u = 0u; u < 2u; u++) {
+        \\  #pragma clang loop unroll(full)
         \\  for (uint o = 0u; o < uint(OTPT); o++) {
+        \\    #pragma clang loop unroll(full)
         \\    for (uint p = 0u; p < 4u; p++) {
         \\      wq[u][o][p] = exl3_decode2(uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu));
         \\    }
         \\  }
         \\}
         \\
-    ++ "for (uint j = 0u; j < " ++ mc ++ "; j++) {\n  for (uint u = 0u; u < 2u; u++) {\n    const auto q = " ++ member_ptr ++ " + u * SGS * TILE;\n" ++
+    ++ "#pragma clang loop unroll(full)\nfor (uint j = 0u; j < " ++ mc ++ "; j++) {\n  #pragma clang loop unroll(full)\n  for (uint u = 0u; u < 2u; u++) {\n    const auto q = " ++ member_ptr ++ " + u * SGS * TILE;\n" ++
         \\    float ins[4];
         \\    ins[0] = float(q[prow]);
         \\    ins[1] = float(q[prow + 1u]);
         \\    ins[2] = float(q[prow + 8u]);
         \\    ins[3] = float(q[prow + 9u]);
+        \\    #pragma clang loop unroll(full)
         \\    for (uint o = 0u; o < uint(OTPT); o++) {
+        \\      #pragma clang loop unroll(full)
         \\      for (uint p = 0u; p < 4u; p++) {
         \\        acc[j][o][p * 2u] = fma(ins[(p * 2u) & 3u], wq[u][o][p].x, acc[j][o][p * 2u]);
         \\        acc[j][o][p * 2u + 1u] = fma(ins[(p * 2u + 1u) & 3u], wq[u][o][p].y, acc[j][o][p * 2u + 1u]);
@@ -6185,20 +6202,23 @@ fn groupFunnelStep(comptime size: u32, comptime mc: []const u8, comptime member_
         \\
     ;
     return loads ++
+        \\#pragma clang loop unroll(full)
         \\for (uint u = 0u; u < 2u; u++) {
         \\
-    ++ "  float ins[" ++ mc ++ "][4];\n  for (uint j = 0u; j < " ++ mc ++ "; j++) {\n    const auto q = " ++ member_ptr ++ " + u * SGS * TILE;\n" ++
+    ++ "  float ins[" ++ mc ++ "][4];\n  #pragma clang loop unroll(full)\n  for (uint j = 0u; j < " ++ mc ++ "; j++) {\n    const auto q = " ++ member_ptr ++ " + u * SGS * TILE;\n" ++
         \\    ins[j][0] = float(q[prow]);
         \\    ins[j][1] = float(q[prow + 1u]);
         \\    ins[j][2] = float(q[prow + 8u]);
         \\    ins[j][3] = float(q[prow + 9u]);
         \\  }
+        \\  #pragma clang loop unroll(full)
         \\  for (uint o = 0u; o < uint(OTPT); o++) {
+        \\    #pragma clang loop unroll(full)
         \\    for (uint p = 0u; p < 4u; p++) {
         \\      const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
         \\      const float2 w = exl3_decode2(cw);
         \\
-    ++ "      for (uint j = 0u; j < " ++ mc ++ "; j++) {\n" ++
+    ++ "      #pragma clang loop unroll(full)\n      for (uint j = 0u; j < " ++ mc ++ "; j++) {\n" ++
         \\        acc[j][o][p * 2u] = fma(ins[j][(p * 2u) & 3u], w.x, acc[j][o][p * 2u]);
         \\        acc[j][o][p * 2u + 1u] = fma(ins[j][(p * 2u + 1u) & 3u], w.y, acc[j][o][p * 2u + 1u]);
         \\      }
@@ -8331,21 +8351,27 @@ const COOP_OUTPUTS_SOURCE: [:0]const u8 =
     \\constexpr uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
     \\for (uint tk = sg; tk < IT; tk += 2u * SGS) {
     \\  exl3_lane_bits<N> merged[2][grouped_rows ? 1 : 2];
+    \\  #pragma clang loop unroll(full)
     \\  for (uint u = 0u; u < 2u; u++) {
+    \\    #pragma clang loop unroll(full)
     \\    for (uint o = 0u; o < (grouped_rows ? 1u : 2u); o++) {
     \\      merged[u][o] = exl3_lane<N>(wp + u * SGS * OT * PACKED_W + o * PACKED_W, lane);
     \\    }
     \\  }
+    \\  #pragma clang loop unroll(full)
     \\  for (uint u = 0u; u < 2u; u++) {
     \\    if constexpr (grouped_rows) {
     \\      float4 input[outputs];
+    \\      #pragma clang loop unroll(full)
     \\      for (uint r = 0u; r < outputs; r++) {
     \\        const uint offset = slot + r < row_count ? r * uint(IDIM) : 0u;
     \\        input[r] = float4(*((const device half4 *)(xp + offset + u * SGS * TILE)));
     \\      }
+    \\      #pragma clang loop unroll(full)
     \\      for (uint p = 0u; p < 4u; p++) {
     \\        const uint2 cw = uint2(exl3_lane_word(merged[u][0], sh[p * 2u]), exl3_lane_word(merged[u][0], sh[p * 2u + 1u])) & uint2(0xffffu);
     \\        const float2 w = exl3_decode2(cw);
+    \\        #pragma clang loop unroll(full)
     \\        for (uint r = 0u; r < outputs; r++) {
     \\          acc[r][p * 2u] = fma(input[r][(p * 2u) & 3u], w.x, acc[r][p * 2u]);
     \\          acc[r][p * 2u + 1u] = fma(input[r][(p * 2u + 1u) & 3u], w.y, acc[r][p * 2u + 1u]);
@@ -8354,7 +8380,9 @@ const COOP_OUTPUTS_SOURCE: [:0]const u8 =
     \\    } else {
     \\      const float4 in4 = float4(*((const device half4 *)(xp + u * SGS * TILE)));
     \\      const float ins[8] = {in4.x, in4.y, in4.z, in4.w, in4.x, in4.y, in4.z, in4.w};
+    \\      #pragma clang loop unroll(full)
     \\      for (uint o = 0u; o < 2u; o++) {
+    \\        #pragma clang loop unroll(full)
     \\        for (uint p = 0u; p < 4u; p++) {
     \\          const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
     \\          const float2 w = exl3_decode2(cw);
