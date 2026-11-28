@@ -283,6 +283,9 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
             \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_pairh_n(uint2 cw) {{
             \\  return exl3_unscaled_n<N>(cw) * half2(4096.0h);
             \\}}
+            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_mma_pairh_n(uint2 cw) {{
+            \\  return FC_B{d} ? exl3_unscaled_n<N>(cw) : exl3_pairh_n<N>(cw);
+            \\}}
             \\template<uint N> __attribute__((always_inline)) static inline float2 exl3_decode2_n(uint2 cw) {{
             \\  return FC_B{d} ? float2(exl3_unscaled_n<N>(cw)) : float2(exl3_pairh_n<N>(cw));
             \\}}
@@ -294,10 +297,11 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
             \\  return (slot & 1u) != 0u ? w.y : w.x;
             \\}}
             \\#define exl3_pairh(cw) exl3_pairh_n<N>((cw))
+            \\#define exl3_mma_pairh(cw) exl3_mma_pairh_n<N>((cw))
             \\#define exl3_decode2(cw) exl3_decode2_n<N>((cw))
             \\#define exl3_slot(cw, slot) exl3_slot_n<N>((cw), (slot))
             \\
-        , .{ win_fc, fold_b, fold_b });
+        , .{ win_fc, fold_b, fold_b, fold_b });
     } else {
         try raw.appendSlice(a, "#define EXL3_LANE_FIRST 0u\n");
         if (opts.mixed_rate) {
@@ -339,6 +343,9 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
             \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_pairh_n(uint2 cw) {{
             \\  return (FC_I{d} == 2) ? (exl3_unscaled_n<N>(cw) * half2(4096.0h)) : exl3_unscaled_n<N>(cw);
             \\}}
+            \\template<uint N> __attribute__((always_inline)) static inline half2 exl3_mma_pairh_n(uint2 cw) {{
+            \\  return (FC_I{d} == 2 && FC_B{d}) ? exl3_unscaled_n<N>(cw) : exl3_pairh_n<N>(cw);
+            \\}}
             \\template<uint N> __attribute__((always_inline)) static inline float2 exl3_decode2_n(uint2 cw) {{
             \\  return (FC_I{d} == 2 && FC_B{d}) ? float2(exl3_unscaled_n<N>(cw)) : float2(exl3_pairh_n<N>(cw));
             \\}}
@@ -349,10 +356,11 @@ fn buildCodecHeader(a: std.mem.Allocator, opts: CodecHeaderOpts) ![]u8 {
             \\  return exl3_decode2_n<N>(uint2(uint(cw[slot]), 0u)).x;
             \\}}
             \\#define exl3_pairh(cw) exl3_pairh_n<N>((cw))
+            \\#define exl3_mma_pairh(cw) exl3_mma_pairh_n<N>((cw))
             \\#define exl3_decode2(cw) exl3_decode2_n<N>((cw))
             \\#define exl3_slot(cw, slot) exl3_slot_n<N>((cw), (slot))
             \\
-        , .{ cb_fc, cb_fc, cb_fc, fold_b, cb_fc, fold_b });
+        , .{ cb_fc, cb_fc, cb_fc, fold_b, cb_fc, fold_b, cb_fc, fold_b });
     }
     try raw.appendSlice(a, kernel_src.HELPERS_TAIL);
 
@@ -383,79 +391,13 @@ fn buildRowsNaxFragsFc(a: std.mem.Allocator) ![]u8 {
     // Replace template<uint N, uint R32, uint SW> rows_wfrag with runtime-arg R32, SW (FCs).
     const old_sig =
         \\template<uint N, uint R32, uint SW>
-        \\static inline nfrag rows_wfrag(const device uint *words, uint lane) {
-        \\  if constexpr (N == 80u && SW != 0u) return nax_k5_frag<N>(words, lane);
-        \\  if constexpr (rows_w32(N, R32)) {
-        \\    constexpr uint W = N / 2u;
-        \\    const uint b = (lane >> 3u) & 1u;
-        \\    const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
-        \\    const uint s0 = nax_sh(N, b, 0u) - 16u;
-        \\    const uint s1 = nax_sh(N, b, 1u) - 16u;
-        \\    const uint s4 = nax_sh(N, b, 4u);
-        \\    uint2 lo, hi;
-        \\    if constexpr (SW != 0u && N == 96u) {
-        \\      const uint l = (end - 1u) >> 5u;
-        \\      const uint s = (0u - end) & 31u;
-        \\      const uint sp = (s + 16u) & 31u;
-        \\      const uint wm = words[l == 1u ? W - 1u : l - 2u];
-        \\      const uint w0 = words[l - 1u];
-        \\      const uint w1 = words[l];
-        \\      const uint w2 = words[l + 1u];
-        \\      lo = uint2(nax_funnel(w1, w0, s), nax_funnel(w0, wm, sp));
-        \\      hi = uint2(nax_funnel(w2, w1, sp), nax_funnel(w2, w1, s));
-        \\    } else {
-        \\      lo = nax_win2(words, end, W);
-        \\      hi = nax_win2(words, end + W, W);
-        \\    }
-        \\    const half2 p0 = exl3_pairh(uint2((lo.y >> s0) & 0xffffu, (lo.y >> s1) & 0xffffu));
-        \\    const half2 p1 = exl3_pairh(uint2((lo.x >> s4) & 0xffffu, lo.x & 0xffffu));
-        \\    const half2 p2 = exl3_pairh(uint2((hi.y >> s0) & 0xffffu, (hi.y >> s1) & 0xffffu));
-        \\    const half2 p3 = exl3_pairh(uint2((hi.x >> s4) & 0xffffu, hi.x & 0xffffu));
-        \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
-        \\  } else {
-        \\    return nax_wfrag_k<N>(words, lane);
-        \\  }
+        \\__attribute__((always_inline)) static inline nfrag rows_wfrag(const device uint *words, uint lane) {
+        \\  return nax_wfrag_k<N>(words, lane);
         \\}
     ;
     const new_sig =
         \\template<uint N>
-        \\__attribute__((always_inline)) static inline nfrag rows_wfrag(const device uint *words, uint lane, uint R32, uint SW) {
-        \\  if constexpr (N == 80u) { if (SW != 0u) return nax_k5_frag<N>(words, lane); }
-        \\  if constexpr (N != 64u && nax_w32_fits(N)) {
-        \\    if (R32 != 0u) {
-        \\      constexpr uint W = N / 2u;
-        \\      const uint b = (lane >> 3u) & 1u;
-        \\      const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
-        \\      const uint s0 = nax_sh(N, b, 0u) - 16u;
-        \\      const uint s1 = nax_sh(N, b, 1u) - 16u;
-        \\      const uint s4 = nax_sh(N, b, 4u);
-        \\      uint2 lo, hi;
-        \\      if constexpr (N == 96u) {
-        \\        if (SW != 0u) {
-        \\          const uint l = (end - 1u) >> 5u;
-        \\          const uint s = (0u - end) & 31u;
-        \\          const uint sp = (s + 16u) & 31u;
-        \\          const uint wm = words[l == 1u ? W - 1u : l - 2u];
-        \\          const uint w0 = words[l - 1u];
-        \\          const uint w1 = words[l];
-        \\          const uint w2 = words[l + 1u];
-        \\          lo = uint2(nax_funnel(w1, w0, s), nax_funnel(w0, wm, sp));
-        \\          hi = uint2(nax_funnel(w2, w1, sp), nax_funnel(w2, w1, s));
-        \\        } else {
-        \\          lo = nax_win2(words, end, W);
-        \\          hi = nax_win2(words, end + W, W);
-        \\        }
-        \\      } else {
-        \\        lo = nax_win2(words, end, W);
-        \\        hi = nax_win2(words, end + W, W);
-        \\      }
-        \\      const half2 p0 = exl3_pairh(uint2((lo.y >> s0) & 0xffffu, (lo.y >> s1) & 0xffffu));
-        \\      const half2 p1 = exl3_pairh(uint2((lo.x >> s4) & 0xffffu, lo.x & 0xffffu));
-        \\      const half2 p2 = exl3_pairh(uint2((hi.y >> s0) & 0xffffu, (hi.y >> s1) & 0xffffu));
-        \\      const half2 p3 = exl3_pairh(uint2((hi.x >> s4) & 0xffffu, hi.x & 0xffffu));
-        \\      return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
-        \\    }
-        \\  }
+        \\__attribute__((always_inline)) static inline nfrag rows_wfrag(const device uint *words, uint lane, uint, uint) {
         \\  return nax_wfrag_k<N>(words, lane);
         \\}
     ;

@@ -376,39 +376,72 @@ pub const GEMM_SORTED_SOURCE: [:0]const u8 =
 /// (n half j>>1, k half j&1) at (fm, fn) and (fm, fn+1).
 pub const GEMM_SIMDMAT_FRAGS: [:0]const u8 =
     \\#define SMAT_UNROLL _Pragma("clang loop unroll(full)")
-    \\template<uint N>
-    \\static inline half2 smat_pair(uint f, uint s0, uint s1) {
-    \\  return exl3_pairh(uint2((f >> s0) & 0xffffu, (f >> s1) & 0xffffu));
+    \\__attribute__((always_inline)) static inline uint smat_funnel(uint late, uint early, uint s) {
+    \\  return uint(((ulong(early) << 32u) | ulong(late)) >> s);
+    \\}
+    \\template<uint N, bool Scaled = false>
+    \\__attribute__((always_inline)) static inline half2 smat_pairh(uint2 cw) {
+    \\  if constexpr (Scaled) return exl3_pairh(cw & uint2(0xffffu));
+    \\  else return exl3_mma_pairh(cw & uint2(0xffffu));
+    \\}
+    \\template<uint N, bool Scaled = false>
+    \\__attribute__((always_inline)) static inline half2 smat_pair(uint f, uint s0, uint s1) {
+    \\  return smat_pairh<N, Scaled>(uint2(f >> s0, f >> s1));
     \\}
     \\// The group's weights 0..L come from one 32-bit funnel ending at weight L, the rest from
     \\// one ending at weight 7: L is the widest split whose first codeword still fits.
     \\static inline constexpr uint smat_split(uint N) {
     \\  return exl3_end(N, 7u) - exl3_end(N, 0u) <= 16u ? 7u : exl3_end(N, 5u) - exl3_end(N, 0u) <= 16u ? 5u : 3u;
     \\}
-    \\template<uint N>
-    \\static inline void smat_group(const device uint *words, uint g, thread half2 *p) {
-    \\  if (N == 64u) {
-    \\    const ulong m = ((ulong)words[(g + 31u) & 31u] << 32u) | (ulong)words[g];
-    \\    SMAT_UNROLL for (uint j = 0u; j < 4u; j++) p[j] = smat_pair<N>(uint(m >> (24u - 8u * j)), 4u, 0u);
-    \\  } else if (exl3_end(N, 3u) - exl3_end(N, 0u) > 16u || N / 2u - exl3_end(N, 4u) > 16u) {
+    \\template<uint N, bool Scaled = false>
+    \\__attribute__((always_inline)) static inline void smat_group(const device uint *words, uint g, thread half2 *p) {
+    \\  if constexpr (N == 64u) {
+    \\    const uint cur = words[g];
+    \\    const uint prev = words[(g + 31u) & 31u];
+    \\    const uint hi = (cur >> 16u) | (prev << 16u);
+    \\    p[0] = smat_pair<N, Scaled>(hi, 12u, 8u);
+    \\    p[1] = smat_pair<N, Scaled>(hi, 4u, 0u);
+    \\    p[2] = smat_pair<N, Scaled>(cur, 12u, 8u);
+    \\    p[3] = smat_pair<N, Scaled>(cur, 4u, 0u);
+    \\  } else if constexpr (exl3_end(N, 3u) - exl3_end(N, 0u) > 16u || N / 2u - exl3_end(N, 4u) > 16u) {
     \\    constexpr uint W = N / 2u;
-    \\    const ulong lo = exl3_window(words, W * g + exl3_end(N, 3u), W, true);
-    \\    const ulong hi = exl3_window(words, W * g + W, W, true);
-    \\    SMAT_UNROLL for (uint j = 0u; j < 4u; j++) {
-    \\      const ulong bits = j < 2u ? lo : hi;
-    \\      const uint end = j < 2u ? exl3_end(N, 3u) : W;
-    \\      p[j] = exl3_pairh(uint2(uint(bits >> (end - exl3_end(N, 2u * j))) & 0xffffu, uint(bits >> (end - exl3_end(N, 2u * j + 1u))) & 0xffffu));
+    \\    const uint end = W * g + W;
+    \\    const uint last = (end - 1u) >> 5u;
+    \\    const uint prev = last == 0u ? W - 1u : last - 1u;
+    \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    const uint a = words[last], b = words[prev], c = words[third];
+    \\    const uint w0 = smat_funnel(a, b, s);
+    \\    const uint w1 = smat_funnel(b, c, s);
+    \\    if constexpr (exl3_lane_sh(N, 0u) + 16u <= 64u) {
+    \\      const ulong bits = as_type<ulong>(uint2(w0, w1));
+    \\      SMAT_UNROLL for (uint j = 0u; j < 4u; j++) {
+    \\        p[j] = smat_pairh<N, Scaled>(uint2(uint(bits >> exl3_lane_sh(N, 2u * j)), uint(bits >> exl3_lane_sh(N, 2u * j + 1u))));
+    \\      }
+    \\    } else {
+    \\      constexpr uint low = W & (0u - W);
+    \\      constexpr bool need4 = exl3_lane_sh(N, 0u) + 16u > 64u + (low < 32u ? low : 32u);
+    \\      const uint w2 = need4 ? smat_funnel(c, words[third == 0u ? W - 1u : third - 1u], s) : (c >> s);
+    \\      const ulong b0 = as_type<ulong>(uint2(w0, w1));
+    \\      const ulong b1 = as_type<ulong>(uint2(w1, w2));
+    \\      SMAT_UNROLL for (uint j = 0u; j < 4u; j++) {
+    \\        const uint sh0 = exl3_lane_sh(N, 2u * j);
+    \\        const uint sh1 = exl3_lane_sh(N, 2u * j + 1u);
+    \\        const uint c0 = sh0 <= 48u ? uint(b0 >> sh0) : uint(b1 >> (sh0 - 32u));
+    \\        const uint c1 = sh1 <= 48u ? uint(b0 >> sh1) : uint(b1 >> (sh1 - 32u));
+    \\        p[j] = smat_pairh<N, Scaled>(uint2(c0, c1));
+    \\      }
     \\    }
     \\  } else {
     \\    constexpr uint W = N / 2u;
     \\    constexpr uint L = smat_split(N);
     \\    const uint lo = uint(exl3_window(words, W * g + exl3_end(N, L), W, false));
-    \\    const uint hi = uint(exl3_window(words, W * g + W, W, false));
+    \\    const uint hi = (L < 7u) ? uint(exl3_window(words, W * g + W, W, false)) : 0u;
     \\    constexpr uint E = exl3_end(N, L);
-    \\    p[0] = smat_pair<N>(lo, E - exl3_end(N, 0u), E - exl3_end(N, 1u));
-    \\    p[1] = smat_pair<N>(lo, E - exl3_end(N, 2u), E - exl3_end(N, 3u));
-    \\    p[2] = L >= 5u ? smat_pair<N>(lo, E - exl3_end(N, 4u), E - exl3_end(N, 5u)) : smat_pair<N>(hi, W - exl3_end(N, 4u), W - exl3_end(N, 5u));
-    \\    p[3] = L == 7u ? smat_pair<N>(lo, E - exl3_end(N, 6u), 0u) : smat_pair<N>(hi, W - exl3_end(N, 6u), 0u);
+    \\    p[0] = smat_pair<N, Scaled>(lo, E - exl3_end(N, 0u), E - exl3_end(N, 1u));
+    \\    p[1] = smat_pair<N, Scaled>(lo, E - exl3_end(N, 2u), E - exl3_end(N, 3u));
+    \\    p[2] = L >= 5u ? smat_pair<N, Scaled>(lo, E - exl3_end(N, 4u), E - exl3_end(N, 5u)) : smat_pair<N, Scaled>(hi, W - exl3_end(N, 4u), W - exl3_end(N, 5u));
+    \\    p[3] = L == 7u ? smat_pair<N, Scaled>(lo, E - exl3_end(N, 6u), 0u) : smat_pair<N, Scaled>(hi, W - exl3_end(N, 6u), 0u);
     \\  }
     \\}
 ;
@@ -479,8 +512,8 @@ pub const GEMM_SIMDMAT_SOURCE: [:0]const u8 =
     \\  const size_t oc = (size_t)(col0 + nb * 8u + uint(fm));
     \\  SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
     \\    const uint m = mb * 8u + uint(fn);
-    \\    if (m < nlive) y[(size_t)(run0 + m) * (size_t)(ODIM) + oc] = half(acc[nb][mb].thread_elements()[0]);
-    \\    if (m + 1u < nlive) y[(size_t)(run0 + m + 1u) * (size_t)(ODIM) + oc] = half(acc[nb][mb].thread_elements()[1]);
+    \\    if (m < nlive) y[(size_t)(run0 + m) * (size_t)(ODIM) + oc] = half(exl3_out(acc[nb][mb].thread_elements()[0]));
+    \\    if (m + 1u < nlive) y[(size_t)(run0 + m + 1u) * (size_t)(ODIM) + oc] = half(exl3_out(acc[nb][mb].thread_elements()[1]));
     \\  }
     \\}
     \\row = run_end;
@@ -494,69 +527,50 @@ pub const GEMM_NAX_INCLUDES: [:0]const u8 =
 ;
 pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\using nfrag = vec<half, 8>;
+    \\template<uint N, bool Scaled = false>
+    \\__attribute__((always_inline)) static inline half2 nax_pairh(uint2 cw) {
+    \\  if constexpr (Scaled) return exl3_pairh(cw & uint2(0xffffu));
+    \\  else return exl3_mma_pairh(cw & uint2(0xffffu));
+    \\}
+    \\__attribute__((always_inline)) static inline uint nax_funnel(uint late, uint early, uint s) { return uint(((ulong(early) << 32u) | ulong(late)) >> s); }
+    \\template<bool Scaled = false>
     \\__attribute__((always_inline)) static inline nfrag nax_wfrag(const device uint *words, uint lane) {
     \\  constexpr uint N = 64u;
     \\  const uint source0 = (lane & 16u) + ((lane & 7u) << 1u);
     \\  const uint2 current = *(const device uint2 *)(words + source0);
     \\  const uint previous = words[(source0 + 31u) & 31u];
     \\  const uint slot = ((lane >> 3u) & 1u) * 2u;
-    \\  const ulong w0 = ((ulong)previous << 32) | (ulong)current.x;
-    \\  const ulong w1 = ((ulong)current.x << 32) | (ulong)current.y;
-    \\  const uint s0 = 28u - slot * 4u;
-    \\  const uint s1 = 28u - (slot + 4u) * 4u;
-    \\  const half2 p00 = exl3_pairh(uint2(uint(w0 >> s0) & 0xffffu, uint(w0 >> (s0 - 4u)) & 0xffffu));
-    \\  const half2 p01 = exl3_pairh(uint2(uint(w1 >> s0) & 0xffffu, uint(w1 >> (s0 - 4u)) & 0xffffu));
-    \\  const half2 p10 = exl3_pairh(uint2(uint(w0 >> s1) & 0xffffu, uint(w0 >> (s1 - 4u)) & 0xffffu));
-    \\  const half2 p11 = exl3_pairh(uint2(uint(w1 >> s1) & 0xffffu, uint(w1 >> (s1 - 4u)) & 0xffffu));
+    \\  const uint hi0 = (current.x >> 16u) | (previous << 16u);
+    \\  const uint hi1 = (current.y >> 16u) | (current.x << 16u);
+    \\  const uint sh = 12u - slot * 4u;
+    \\  const half2 p00 = nax_pairh<N, Scaled>(uint2(hi0 >> sh, hi0 >> (sh - 4u)));
+    \\  const half2 p01 = nax_pairh<N, Scaled>(uint2(hi1 >> sh, hi1 >> (sh - 4u)));
+    \\  const half2 p10 = nax_pairh<N, Scaled>(uint2(current.x >> sh, current.x >> (sh - 4u)));
+    \\  const half2 p11 = nax_pairh<N, Scaled>(uint2(current.y >> sh, current.y >> (sh - 4u)));
     \\  return nfrag(p00.x, p00.y, p01.x, p01.y, p10.x, p10.y, p11.x, p11.y);
     \\}
     \\// A lane's weights are 16m + 2b + {0, 1, 4, 5} and the same + 8: one funnel per quad, ending at
     \\// its last weight. 16 weights span N whole bits, so the shifts depend on b alone.
     \\static inline constexpr uint nax_end(uint N, uint b, uint j) { return ((2u * b + j + 1u) * N) >> 4u; }
-    \\// Past 32 bits (n > 50) a quad's funnel reads 64 bits from three words.
-    \\static inline constexpr bool nax_quads_fit(uint N) {
-    \\  return nax_end(N, 0u, 5u) - nax_end(N, 0u, 0u) <= 16u && nax_end(N, 1u, 5u) - nax_end(N, 1u, 0u) <= 16u;
-    \\}
     \\__attribute__((always_inline)) static inline uint nax_sh(uint N, uint b, uint j) {
     \\  const uint s0 = nax_end(N, 0u, 5u) - nax_end(N, 0u, j);
     \\  return s0 + b * (nax_end(N, 1u, 5u) - nax_end(N, 1u, j) - s0);
     \\}
-    \\template<uint N, typename F>
+    \\template<uint N, bool Scaled = false, typename F>
     \\__attribute__((always_inline)) static inline nfrag nax_quads(F lo, F hi, uint s0, uint s1, uint s4) {
-    \\  const half2 p0 = exl3_pairh(uint2(uint(lo >> s0) & 0xffffu, uint(lo >> s1) & 0xffffu));
-    \\  const half2 p1 = exl3_pairh(uint2(uint(lo >> s4) & 0xffffu, uint(lo) & 0xffffu));
-    \\  const half2 p2 = exl3_pairh(uint2(uint(hi >> s0) & 0xffffu, uint(hi >> s1) & 0xffffu));
-    \\  const half2 p3 = exl3_pairh(uint2(uint(hi >> s4) & 0xffffu, uint(hi) & 0xffffu));
+    \\  const half2 p0 = nax_pairh<N, Scaled>(uint2(uint(lo >> s0), uint(lo >> s1)));
+    \\  const half2 p1 = nax_pairh<N, Scaled>(uint2(uint(lo >> s4), uint(lo)));
+    \\  const half2 p2 = nax_pairh<N, Scaled>(uint2(uint(hi >> s0), uint(hi >> s1)));
+    \\  const half2 p3 = nax_pairh<N, Scaled>(uint2(uint(hi >> s4), uint(hi)));
     \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
     \\}
-    \\// The 64 stream bits ending at `end` as two 32-bit funnels: .x the last 32, .y the 32 ending 16 bits earlier.
-    \\__attribute__((always_inline)) static inline uint2 nax_win2(const device uint *words, uint end, uint nwords) {
-    \\  const uint last = (end - 1u) >> 5u;
-    \\  const uint prev = last == 0u ? nwords - 1u : last - 1u;
-    \\  const uint third = prev == 0u ? nwords - 1u : prev - 1u;
-    \\  const uint s = (0u - end) & 31u;
-    \\  const uint lo = (words[last] >> s) | ((words[prev] << 1u) << (31u - s));
-    \\  const uint hi = (words[prev] >> s) | ((words[third] << 1u) << (31u - s));
-    \\  return uint2(lo, (lo >> 16u) | (hi << 16u));
-    \\}
-    \\// nax_quads over nax_win2's halves below n64, where the second weight starts within 16 bits of the last and the
-    \\// first lies 16 to 32 bits past .x's reach, so it reads .y.
-    \\template<uint N>
-    \\__attribute__((always_inline)) static inline nfrag nax_quads_win2(uint2 lo, uint2 hi, uint s0, uint s1, uint s4) {
-    \\  const half2 p0 = exl3_pairh(uint2((lo.y >> (s0 - 16u)) & 0xffffu, (lo.x >> s1) & 0xffffu));
-    \\  const half2 p1 = exl3_pairh(uint2((lo.x >> s4) & 0xffffu, lo.x & 0xffffu));
-    \\  const half2 p2 = exl3_pairh(uint2((hi.y >> (s0 - 16u)) & 0xffffu, (hi.x >> s1) & 0xffffu));
-    \\  const half2 p3 = exl3_pairh(uint2((hi.x >> s4) & 0xffffu, hi.x & 0xffffu));
-    \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
-    \\}
-    \\__attribute__((always_inline)) static inline uint nax_funnel(uint late, uint early, uint s) { return uint(((ulong(early) << 32u) | ulong(late)) >> s); }
-    \\template<uint N>
+    \\template<uint N, bool Scaled = false>
     \\__attribute__((always_inline)) static inline half2 nax_k5_pair(uint bits) {
-    \\  return exl3_pairh(uint2(bits >> 5u, bits) & uint2(0xffffu));
+    \\  return nax_pairh<N, Scaled>(uint2(bits >> 5u, bits));
     \\}
     \\// A K5 lane's four codeword pairs lie in four adjacent words, funneled once at the lane's offset;
     \\// word 0's predecessor is the tile's last word, as the trellis wraps.
-    \\template<uint N>
+    \\template<uint N, bool Scaled = false>
     \\__attribute__((always_inline)) static inline nfrag nax_k5_frag(const device uint *words, uint lane) {
     \\  const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
     \\  const uint word = (5u * group) >> 1u;
@@ -566,13 +580,13 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\  const uint a = nax_funnel(x, prev, shift);
     \\  const uint b = nax_funnel(y, x, shift);
     \\  const uint c = nax_funnel(z, y, shift);
-    \\  const half2 p0 = nax_k5_pair<N>((a << 4u) | (b >> 28u));
-    \\  const half2 p1 = nax_k5_pair<N>((a << 24u) | (b >> 8u));
-    \\  const half2 p2 = nax_k5_pair<N>((b << 12u) | (c >> 20u));
-    \\  const half2 p3 = nax_k5_pair<N>(c);
+    \\  const half2 p0 = nax_k5_pair<N, Scaled>(nax_funnel(b, a, 28u));
+    \\  const half2 p1 = nax_k5_pair<N, Scaled>(b >> 8u);
+    \\  const half2 p2 = nax_k5_pair<N, Scaled>(nax_funnel(c, b, 20u));
+    \\  const half2 p3 = nax_k5_pair<N, Scaled>(c);
     \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
     \\}
-    \\template<uint N>
+    \\template<uint N, bool Scaled = false>
     \\__attribute__((always_inline)) static inline nfrag nax_wfrag_k(const device uint *words, uint lane) {
     \\  // A PAIR1 lane's four odd codewords at K2.5 to K3.5 lie in three adjacent words, each read once.
     \\  if constexpr (EXL3_LANE_FIRST == 1u && (N == 40u || N == 48u || N == 56u)) {
@@ -584,19 +598,116 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\    const uint prev = words[last - 1u];
     \\    const uint lo = nax_funnel(words[last], prev, s);
     \\    const uint hi = nax_funnel(prev, words[last == 1u ? N / 2u - 1u : last - 2u], s);
-    \\    return nax_quads<N>(nax_funnel(lo, hi, 4u * P), lo, 0u, 2u * P, 0u);
+    \\    return nax_quads<N, Scaled>(nax_funnel(lo, hi, 4u * P), lo, 0u, 2u * P, 0u);
     \\  }
-    \\  if constexpr (N == 80u) return nax_k5_frag<N>(words, lane);
-    \\  if (N == 64u) return nax_wfrag(words, lane);
+    \\  if constexpr (N == 32u) {
+    \\    const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+    \\    const uint cur = words[group];
+    \\    const uint prev = words[(group + 15u) & 15u];
+    \\    const uint s = ((lane >> 3u) & 1u) ? 0u : 4u;
+    \\    const uint lo = cur >> s;
+    \\    const uint hi = ((cur >> 16u) | (prev << 16u)) >> s;
+    \\    const half2 p0 = nax_pairh<N, Scaled>(uint2(hi >> 10u, hi >> 8u));
+    \\    const half2 p1 = nax_pairh<N, Scaled>(uint2(hi >> 2u, hi));
+    \\    const half2 p2 = nax_pairh<N, Scaled>(uint2(lo >> 10u, lo >> 8u));
+    \\    const half2 p3 = nax_pairh<N, Scaled>(uint2(lo >> 2u, lo));
+    \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+    \\  }
+    \\  if constexpr (N == 64u) return nax_wfrag<Scaled>(words, lane);
+    \\  if constexpr (N == 80u) return nax_k5_frag<N, Scaled>(words, lane);
+    \\  if constexpr (N == 96u) {
+    \\    constexpr uint W = 48u;
+    \\    const uint b = (lane >> 3u) & 1u;
+    \\    const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
+    \\    const uint l = (end - 1u) >> 5u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    const uint sp = (s + 16u) & 31u;
+    \\    const uint wm = words[l == 1u ? W - 1u : l - 2u];
+    \\    const uint w0 = words[l - 1u];
+    \\    const uint w1 = words[l];
+    \\    const uint w2 = words[l + 1u];
+    \\    const uint2 lo = uint2(nax_funnel(w1, w0, s), nax_funnel(w0, wm, sp));
+    \\    const uint2 hi = uint2(nax_funnel(w2, w1, sp), nax_funnel(w2, w1, s));
+    \\    const half2 p0 = nax_pairh<N, Scaled>(uint2(lo.y >> 14u, lo.y >> 8u));
+    \\    const half2 p1 = nax_pairh<N, Scaled>(uint2(lo.x >> 6u, lo.x));
+    \\    const half2 p2 = nax_pairh<N, Scaled>(uint2(hi.y >> 14u, hi.y >> 8u));
+    \\    const half2 p3 = nax_pairh<N, Scaled>(uint2(hi.x >> 6u, hi.x));
+    \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+    \\  }
+    \\  if constexpr (N == 128u) {
+    \\    const uint wbase = (((lane & 16u) >> 1u) + (lane & 7u)) << 2u;
+    \\    const uint4 v = *(const device uint4 *)(words + wbase);
+    \\    const uint prev = words[(wbase + 63u) & 63u];
+    \\    const uint s = ((lane >> 3u) & 1u) ? 0u : 16u;
+    \\    const uint u0 = nax_funnel(v.x, prev, s);
+    \\    const uint u1 = nax_funnel(v.y, v.x, s);
+    \\    const uint u2 = nax_funnel(v.z, v.y, s);
+    \\    const uint u3 = nax_funnel(v.w, v.z, s);
+    \\    const half2 p0 = nax_pairh<N, Scaled>(uint2(u0 >> 8u, u0));
+    \\    const half2 p1 = nax_pairh<N, Scaled>(uint2(u1 >> 8u, u1));
+    \\    const half2 p2 = nax_pairh<N, Scaled>(uint2(u2 >> 8u, u2));
+    \\    const half2 p3 = nax_pairh<N, Scaled>(uint2(u3 >> 8u, u3));
+    \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+    \\  }
     \\  constexpr uint W = N / 2u;
-    \\  const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * ((lane >> 3u) & 1u) + nax_end(N, 0u, 5u);
     \\  const uint b = (lane >> 3u) & 1u;
+    \\  const uint end_lo = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
+    \\  const uint end_hi = end_lo + W;
+    \\  const uint l = (end_hi - 1u) >> 5u;
+    \\  const uint s = (0u - end_hi) & 31u;
     \\  const uint s0 = nax_sh(N, b, 0u);
     \\  const uint s1 = nax_sh(N, b, 1u);
     \\  const uint s4 = nax_sh(N, b, 4u);
-    \\  if (nax_quads_fit(N)) return nax_quads<N>(uint(exl3_window(words, end, W, false)), uint(exl3_window(words, end + W, W, false)), s0, s1, s4);
-    \\  if (N < 64u) return nax_quads_win2<N>(nax_win2(words, end, W), nax_win2(words, end + W, W), s0, s1, s4);
-    \\  return nax_quads<N>(exl3_window(words, end, W, true), exl3_window(words, end + W, W, true), s0, s1, s4);
+    \\  if constexpr (N <= 58u) {
+    \\    // 3 adjacent words + 2 hardware funnels hold all 64 bits (W + s0 + 16 <= 64 for N <= 58).
+    \\    const uint p1 = l == 0u ? W - 1u : l - 1u;
+    \\    const uint p0 = p1 == 0u ? W - 1u : p1 - 1u;
+    \\    const uint w2 = words[l], w1 = words[p1], w0 = words[p0];
+    \\    const ulong bits = as_type<ulong>(uint2(nax_funnel(w2, w1, s), nax_funnel(w1, w0, s)));
+    \\    const half2 hp0 = nax_pairh<N, Scaled>(uint2(uint(bits >> (W + s0)), uint(bits >> (W + s1))));
+    \\    const half2 hp1 = nax_pairh<N, Scaled>(uint2(uint(bits >> (W + s4)), uint(bits >> W)));
+    \\    const half2 hp2 = nax_pairh<N, Scaled>(uint2(uint(bits >> s0), uint(bits >> s1)));
+    \\    const half2 hp3 = nax_pairh<N, Scaled>(uint2(uint(bits >> s4), uint(bits)));
+    \\    return nfrag(hp0.x, hp0.y, hp2.x, hp2.y, hp1.x, hp1.y, hp3.x, hp3.y);
+    \\  } else if constexpr (N <= 98u) {
+    \\    // 4 adjacent words + 3 hardware funnels hold 96 bits (W + s0 + 16 <= 96 for N = 60..98).
+    \\    const uint p2 = l == 0u ? W - 1u : l - 1u;
+    \\    const uint p1 = p2 == 0u ? W - 1u : p2 - 1u;
+    \\    const uint p0 = p1 == 0u ? W - 1u : p1 - 1u;
+    \\    const uint w3 = words[l], w2 = words[p2], w1 = words[p1], w0 = words[p0];
+    \\    const uint c = nax_funnel(w3, w2, s);
+    \\    const uint m = nax_funnel(w2, w1, s);
+    \\    const uint a = nax_funnel(w1, w0, s);
+    \\    const ulong lo = as_type<ulong>(uint2(c, m));
+    \\    const ulong hi = as_type<ulong>(uint2(m, a));
+    \\    uint cw5;
+    \\    if constexpr (N <= 62u) cw5 = uint(lo >> W);
+    \\    else cw5 = uint(hi >> (W - 32u));
+    \\    const half2 hp0 = nax_pairh<N, Scaled>(uint2(uint(hi >> (W + s0 - 32u)), uint(hi >> (W + s1 - 32u))));
+    \\    const half2 hp1 = nax_pairh<N, Scaled>(uint2(uint(hi >> (W + s4 - 32u)), cw5));
+    \\    const half2 hp2 = nax_pairh<N, Scaled>(uint2(uint(lo >> s0), uint(lo >> s1)));
+    \\    const half2 hp3 = nax_pairh<N, Scaled>(uint2(c >> s4, c));
+    \\    return nfrag(hp0.x, hp0.y, hp2.x, hp2.y, hp1.x, hp1.y, hp3.x, hp3.y);
+    \\  } else {
+    \\    // 5 adjacent words + 4 hardware funnels hold 128 bits (W + s0 + 16 <= 119 for N = 100..126).
+    \\    const uint p3 = l == 0u ? W - 1u : l - 1u;
+    \\    const uint p2 = p3 == 0u ? W - 1u : p3 - 1u;
+    \\    const uint p1 = p2 == 0u ? W - 1u : p2 - 1u;
+    \\    const uint p0 = p1 == 0u ? W - 1u : p1 - 1u;
+    \\    const uint w4 = words[l], w3 = words[p3], w2 = words[p2], w1 = words[p1], w0 = words[p0];
+    \\    const uint d0 = nax_funnel(w4, w3, s);
+    \\    const uint d1 = nax_funnel(w3, w2, s);
+    \\    const uint d2 = nax_funnel(w2, w1, s);
+    \\    const uint d3 = nax_funnel(w1, w0, s);
+    \\    const ulong q0 = as_type<ulong>(uint2(d0, d1));
+    \\    const ulong q1 = as_type<ulong>(uint2(d1, d2));
+    \\    const ulong q2 = as_type<ulong>(uint2(d2, d3));
+    \\    const half2 hp0 = nax_pairh<N, Scaled>(uint2(uint(q2 >> (W + s0 - 64u)), uint(q2 >> (W + s1 - 64u))));
+    \\    const half2 hp1 = nax_pairh<N, Scaled>(uint2(uint(q1 >> (W + s4 - 32u)), uint(q1 >> (W - 32u))));
+    \\    const half2 hp2 = nax_pairh<N, Scaled>(uint2(uint(q0 >> s0), uint(q0 >> s1)));
+    \\    const half2 hp3 = nax_pairh<N, Scaled>(uint2(d0 >> s4, d0));
+    \\    return nfrag(hp0.x, hp0.y, hp2.x, hp2.y, hp1.x, hp1.y, hp3.x, hp3.y);
+    \\  }
     \\}
     \\__attribute__((always_inline)) static inline short2 nax_origin(uint lane) {
     \\  const short qid = short(lane >> 2u);
@@ -645,8 +756,8 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\    for (uint c = 0u; c < 4u; c++) {
     \\      const uint col = obase + ct * 16u + uint(origin.x) + c;
     \\      if (col >= odim) continue;
-    \\      if (l0) y[o0 + col] = Y(dst[ct * 8u + c]);
-    \\      if (l1) y[o1 + col] = Y(dst[ct * 8u + 4u + c]);
+    \\      if (l0) y[o0 + col] = Y(exl3_out(float(dst[ct * 8u + c])));
+    \\      if (l1) y[o1 + col] = Y(exl3_out(float(dst[ct * 8u + 4u + c])));
     \\    }
     \\  }
     \\}
@@ -1145,17 +1256,26 @@ fn getGemmNaxKernelFor(order: TileOrder, s: mlx.mlx_stream) !mlx.mlx_fast_metal_
     switch (active_decode.codebook) {
         inline else => |cb| switch (active_decode.window) {
             inline else => |win| {
-                const slot = &slots[kernel_src.slotRow(cb, false)][win.index()];
+                const unfolded = @import("builtin").is_test and kernel_src.foldScale(cb) != 1 and unfolded_for_test;
+                const slot = &slots[kernel_src.slotRow(cb, unfolded)][win.index()];
                 if (slot.*) |k| return k;
                 if (host_side.dry()) return error.Exl3KernelProofDry;
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 const alloc = arena.allocator();
-                const header = try kernel_src.withTableRows(alloc, cb, kernel_src.naxHeader(cb, win));
+                const header = try kernel_src.withTableRows(alloc, cb, if (unfolded) kernel_src.naxHeaderUnfolded(cb, win) else kernel_src.naxHeader(cb, win));
                 const kernel = (if (ref)
-                    buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
+                    if (unfolded)
+                        buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ kernel_src.cbSuffix(cb) ++ "_unfolded" ++ kernel_src.winSuffix(win))).ptr, s)
+                    else
+                        buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
                 else if (order == .tile_major)
-                    buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
+                    if (unfolded)
+                        buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ "_unfolded" ++ kernel_src.winSuffix(win))).ptr, s)
+                    else
+                        buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
+                else if (unfolded)
+                    buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax" ++ kernel_src.cbSuffix(cb) ++ "_unfolded" ++ kernel_src.winSuffix(win))).ptr, s)
                 else
                     buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)) orelse {
                     if (host_side.of(s) == 1) return error.MetalKernelCompileFailed;
@@ -5739,13 +5859,13 @@ pub fn rowsParityStats(c: RowsCase) !Exl3GemmParityStats {
     return st;
 }
 
-pub fn weightReaderExact(comptime n: u32, comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime reader: ReaderArm) !void {
+pub fn weightReaderExact(n: u32, comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime reader: ReaderArm) !void {
     return weightReaderExactAt(n, cb, win, raw, reader, if (cb.tabledHashMask()) exl3.Decode.tabled(cb, .w15).table else null);
 }
 
 const ReaderArm = enum { lane, nax, simdmat };
 
-pub fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime reader: ReaderArm, table: ?u8) !void {
+pub fn weightReaderExactAt(n: u32, comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime reader: ReaderArm, table: ?u8) !void {
     const t = std.testing;
     const dec: exl3.Decode = .{ .codebook = cb, .window = win, .table = table };
     setDecodeParams(dec);
@@ -5756,7 +5876,7 @@ pub fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime
         \\const uint lane = thread_position_in_grid.x % 32u;
         \\const uint tile = thread_position_in_grid.x / 32u;
         \\half2 p[4];
-        \\smat_group<uint(NHW)>((const device uint *)trellis + tile * (uint(NHW) / 2u), lane, p);
+        \\smat_group<uint(NHW), true>((const device uint *)trellis + tile * (uint(NHW) / 2u), lane, p);
         \\for (uint j = 0u; j < 4u; j++) {
         \\  result[tile * 256u + lane * 8u + 2u * j] = as_type<ushort>(p[j].x);
         \\  result[tile * 256u + lane * 8u + 2u * j + 1u] = as_type<ushort>(p[j].y);
@@ -5776,25 +5896,30 @@ pub fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime
     else
         \\const uint lane = thread_position_in_grid.x % 32u;
         \\const uint tile = thread_position_in_grid.x / 32u;
-        \\const nfrag f = nax_wfrag_k<uint(NHW)>((const device uint *)trellis + tile * (uint(NHW) / 2u), lane);
+        \\const nfrag f = nax_wfrag_k<uint(NHW), true>((const device uint *)trellis + tile * (uint(NHW) / 2u), lane);
         \\for (uint j = 0u; j < 8u; j++) result[tile * 256u + lane * 8u + j] = as_type<ushort>(f[j]);
     ;
     const identity =
         \\static inline half2 exl3_raw_pair(uint2 cw) { return as_type<half2>(ushort2(cw)); }
+        \\#undef exl3_pairh
+        \\#undef exl3_mma_pairh
         \\#define exl3_pairh exl3_raw_pair
+        \\#define exl3_mma_pairh exl3_raw_pair
         \\
     ;
     const header = comptime (if (reader == .simdmat) "" else GEMM_NAX_INCLUDES) ++ kernel_src.codebookHelpers(cb, win) ++ (if (raw) identity else "") ++ (if (reader == .simdmat) GEMM_SIMDMAT_FRAGS else GEMM_NAX_FRAGS);
     var kernel: ?mlx.mlx_fast_metal_kernel = null;
-    const name = comptime std.fmt.comptimePrint("exl3_n{d}_reader_exact", .{n}) ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win) ++ (if (raw) "_raw" else "_weights") ++ "_" ++ @tagName(reader);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const k = try getNamedKernel(&kernel, (try kernel_src.tableKernelName(arena.allocator(), cb, name)).ptr, &.{"trellis"}, &.{"result"}, source, try kernel_src.withTableRows(arena.allocator(), cb, header));
+    const alloc = arena.allocator();
+    const name = try std.fmt.allocPrintSentinel(alloc, "exl3_n{d}_reader_exact" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win) ++ (if (raw) "_raw" else "_weights") ++ "_" ++ @tagName(reader), .{n}, 0);
+    const k = try getNamedKernel(&kernel, (try kernel_src.tableKernelName(alloc, cb, name)).ptr, &.{"trellis"}, &.{"result"}, source, try kernel_src.withTableRows(alloc, cb, header));
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
-    var trellis_data: [128 * n]u16 = undefined;
+    var trellis_buf: [128 * exl3.Rate.max_n]u16 = undefined;
+    const trellis_data = trellis_buf[0 .. 128 * n];
     var prng = std.Random.DefaultPrng.init(430);
-    for (&trellis_data) |*v| v.* = prng.random().int(u16);
-    const tr = try host_side.made(mlx.mlx_array_new_data(&trellis_data, &.{ 128, @intCast(n) }, 2, .uint16));
+    for (trellis_data) |*v| v.* = prng.random().int(u16);
+    const tr = try host_side.made(mlx.mlx_array_new_data(trellis_data.ptr, &.{ 128, @intCast(n) }, 2, .uint16));
     defer _ = mlx.mlx_array_free(tr);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);

@@ -358,12 +358,13 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\    for (uint c = 0u; c < 4u; c++) {
     \\      const uint col = col0 * 32u + ct * 16u + uint(origin.x) + c;
     \\      if constexpr (FOLD || KPARTS > 1u) tgm[(row * KPARTS + kslice) * 128u + col] = destination[ct * 8u + 4u * h + c];
-    \\      else exl3_store(y + (size_t)(row * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, float(destination[ct * 8u + 4u * h + c]));
+    \\      else exl3_store(y + (size_t)(row * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, exl3_out(float(destination[ct * 8u + 4u * h + c])));
     \\    }
     \\  }
     \\}
     \\if constexpr (FOLD) {
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  const float psc = exl3_out(0.08838834764831845f);
     \\
 ++ ROWS_FOLD ++
     \\} else if constexpr (KPARTS > 1u) {
@@ -373,7 +374,7 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\    const uint c = i - r * 128u;
     \\    float sum = 0.0f;
     \\    for (uint k = 0u; k < KPARTS; k++) sum += tgm[(r * KPARTS + k) * 128u + c];
-    \\    exl3_store(y + (size_t)(r * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + c, sum);
+    \\    exl3_store(y + (size_t)(r * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + c, exl3_out(sum));
     \\  }
     \\}
 ;
@@ -446,12 +447,12 @@ pub const ROWS_NAX_PREPPED_SOURCE: [:0]const u8 =
     \\    for (uint c = 0u; c < 4u; c++) {
     \\      const uint col = col0 * 32u + ct * 16u + uint(origin.x) + c;
     \\      if constexpr (FOLD || KPARTS > 1u) tgm[(row * KPARTS + kslice) * 128u + col] = destination[ct * 8u + 4u * h + c];
-    \\      else exl3_store(y + (size_t)(row * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, float(destination[ct * 8u + 4u * h + c]));
+    \\      else exl3_store(y + (size_t)(row * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, exl3_out(float(destination[ct * 8u + 4u * h + c])));
     \\    }
     \\  }
     \\}
     \\if constexpr (FOLD) {
-    \\  const float psc = 0.08838834764831845f;
+    \\  const float psc = exl3_out(0.08838834764831845f);
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
 ++ ROWS_FOLD ++
@@ -462,7 +463,7 @@ pub const ROWS_NAX_PREPPED_SOURCE: [:0]const u8 =
     \\    const uint c = i - r * 128u;
     \\    float sum = 0.0f;
     \\    for (uint k = 0u; k < KPARTS; k++) sum += tgm[(r * KPARTS + k) * 128u + c];
-    \\    exl3_store(y + (size_t)(r * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + c, sum);
+    \\    exl3_store(y + (size_t)(r * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + c, exl3_out(sum));
     \\  }
     \\}
 ;
@@ -975,51 +976,11 @@ pub const ROWS_INS = [_][*:0]const u8{ "x", "trellis", "suh", "svh" };
 
 pub const ROWS_NAX_FRAGS: [:0]const u8 = kernels.GEMM_NAX_INCLUDES ++ kernels.GEMM_NAX_FRAGS ++ ROWS_HELPERS ++ W32_FRAGS;
 
-/// `nax_wfrag_k` on two 32-bit funnels (`nax_win2`) where a quad's two early codewords lie in the 32 bits ending 16
-/// before its last bit and its two late ones in the last 32 (n62 to n102): the same codewords, no 64-bit shift. n64 keeps
-/// `nax_wfrag`, whose two-word read measured faster there.
+/// `rows_wfrag` delegates to `nax_wfrag_k`, which now carries all branchless funnel fast paths across n16..n128.
 const W32_FRAGS: [:0]const u8 =
-    \\static inline constexpr bool nax_w32_fits(uint N) {
-    \\  for (uint b = 0u; b < 2u; b++) {
-    \\    const uint last = nax_end(N, b, 5u);
-    \\    if (last - nax_end(N, b, 1u) < 16u || last - nax_end(N, b, 0u) > 32u || last - nax_end(N, b, 4u) > 16u) return false;
-    \\  }
-    \\  return true;
-    \\}
-    \\static inline constexpr bool rows_w32(uint N, uint R32) { return R32 != 0u && N != 64u && nax_w32_fits(N); }
     \\template<uint N, uint R32, uint SW>
-    \\static inline nfrag rows_wfrag(const device uint *words, uint lane) {
-    \\  if constexpr (N == 80u && SW != 0u) return nax_k5_frag<N>(words, lane);
-    \\  if constexpr (rows_w32(N, R32)) {
-    \\    constexpr uint W = N / 2u;
-    \\    const uint b = (lane >> 3u) & 1u;
-    \\    const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
-    \\    const uint s0 = nax_sh(N, b, 0u) - 16u;
-    \\    const uint s1 = nax_sh(N, b, 1u) - 16u;
-    \\    const uint s4 = nax_sh(N, b, 4u);
-    \\    uint2 lo, hi;
-    \\    if constexpr (SW != 0u && N == 96u) {
-    \\      const uint l = (end - 1u) >> 5u;
-    \\      const uint s = (0u - end) & 31u;
-    \\      const uint sp = (s + 16u) & 31u;
-    \\      const uint wm = words[l == 1u ? W - 1u : l - 2u];
-    \\      const uint w0 = words[l - 1u];
-    \\      const uint w1 = words[l];
-    \\      const uint w2 = words[l + 1u];
-    \\      lo = uint2(nax_funnel(w1, w0, s), nax_funnel(w0, wm, sp));
-    \\      hi = uint2(nax_funnel(w2, w1, sp), nax_funnel(w2, w1, s));
-    \\    } else {
-    \\      lo = nax_win2(words, end, W);
-    \\      hi = nax_win2(words, end + W, W);
-    \\    }
-    \\    const half2 p0 = exl3_pairh(uint2((lo.y >> s0) & 0xffffu, (lo.y >> s1) & 0xffffu));
-    \\    const half2 p1 = exl3_pairh(uint2((lo.x >> s4) & 0xffffu, lo.x & 0xffffu));
-    \\    const half2 p2 = exl3_pairh(uint2((hi.y >> s0) & 0xffffu, (hi.y >> s1) & 0xffffu));
-    \\    const half2 p3 = exl3_pairh(uint2((hi.x >> s4) & 0xffffu, hi.x & 0xffffu));
-    \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
-    \\  } else {
-    \\    return nax_wfrag_k<N>(words, lane);
-    \\  }
+    \\__attribute__((always_inline)) static inline nfrag rows_wfrag(const device uint *words, uint lane) {
+    \\  return nax_wfrag_k<N>(words, lane);
     \\}
     \\
 ;

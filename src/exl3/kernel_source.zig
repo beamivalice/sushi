@@ -49,9 +49,9 @@ pub fn cbSuffix(comptime cb: exl3.Codebook) [:0]const u8 {
     };
 }
 
-/// The power of two `exl3_decode2` leaves out of a codebook's weights: a hash-mask codebook's
-/// scale, restored by `exl3_out` once per stored sum instead of once per decoded pair.
-fn foldScale(comptime cb: exl3.Codebook) u32 {
+/// The power of two `exl3_decode2` and `exl3_mma_pairh` leave out of a codebook's weights: a hash-mask or PAIR1
+/// codebook's scale, restored by `exl3_out` once per stored sum instead of once per decoded pair.
+pub fn foldScale(comptime cb: exl3.Codebook) u32 {
     return if (cb.isHashMask()) exl3.hash_mask_scale else if (cb == .pair1) PAIR1_SCALE else 1;
 }
 
@@ -146,16 +146,40 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\    return uint2(uint((((ulong)b << 32u) | (ulong)a) >> s), uint((((ulong)c << 32u) | (ulong)b) >> s));
     \\  }
     \\};
+    \\// Wide lane read (N > 108, up to 72 bits spanning 3 words when 64 + low >= sh0 + 16, else 4 words):
+    \\// uint3 holds bits [0..95] with 3-4 loads and 2-3 hardware funnels instead of double 64-bit exl3_window.
     \\template<> struct exl3_lane_type<true, false, 0u> {
-    \\  using type = ulong2;
-    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool full) {
-    \\    return ulong2(exl3_window(words, end, W, full), exl3_window(words, end - 32u, W, true));
+    \\  using type = uint3;
+    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\    const uint last = (end - 1u) >> 5u;
+    \\    const uint prev = last == 0u ? W - 1u : last - 1u;
+    \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    const uint a = words[last];
+    \\    const uint b = words[prev];
+    \\    const uint c = words[third];
+    \\    return uint3(uint((((ulong)b << 32u) | (ulong)a) >> s), uint((((ulong)c << 32u) | (ulong)b) >> s), c >> s);
+    \\  }
+    \\};
+    \\template<> struct exl3_lane_type<true, true, 0u> {
+    \\  using type = uint3;
+    \\  __attribute__((always_inline)) static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\    const uint last = (end - 1u) >> 5u;
+    \\    const uint prev = last == 0u ? W - 1u : last - 1u;
+    \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
+    \\    const uint fourth = third == 0u ? W - 1u : third - 1u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    const uint a = words[last];
+    \\    const uint b = words[prev];
+    \\    const uint c = words[third];
+    \\    const uint d = words[fourth];
+    \\    return uint3(uint((((ulong)b << 32u) | (ulong)a) >> s), uint((((ulong)c << 32u) | (ulong)b) >> s), uint((((ulong)d << 32u) | (ulong)c) >> s));
     \\  }
     \\};
     \\static inline constexpr uint exl3_pair_kind(uint N) {
     \\  return (EXL3_LANE_FIRST == 1u && exl3_lane_sh(N, 0u) + 16u <= 64u)
     \\    ? (exl3_lane_sh(N, 1u) + 16u <= 32u ? 1u : 2u)
-    \\    : 0u;
+    \\    : (exl3_lane_sh(N, 0u) + 16u <= 32u ? 1u : 0u);
     \\}
     \\template<uint N> using exl3_lane_bits = typename exl3_lane_type<(exl3_lane_sh(N, 0u) + 16u > 64u), false, exl3_pair_kind(N)>::type;
     \\__attribute__((always_inline)) static inline uint exl3_lane_word(uint bits, uint sh) { return bits >> sh; }
@@ -163,8 +187,8 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\  return sh <= 16u ? (bits.x >> sh) : (sh < 32u ? ((bits.x >> sh) | (bits.y << (32u - sh))) : (bits.y >> (sh - 32u)));
     \\}
     \\__attribute__((always_inline)) static inline uint exl3_lane_word(ulong bits, uint sh) { return uint(bits >> sh); }
-    \\__attribute__((always_inline)) static inline uint exl3_lane_word(ulong2 bits, uint sh) {
-    \\  return sh <= 48u ? uint(bits.x >> sh) : uint(bits.y >> (sh - 32u));
+    \\__attribute__((always_inline)) static inline uint exl3_lane_word(uint3 bits, uint sh) {
+    \\  return sh <= 48u ? uint(as_type<ulong>(uint2(bits.x, bits.y)) >> sh) : uint(as_type<ulong>(uint2(bits.y, bits.z)) >> (sh - 32u));
     \\}
     \\template<uint N>
     \\__attribute__((always_inline)) static inline exl3_lane_bits<N> exl3_lane(const device uint *words, uint lane) {
@@ -172,7 +196,9 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\  constexpr uint low = W & (0u - W);
     \\  constexpr bool wide = exl3_lane_sh(N, 0u) + 16u > 64u;
     \\  constexpr uint pk = exl3_pair_kind(N);
-    \\  constexpr bool full = exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 32u + (low < 32u ? low : 32u);
+    \\  constexpr bool full = wide
+    \\    ? (exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 64u + (low < 32u ? low : 32u))
+    \\    : (exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 32u + (low < 32u ? low : 32u));
     \\  const uint end = W * lane + W;
     \\  // At K3.5 the W bits under a lane's 32-bit window are the high W bits of the preceding lane's
     \\  // window, so a shuffle stands in for their loads. Every caller runs it with the simdgroup in step.
@@ -181,7 +207,7 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\    const uint prior = simd_shuffle(low_bits, ushort((lane + 31u) & 31u));
     \\    return uint2(low_bits, prior >> (32u - W));
     \\  }
-    \\  return exl3_lane_type<wide, !wide && full, pk>::read(words, end, W, full);
+    \\  return exl3_lane_type<wide, full, pk>::read(words, end, W, full);
     \\}
     \\// Weight t's 16-bit codeword is the window ending at floor((t+1)*K), with
     \\// K = N/16; the pair (t0, t0+1) shares one 32-bit funnel read.
@@ -238,10 +264,12 @@ fn helpersWithBody(comptime prefix: [:0]const u8, comptime body: [:0]const u8, c
     else
         prefix ++ "static inline half2 exl3_pairh(uint2 cw) {\n" ++ mask ++ body ++ "\n}\n";
     const decode = comptime if (fold == 1)
+        \\static inline half2 exl3_mma_pairh(uint2 cw) { return exl3_pairh(cw); }
         \\static inline float2 exl3_decode2(uint2 cw) { return float2(exl3_pairh(cw)); }
         \\static inline float exl3_out(float v) { return v; }
         \\
     else if (hash_scale != null and fold == hash_scale.?)
+        \\static inline half2 exl3_mma_pairh(uint2 cw) { return exl3_unscaled(cw); }
         \\static inline float2 exl3_decode2(uint2 cw) { return float2(exl3_unscaled(cw)); }
         \\
     ++ std.fmt.comptimePrint("static inline float exl3_out(float v) {{ return v * {d}.0f; }}\n", .{fold})
@@ -260,16 +288,19 @@ fn helpersWithBody(comptime prefix: [:0]const u8, comptime body: [:0]const u8, c
 /// `N` to them, so each row constant is a compile-time immediate of its own kernel instance.
 fn rowedHelpers(comptime fold: u32, comptime scale: u32, comptime slot: [:0]const u8) [:0]const u8 {
     const out: [:0]const u8 = comptime if (fold == 1)
-        "template<uint N> static inline float2 exl3_decode2_n(uint2 cw) { return float2(exl3_pairh_n<N>(cw)); }\n" ++
+        "template<uint N> static inline half2 exl3_mma_pairh_n(uint2 cw) { return exl3_pairh_n<N>(cw); }\n" ++
+            "template<uint N> static inline float2 exl3_decode2_n(uint2 cw) { return float2(exl3_pairh_n<N>(cw)); }\n" ++
             "static inline float exl3_out(float v) { return v; }\n"
     else if (fold == scale)
-        "template<uint N> static inline float2 exl3_decode2_n(uint2 cw) { return float2(exl3_unscaled_n<N>(cw)); }\n" ++
+        "template<uint N> static inline half2 exl3_mma_pairh_n(uint2 cw) { return exl3_unscaled_n<N>(cw); }\n" ++
+            "template<uint N> static inline float2 exl3_decode2_n(uint2 cw) { return float2(exl3_unscaled_n<N>(cw)); }\n" ++
             std.fmt.comptimePrint("static inline float exl3_out(float v) {{ return v * {d}.0f; }}\n", .{fold})
     else
         @compileError("a fold is the codebook's scale or none");
     return comptime std.fmt.comptimePrint("template<uint N> static inline half2 exl3_pairh_n(uint2 cw) {{ return exl3_unscaled_n<N>(cw) * half2({d}.0h); }}\n", .{scale}) ++
         out ++ slot ++
         "#define exl3_pairh(cw) exl3_pairh_n<N>((cw))\n" ++
+        "#define exl3_mma_pairh(cw) exl3_mma_pairh_n<N>((cw))\n" ++
         "#define exl3_decode2(cw) exl3_decode2_n<N>((cw))\n" ++
         "#define exl3_slot(cw, slot) exl3_slot_n<N>((cw), (slot))\n";
 }
@@ -350,13 +381,17 @@ fn tableKernel(slot: *?mlx.mlx_fast_metal_kernel, comptime cb: exl3.Codebook, co
 }
 
 /// MLX keys a kernel library by name, so a SPEC1 kernel's name spells its table (on `alloc`, a build's arena).
-pub fn tableKernelName(alloc: std.mem.Allocator, comptime cb: exl3.Codebook, comptime name: [:0]const u8) ![:0]const u8 {
+pub fn tableKernelName(alloc: std.mem.Allocator, comptime cb: exl3.Codebook, name: [:0]const u8) ![:0]const u8 {
     if (!cb.tabledHashMask()) return name;
     return std.fmt.allocPrintSentinel(alloc, "{s}_t{s}", .{ name, codebook_tables.tables[tableOf(kernels.active_decode)].digest }, 0);
 }
 
 pub fn naxHeader(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]const u8 {
     return comptime kernels.GEMM_NAX_INCLUDES ++ codebookHelpers(cb, win) ++ kernels.GEMM_NAX_FRAGS;
+}
+
+pub fn naxHeaderUnfolded(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]const u8 {
+    return comptime kernels.GEMM_NAX_INCLUDES ++ decodeHelpers(cb, win, 1) ++ kernels.GEMM_NAX_FRAGS;
 }
 
 /// A weight kernel under the active decode parameters: its own slot, name and
@@ -642,4 +677,199 @@ test "exl3 K5 NAX fragments match host SPEC1 weights at both halfword alignments
 
 test "exl3 routed prefill fragments match host PAIR1 weights at K2.5 K3 and K3.5" {
     inline for (.{ 40, 48, 56 }) |n| try kernels.weightReaderExact(n, .pair1, .w16, false, .nax);
+}
+
+// Exhaustive hardware fidelity gate: verifies that subnormal half weights from `exl3_mma_pairh`
+// pass through BOTH `simdgroup_matrix<half, 8, 8>` (M1-M5) and NAX `matmul2d(relaxed_precision=true)`
+// (M5+) without flush-to-zero, matching unfolded `exl3_pairh` bit-for-bit across all 32,768 w15
+// codewords and K=256 accumulated random dot products at K4, K5, and K6.
+test "exl3 MMA subnormal fold is bit-exact across all 32768 w15 codewords on simdgroup_matrix and NAX" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    kernels.setDecodeParams(kernels.SPEC1_W15);
+    defer kernels.setDecodeParams(.mul1);
+
+    const smat_src =
+        \\constexpr uint N = uint(NHW);
+        \\const uint tg = uint(threadgroup_position_in_grid.x);
+        \\const uint lane = uint(thread_index_in_simdgroup);
+        \\threadgroup half eye[64];
+        \\eye[lane] = half(((lane >> 3u) == (lane & 7u)) ? 1.0h : 0.0h);
+        \\eye[lane + 32u] = half((((lane + 32u) >> 3u) == ((lane + 32u) & 7u)) ? 1.0h : 0.0h);
+        \\threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\simdgroup_matrix<half, 8, 8> a, bf, bu;
+        \\simdgroup_matrix<float, 8, 8> af = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\simdgroup_matrix<float, 8, 8> au = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\simdgroup_load(a, eye, 8u);
+        \\const uint base = tg * 64u + lane * 2u;
+        \\const uint2 cw = uint2(base, base + 1u);
+        \\const half2 wf = exl3_mma_pairh(cw);
+        \\const half2 wu = exl3_pairh(cw);
+        \\bf.thread_elements()[0] = wf.x; bf.thread_elements()[1] = wf.y;
+        \\bu.thread_elements()[0] = wu.x; bu.thread_elements()[1] = wu.y;
+        \\simdgroup_multiply_accumulate(af, a, bf, af);
+        \\simdgroup_multiply_accumulate(au, a, bu, au);
+        \\uint diffs = 0u;
+        \\if (as_type<uint>(exl3_out(af.thread_elements()[0])) != as_type<uint>(au.thread_elements()[0])) diffs++;
+        \\if (as_type<uint>(exl3_out(af.thread_elements()[1])) != as_type<uint>(au.thread_elements()[1])) diffs++;
+        \\// K=256 accumulated dot products across 3 activation scales (1e-3, 1.0, 50.0)
+        \\if (tg < 3u) {
+        \\  const float scales[3] = { 1e-3f, 1.0f, 50.0f };
+        \\  const float sc = scales[tg];
+        \\  af = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\  au = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        \\  for (uint k = 0u; k < 32u; k++) {
+        \\    const uint h0 = (k * 73856093u) ^ (lane * 19349663u) ^ (tg * 83492791u);
+        \\    const uint h1 = h0 * 2654435761u + 17u;
+        \\    a.thread_elements()[0] = half((float(int(h0 & 0xFFFFu) - 32768) / 32768.0f) * sc);
+        \\    a.thread_elements()[1] = half((float(int(h1 & 0xFFFFu) - 32768) / 32768.0f) * sc);
+        \\    const uint cbase = ((k * 1024u + tg * 64u + lane * 2u) & 0x7FFEu);
+        \\    const uint2 kcw = uint2(cbase, cbase + 1u);
+        \\    const half2 kwf = exl3_mma_pairh(kcw);
+        \\    const half2 kwu = exl3_pairh(kcw);
+        \\    bf.thread_elements()[0] = kwf.x; bf.thread_elements()[1] = kwf.y;
+        \\    bu.thread_elements()[0] = kwu.x; bu.thread_elements()[1] = kwu.y;
+        \\    simdgroup_multiply_accumulate(af, a, bf, af);
+        \\    simdgroup_multiply_accumulate(au, a, bu, au);
+        \\  }
+        \\  if (as_type<uint>(exl3_out(af.thread_elements()[0])) != as_type<uint>(au.thread_elements()[0])) diffs++;
+        \\  if (as_type<uint>(exl3_out(af.thread_elements()[1])) != as_type<uint>(au.thread_elements()[1])) diffs++;
+        \\}
+        \\out[tg * 32u + lane] = diffs;
+    ;
+
+    const nax_src =
+        \\constexpr uint N = uint(NHW);
+        \\const uint tg = uint(threadgroup_position_in_grid.x);
+        \\const uint lane = uint(thread_index_in_simdgroup);
+        \\constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+        \\matmul2d<desc, execution_simdgroup> op;
+        \\auto left = op.get_left_input_cooperative_tensor<half, half, float>();
+        \\auto rf = op.get_right_input_cooperative_tensor<half, half, float>();
+        \\auto ru = op.get_right_input_cooperative_tensor<half, half, float>();
+        \\auto df = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(left)>, metal::remove_addrspace_t<decltype(rf)>, float>();
+        \\auto du = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(left)>, metal::remove_addrspace_t<decltype(ru)>, float>();
+        \\nax_zero(df);
+        \\nax_zero(du);
+        \\const short2 o = nax_origin(lane);
+        \\for (uint c = 0u; c < 4u; c++) {
+        \\  left[c] = half((uint(o.y) == uint(o.x) + c) ? 1.0h : 0.0h);
+        \\  left[4u + c] = half((uint(o.y) + 8u == uint(o.x) + c) ? 1.0h : 0.0h);
+        \\}
+        \\const uint base = tg * 512u + lane * 16u;
+        \\for (uint p = 0u; p < 8u; p++) {
+        \\  const uint2 cw = uint2(base + 2u * p, base + 2u * p + 1u);
+        \\  const half2 wf = exl3_mma_pairh(cw);
+        \\  const half2 wu = exl3_pairh(cw);
+        \\  rf[2u * p] = wf.x; rf[2u * p + 1u] = wf.y;
+        \\  ru[2u * p] = wu.x; ru[2u * p + 1u] = wu.y;
+        \\}
+        \\op.run(left, rf, df);
+        \\op.run(left, ru, du);
+        \\uint diffs = 0u;
+        \\for (uint s = 0u; s < df.get_capacity(); s++) {
+        \\  if (as_type<uint>(exl3_out(float(df[s]))) != as_type<uint>(float(du[s]))) diffs++;
+        \\}
+        \\if (tg < 3u) {
+        \\  const float scales[3] = { 1e-3f, 1.0f, 50.0f };
+        \\  const float sc = scales[tg];
+        \\  nax_zero(df);
+        \\  nax_zero(du);
+        \\  for (uint k = 0u; k < 16u; k++) {
+        \\    for (uint c = 0u; c < 8u; c++) {
+        \\      const uint h = ((k * 31u + c) * 73856093u) ^ (lane * 19349663u) ^ (tg * 83492791u);
+        \\      left[c] = half((float(int(h & 0xFFFFu) - 32768) / 32768.0f) * sc);
+        \\    }
+        \\    for (uint p = 0u; p < 8u; p++) {
+        \\      const uint cbase = ((k * 2048u + tg * 512u + lane * 16u + 2u * p) & 0x7FFEu);
+        \\      const uint2 kcw = uint2(cbase, cbase + 1u);
+        \\      const half2 kwf = exl3_mma_pairh(kcw);
+        \\      const half2 kwu = exl3_pairh(kcw);
+        \\      rf[2u * p] = kwf.x; rf[2u * p + 1u] = kwf.y;
+        \\      ru[2u * p] = kwu.x; ru[2u * p + 1u] = kwu.y;
+        \\    }
+        \\    op.run(left, rf, df);
+        \\    op.run(left, ru, du);
+        \\  }
+        \\  for (uint s = 0u; s < df.get_capacity(); s++) {
+        \\    if (as_type<uint>(exl3_out(float(df[s]))) != as_type<uint>(float(du[s]))) diffs++;
+        \\  }
+        \\}
+        \\out[tg * 32u + lane] = diffs;
+    ;
+
+    const dummy_data = [_]u32{0};
+    const dummy = mlx.mlx_array_new_data(&dummy_data, &.{1}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(dummy);
+    const inputs = mlx.mlx_vector_array_new_data(&.{dummy}, 1);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // 1. simdgroup_matrix<half, 8, 8> across all 32,768 w15 codewords (M1-M5)
+    {
+        var slot: ?mlx.mlx_fast_metal_kernel = null;
+        const header = try withTableRows(alloc, .spec1, comptime codebookHelpers(.spec1, .w15));
+        const k = try kernels.getNamedKernel(&slot, (try tableKernelName(alloc, .spec1, "exl3_subnormal_smat_spec1_w15")).ptr, &.{"dummy"}, &.{"out"}, smat_src, header);
+        defer _ = mlx.mlx_fast_metal_kernel_free(k);
+        for ([_]c_int{ 64, 80, 96 }) |n| {
+            const cfg = mlx.mlx_fast_metal_kernel_config_new();
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 512 * 32 }, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 512 * 32, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", n));
+            var outputs = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(outputs);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, k, inputs, cfg, s));
+            var res = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(res);
+            try mlx.check(mlx.mlx_vector_array_get(&res, outputs, 0));
+            try mlx.check(mlx.mlx_array_eval(res));
+            const got = mlx.mlx_array_data_uint32(res) orelse return error.U32Unreadable;
+            for (0..512 * 32) |i| try t.expectEqual(@as(u32, 0), got[i]);
+        }
+    }
+
+    // 2. NAX matmul2d(relaxed_precision=true) across all 32,768 w15 codewords (M5+)
+    if (kernels.gemmNaxOn()) {
+        var slot: ?mlx.mlx_fast_metal_kernel = null;
+        const header = try withTableRows(alloc, .spec1, comptime naxHeader(.spec1, .w15));
+        const k = try kernels.getNamedKernel(&slot, (try tableKernelName(alloc, .spec1, "exl3_subnormal_nax_spec1_w15")).ptr, &.{"dummy"}, &.{"out"}, nax_src, header);
+        defer _ = mlx.mlx_fast_metal_kernel_free(k);
+        for ([_]c_int{ 64, 80, 96 }) |n| {
+            const cfg = mlx.mlx_fast_metal_kernel_config_new();
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 64 * 32 }, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 64 * 32, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", n));
+            var outputs = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(outputs);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, k, inputs, cfg, s));
+            var res = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(res);
+            try mlx.check(mlx.mlx_vector_array_get(&res, outputs, 0));
+            try mlx.check(mlx.mlx_array_eval(res));
+            const got = mlx.mlx_array_data_uint32(res) orelse return error.U32Unreadable;
+            for (0..64 * 32) |i| try t.expectEqual(@as(u32, 0), got[i]);
+        }
+    }
+}
+
+test "exl3 all rate-tier readers match host across w16 and w15 boundaries" {
+    // Covers every tier transition in nax_wfrag_k, smat_group, and exl3_lane at full 16-bit w16.
+    for ([_]u32{ 16, 18, 24, 32, 34, 36, 38, 56, 58, 60, 62, 64, 66, 78, 80, 82, 84, 86, 94, 96, 98, 100, 102, 108, 110, 112, 126, 128 }) |n| {
+        inline for (.{ .lane, .nax, .simdmat }) |reader| {
+            try kernels.weightReaderExact(n, .mcg, .w16, false, reader);
+        }
+    }
+    for ([_]u32{ 24, 32, 36, 58, 64, 80, 96, 128 }) |n| {
+        inline for (.{ .lane, .nax, .simdmat }) |reader| {
+            try kernels.weightReaderExactAt(n, .spec1, .w15, false, reader, kernels.SPEC1_W15.table);
+        }
+    }
 }

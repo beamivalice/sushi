@@ -233,8 +233,8 @@ fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, dec: api.format.Decode)
     }
     const ids = try o.own(mlx.mlx_array_new_data(&id_data, &[_]c_int{ 1, 2048, 8 }, 3, .uint32));
     const scores = try o.own(mlx.mlx_array_new_data(&score_data, &[_]c_int{ 1, 2048, 8 }, 3, .float32));
-    // A hash-mask codebook's reference is its sorted chain with the scale decoded into every weight.
-    base.unfolded_for_test = dec.codebook.isHashMask();
+    // A hash-mask or PAIR1 codebook's reference is its sorted chain with the scale decoded into every weight.
+    base.unfolded_for_test = dec.codebook.isHashMask() or dec.codebook == .pair1;
     defer base.unfolded_for_test = false;
     const want = try o.own(try api.moeClamped(s, x.*, bank, ids.*, scores.*, dec, 10));
     try mlx.check(mlx.mlx_array_eval(want.*));
